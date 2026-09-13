@@ -27,7 +27,11 @@ tsim = T(100);
 T_L = 0.01  # correlation time of the forcing
 e_star = 0.1 # energy injection rate
 k_f = sqrt(2) # forcing wavenumber  
-freeze = 1 # number of time steps to freeze the forcing
+# ⚠️ The forcing here is INHERITED, not set. This script splats `params_track...`, which
+# carries `ou_bodyforce` -- freeze, rng_seed and all -- from the tracking run, and a local
+# `freeze` would be dead code that reads as if it did something. The value is checked after
+# the splat instead, because `freeze = 1` at the LF step is what keeps this run's forcing
+# aligned with the HF reference's `freeze = 10` at a ten-times-smaller step (gotcha #33).
 
 # For running on a CUDA compatible GPU
 ArrayType = CuArray
@@ -73,6 +77,19 @@ params = (;
     ArrayType,
     backend,
     savefreq = 1000);
+
+# 🔴 The inherited forcing must be the one this run assumes. `freeze = 1` at the LF step of
+# 2.5e-3 advances the OU chain on exactly the same schedule, and with exactly the same per-advance
+# Delta t, as the HF reference's `freeze = 10` at 2.5e-4 -- 40001 advances of 2.5e-3 either way, each
+# forcing field covering the same physical interval (verified 2026-09-13, and bit-identical only in
+# Float64: in Float32 the two products are 1 ulp apart). A `params_track` carrying `freeze != 1`
+# would silently break that correspondence, so it is checked rather than assumed.
+haskey(params, :ou_bodyforce) ||
+    error("params_track carries no ou_bodyforce; this run would be unforced")
+params.ou_bodyforce.freeze == 1 || error(
+    "inherited ou_bodyforce.freeze = $(params.ou_bodyforce.freeze), expected 1. At the LF step " *
+    "that would advance the OU chain on a different schedule from the HF reference.",
+)
 
 # Run replicas
 for i in 1:n_replicas

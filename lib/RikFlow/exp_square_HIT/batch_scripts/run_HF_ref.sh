@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -J HF_ref
-#SBATCH -t 24:00:00
+#SBATCH -t 30:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 
@@ -10,25 +10,18 @@
 #     sbatch batch_scripts/run_HF_ref.sh
 #     sbatch exp_square_HIT/batch_scripts/run_HF_ref.sh
 #
-# 🔴 READ THIS BEFORE SUBMITTING. The wall limit is 24 h and the run may not fit in it.
+# Wall limit: 30 h against a measured 20.9 h. Measured 2026-09-13 by `hf_timing_probe.jl` on an
+# H100 over 5000 steps at this exact configuration: 0.175 s per plain step, two independent
+# projections agreeing to 1.1% (20.65 h and 20.87 h). The archived Float32/RK44 run took 19.3 h, so
+# Float64 plus LMWray3 costs about 8% more.
 #
-# The archived Float32/RK44 reference recorded comptime = 69,329 s = 19.3 h for these same 400,000
-# steps. This run is Float64, which roughly doubles the memory traffic this solver is bound by, and
-# LMWray3, which removes one of RK44's four stages. Those pull in opposite directions and the net
-# is not known — `hf_timing_probe.jl` exists to measure it and, as of 2026-09-13, has not been run
-# at 512^3. The unmeasured estimate is 25–35 h, i.e. **over this limit**.
+# 🔑 The 9 h of headroom is not padding for its own sake. `create_ref_data` writes its output only
+# at the very end, and its checkpoints are written but nothing reads them back — so a job that hits
+# the limit loses the entire run rather than its last hour. At 24 h the margin was 15%, which one
+# slow node eats. SLURM bills time used, not time requested, so the extra costs nothing.
 #
-# And there is no resume. `create_ref_data` writes its output only at the very end; its checkpoints
-# are written but nothing reads them back. A job killed at 24 h therefore loses the entire run, not
-# the last hour of it.
-#
-# So one of these first:
-#   1. `sbatch batch_scripts/run_hf_timing_probe.sh` (1 h) and read its projection. If it says
-#      under ~19 h, this fits with margin and nothing else is needed.
-#   2. Lower `tsim` in 2_HF_ref.jl to what does fit, and accept a shorter reference.
-#   3. Write the restart. It is feasible — `OU_advance!` replays the chain from (seed, n, Δt)
-#      alone (gotcha #33) and a checkpoint already holds `u_cpu` and `results` — but it does not
-#      exist yet, and without it 24 h is a hard cap on a single job.
+# If this ever does need splitting, the restart is feasible but unwritten: `OU_advance!` replays the
+# chain from (seed, n, Δt) alone (gotcha #33) and a checkpoint already holds `u_cpu` and `results`.
 #
 # Disk: the run refuses to start unless ~6.9 GiB is free (2.58 GiB final file, one 4.33 GiB
 # checkpoint, plus a 15% margin). It prints the full table before doing anything expensive.
