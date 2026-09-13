@@ -50,6 +50,19 @@ const REF_RAW = get(ENV, "HF_REF_RAW", "")
 
 const LABELS = ["Z[0,6]", "E[0,6]", "Z[7,15]", "E[7,15]", "Z[16,32]", "E[16,32]"]
 
+# 🔴 The archive's own sample spacing, fixed by the run that produced it: savefreq = 10 at
+# Δt = 2.5e-4. It is *not* read from the probe. Using the probe's spacing for both series is right
+# only while the probe runs production sampling, and silently wrong the moment it does not —
+# `HFT_SAVEFREQ=2` would put the archive on a five-times-compressed axis with nothing to show for
+# it. Each series gets its own axis below, and `commensurate` decides what may be compared
+# column-by-column.
+const ARCH_DT = 2.5e-3
+
+# How much of the archive to show behind the probe window. The probe covers well under one eddy
+# turnover, so on its own axis there is no way to tell a difference from an ordinary excursion;
+# this is the context that makes that judgeable.
+const CONTEXT_TU = parse(Float64, get(ENV, "HF_CONTEXT_TU", "10"))
+
 CairoMakie.activate!(; type = "png", px_per_unit = 2)
 
 # Same palette as `plot_validation.jl` and `plot_paper4.jl`: colour-blind safe, archive darker and
@@ -120,11 +133,22 @@ end
 # Figures
 # ---------------------------------------------------------------------------------------------
 
-"Six panels, one per QoI band: both trajectories on the same absolute time axis."
-function fig_trajectories(pr, ar, n)
+"""
+Six panels, one per QoI band.
+
+The archive runs out to `CONTEXT_TU`; the probe covers whatever it covers, shaded. Showing only
+the overlap would be misleading in the one direction that matters — over 0.8 TU any two turbulent
+trajectories look similar, and there would be nothing to say whether a gap is a difference or an
+ordinary excursion. The archive's own wander over 10 TU is that yardstick.
+
+Each series is drawn on its **own** time axis (`ARCH_DT` for the archive, the probe's measured
+spacing for the probe), so the figure stays correct even when the probe is run with non-production
+sampling.
+"""
+function fig_trajectories(pr, ar, nctx, n)
     fig = Figure(; size = (1000, 620))
-    t = pr.t[1:n]
-    twarm = pr.t[pr.nwarm]
+    tarc = (0:nctx-1) .* ARCH_DT
+    tnew = pr.t[1:n]
     for i = 1:6
         r, c = fldmod1(i, 3)
         ax = Axis(fig[r, c];
@@ -135,21 +159,24 @@ function fig_trajectories(pr, ar, n)
             # O(1e3) for Z and O(1) for E — same order within each kind — so a log axis would
             # compress the only thing worth seeing, which is how the two lines separate.
         )
-        # The warm-up half of the probe is shaded, not hidden: it is the same solver and the same
-        # forcing, it is simply where compilation was paid.
-        vspan!(ax, 0, twarm; color = C_WARM)
-        lines!(ax, t, view(ar.q, i, 1:n); color = C_ARCH, linewidth = 1.4)
-        lines!(ax, t, view(pr.q, i, 1:n); color = C_NEW, linewidth = 1.6)
+        # The probe's whole window, not just its warm-up: at 10 TU the warm-up is a hairline and
+        # what the eye needs is how little of the record the new run covers.
+        vspan!(ax, 0, tnew[end]; color = C_WARM)
+        lines!(ax, tarc, view(ar.q, i, 1:nctx); color = C_ARCH, linewidth = 1.2)
+        lines!(ax, tnew, view(pr.q, i, 1:n); color = C_NEW, linewidth = 1.8)
     end
     Legend(fig[3, 1:3],
         [LineElement(color = C_ARCH, linewidth = 2), LineElement(color = C_NEW, linewidth = 2),
          PolyElement(color = C_WARM)],
-        ["archive (Float32 / RK44, old Nyquist)", "new (Float64 / LMWray3)", "probe warm-up"];
+        [@sprintf("archive, %.3g TU (Float32 / RK44, old Nyquist)", tarc[end]),
+         @sprintf("new, %.3g TU (Float64 / LMWray3)", tnew[end]),
+         "probe window"];
         orientation = :horizontal, framevisible = false)
     rowsize!(fig.layout, 3, Relative(0.08))
     Label(fig[0, 1:3],
-        "HF QoI trajectories: timing probe vs the archive's opening — different realisations, " *
-        "divergence is expected";
+        "HF QoI trajectories: timing probe against the archive's first " *
+        @sprintf("%.3g TU", tarc[end]) *
+        " — different realisations, divergence is expected";
         fontsize = 13, padding = (0, 0, 4, 0))
     fig
 end
@@ -186,17 +213,33 @@ end
 
 pr = load_probe(PROBE)
 ar = load_archive(size(pr.q, 2))
+
+# Context window for the archive, and the column-paired overlap for everything else.
+nctx = min(size(ar.q, 2), round(Int, CONTEXT_TU / ARCH_DT) + 1)
 n = min(size(pr.q, 2), size(ar.q, 2))
 n >= 2 || error("only $n overlapping samples; nothing to plot")
+
+# 🔴 Column-by-column comparison is only meaningful when both series are sampled at the same
+# spacing. The trajectory figure is safe either way — each series has its own axis — but the
+# deviation curve and the window statistics pair column i against column i, which is nonsense
+# across different Δt. Production sampling gives exactly ARCH_DT, so this only fires on a probe run
+# with HFT_SAVEFREQ / Δt overridden.
+commensurate = isapprox(pr.dt_sample, ARCH_DT; rtol = 1e-9)
 
 mkpath(FIGS)
 
 @printf("probe   %s\n", PROBE)
 @printf("        %d samples every %.4g t  (%d warm-up + %d measured), t = 0 .. %.4g\n",
     size(pr.q, 2), pr.dt_sample, pr.nwarm, size(pr.q, 2) - pr.nwarm, pr.t[end])
-@printf("archive %s\n        %d samples, using the first %d\n", ar.src, size(ar.q, 2), n)
+@printf("archive %s\n        %d samples every %.4g t; showing %d (%.3g TU) as context\n",
+    ar.src, size(ar.q, 2), ARCH_DT, nctx, (nctx - 1) * ARCH_DT)
 if size(ar.q, 2) < size(pr.q, 2)
     @warn "the archive is shorter than the probe window; comparing over the overlap only"
+end
+if !commensurate
+    @warn "probe and archive are sampled at different spacings — the trajectory figure is still " *
+          "correct (each series has its own axis) but column-paired comparisons are not" probe =
+        pr.dt_sample archive = ARCH_DT
 end
 
 println()
@@ -208,21 +251,29 @@ for i = 1:6
 end
 
 println()
-@printf("window statistics over t = 0 .. %.4g (%d samples) — regime check only, not agreement\n",
-    pr.t[n], n)
-println("  band          archive mean ± sd              new mean ± sd")
+@printf("window statistics. The probe's %.3g TU against the same window of the archive, and\n",
+    pr.t[n])
+@printf("against the archive's full %.3g TU — the second is the yardstick: a new-run mean that\n",
+    (nctx - 1) * ARCH_DT)
+println("sits inside the archive's own wander is as much agreement as this window can show.")
+println("  band          new (probe window)        archive (same window)     archive (context)")
 for i = 1:6
-    a = view(ar.q, i, 1:n)
     b = view(pr.q, i, 1:n)
-    @printf("  %-12s  %.4e ± %.2e    %.4e ± %.2e\n",
-        LABELS[i], mean(a), std(a), mean(b), std(b))
+    a = view(ar.q, i, 1:n)
+    c = view(ar.q, i, 1:nctx)
+    @printf("  %-12s  %.3e ± %.1e    %.3e ± %.1e    %.3e ± %.1e\n",
+        LABELS[i], mean(b), std(b), mean(a), std(a), mean(c), std(c))
 end
 
 f1 = joinpath(FIGS, "hf_probe_vs_archive_trajectories.png")
-f2 = joinpath(FIGS, "hf_probe_vs_archive_deviation.png")
-save(f1, fig_trajectories(pr, ar, n))
-save(f2, fig_deviation(pr, ar, n))
+save(f1, fig_trajectories(pr, ar, nctx, n))
 println()
 println("Written:")
 println("  $f1")
-println("  $f2")
+if commensurate
+    f2 = joinpath(FIGS, "hf_probe_vs_archive_deviation.png")
+    save(f2, fig_deviation(pr, ar, n))
+    println("  $f2")
+else
+    println("  (deviation figure skipped: sample spacings differ, see the warning above)")
+end
