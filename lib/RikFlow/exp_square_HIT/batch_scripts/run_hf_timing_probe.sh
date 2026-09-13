@@ -58,6 +58,13 @@ fi
 #
 # rather than rebuilding silently. Doing it here rebuilds once, in the same environment the run
 # uses, instead of failing mid-load.
-julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+#
+# ⚠️ A failure here is deliberately not fatal, and that is load-bearing rather than sloppy. Measured
+# 2026-09-13 under Julia 1.13: a stale `Zstd_jll` image in the depot made this step error out while
+# the probe itself then ran to completion, compiling what it needed in-process. The script has no
+# `set -e`, so it continues either way; the `||` makes that a decision instead of an accident, and
+# puts a line in the log so a slow start is explicable.
+julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' ||
+    echo "precompile step failed — continuing; the run will compile in-process (slower start)" >&2
 
 julia --project "$SCRIPT"
