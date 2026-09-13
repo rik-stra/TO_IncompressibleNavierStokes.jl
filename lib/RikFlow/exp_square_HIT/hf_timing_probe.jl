@@ -387,12 +387,24 @@ fieldbytes = sum(sizeof, fields; init = 0) + sum(sizeof, fields_warm; init = 0)
 
 # Classify each step by what production does on it. The checkpoint step is in none of the classes:
 # its time is a plain step plus the write, and it is separated out below.
+#
+# 🔴 The OU class is `(n - 1) % freeze == 0`, not `n % freeze == 0`, and getting it wrong hid the
+# single biggest per-step cost at 512^3. `solve_unsteady` advances the chain at the **top** of
+# iteration `it`, gated on `mod(stepper.n, freeze) == 0` where `stepper.n` is still `it - 1`; the
+# step then ends at `n = it`. So the cost lands on n = 1, 11, 21, ... Measured 2026-09-13: those
+# steps take 0.308 s against a plain step's 0.175 — the partial inverse transform in
+# `OU_forcing_step!` is O(N_f^3 N^3) and costs most of a timestep on its own. Classifying them as
+# plain left them out of the per-class projection, which then came in 1.5 h under the block mean
+# over 400,000 steps.
 isstore(n) = n % plotfreq == 0
 isqoi(n) = n % savefreq == 0 && !isstore(n)
+isou(n) = (n - 1) % freeze == 0
 isckpt(n) = n == ckpt_n
-t_store = [d for (n, d) in zip(ns, dts) if isstore(n) && !isckpt(n)]
-t_qoi = [d for (n, d) in zip(ns, dts) if isqoi(n) && !isckpt(n)]
-t_plain = [d for (n, d) in zip(ns, dts) if !isstore(n) && !isqoi(n) && !isckpt(n)]
+keep(n) = !isckpt(n)
+t_store = [d for (n, d) in zip(ns, dts) if isstore(n) && !isou(n) && keep(n)]
+t_qoi = [d for (n, d) in zip(ns, dts) if isqoi(n) && !isou(n) && keep(n)]
+t_ou = [d for (n, d) in zip(ns, dts) if isou(n) && keep(n)]
+t_plain = [d for (n, d) in zip(ns, dts) if !isstore(n) && !isqoi(n) && !isou(n) && keep(n)]
 
 med(v) = isempty(v) ? NaN : median(v)
 
@@ -445,11 +457,14 @@ end
 # ---------------------------------------------------------------------------------------------
 
 nt = store.nt
-# How production distributes its steps across the three classes. `nfields - 1` because the field
-# stored at n = 0 is not a step.
-n_store = store.nfields - 1
-n_qoi = store.nqoi - 1 - n_store
-n_plain = nt - n_store - n_qoi
+# How production distributes its steps across the classes. `nfields - 1` because the field stored
+# at n = 0 is not a step. The OU class is counted first and removed from the others, matching the
+# classification above: a step that both advances the chain and samples the QoIs is charged once,
+# to the OU class, because that is where its time was measured.
+n_ou = length(1:freeze:nt)
+n_store = count(n -> n % plotfreq == 0 && !((n - 1) % freeze == 0), 1:nt)
+n_qoi = count(n -> n % savefreq == 0 && n % plotfreq != 0 && !((n - 1) % freeze == 0), 1:nt)
+n_plain = nt - n_ou - n_store - n_qoi
 
 # 🔴 Scale the checkpoint cost by size; do not reuse the measured seconds. The probe writes a
 # checkpoint holding the DNS field plus the handful of LES fields *it* accumulated; production's
@@ -470,7 +485,8 @@ setup_wall = block_wall - step_wall          # one-off: processors, priming, and
 per_step = (step_wall - (isfinite(ckpt_time) ? ckpt_time : 0.0)) / length(dts)
 proj_block = per_step * nt + ckpt_total
 proj_class =
-    n_plain * med(t_plain) + n_qoi * med(t_qoi) + n_store * med(t_store) + ckpt_total
+    n_plain * med(t_plain) + n_qoi * med(t_qoi) + n_store * med(t_store) +
+    n_ou * med(t_ou) + ckpt_total
 spread = abs(proj_block - proj_class) / max(proj_block, proj_class)
 
 hrs(s) = s / 3600
@@ -488,6 +504,8 @@ println("="^88)
     med(t_qoi), length(t_qoi), savefreq)
 @printf("  + field-store step   %.4f s   (median of %d, every %d steps)\n",
     med(t_store), length(t_store), plotfreq)
+@printf("  + OU forcing step    %.4f s   (median of %d, every %d steps: n = 1, %d, ...)\n",
+    med(t_ou), length(t_ou), freeze, freeze + 1)
 if isfinite(ckpt_time) && ckpt_bytes > 0
     @printf("  checkpoint write     %.1f s for %s measured  ->  %s/s\n",
         ckpt_time, humanbytes(ckpt_bytes), humanbytes(ckpt_rate))
@@ -497,8 +515,8 @@ else
     println("  checkpoint write     NOT MEASURED — no checkpoint file was produced")
 end
 println()
-@printf("PROJECTION to tsim = %g  (%d steps: %d plain, %d QoI, %d store)\n",
-    target_tsim, nt, n_plain, n_qoi, n_store)
+@printf("PROJECTION to tsim = %g  (%d steps: %d plain, %d QoI, %d store, %d OU)\n",
+    target_tsim, nt, n_plain, n_qoi, n_store, n_ou)
 @printf("  from the block mean   %s\n", dur(proj_block))
 @printf("  from the step classes %s\n", dur(proj_class))
 @printf("  the two differ by     %.1f%%\n", 100 * spread)
@@ -561,6 +579,8 @@ jldsave(
         t_plain = med(t_plain),
         t_qoi = med(t_qoi),
         t_store = med(t_store),
+        t_ou = med(t_ou),
+        n_ou,
         ckpt_time,
         ckpt_bytes,
         ckpt_rate,
