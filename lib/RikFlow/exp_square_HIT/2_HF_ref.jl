@@ -12,7 +12,13 @@ println("Loading modules...")
 t0 = time()
 using LoggingExtras
 using Random
-using CairoMakie
+# 🔴 `using CairoMakie` was here and would have killed the job at load: CairoMakie is not in
+# `lib/RikFlow`'s `[deps]` (only `Makie`, and only as a weak dependency behind `RikFlowMakieExt`),
+# so the run dies with "Package CairoMakie not found in current path" before the first step —
+# after the queue wait, with nothing done. Nothing in this file or in `create_ref_data` plots:
+# `plotfreq` reaches `lesdatagen` as `n_plot`, where it decides when to *store* a filtered field,
+# and `create_ref_data`'s only `plot = energy_spectrum_plot` line is commented out.
+# Gotcha #47's class again — an import that a parse check cannot flag.
 using JLD2
 using RikFlow
 using IncompressibleNavierStokes
