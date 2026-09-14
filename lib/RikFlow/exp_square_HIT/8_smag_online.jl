@@ -10,10 +10,31 @@ using IncompressibleNavierStokes
 using CUDA
 
 smag_folder = @__DIR__()*"/output/smag"
-track_file = @__DIR__()*"/output/data_track_tsim10.0.jld2" #we will take some parameters and the initial field from here
+# The tracking record produced by `3_track_ref.jl` on the REGENERATED HF reference.
+#
+# 🔴 The `_f64_lmwray3` suffix is deliberate and must not be dropped: a Float64/LMWray3 record must
+# never be confusable with the archived Float32/RK44 one, which is otherwise identically named. The
+# archive sits on the pre-`09954be1` Nyquist convention, which changed `∂` and therefore `tau` and
+# `dQ`, so it is a *different dynamical system* rather than a less accurate measurement of this one
+# (claude_memory.md #45, #46).
+#
+# 🔑 100 TU, not 10 (Rik, 2026-09-14). One tracking run carries the 1–10 TU fit window *and* the 401
+# fields at 0.25 TU that D6 draws its initial conditions from. `train_range = (400, 4000)` selects
+# t ∈ [1, 10] out of whatever record it is given, so fitting "to 10 TU" needs no change here.
+track_file = get(ENV, "RIKFLOW_TRACK_FILE",
+    @__DIR__()*"/output/data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2")
+# Parameters and the initial field come from here.
 ispath(smag_folder) || mkpath(smag_folder)
 
-smag_vals = [0.071]
+# 🔴 `c_s = 0.07` by Rik's instruction, 2026-09-14 — NOT paper 2's 0.071.
+#
+# Paper 2 tuned `C_s` for best agreement with the reference distributions and reports
+# `C_s = 0.071`, summed KS-distance 0.705. Two reasons that number is not simply inherited:
+# the tuning was against the *archived* reference, which is on the old Nyquist convention, and the
+# merge replaced our Smagorinsky kernels with upstream's (map §9, Q2) — a different implementation
+# of the same model. ⚠️ So this baseline is neither paper 2's constant nor paper 2's code, and its
+# summed KS must not be compared with 0.705 without saying so.
+smag_vals = [0.07]
 # simulation parameters
 T = Float64
 Re = T(2_000);

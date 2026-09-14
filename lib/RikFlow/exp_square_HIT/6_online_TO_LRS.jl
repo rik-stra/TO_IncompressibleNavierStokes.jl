@@ -10,13 +10,30 @@ using IncompressibleNavierStokes
 using CUDA
 
 # parse input ARGS
+#
+# 🔴 A live `model_index = 2` used to sit here, two lines below the parse, under the comment "or set
+# model_index manually". It was not commented out, so this script deployed configuration 2 whatever
+# the batch array told it — silently, and with `5_train_LinReg.jl` (whose manual line *is*
+# commented) happily training something else. Train and deploy could disagree about which model was
+# being run, with no error anywhere. Fixed 2026-09-14; see claude_memory.md #55.
+length(ARGS) >= 1 || error("usage: julia 6_online_TO_LRS.jl <model_index>")
 model_index = parse(Int, ARGS[1])
-# or set model_index manually
-model_index = 2
 
 inputs_file_name = "/inputs_example.jld2"
 TO_folder = @__DIR__()*"/output/TO_LRS"
-track_file = @__DIR__()*"/output/data_track_tsim10.0.jld2"
+# The tracking record produced by `3_track_ref.jl` on the REGENERATED HF reference.
+#
+# 🔴 The `_f64_lmwray3` suffix is deliberate and must not be dropped: a Float64/LMWray3 record must
+# never be confusable with the archived Float32/RK44 one, which is otherwise identically named. The
+# archive sits on the pre-`09954be1` Nyquist convention, which changed `∂` and therefore `tau` and
+# `dQ`, so it is a *different dynamical system* rather than a less accurate measurement of this one
+# (claude_memory.md #45, #46).
+#
+# 🔑 100 TU, not 10 (Rik, 2026-09-14). One tracking run carries the 1–10 TU fit window *and* the 401
+# fields at 0.25 TU that D6 draws its initial conditions from. `train_range = (400, 4000)` selects
+# t ∈ [1, 10] out of whatever record it is given, so fitting "to 10 TU" needs no change here.
+track_file = get(ENV, "RIKFLOW_TRACK_FILE",
+    @__DIR__()*"/output/data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2")
 
 # simulation parameters
 T = Float64

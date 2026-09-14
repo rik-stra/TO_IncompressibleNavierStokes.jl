@@ -71,3 +71,129 @@
     @test isempty(parse1(raw"""@printf(io, "a %d\n", 1)"""))
     @test isempty(parse1(raw"""@printf(stdout, "plain\n")"""))
 end
+
+# V35 -- every `using` in a runnable script resolves from `[deps]`, `[weakdeps]` or `@stdlib`.
+#
+# Gotcha #53 was `2_HF_ref.jl` carrying `using CairoMakie`, which is not in `lib/RikFlow`'s
+# `[deps]`: a 20-hour job that would have died at load with "Package CairoMakie not found in current
+# path", after the queue wait, with nothing done. Nothing in the file plotted. The rule written down
+# then -- "before submitting a long job, check every `using` in the driver against the project's
+# `[deps]`" -- was a habit, and on 2026-09-14 the same defect was found in **two more drivers on the
+# critical path**: `4_setup_search.jl` (`using DataFrames`) and `5_train_LinReg.jl`
+# (`using CairoMakie`). A habit that fails three times is a test.
+#
+# 🔑 This is the class V31 cannot reach: a parse check sees the `using` but not whether it resolves.
+# Like V31 it works on source text, so it needs no packages and covers the drivers this suite cannot
+# import. Stdlibs are exempt -- they resolve from `@stdlib` whatever the project says, which is why
+# `using Printf` works undeclared and hides the fact that the check is needed at all.
+@testitem "V35 every `using` in a script resolves from [deps] or @stdlib" default_imports = false begin
+    using Test
+
+    const RF = normpath(joinpath(@__DIR__, ".."))
+
+    """The union of `[deps]` and `[weakdeps]` names in a Project.toml, by line scan (no TOML dep)."""
+    function project_names(path)
+        names, inside = Set{String}(), false
+        for line in eachline(path)
+            s = strip(line)
+            if startswith(s, "[")
+                inside = s in ("[deps]", "[weakdeps]")
+            elseif inside && occursin("=", s) && !startswith(s, "#")
+                push!(names, strip(split(s, "=")[1]))
+            end
+        end
+        return names
+    end
+
+    stdlib_names() = Set(readdir(joinpath(Sys.BINDIR, "..", "share", "julia", "stdlib",
+                                          "v$(VERSION.major).$(VERSION.minor)")))
+
+    "Top-level `using X` / `import X` package names in a file, first name only."
+    function imported(path)
+        out = String[]
+        for line in eachline(path)
+            m = match(r"^\s*(?:using|import)\s+([A-Za-z][A-Za-z0-9_]*)", line)
+            m === nothing && continue
+            push!(out, m.captures[1])
+        end
+        return out
+    end
+
+    deps = project_names(joinpath(RF, "Project.toml"))
+    stdlibs = stdlib_names()
+    allowed = union(deps, stdlibs, Set(["RikFlow"]))
+
+    # The scripts that are actually submitted. Analysis drivers run under `analysis/Project.toml`
+    # and are checked against that one instead; plotting and notebook helpers are not job scripts.
+    dirs = [(joinpath(RF, "exp_square_HIT"), allowed),
+            (joinpath(RF, "exp_square_HIT", "tools"), allowed),
+            (joinpath(RF, "analysis"),
+             union(project_names(joinpath(RF, "analysis", "Project.toml")), stdlibs,
+                   Set(["RikFlow"])))]
+
+    # 🔑 In a function, not a bare loop: assigning to `nfiles` inside a top-level `for` when a
+    # global of that name exists makes it a new local and the read throws. Gotcha #47's last bullet,
+    # which bit three times in one session and twice more on 2026-09-14.
+    function scan_imports(dirs, root)
+        bad, nfiles = String[], 0
+        for (dir, ok) in dirs
+            isdir(dir) || continue
+            for f in sort(filter(x -> endswith(x, ".jl"), readdir(dir)))
+                path = joinpath(dir, f)
+                nfiles += 1
+                for pkg in imported(path)
+                    pkg in ok || push!(bad, "$(relpath(path, root)): using $pkg")
+                end
+            end
+        end
+        return bad, nfiles
+    end
+
+    bad, nfiles = scan_imports(dirs, RF)
+
+    # 🔴 Known, pre-existing, and NOT on the fit/online/D6 path. Listed with a reason each rather
+    # than waved through, because the point of this test is that a new one cannot appear quietly.
+    #
+    #   1_spinnup.jl / figs_paper.jl / plot_spinnup_output.jl -- CairoMakie. The last two really do
+    #     plot, so the fix is a dependency decision (add CairoMakie, or move them under a project
+    #     that has it), not a deletion. 1_spinnup.jl is 2_HF_ref.jl's defect again and IS a job
+    #     script, so it is the one of the three that would actually bite; it is not rerun in the
+    #     current rebaseline only because the archived spin-up field is reused deliberately.
+    #   compute_ks*.jl -- DataFrames, genuinely used. P2r/R2 scores through the analysis metric
+    #     layer instead (one scoring path, gotcha #36), so these are off the critical path;
+    #     compute_ks.jl separately loads a filename nothing writes (#55).
+    #   analysis/ou_replay.jl -- IncompressibleNavierStokes, genuinely needed for its CPU mini-solve.
+    #     `analysis/Project.toml` excludes INS on purpose, so this one script must run under
+    #     `lib/RikFlow`'s project. Deliberate, and recorded here so it is not "fixed".
+    sep = Base.Filesystem.path_separator
+    known = Set(replace.([
+        "exp_square_HIT/1_spinnup.jl: using CairoMakie",
+        "exp_square_HIT/compute_ks.jl: using DataFrames",
+        "exp_square_HIT/compute_ks_DDN_smag_LF.jl: using DataFrames",
+        "exp_square_HIT/figs_paper.jl: using CairoMakie",
+        "exp_square_HIT/plot_spinnup_output.jl: using CairoMakie",
+        "analysis/ou_replay.jl: using IncompressibleNavierStokes",
+    ], "/" => sep))
+    novel = setdiff(Set(bad), known)
+
+    @test nfiles > 15                      # the walk found the tree, not an empty directory
+
+    # The gate: no NEW unresolvable import. This is exactly what would have caught
+    # 4_setup_search.jl and 5_train_LinReg.jl before they reached the queue.
+    @test isempty(novel) ||
+          (println("\n  NEW unresolvable imports:\n  ", join(sort(collect(novel)), "\n  ")); false)
+
+    # The debt, visible rather than hidden: broken until the six above are decided.
+    @test_broken isempty(bad)
+
+    # Positive control: a scanner that has never seen an offender is not a test.
+    let ok = Set(["JLD2", "Printf"])
+        probe(line) = [p for p in [match(r"^\s*(?:using|import)\s+([A-Za-z][A-Za-z0-9_]*)", line)]
+                       if p !== nothing && !(p.captures[1] in ok)]
+        @test length(probe("using CairoMakie")) == 1
+        @test length(probe("import DataFrames")) == 1
+        @test isempty(probe("using JLD2"))
+        @test isempty(probe("using Printf"))
+        @test isempty(probe("# using CairoMakie   -- a comment is not an import"))
+    end
+end

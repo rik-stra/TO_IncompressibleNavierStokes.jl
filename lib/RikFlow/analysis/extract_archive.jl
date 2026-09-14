@@ -147,6 +147,68 @@ function extract_reference(; force = false)
 end
 
 # ---------------------------------------------------------------------------------------------
+# D3' -- the REGENERATED high-fidelity reference (2026-09-14)
+#
+# Same object as D3, from `2_HF_ref.jl` on the merged solver: Float64, LMWray3, corrected Nyquist
+# convention, the archive's own spin-up field as its initial condition. It is a *different
+# realisation* from D3, not a refinement of it (the OU chain draws into a Float64 buffer, which
+# consumes the random stream differently, and the stepper changed) -- see gotchas #45, #46, #52.
+# Cached here for the same reason as D3: the QoIs are ~2 MB of a 2.58 GB file.
+# ---------------------------------------------------------------------------------------------
+
+const NEW_REFERENCE_FILE = get(
+    ENV, "RIKFLOW_HF_NEW",
+    normpath(joinpath(@__DIR__, "..", "exp_square_HIT", "output",
+        "data_train_dns512_les64_Re2000.0_freeze_10_tsim100.0_f64_lmwray3.jld2")),
+)
+
+const NEW_REFERENCE_CACHE = "hf_reference_new_tsim100.0_f64_lmwray3_qois.jld2"
+
+"""
+    extract_new_reference(; force = false)
+
+Cache the regenerated 100 TU HF reference QoI trajectory as `q_ref`, `N_Q x nstep+1`.
+
+Stores `dt_sample` alongside it, computed from the run's own `savefreq * Δt` rather than assumed.
+D3's spacing is a constant in the consumers because the archive cannot be re-read cheaply; there is
+no reason to repeat that here, and a run with different sampling must not land silently on D3's
+axis.
+
+Also stores `comptime` (the solver's own wall time, which is the only record of what the run cost)
+and `nfields` (the stored filtered LES fields -- 401 at the production `plotfreq = 1000`).
+"""
+function extract_new_reference(; force = false)
+    src = NEW_REFERENCE_FILE
+    out = joinpath(DATA_DIR, NEW_REFERENCE_CACHE)
+    isfile(out) && !force && (@printf("  exists, skipping: %s (%.2f MB)\n", basename(out),
+                                      filesize(out) / 2^20); return out)
+    isfile(src) || (@warn "no regenerated HF reference at $src"; return nothing)
+    mkpath(DATA_DIR)
+
+    @printf("  reading %s (%.2f GB) ...\n", basename(src), filesize(src) / 2^30)
+    flush(stdout)
+    t0 = time()
+    q_ref, dt_sample, comptime, nfields, params = jldopen(src, "r") do io
+        d = io["data_train"]
+        e = d.data[1]
+        p = io["params_train"]
+        # `params_train` comes back as a JLD2 reconstruction (it carries `ArrayType`, `backend` and
+        # `filters`, none of which exist in this environment), so its fields are read through
+        # `getproperty` and never splatted or reconstructed.
+        (stack(e.qoi_hist), Float64(p.savefreq) * Float64(p.Δt), Float64(d.comptime),
+         length(e.u), string(p))
+    end
+    jldsave(out; q_ref, dt_sample, comptime, nfields, source = abspath(src),
+            source_bytes = filesize(src), params = params, extracted = string(now()))
+    @printf("  read in %.1f s; wrote %s (%.2f MB), q_ref = %s at Δt_sample = %.4g\n",
+            time() - t0, basename(out), filesize(out) / 2^20, size(q_ref), dt_sample)
+    @printf("  run cost %.1f s = %.2f h; %d stored LES fields\n", comptime, comptime / 3600,
+            nfields)
+    flush(stdout)
+    return out
+end
+
+# ---------------------------------------------------------------------------------------------
 # D5 -- the online ensembles
 # ---------------------------------------------------------------------------------------------
 
@@ -252,10 +314,27 @@ function load_reference()
     return load(p, "q_ref")
 end
 
+"""
+    load_new_reference()
+
+Load the cached **regenerated** HF reference, extracting it first if needed.
+
+Returns a NamedTuple, not a bare matrix: `dt_sample` is what keeps a consumer off D3's hard-coded
+axis, and `comptime`/`nfields` are the only surviving record of what the 20.7 h run produced.
+"""
+function load_new_reference()
+    p = joinpath(DATA_DIR, NEW_REFERENCE_CACHE)
+    isfile(p) || extract_new_reference()
+    isfile(p) || error("extraction produced no cache at $p")
+    d = load(p)
+    return (; q_ref = d["q_ref"], dt_sample = d["dt_sample"], comptime = d["comptime"],
+            nfields = d["nfields"], source = d["source"], path = p)
+end
+
 const ARCHIVED_CONFIGS = ("LinReg1", "LinReg63", "LinReg64", "LinReg73", "LinReg74")
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    targets = isempty(ARGS) ? ["reference", ARCHIVED_CONFIGS...] : ARGS
+    targets = isempty(ARGS) ? ["reference", "new-reference", ARCHIVED_CONFIGS...] : ARGS
     println("extracting archive QoIs to ", DATA_DIR)
     println("  frozen root: ", FROZEN)
     println("  dev root:    ", DEV)
@@ -264,6 +343,12 @@ if abspath(PROGRAM_FILE) == @__FILE__
         println()
         println("== ", t)
         flush(stdout)
-        t == "reference" ? extract_reference() : extract_ensemble(t)
+        if t == "reference"
+            extract_reference()
+        elseif t == "new-reference"
+            extract_new_reference()
+        else
+            extract_ensemble(t)
+        end
     end
 end

@@ -6,7 +6,10 @@ end
 using RikFlow
 using JLD2
 using Random
-using CairoMakie
+# 🔴 `using CairoMakie` was here and would have killed this job at load: CairoMakie is not in
+# `lib/RikFlow`'s `[deps]` (only `Makie`, and only as a weak dependency behind `RikFlowMakieExt`).
+# Nothing in this file plots. Exactly the defect #53 found in `2_HF_ref.jl`, in the second step of
+# the fit pipeline.
 using Distributions
 using LinearAlgebra
 using RegularizedLeastSquares
@@ -17,7 +20,19 @@ model_index = parse(Int, ARGS[1])
 #model_index = 1
 inputs_file_name = "/inputs_example.jld2"
 TO_folder = @__DIR__()*"/output/TO_LRS"
-track_file = @__DIR__()*"/output/data_track_tsim10.0.jld2"
+# The tracking record produced by `3_track_ref.jl` on the REGENERATED HF reference.
+#
+# 🔴 The `_f64_lmwray3` suffix is deliberate and must not be dropped: a Float64/LMWray3 record must
+# never be confusable with the archived Float32/RK44 one, which is otherwise identically named. The
+# archive sits on the pre-`09954be1` Nyquist convention, which changed `∂` and therefore `tau` and
+# `dQ`, so it is a *different dynamical system* rather than a less accurate measurement of this one
+# (claude_memory.md #45, #46).
+#
+# 🔑 100 TU, not 10 (Rik, 2026-09-14). One tracking run carries the 1–10 TU fit window *and* the 401
+# fields at 0.25 TU that D6 draws its initial conditions from. `train_range = (400, 4000)` selects
+# t ∈ [1, 10] out of whatever record it is given, so fitting "to 10 TU" needs no change here.
+track_file = get(ENV, "RIKFLOW_TRACK_FILE",
+    @__DIR__()*"/output/data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2")
 
 function create_history(hist_len, q_star, q, dQ; include_predictor = true)
     if hist_len == 0
