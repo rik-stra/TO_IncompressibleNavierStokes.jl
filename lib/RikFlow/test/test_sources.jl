@@ -197,3 +197,100 @@ end
         @test isempty(probe("# using CairoMakie   -- a comment is not an import"))
     end
 end
+
+# V36 -- no top-level `for`/`while` assigns a name that is already bound at top level.
+#
+# Julia's soft scope: inside a top-level loop, assigning to a name that already exists as a global
+# creates a NEW LOCAL, and reading it throws `UndefVarError`. The REPL special-cases this and
+# assigns to the global with only a warning, so a script written interactively runs there and dies
+# when run as a script.
+#
+# 🔴 `4_setup_search.jl` had exactly this and had therefore **never run as a script** -- its
+# `i = 0; for ...; i += 1; end` counter threw on the first real invocation, 2026-09-14. Gotcha #47
+# already records three instances in one session, and two more happened while writing V35. Six is
+# enough.
+#
+# 🔑 This is the class #47 says a parse check cannot reach and an `include` would not catch either:
+# it is a runtime error in a code path that only executes when the script is run. A *static* check
+# for the shape does reach it, which is what this is. The fix is always the same -- put the loop in
+# a function -- and never `global`.
+@testitem "V36 no top-level loop assigns a top-level binding (soft scope)" default_imports = false begin
+    using Test
+
+    const RF36 = normpath(joinpath(@__DIR__, ".."))
+
+    "Names bound by a plain top-level assignment or `const`."
+    function toplevel_bindings(ast)
+        names = Set{Symbol}()
+        for ex in ast.args
+            ex isa Expr || continue
+            if ex.head === :(=) && ex.args[1] isa Symbol
+                push!(names, ex.args[1])
+            elseif ex.head === :const && ex.args[1] isa Expr && ex.args[1].args[1] isa Symbol
+                push!(names, ex.args[1].args[1])
+            end
+        end
+        return names
+    end
+
+    """Names assigned anywhere inside `ex`, NOT descending into function bodies -- those introduce
+    a hard scope and are exactly the recommended fix, so they must not be flagged."""
+    function assigned_in(ex, acc = Set{Symbol}())
+        ex isa Expr || return acc
+        ex.head in (:function, :(->)) && return acc
+        if ex.head === :(=) || (let h = string(ex.head); endswith(h, "=") && length(h) > 1 end)
+            ex.args[1] isa Symbol && push!(acc, ex.args[1])
+        end
+        for a in ex.args
+            assigned_in(a, acc)
+        end
+        return acc
+    end
+
+    function offenders(ast)
+        globals = toplevel_bindings(ast)
+        out = Symbol[]
+        for ex in ast.args
+            ex isa Expr && ex.head in (:for, :while) || continue
+            append!(out, intersect(assigned_in(ex), globals))
+        end
+        return out
+    end
+
+    function scan36(dirs, root)
+        bad, nfiles = String[], 0
+        for d in dirs
+            dir = joinpath(root, d)
+            isdir(dir) || continue
+            for f in sort(filter(x -> endswith(x, ".jl"), readdir(dir)))
+                p = joinpath(dir, f)
+                nfiles += 1
+                ast = try
+                    Meta.parseall(read(p, String); filename = p)
+                catch
+                    continue
+                end
+                for n in offenders(ast)
+                    push!(bad, "$(relpath(p, root)): top-level loop assigns global `$n`")
+                end
+            end
+        end
+        return bad, nfiles
+    end
+
+    bad, nfiles = scan36(["exp_square_HIT", joinpath("exp_square_HIT", "tools"), "analysis"], RF36)
+
+    @test nfiles > 15
+    @test isempty(bad) || (println("\n  soft-scope traps:\n  ", join(sort(bad), "\n  ")); false)
+
+    # Positive control: a scanner that has never seen an offender is not a test. The first is the
+    # exact shape that broke 4_setup_search.jl.
+    parse36(code) = offenders(Meta.parseall(code; filename = "control.jl"))
+    @test parse36("i = 0\nfor x in 1:3\n    i += 1\nend\n") == [:i]
+    @test parse36("acc = []\nfor x in 1:3\n    acc = vcat(acc, x)\nend\n") == [:acc]
+    @test parse36("n = 0\nwhile n < 3\n    n += 1\nend\n") == [:n]
+    # And the three shapes that are fine.
+    @test isempty(parse36("f() = (i = 0; for x in 1:3; i += 1; end; i)\n"))   # inside a function
+    @test isempty(parse36("acc = []\nfor x in 1:3\n    push!(acc, x)\nend\n"))  # mutation, not assignment
+    @test isempty(parse36("for x in 1:3\n    y = x\nend\n"))                    # no such global
+end

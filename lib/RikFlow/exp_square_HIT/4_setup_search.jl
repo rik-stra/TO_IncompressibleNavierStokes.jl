@@ -42,14 +42,21 @@ fixed_parameters = (
 hist_lens = [5, 20]
 labs = [0, 0.01]
 
-i = 0
-inputs = []
-for hist_len in hist_lens
-    for lambda in labs
+# 🔴 In a function, not a bare loop. `i += 1` inside a top-level `for` when a global `i` exists
+# makes `i` a NEW LOCAL, and the read throws `UndefVarError` -- so this script has never run as a
+# script. It worked only in the REPL, where Julia special-cases soft-scope assignment to an existing
+# global. Gotcha #47's last bullet; do not reach for `global` to fix it.
+function build_inputs(hist_lens, labs, fixed)
+    inputs = NamedTuple[]
+    i = 0
+    for hist_len in hist_lens, lambda in labs
         i += 1
-        push!(inputs, (name = "LinReg$i", fixed_parameters..., hist_len, lambda))
+        push!(inputs, (name = "LinReg$i", fixed..., hist_len, lambda))
     end
+    return inputs
 end
+
+inputs = build_inputs(hist_lens, labs, fixed_parameters)
 
 outdir = @__DIR__()*"/output/TO_LRS"
 ispath(outdir) || mkpath(outdir)

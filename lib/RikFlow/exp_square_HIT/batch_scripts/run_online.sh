@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J online
 #SBATCH -t 06:00:00
-#SBATCH --partition=gpu_a100
+#SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 
 # P2r/R2 -- fit a TO-LRS configuration and run it online, or run one of the other closures.
