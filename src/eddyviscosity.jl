@@ -15,7 +15,7 @@ strain!(S, u, setup) = apply!(strain_kernel!, setup, S, u, getgrid(setup))
     I = @index(Global, Cartesian)
     I = I + O
     (; Δ, Δu) = grid
-    ex, ey = unit_cartesian_indices(2)
+    ex, ey = unit_cartesian_indices(Val(2))
     Δux, Δuy = Δu[1][I[1]], Δ[2][I[2]]
     Δvx, Δvy = Δ[1][I[1]], Δu[2][I[2]]
     ∂u∂x = (u[I, 1] - u[I-ex, 1]) / Δux
@@ -31,7 +31,7 @@ end
     I = @index(Global, Cartesian)
     I = I + O
     (; Δ, Δu) = grid
-    ex, ey, ez = unit_cartesian_indices(3)
+    ex, ey, ez = unit_cartesian_indices(Val(3))
     Δux, Δuy, Δuz = Δu[1][I[1]], Δ[2][I[2]], Δ[3][I[3]]
     Δvx, Δvy, Δvz = Δ[1][I[1]], Δu[2][I[2]], Δ[3][I[3]]
     Δwx, Δwy, Δwz = Δ[1][I[1]], Δ[2][I[2]], Δu[3][I[3]]
@@ -58,7 +58,7 @@ gradient_tensor!(G, u, setup) = apply!(gradient_tensor_kernel!, setup, G, u, get
     I = @index(Global, Cartesian)
     I = I + O
     (; Δ, Δu) = grid
-    ex, ey, ez = unit_cartesian_indices(3)
+    ex, ey, ez = unit_cartesian_indices(Val(3))
     Δux, Δuy, Δuz = Δ[1][I[1]], Δu[2][I[2]], Δu[3][I[3]]
     Δvx, Δvy, Δvz = Δu[1][I[1]], Δ[2][I[2]], Δu[3][I[3]]
     Δwx, Δwy, Δwz = Δu[1][I[1]], Δu[2][I[2]], Δ[3][I[3]]
@@ -91,7 +91,7 @@ smagorinsky_viscosity!(visc, S, θ, setup) =
 @kernel function smagorinsky_viscosity_kernel!(O::CartesianIndex{2}, visc, S, θ, grid)
     I = @index(Global, Cartesian)
     I = I + O
-    ex, ey = unit_cartesian_indices(2)
+    ex, ey = unit_cartesian_indices(Val(2))
     d = gridsize_vol(grid, I)
     Sxx2 = S.xx[I]^2
     Syy2 = S.yy[I]^2
@@ -102,7 +102,7 @@ end
 @kernel function smagorinsky_viscosity_kernel!(O::CartesianIndex{3}, visc, S, θ, grid)
     I = @index(Global, Cartesian)
     I = I + O
-    ex, ey, ez = unit_cartesian_indices(3)
+    ex, ey, ez = unit_cartesian_indices(Val(3))
     d = gridsize_vol(grid, I)
     Sxx2 = S.xx[I]^2
     Syy2 = S.yy[I]^2
@@ -120,7 +120,7 @@ apply_eddy_viscosity!(σ, visc, setup) =
 @kernel function apply_eddy_viscosity_kernel!(O::CartesianIndex{2}, σ, visc, Δ)
     I = @index(Global, Cartesian)
     I = I + O
-    ex, ey = unit_cartesian_indices(2)
+    ex, ey = unit_cartesian_indices(Val(2))
 
     # Get linear interpolation weights
     Δx, Δy = Δ
@@ -144,7 +144,7 @@ end
 @kernel function apply_eddy_viscosity_kernel!(O::CartesianIndex{3}, σ, visc, Δ)
     I = @index(Global, Cartesian)
     I = I + O
-    ex, ey, ez = unit_cartesian_indices(3)
+    ex, ey, ez = unit_cartesian_indices(Val(3))
 
     # Get linear interpolation weights
     Δx, Δy, Δz = Δ
@@ -186,7 +186,7 @@ divoftensor!(c, σ, setup) = apply!(divoftensor_kernel!, setup, c, σ, getgrid(s
     I = @index(Global, Cartesian)
     I = I + O
     (; Δ, Δu) = grid
-    ex, ey = unit_cartesian_indices(2)
+    ex, ey = unit_cartesian_indices(Val(2))
     Δpx, Δpy = Δ[1][I[1]], Δ[2][I[2]]
     Δux, Δuy = Δu[1][I[1]], Δu[2][I[2]]
     ∂σxx∂x = (σ.xx[I+ex] - σ.xx[I]) / Δux
@@ -201,7 +201,7 @@ end
     I = @index(Global, Cartesian)
     I = I + O
     (; Δ, Δu) = grid
-    ex, ey, ez = unit_cartesian_indices(3)
+    ex, ey, ez = unit_cartesian_indices(Val(3))
     Δpx, Δpy, Δpz = Δ[1][I[1]], Δ[2][I[2]], Δ[3][I[3]]
     Δux, Δuy, Δuz = Δu[1][I[1]], Δu[2][I[2]], Δu[3][I[3]]
     ∂σxx∂x = (σ.xx[I+ex] - σ.xx[I]) / Δux
@@ -224,7 +224,7 @@ Put the tensor in a statically sized `SMatrix`.
 """
 function collocate_tensor end
 function collocate_tensor(σ, I::CartesianIndex{2})
-    ex, ey = unit_cartesian_indices(2)
+    ex, ey = unit_cartesian_indices(Val(2))
     return SMatrix{2,2,eltype(σ.xx),4}(
         σ.xx[I],
         (σ.yx[I] + σ.yx[I-ex] + σ.yx[I-ey] + σ.yx[I-ex-ey]) / 4,
@@ -233,7 +233,7 @@ function collocate_tensor(σ, I::CartesianIndex{2})
     )
 end
 function collocate_tensor(σ, I::CartesianIndex{3})
-    ex, ey, ez = unit_cartesian_indices(3)
+    ex, ey, ez = unit_cartesian_indices(Val(3))
     return SMatrix{3,3,eltype(σ.xx),9}(
         σ.xx[I],
         (σ.yx[I] + σ.yx[I-ex] + σ.yx[I-ey] + σ.yx[I-ex-ey]) / 4,

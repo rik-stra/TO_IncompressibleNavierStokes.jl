@@ -53,6 +53,29 @@ Offset(D) = Offset{D}()
 "Get tuple of all unit vectors as Cartesian indices."
 unit_cartesian_indices(D) = ntuple(i -> Offset(D)(i), D)
 
+"""
+Same, with the dimension carried as a **type** parameter.
+
+🔴 Use this one inside GPU kernels. `Offset(D) = Offset{D}()` turns a *value* into a type
+parameter, so `unit_cartesian_indices(D::Int)` is inferrable **only if constant propagation reaches
+it**, and that is not a guarantee -- it depends on the Julia, CUDA.jl and KernelAbstractions
+versions and on the inference budget along the call path.
+
+⚠️ **The `Int` form is not broken everywhere; it is fragile.** The same upstream code compiles on
+other machines. On Snellius, 2026-09-14, it did not: the literal `3` in `strain_kernel!` survived
+inference on the CPU and did not survive it on the GPU, the `ntuple` heap-allocated and the returned
+indices came back `Any`. The result was a compile failure, not a slowdown -
+
+    unsupported call to an unknown function (call to gpu_gc_pool_alloc)
+    unsupported dynamic function invocation (call to -)
+    unsupported dynamic function invocation (call to getindex)
+
+- because `ex` was untyped, so `I - ex` and `u[I - ex, 1]` became dynamic calls. Measured on the
+CPU with constant propagation defeated: the `Int` form infers `Any` and allocates 320 bytes, the
+`Val` form infers `NTuple{D,CartesianIndex{D}}` and allocates nothing.
+"""
+@inline unit_cartesian_indices(::Val{D}) where {D} = ntuple(i -> Offset{D}()(i), Val(D))
+
 "Left index `n` times away in direction `i`."
 @inline left(I::CartesianIndex{D}, i, n = 1) where {D} =
     CartesianIndex(ntuple(j -> j == i ? I[j] - n : I[j], D))

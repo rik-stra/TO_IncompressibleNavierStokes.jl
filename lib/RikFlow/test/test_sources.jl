@@ -294,3 +294,72 @@ end
     @test isempty(parse36("acc = []\nfor x in 1:3\n    push!(acc, x)\nend\n"))  # mutation, not assignment
     @test isempty(parse36("for x in 1:3\n    y = x\nend\n"))                    # no such global
 end
+
+# V37 -- `unit_cartesian_indices` is called with `Val(D)`, never a bare integer.
+#
+# `Offset(D) = Offset{D}()` turns a VALUE into a TYPE PARAMETER, so
+# `unit_cartesian_indices(D::Int) = ntuple(i -> Offset(D)(i), D)` is inferrable only when constant
+# propagation reaches it. On the CPU it does. Inside a KernelAbstractions kernel on the GPU it does
+# not, and the failure is a compile error rather than a slowdown:
+#
+#     unsupported call to an unknown function (call to gpu_gc_pool_alloc)
+#     unsupported dynamic function invocation (call to -)
+#     unsupported dynamic function invocation (call to getindex)
+#
+# -- the `ntuple` heap-allocates and `ex, ey, ez` come back untyped, so `I - ex` and `u[I-ex, 1]`
+# become dynamic calls. It killed the first Smagorinsky run on Snellius, 2026-09-14, in
+# `IncompressibleNavierStokes.gpu_strain_kernel!`.
+#
+# Measured with constant propagation defeated: the `Int` form returns the abstract `Tuple` and
+# allocates 320 bytes; `Val(3)` returns `NTuple{3,CartesianIndex{3}}` and allocates nothing.
+#
+# ⚠️ **Not an upstream bug.** The same upstream code compiles on other machines (Rik, 2026-09-14);
+# `git log` only showed that upstream *wrote* those lines, which says nothing about whether they
+# work. What the `Int` form is, is **fragile**: it compiles or not depending on the Julia, CUDA.jl
+# and KernelAbstractions versions and on the inference budget along the call path. `Val` removes the
+# dependence rather than working around a defect, so it is worth keeping either way -- but the
+# version difference against the machine where it works is still worth pinning down, because
+# anything else that leans on constant propagation is exposed the same way.
+#
+# 🔑 Why the check lives here rather than in the INS suite: this is the suite that actually gets
+# run, and like V31/V35/V36 it needs no packages, so it reaches code the RikFlow test environment
+# cannot import. And a CPU test cannot catch this class -- constant propagation succeeds there, so
+# the CPU stays green while the GPU cannot compile. A source check is the only cheap guard.
+@testitem "V37 unit_cartesian_indices is called with Val, not a bare integer" default_imports = false begin
+    using Test
+
+    # code_base/lib/RikFlow/test -> code_base
+    const INS_SRC = normpath(joinpath(@__DIR__, "..", "..", "..", "src"))
+
+    @test isdir(INS_SRC)
+
+    function scan37(dir)
+        bad, nfiles = String[], 0
+        for f in sort(filter(x -> endswith(x, ".jl"), readdir(dir)))
+            p = joinpath(dir, f)
+            nfiles += 1
+            for (i, line) in enumerate(eachline(p))
+                # the definition itself is allowed to take a plain integer; call sites are not
+                occursin(r"^\s*unit_cartesian_indices\(D\)\s*=", line) && continue
+                m = match(r"unit_cartesian_indices\(\s*\d", line)
+                m === nothing && continue
+                push!(bad, "$f:$i: $(strip(line))")
+            end
+        end
+        return bad, nfiles
+    end
+
+    bad, nfiles = scan37(INS_SRC)
+
+    @test nfiles > 10                       # the walk found src/, not an empty directory
+    @test isempty(bad) ||
+          (println("\n  bare-integer unit_cartesian_indices (breaks GPU kernels):\n  ",
+                   join(bad, "\n  ")); false)
+
+    # Positive control: a scanner that has never seen an offender is not a test.
+    probe(l) = match(r"unit_cartesian_indices\(\s*\d", l) !== nothing
+    @test probe("    ex, ey, ez = unit_cartesian_indices(3)")
+    @test probe("    ex, ey = unit_cartesian_indices( 2 )")
+    @test !probe("    ex, ey, ez = unit_cartesian_indices(Val(3))")
+    @test !probe("unit_cartesian_indices(D) = ntuple(i -> Offset(D)(i), D)")
+end

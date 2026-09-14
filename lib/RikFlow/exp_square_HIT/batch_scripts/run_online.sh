@@ -50,9 +50,9 @@ esac
 
 # Reuse the existing depot rather than building another. `JULIA_CPU_TARGET` multiversions the
 # precompiled code across Zen2, Zen4 and Icelake-server, so **one depot serves the a100 and h100
-# partitions** without recompiling per architecture -- which is why the name says h100 while this job
-# asks for a100. That is deliberate: it is the populated depot every other script here uses, and
-# splitting it per partition only means precompiling twice.
+# partitions** without recompiling per architecture. The name is historical, not a claim about which
+# partition this job asks for: it is the populated depot every other script here uses, and splitting
+# it per partition only means precompiling twice.
 export JULIA_DEPOT_PATH=$HOME/julia/julia_h100:
 export JULIA_CPU_TARGET="generic;znver2,clone_all;znver4,clone_all;icelake-server,clone_all"
 
