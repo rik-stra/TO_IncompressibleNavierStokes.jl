@@ -16,8 +16,22 @@ using CUDA
 # the batch array told it — silently, and with `5_train_LinReg.jl` (whose manual line *is*
 # commented) happily training something else. Train and deploy could disagree about which model was
 # being run, with no error anywhere. Fixed 2026-09-14; see claude_memory.md #55.
-length(ARGS) >= 1 || error("usage: julia 6_online_TO_LRS.jl <model_index>")
+length(ARGS) >= 1 || error("usage: julia 6_online_TO_LRS.jl <model_index> [replica]")
 model_index = parse(Int, ARGS[1])
+
+# Optional second argument: run ONE replica instead of all `n_replicas`, so a SLURM array can put
+# the ensemble members on separate GPUs.
+#
+# 🔑 **This is bit-identical to running that replica inside the loop, and that is a property of the
+# code rather than a hope.** The only per-replica state is `Xoshiro(seeds.to + i + 2)`, keyed on the
+# index; `q_hist` is freshly allocated per iteration, `online_sgs` rebuilds its OU `force_cache` on
+# every call so the forcing realisation restarts identically, and `solve_unsteady` takes
+# `docopy = true` by default (`src/solver.jl:22`, `state = deepcopy(start)`) so `ustart` is never
+# mutated by a previous replica. Nothing carries over between iterations.
+#
+# ⚠️ The replica index therefore selects the seed, NOT a position in a sequence: task 3 of an array
+# writes exactly the `..._replica3.jld2` the serial loop would have written.
+replica_arg = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : nothing
 
 inputs_file_name = "/inputs_example.jld2"
 TO_folder = @__DIR__()*"/output/TO_LRS"
@@ -66,6 +80,17 @@ seeds = (;
 inputs = load(TO_folder*inputs_file_name, "inputs")
 (; name, hist_len, n_replicas, hist_var,tracking_noise) = inputs[model_index]
 
+# Resolve which replicas this process owns, and refuse a bad index HERE -- immediately after the
+# 12 kB inputs table and *before* the 2.7 GB track file, the CuArray initial condition and the
+# solver setup below. Validating after those costs a GPU allocation and several minutes to say
+# "4 is not in 1:3"; validating here costs a second.
+if replica_arg !== nothing
+    1 <= replica_arg <= n_replicas || error(
+        "replica $replica_arg is out of range: $name declares n_replicas = $n_replicas")
+end
+replicas = replica_arg === nothing ? (1:n_replicas) : (replica_arg:replica_arg)
+@info "Deploying $name" model_index lambda=get(inputs[model_index], :lambda, missing) replicas=collect(replicas) n_replicas
+
 out_dir = TO_folder*"/$(name)/"
 
 # load reference data
@@ -108,8 +133,8 @@ params.ou_bodyforce.freeze == 1 || error(
     "that would advance the OU chain on a different schedule from the HF reference.",
 )
 
-# Run replicas
-for i in 1:n_replicas
+# Run replicas -- all of them, or the single one this array task owns (resolved above).
+for i in replicas
     LinReg_file_name = out_dir*"LinReg.jld2"
     if hist_len == 0
         q_hist = nothing

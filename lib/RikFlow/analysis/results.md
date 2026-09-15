@@ -16,6 +16,16 @@ julia --startup-file=no --project=analysis analysis/plot_paper4.jl       # -> fi
 julia --startup-file=no --project=test     test/runtests.jl              # 1461 tests
 ```
 
+§4b, the rebaselined runs, is a separate pipeline on separate data and has its own two commands:
+
+```bash
+julia --startup-file=no --project=analysis analysis/extract_rebaseline.jl  # cache the R2 ensembles
+julia --startup-file=no --project=analysis analysis/plot_rebaseline.jl     # -> figures/fig8_*.png
+```
+
+`plot_rebaseline.jl` prints §4b's three tables in the form §4b quotes them, so the section can be
+diffed against a re-run rather than retyped.
+
 **Data.** HIT. `D1` the 100 TU tracked record, `D3` the 100 TU HF reference (40 001 points),
 `D5` the archived online ensembles, `D8` a split of D3 for the KS noise floor. Paper 2's archive is
 gitignored and lives outside the repository; `RIKFLOW_ARCHIVE` and `RIKFLOW_DEV_ARCHIVE` point at
@@ -493,6 +503,153 @@ and for Taylor-Green, whose training path additionally drops rows at a **differe
 clamped).
 
 ---
+
+## 4b. The rebaselined pipeline — R1 and R2 on the regenerated reference 🆕 2026-09-15
+
+🔴 **These runs are NOT comparable with §3's numbers.** Everything here is on the regenerated HF
+reference and a new tracking record, i.e. the post-`09954be1` Nyquist convention, which changed `∂`,
+`tau` and therefore the dynamical system (memory #45, #46). §3 scores paper 2's archive against
+paper 2's reference. The two tables measure different systems with the same statistic.
+
+### R1 — the tracking run
+
+`data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2`: `q` (6, 40001) Float64, 401 stored
+fields at 0.25 TU, `Re = 2000.0`, `Δt = 2.5e-3`, `savefreq = 100`, `freeze = 1`, OU seed 333.
+
+Tracking error `|q_ref − q| / |q_ref|` over all 40 001 columns:
+
+| band | max | mean | p99 |
+|---|---|---|---|
+| Z[0,6] | 1.545e-4 | 8.46e-6 | 5.12e-5 |
+| E[0,6] | 2.314e-4 | 8.21e-6 | 5.94e-5 |
+| Z[7,15] | 4.707e-5 | 5.47e-6 | 2.20e-5 |
+| E[7,15] | 3.692e-5 | 4.14e-6 | 1.79e-5 |
+| Z[16,32] | **9.338e-4** | 4.99e-4 | 7.85e-4 |
+| E[16,32] | 5.502e-4 | 3.06e-4 | 4.70e-4 |
+
+🔑 **The two top bands track ~60× worse than the other four** — means 3–5e-4 against 4–8e-6. Expected
+in kind (smallest scales, least LF skill) but it is the margin that matters: the driver's gate ships
+at a deliberately loose 1e-1 and the real bound should come from this table.
+
+### R2 — four closures, 100 TU each, scored against the regenerated reference
+
+All stable; all launched from the same initial field as the tracking record (rel diff ≤ 1.2e-16).
+
+| model | replicas | stable | summed KS, per replica | ensemble |
+|---|---|---|---|---|
+| **LinReg1** (h = 5, λ = 0, `:normal`) | 5 | 5/5 | 0.586 – 1.010 | **0.836** |
+| **DDN** | 5 | 5/5 | 1.285 – 1.382 | 1.332 |
+| no model | 1 | 1/1 | — | 2.487 |
+| Smagorinsky `c_s = 0.07` | 1 | 1/1 | — | 3.710 |
+
+Per-band KS, ensemble:
+
+| model | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
+|---|---|---|---|---|---|---|
+| LinReg1 | 0.1448 | 0.1107 | 0.1507 | 0.1513 | 0.1390 | 0.1397 |
+| DDN | 0.1663 | 0.0869 | 0.1530 | 0.1679 | 0.3945 | 0.3639 |
+| no model | 0.1759 | 0.0279 | 0.2120 | 0.3304 | 0.9013 | 0.8396 |
+| Smagorinsky | 0.4658 | 0.3070 | 0.5461 | 0.4758 | 0.9672 | 0.9479 |
+
+**Ordering: LRS < DDN < no model < Smagorinsky.** The LRS beats the DDN on the two top bands by ~2.6×
+and is flat across all six; the DDN and both deterministic baselines fail in `[16,32]`.
+
+### The trajectories, one figure per closure
+
+`analysis/plot_rebaseline.jl` writes four figures, `fig8_online_<model>.png`, each showing that
+closure's online QoI trajectories against the regenerated reference across all six bands, with the
+marginal the KS statistic actually scores drawn beside each band.
+
+⚠️ **Band naming, because §4b above uses the other convention.** "The two top bands" there means the
+two *highest-wavenumber* ones, `Z[16,32]` and `E[16,32]`. Below they are called **the `[16,32]`
+pair** and the other four **the larger-scale bands**, so that nothing turns on which end of the
+spectrum "top" points at.
+
+⚠️ **How to read them.** Regime C is free-running — nothing is replayed, `q*` comes from the solver,
+and two runs launched from the same field decorrelate within an eddy turnover (~0.3 TU). So
+*pointwise* agreement past the opening is not expected and its absence is not a defect. The
+trajectory panel is read for the **envelope**: does the closure hold the right band of amplitudes,
+does it drift, does it collapse. The marginal beside it carries the claim.
+
+🔑 **The direction of each failure, which KS discards.** KS is a distance and has no sign, so the
+ratio of means is reported beside it — it takes one line and it separates two closures that KS ranks
+adjacently:
+
+| model, mean(q) / mean(q_ref) | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
+|---|---|---|---|---|---|---|
+| LinReg1 | 0.941 | 0.943 | 0.926 | 0.928 | 0.911 | 0.913 |
+| DDN | 0.941 | 0.967 | 0.947 | 0.941 | 0.821 | 0.842 |
+| no model | 0.939 | 1.012 | 0.918 | 0.870 | **2.391** | **2.015** |
+| Smagorinsky | **1.169** | **1.157** | **1.206** | **1.166** | **2.153** | **1.942** |
+
+**The two stochastic closures are low everywhere and the two deterministic ones are high in
+`[16,32]`.** Under-dissipation at the smallest resolved scales is the baselines' failure; the TO
+closures have the opposite sign, and nothing in the summed KS says so.
+
+![LinReg1 online](figures/fig8_online_LinReg1.png)
+
+🔑 **The LRS's error is a modest low bias carried by a left tail.** Its marginal sits on the
+reference's through the body of the distribution — the modes line up in all six bands — but the mean
+runs **6–9% low in every band**, and the trajectories show where that comes from: downward
+excursions to values the reference never visits. `Z[16,32]` reaches **181** against a reference
+minimum of **721**; `E[16,32]` reaches **6.2e-3** against **0.0243**. The flat ~0.14 KS profile
+across all six bands is therefore not six independent near-misses but one failure mode expressed six
+times.
+
+![DDN online](figures/fig8_online_DDN.png)
+
+🔑 **The DDN fails differently, and only in `[16,32]`.** Its four larger-scale bands are as good as
+the LRS's or better (`E[0,6]` KS 0.0869 against 0.1107, mean ratio 0.967 against 0.943), but `Z[16,32]` and
+`E[16,32]` both overshoot the reference — max **7 967** against **3 791** — *and* repeatedly collapse
+toward zero: minimum `Z[16,32]` **0.42** and `E[16,32]` **8.4e-6**, the latter more than three orders
+below the reference's own minimum of 0.0243. The marginal is bimodal, with mass piled at the bottom
+of the range where the reference has none. **These are the excursions the stabilizer catches on the
+LRS**, and the DDN has no stabilizer.
+
+![no model online](figures/fig8_online_nomodel.png)
+
+![Smagorinsky online](figures/fig8_online_smag.png)
+
+🔴 **The 3.710-against-2.487 ordering does not come from `[16,32]`, where KS is saturated.** Both
+baselines pile up there — no model reaches `Z[16,32]` = **10 170** against the reference's median of
+2 023 — and the KS values (0.84–0.97) sit where the distributions barely overlap either way, so the
+statistic cannot rank them in that band. What the trajectories add is that the eddy viscosity *does*
+cut the pile-up: max `Z[16,32]` **7 135** against **10 170**, mean ratio 2.15 against 2.39.
+
+**The gap is paid in the four larger-scale bands.** Decomposing the 3.710 − 2.487 = 1.223:
+**1.048 of it (86%) comes from those four** — 1.795 for Smagorinsky against 0.746 for no model —
+and only 0.174 from the saturated `[16,32]` pair. No model is close to the reference there in the
+mean (0.918–1.012 on three of the four, with `E[7,15]` the exception at 0.870, and `E[0,6]` KS
+**0.0279**, the lowest number anywhere in this table); `c_s = 0.07` is biased **16–21% high on all
+four**. A statement about this untuned `c_s` on these kernels, not about Smagorinsky.
+
+🔴 **Three things stop this being a result yet.**
+
+1. **The stabilizer clamp fires on the LRS and cannot fire on the DDN** (memory #59). 160 / 539 / 359
+   / 465 / 736 identically-zero `dQ` columns per replica out of **40 000** — 0.4–1.8% of steps. The
+   clamp lives only in the `LinReg` path (`time_series_methods.jl:162,165,190,193`); `MVG_sampler`
+   never receives `q_star`. So **LinReg1's KS is model + stabilizer, and the LRS/DDN difference
+   carries that asymmetry.**
+   ✅ **Two things sharpened here, both by measurement rather than by re-reading.** `E[16,32]` is
+   under the threshold on **100% of fired steps in all five replicas** — memory #59 checked only
+   the worst one — and no other band is under it on any fired step, in any replica. And the events
+   are **clustered, not a uniform tax**: 13 / 20 / 31 / 20 / 79 contiguous bursts, so replica 1's
+   160 steps are 13 bursts inside a single 0.78 TU window (steps 32 728–33 040). A stabilizer that
+   sits on one excursion is a different object from one that shaves 1% of every step, and only the
+   burst count distinguishes them.
+2. **The threshold is too close to the physics.** The reference's own `E[16,32]` minimum is 0.0243,
+   only 2.4× the 1e-2 clamp. Reconstructed `|q*|` minima: LRS 6.2e-3 – 8.6e-3, DDN down to 4.57e-4.
+   ⚠️ Memory #59 calls the DDN figure *"three orders below the threshold"*; the value is right and
+   the characterisation is not — 1e-2 / 4.57e-4 = **22**. Three orders is the right description of a
+   different quantity, the DDN's minimum on the **level**: `E[16,32]` reaches **8.4e-6** against the
+   reference's own minimum of 0.0243.
+3. 🔴 **LinReg1's 0.836 is ~4× §3's archived 0.198**, well outside the 0.1848 noise floor. Untested
+   candidates: the clamp; the changed `tau`; the split now being a continuation of one record instead
+   of two; a different reference realisation. **Not reportable until understood.**
+
+⚠️ **Smagorinsky here is an untuned point, not paper 2's baseline.** Paper 2 tuned `c_s` against its
+own reference with its own kernels and reported 0.705; this is `c_s = 0.07` on upstream's rewritten
+kernels against a different reference. Never quote the two side by side.
 
 ## 5. Findings that change the plan
 

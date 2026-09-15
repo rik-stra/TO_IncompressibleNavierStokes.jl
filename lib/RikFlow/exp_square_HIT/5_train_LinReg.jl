@@ -61,10 +61,20 @@ end
 ## Load parameters
 inputs = load(TO_folder*inputs_file_name, "inputs")
 (; name, hist_len, hist_var, n_replicas, normalization, include_predictor, tracking_noise, train_range, indep_normals, lambda, fitted_qois, model_noise) = inputs[model_index]
+# Added 2026-09-15; read with a fallback so an `inputs_example.jld2` written before they existed
+# still loads and keeps the behaviour it had (ADMM, intercept penalized -- what paper 2 ran).
+ridge_solver      = get(inputs[model_index], :ridge_solver, :admm)
+penalize_intercept = get(inputs[model_index], :penalize_intercept, true)
 
 
 out_dir = TO_folder*"/$(name)/"
-save(out_dir*"parameters.jld2", "parameters", (; name, hist_len, hist_var, n_replicas, normalization, include_predictor))
+# 🔴 `lambda`, `ridge_solver` and `penalize_intercept` are recorded here. They were NOT, and
+# `test_g1.jl:52` says so outright -- "parameters.jld2 does not store lambda" -- so a fitted model
+# on disk could not be told apart from another at a different penalty. With λ > 0 cells in the
+# table that is the difference between two experiments.
+save(out_dir*"parameters.jld2", "parameters",
+     (; name, hist_len, hist_var, n_replicas, normalization, include_predictor,
+        lambda, ridge_solver, penalize_intercept, train_range, track_file))
 
 
 data = load(track_file, "data_track");
@@ -78,12 +88,20 @@ scaling = (in_scaling = in_scaling, out_scaling = in_scaling)
 inputs, outputs = create_history(hist_len, q_star_scaled, q_scaled, dQ_scaled, hist_var; include_predictor)
 
 
-function fit_model(inputs, outputs, fitted_qois; indep_normals = false, lambda = 0.0, regularizer = :l2)
+function fit_model(inputs, outputs, fitted_qois; indep_normals = false, lambda = 0.0,
+                  regularizer = :l2, ridge_solver = :exact, penalize_intercept = false)
     n_targets = length(fitted_qois)
     inp = cat(inputs',ones(eltype(inputs), (size(inputs,2),1)),dims=2) # add a bias term
 
     # solve linear regression
-    if lambda > 0.0
+    if lambda > 0.0 && (regularizer == :nuclear || ridge_solver == :admm)
+        # 🔴 The historical path, and for `:l2` it does not solve the problem it claims to.
+        # Measured on R1's record 2026-09-15 (the parity check `results.md` §7 lists as never
+        # run): against the exact ridge minimiser the ADMM iterate differs by a relative 0.97 at
+        # λ = 1e-5, 0.90 at 1e-4 and 0.45 at 1e-2, and its TRAINING RMSE is ~0.00714 at every one
+        # of those λ -- it is iteration-limited, not λ-limited, so a sweep run through it is not a
+        # sweep in λ. Kept because paper 2's archived λ > 0 models came out of it and reproducing
+        # one needs it, and because `:nuclear` has no closed form and must come here.
         inp_r = kron(Matrix(I, n_targets,n_targets),inp)
         if regularizer == :l2
             reg = L2Regularization(lambda)
@@ -94,6 +112,17 @@ function fit_model(inputs, outputs, fitted_qois; indep_normals = false, lambda =
         b = reshape(outputs[fitted_qois,:]', length(fitted_qois)*size(outputs,2),1)
         c = solve!(solver, b)
         c = reshape(c, :, length(fitted_qois))
+    elseif lambda > 0.0
+        # The squared-ridge minimiser in closed form, as the augmented system rather than the
+        # normal equations: `cond(X)` is 1.9e6 here, so `X'X` would square that to 3.4e12 and lose
+        # most of the coefficient vector. Identical construction to `RikFlow.fit_ridge`
+        # (`src/ts_fit.jl`), which V1 covers; written out here because this script does not load
+        # the `ts_*` layer.
+        T = eltype(inp)
+        m = size(inp, 2)
+        P = Matrix{T}(I, m, m) * T(sqrt(lambda))
+        penalize_intercept || (P[m, m] = zero(T))   # the bias column is the last one
+        c = [inp; P] \ [outputs[fitted_qois,:]'; zeros(T, m, n_targets)]
     else
         c = inp \ outputs[fitted_qois,:]'
     end 
@@ -120,7 +149,8 @@ function run_model(inputs, c, stoch_distr, fitted_qois)
 end
 
 # fit model
-c, stoch_distr = fit_model(inputs, outputs, fitted_qois; indep_normals, lambda, regularizer = :l2)
+c, stoch_distr = fit_model(inputs, outputs, fitted_qois; indep_normals, lambda,
+                          regularizer = :l2, ridge_solver, penalize_intercept)
 
 # overwrite the nose distribution
 if model_noise == :tracking_noise

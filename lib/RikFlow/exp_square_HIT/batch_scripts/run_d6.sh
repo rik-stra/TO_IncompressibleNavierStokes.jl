@@ -30,15 +30,22 @@
 #SBATCH --partition=gpu_a100
 #SBATCH --gpus=1
 #SBATCH --array=1-5
-#SBATCH -o logs/d6_%A_%a.out
-#SBATCH -e logs/d6_%A_%a.err
+
+# No -o/-e: on Snellius an array job already gets one slurm-%A_%a.out per task by default (Rik,
+# 2026-09-14), so redirecting into logs/ bought a nicer name and a real trap -- SLURM opens those
+# files before this script body runs, so the `mkdir` below was always too late for them, and logs/
+# is not in the repository.
 
 # Depot with the trailing colon, as every other script in this repository has it. ⚠️ The handoff
 # said /scratch-shared/$USER/.julia_a100: ; the repository's own scripts use $HOME/julia/julia_<gpu>
 # and that is what is followed here.
 export JULIA_DEPOT_PATH=$HOME/julia/julia_a1003:
 
-mkdir -p logs output/D6
+# ⚠️ The depot above does not follow this directory's convention: every other script uses
+# $HOME/julia/julia_h100, and JULIA_CPU_TARGET multiversioning means one depot serves both
+# partitions. `julia_a1003` is an artifact and is kept only because the 2026-09-11 D6 run populated
+# it; consolidating is a one-line change whenever someone is willing to pay one precompile.
+mkdir -p output/D6
 
 # Optional; run_d6.jl falls back to output/d6_ics and then to the local analysis build directory.
 # export D6_IC_DIR=$PWD/output/d6_ics
