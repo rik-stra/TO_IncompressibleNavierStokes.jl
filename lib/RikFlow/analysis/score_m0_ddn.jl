@@ -46,6 +46,7 @@ for f in ("ts_scaling", "ts_history", "ts_models", "ts_fit", "ts_score", "ts_rol
 end
 include(joinpath(HERE, "extract_qois.jl"))
 include(joinpath(HERE, "extract_archive.jl"))
+include(joinpath(HERE, "extract_rebaseline.jl"))
 
 const OUT = joinpath(HERE, "output")
 const DT = 2.5e-3                      # HIT LES time step
@@ -295,6 +296,11 @@ function score_regime_c(name, ens, q_ref, ref_dQ; dt = DT, lag_int = nothing)
     trajs = [Float64.(t) for t in ens.q]            # the level: the primary object
     dtrajs = [Float64.(t) for t in ens.dQ]          # the correction: secondary
     qref = Float64.(q_ref)
+    # 🔴 Smagorinsky and no-model emit no correction at all -- no `dQ`, no `q*`. Every secondary
+    # statistic below is then **undefined, not zero**; returning 0.0 would put a perfect-looking
+    # `dQ` score beside a closure that has no `dQ` (the shape of memory #59's mistake). The level
+    # statistics are unaffected and are the ones every claim rests on.
+    has_dQ = !isempty(dtrajs)
     li = lag_int === nothing ? 1 : lag_int
 
     ks_per = [summed_ks(t, qref) for t in trajs]
@@ -305,10 +311,10 @@ function score_regime_c(name, ens, q_ref, ref_dQ; dt = DT, lag_int = nothing)
 
     # The same three on the correction, kept because it is what the model actually emits and
     # because the contrast between the two is itself the O7 finding.
-    ks_per_dQ = [summed_ks(t, ref_dQ) for t in dtrajs]
-    eks_dQ = ensemble_ks(dtrajs, ref_dQ)
-    dr1_dQ = [delta_rho(t, ref_dQ; lag = 1, maxlag = 400) for t in dtrajs]
-    drt_dQ = [delta_rho(t, ref_dQ; lag = li) for t in dtrajs]
+    ks_per_dQ = has_dQ ? [summed_ks(t, ref_dQ) for t in dtrajs] : nothing
+    eks_dQ    = has_dQ ? ensemble_ks(dtrajs, ref_dQ) : nothing
+    dr1_dQ    = has_dQ ? [delta_rho(t, ref_dQ; lag = 1, maxlag = 400) for t in dtrajs] : nothing
+    drt_dQ    = has_dQ ? [delta_rho(t, ref_dQ; lag = li) for t in dtrajs] : nothing
     # #18: the climatological spread-skill of the **level**, from replicas that have fully
     # decorrelated from their common start. Reported and labelled, never quoted as a lead.
     M = length(trajs)
@@ -322,8 +328,8 @@ function score_regime_c(name, ens, q_ref, ref_dQ; dt = DT, lag_int = nothing)
         return length(ts) > 1 ? spread_skill(arr, transpose(view(ref, :, 1:K))) : nothing
     end
     ss = ss_of(trajs, qref)
-    ss_dQ = ss_of(dtrajs, ref_dQ)
-    return (; name, M, replicas = ens.replicas, family = ens.family, root = ens.root,
+    ss_dQ = has_dQ ? ss_of(dtrajs, ref_dQ) : nothing
+    return (; name, M, replicas = ens.replicas, family = ens.family, root = ens.root, has_dQ,
             # --- primary: the QoI level ---
             ks_summed = [k.total for k in ks_per], ks_per_qoi = [k.per_qoi for k in ks_per],
             ks_ensemble = eks.total, ks_ensemble_per_qoi = eks.per_qoi,
@@ -333,10 +339,13 @@ function score_regime_c(name, ens, q_ref, ref_dQ; dt = DT, lag_int = nothing)
             rho_model = dr1[1].rho_model, rho_ref = dr1[1].rho_ref,
             spread_skill = ss,
             # --- secondary: the correction the model emits ---
-            ks_summed_dQ = [k.total for k in ks_per_dQ], ks_ensemble_dQ = eks_dQ.total,
-            drho1_dQ = [d.at_lag for d in dr1_dQ], drho_tau_dQ = [d.at_lag for d in drt_dQ],
-            drho_int_dQ = [d.integral for d in dr1_dQ],
-            rho_model_dQ = dr1_dQ[1].rho_model, rho_ref_dQ = dr1_dQ[1].rho_ref,
+            ks_summed_dQ = has_dQ ? [k.total for k in ks_per_dQ] : Float64[],
+            ks_ensemble_dQ = has_dQ ? eks_dQ.total : NaN,
+            drho1_dQ = has_dQ ? [d.at_lag for d in dr1_dQ] : Float64[],
+            drho_tau_dQ = has_dQ ? [d.at_lag for d in drt_dQ] : Float64[],
+            drho_int_dQ = has_dQ ? [d.integral for d in dr1_dQ] : Float64[],
+            rho_model_dQ = has_dQ ? dr1_dQ[1].rho_model : Float64[],
+            rho_ref_dQ = has_dQ ? dr1_dQ[1].rho_ref : Float64[],
             spread_skill_dQ = ss_dQ)
 end
 
@@ -397,6 +406,73 @@ Archive_root() = get(ENV, "RIKFLOW_ARCHIVE", FROZEN)
 # main
 # ---------------------------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------------------------
+# which data this run scores
+# ---------------------------------------------------------------------------------------------
+
+"R1's tracking record, cached QoIs. The source is 2.6 GB; `extract_qois.jl` makes this 7 MB."
+const NEW_TRACK_QOIS = joinpath(HERE, "data",
+    "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2")
+
+"""
+    DATASET
+
+`:archive` (the default) scores paper 2's frozen data -- the 100 TU `data_track2` record, the
+archived HF reference and the five archived online ensembles. `:new` scores P2r's rebaselined
+pipeline: R1's tracking record, the regenerated HF reference and R2's four closures.
+
+Select with `RIKFLOW_DATASET=new`. The two write different score files, and `results.md` reports
+the `:new` numbers as primary; `:archive` stays because G1's reproduction of paper 2 is defined
+only against paper 2's own data and cannot be rebased onto a different record.
+
+🔴 **Never pool them.** The rebaselined runs are post-`09954be1`, which changed the Nyquist
+convention and therefore `tau` and `dQ`: a different dynamical system, not a better measurement of
+the same one (memory #45, #46).
+"""
+const DATASET = Symbol(get(ENV, "RIKFLOW_DATASET", "archive"))
+
+"""
+    rebaselined_ensemble(key)
+
+`load_rebaseline` reshaped into what [`score_regime_c`](@ref) expects.
+
+The deterministic baselines carry no `dQ` and no `q_star`, so those come back empty and every
+correction-based statistic is skipped rather than zeroed -- the `has_dQ` branch there.
+"""
+function rebaselined_ensemble(key::AbstractString)
+    e = load_rebaseline(key)
+    return (; e.q, e.q_star, e.dQ, e.tau, replicas = e.replica_index,
+            family = e.label, root = :rebaselined, e.stochastic, e.clampable, e.key)
+end
+
+"The data sources for `which`, and what is and is not defined on them."
+function dataset(which::Symbol)
+    if which === :archive
+        return (; tag = "archive",
+                rec = load_qois(joinpath(HERE, "data",
+                    "data_track2_dns512_les64_Re2000.0_tsim100.0_qois.jld2")),
+                # Paper 2 fitted LinReg1 on a 10 TU record; kept for the clamp census, the one
+                # place where the two records answer different questions.
+                rec10 = load_qois(joinpath(HERE, "data",
+                    "data_track_trackingnoise_std_0.0_Re2000.0_tsim10.0_replica1_qois.jld2")),
+                q_ref = Float64.(load_reference()),
+                configs = collect(ARCHIVED_CONFIGS), load_ens = load_ensemble,
+                g1 = true, out = "paper4_scores.jld2")
+    elseif which === :new
+        return (; tag = "rebaselined",
+                rec = load_qois(NEW_TRACK_QOIS),
+                # 🔴 No 10 TU counterpart exists and none is coming: R1 tracked for 100 TU exactly
+                # so one record carries both the fit window and D6's IC pool (#58).
+                rec10 = nothing,
+                q_ref = Float64.(load_new_reference().q_ref),
+                configs = [m.key for m in REBASE_MODELS], load_ens = rebaselined_ensemble,
+                g1 = false, out = "paper4_scores_new.jld2")
+    else
+        error("RIKFLOW_DATASET must be `archive` or `new`; got $which")
+    end
+end
+
+
 function main()
     mkpath(OUT)
     rng = Random.MersenneTwister(SEED)
@@ -406,15 +482,16 @@ function main()
     flush(stdout)
 
     # ---- data ----------------------------------------------------------------------------
-    rec10 = load_qois(joinpath(HERE, "data",
-                               "data_track_trackingnoise_std_0.0_Re2000.0_tsim10.0_replica1_qois.jld2"))
-    rec100 = load_qois(joinpath(HERE, "data",
-                                "data_track2_dns512_les64_Re2000.0_tsim100.0_qois.jld2"))
-    q_ref = load_reference()
+    ds = dataset(DATASET)
+    rec10 = ds.rec10
+    rec100 = ds.rec
+    q_ref = ds.q_ref
     nq = size(rec100.q, 1)
-    @printf("  D1 10 TU  tracked : q %s  q_star %s\n", size(rec10.q), size(rec10.q_star))
-    @printf("  D1 100 TU tracked : q %s  q_star %s\n", size(rec100.q), size(rec100.q_star))
-    @printf("  D3 HF reference   : q_ref %s\n", size(q_ref))
+    @printf("  dataset           : %s\n", ds.tag)
+    rec10 === nothing ? println("  10 TU tracked     : none in this dataset") :
+        @printf("  10 TU tracked     : q %s  q_star %s\n", size(rec10.q), size(rec10.q_star))
+    @printf("  100 TU tracked    : q %s  q_star %s\n", size(rec100.q), size(rec100.q_star))
+    @printf("  HF reference      : q_ref %s\n", size(q_ref))
     flush(stdout)
 
     # The reference correction, for the regime-C comparison. The HF record is a reference QoI
@@ -436,12 +513,30 @@ function main()
     # several times that. They are two different quantities: an exponential fit to rho_1 gives a
     # lag-1-equivalent time, and the integral of the autocorrelation gives another. Delta_rho's
     # lag, the bootstrap block length, N_eff and P2c's whole cost hang off which is which.
+    # 🔑 Both series, because they are different objects and this project has quoted one for the
+    # other before. The CORRECTION decorrelates in tens of steps; the LEVEL inherits the QoI's own
+    # smoothness, `rho_1(q)` is about 1, and its integral time is hundreds. D6's grid sizing runs
+    # off the LEVEL's `T_int` (#58) while `Delta_rho`'s lag below runs off the CORRECTION's --
+    # quoting the wrong one mis-sizes either the forecast grid or the temporal metric.
+    #
+    # The level gets a 4000-lag (10 TU) window: at the 500-lag default its ACF need not have
+    # crossed zero yet, and `T_int` would come back as the window rather than the timescale.
+    # `truncated` records which happened instead of leaving it to be assumed.
     tint = [correlation_time(collect(Float64.(view(ref_dQ, i, :))), DT) for i in 1:nq]
-    println("\n  t_int per QoI on the reference dQ (metric O5):")
+    tint_q = [correlation_time(collect(Float64.(view(q_ref, i, :))), DT; maxlag = 4000)
+              for i in 1:nq]
+    tint_qtrack = [correlation_time(collect(Float64.(view(rec100.q, i, :))), DT; maxlag = 4000)
+                   for i in 1:nq]
+    println("\n  timescales per QoI -- CORRECTION dQ and LEVEL q (metric O5):")
+    @printf("    %-12s %-27s | %-27s\n", "", "dQ   rho1  T_exp   T_int", "q    rho1  T_exp   T_int")
     for i in 1:nq
-        @printf("    %-12s rho_1 = %.4f   T_exp = %.4f TU   T_int = %.4f TU\n",
-                LABELS[i], tint[i].rho1, tint[i].T_exp, tint[i].T_int)
+        @printf("    %-12s %7.4f %7.4f %7.4f %-3s | %7.4f %7.4f %7.4f %s\n", LABELS[i],
+                tint[i].rho1, tint[i].T_exp, tint[i].T_int, tint[i].truncated ? "(t)" : "",
+                tint_q[i].rho1, tint_q[i].T_exp, tint_q[i].T_int,
+                tint_q[i].truncated ? "(truncated -- lower bound)" : "")
     end
+    @printf("    %-12s tracked-record q, T_int: %s\n", "",
+            join((@sprintf("%.3f", t.T_int) for t in tint_qtrack), "  "))
     t_int_med = median([t.T_int for t in tint])
     lag_tau = max(1, round(Int, t_int_med / DT))
     @printf("    median T_int = %.4f TU  =>  Delta_rho lag = %d steps\n", t_int_med, lag_tau)
@@ -451,7 +546,9 @@ function main()
     # #26. A property of the record, so computable for both models; the *firing* belongs to the
     # LinReg path alone, because DDN's sampler has no clamp.
     census = Dict{String,Any}()
-    for (nm, r) in (("tracked_10TU", rec10), ("tracked_100TU", rec100))
+    recs = rec10 === nothing ? (("tracked_100TU", rec100),) :
+           (("tracked_10TU", rec10), ("tracked_100TU", rec100))
+    for (nm, r) in recs
         c = clamp_census(Float64.(r.q_star))
         census[nm] = c
         @printf("\n  clamp census %-14s rate = %.3e over %d steps\n", nm, c.rate, c.nsteps)
@@ -644,12 +741,12 @@ function main()
     flush(stdout)
 
     # ---- regime C ------------------------------------------------------------------------
-    println("\n  regime C: archived online ensembles ...")
+    @printf("\n  regime C: %s online ensembles ...\n", ds.tag)
     flush(stdout)
     online = Dict{String,Any}()
-    for nm in ARCHIVED_CONFIGS
+    for nm in ds.configs
         e = try
-            load_ensemble(nm)
+            ds.load_ens(nm)
         catch err
             @warn "no online ensemble for $nm" err
             nothing
@@ -660,8 +757,10 @@ function main()
         @printf("    %-10s M=%d %-6s | q: sumKS %.3f-%.3f ensKS %.3f drho1 %.3f drho%d %.3f | ",
                 nm, s.M, string(s.root), minimum(s.ks_summed), maximum(s.ks_summed),
                 s.ks_ensemble, median(s.drho1), s.lag_tau, median(s.drho_tau))
-        @printf("dQ: sumKS %.3f-%.3f drho1 %.3f | stab %.2f\n", minimum(s.ks_summed_dQ),
-                maximum(s.ks_summed_dQ), median(s.drho1_dQ), s.stability)
+        s.has_dQ ?
+            @printf("dQ: sumKS %.3f-%.3f drho1 %.3f | stab %.2f\n", minimum(s.ks_summed_dQ),
+                    maximum(s.ks_summed_dQ), median(s.drho1_dQ), s.stability) :
+            @printf("dQ: none (deterministic closure) | stab %.2f\n", s.stability)
         flush(stdout)
     end
     floor_ = ks_noise_floor(Float64.(q_ref))
@@ -670,8 +769,16 @@ function main()
             floor_dQ.total)
 
     # G1's online acceptance: the level-based summed KS against paper 2's own published table.
-    println("\n  G1 online: this round's level-based summed KS against paper 2's archived table")
+    # 🔴 `archived` is declared OUTSIDE the branch: it is saved unconditionally, so leaving it
+    # inside `else` makes it undefined on the rebaselined run -- an UndefVarError at the jldsave,
+    # after every score has been computed.
     archived = Dict{String,Any}()
+    if !ds.g1
+        println("\n  G1 online: SKIPPED -- G1 reproduces paper 2's published KS table, and " *
+                "these runs are a different dynamical system (#45, #46); nothing to reproduce. " *
+                "An empty `archived_ks` in the score file means this, not a failed comparison.")
+    else
+    println("\n  G1 online: this round's level-based summed KS against paper 2's archived table")
     for nm in sort(collect(keys(online)))
         a = compare_archived_ks(nm)
         s = online[nm]
@@ -687,13 +794,16 @@ function main()
                 inside ? "median INSIDE paper 2 range" : "median OUTSIDE", a.file)
         flush(stdout)
     end
+    end
 
     # #26 on the free-running records. The tracked records answer only half the question: nudging
     # holds the QoIs near the reference, so a small predictor is unlikely there by construction. An
     # online run is free to wander, and it is the run the clamp actually sits in.
     println("\n  clamp census on the free-running online records:")
     for nm in sort(collect(keys(online)))
-        e = load_ensemble(nm)
+        e = ds.load_ens(nm)
+        isempty(e.q_star) &&
+            (@printf("    %-10s deterministic -- no q*, stabilizer does not apply\n", nm); continue)
         rates = Float64[]
         mins = Float64[]
         for qs in e.q_star
@@ -710,11 +820,14 @@ function main()
     end
 
     # ---- save ----------------------------------------------------------------------------
-    out = joinpath(OUT, "paper4_scores.jld2")
+    out = joinpath(OUT, ds.out)
     jldsave(out;
-            labels = LABELS, dt = DT, seed = SEED,
+            labels = LABELS, dt = DT, seed = SEED, dataset = String(DATASET),
             windows = (; train = win.train, heldout = win.heldout, nsteps = win.nsteps),
             tint = [(; t.rho1, t.T_exp, t.T_int) for t in tint], lag_tau, t_int_med,
+            tint_q = [(; t.rho1, t.T_exp, t.T_int, t.truncated) for t in tint_q],
+            tint_q_tracked = [(; t.rho1, t.T_exp, t.T_int, t.truncated) for t in tint_qtrack],
+            t_int_q_med = median([t.T_int for t in tint_q]),
             census = Dict(k => (; v.rate, v.nfired, v.nsteps, v.per_qoi_rate, v.threshold)
                           for (k, v) in census),
             m0 = (; m0.h, m0.lambda, m0.normalization, m0.penalize_intercept, m0.C,

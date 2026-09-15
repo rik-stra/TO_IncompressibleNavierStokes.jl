@@ -110,13 +110,20 @@ the lag-one autocorrelation, `-dt/log(rho_1)`, which is what a diagonal AR(1) pr
 This is the quantity Rességuier et al. estimate for their own residual before down-sampling the
 time step towards it. That escape is closed here: `dt` is the LES time step.
 """
-function correlation_time(x::AbstractVector, dt)
-    r = autocorr(x, min(500, length(x) ÷ 4))
+function correlation_time(x::AbstractVector, dt; maxlag = min(500, length(x) ÷ 4))
+    r = autocorr(x, maxlag)
     T_exp = (r[2] > 0 && r[2] < 1) ? -dt / log(r[2]) : NaN
     zc = findfirst(<=(0.0), r[2:end])
-    k = zc === nothing ? length(r) - 1 : zc
+    # 🔴 `truncated` is the difference between a measurement and a lower bound. The sum runs to the
+    # first non-positive rho (Sokal's window); if that never happens inside `maxlag`, the window is
+    # the cap and `T_int` is whatever fitted in it. On the QoI **level** that is a live risk --
+    # rho_1(q) is about 1 and the level's integral time is 0.5-1.1 TU against a default window of
+    # 500 lags = 1.25 TU -- whereas on `dQ` the ACF crosses within tens of lags. A truncated value
+    # must be reported as a lower bound, never as the timescale.
+    truncated = zc === nothing
+    k = truncated ? length(r) - 1 : zc
     T_int = dt * (0.5 + sum(r[2:k]))
-    return (; T_exp, T_int, rho1 = r[2])
+    return (; T_exp, T_int, rho1 = r[2], truncated, maxlag, window = k)
 end
 
 """

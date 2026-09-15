@@ -1,10 +1,35 @@
 # Results — M0 and DDN scored on HIT
 
-**What this is.** The first round of measurements for paper 4: TO+LRS (**M0**) and paper 1's
-data-driven noise model (**DDN**) scored on one axis, on existing data. No new model was built and
-no simulation was run — **0 SBU**. Companion to `meta_files/plan.md` (design) and `meta_files/metrics.md` (definitions);
-where a number here disagrees with either of those, this file is the measurement and they are the
-prediction.
+**What this is.** Measurements for paper 4: TO+LRS (**M0**) and paper 1's data-driven noise model
+(**DDN**) scored on one axis. Companion to `meta_files/plan.md` (design) and
+`meta_files/metrics.md` (definitions); where a number here disagrees with either of those, this
+file is the measurement and they are the prediction.
+
+🔴 **REBASED ON THE NEW DATA, 2026-09-15. Read this before any number below.**
+
+Every section is now computed on **P2r's rebaselined pipeline** — R1's tracking record, the
+regenerated HF reference and R2's online ensembles — unless the section says otherwise. The
+scoring driver takes the dataset as a switch and the two runs write different files:
+
+```bash
+julia --startup-file=no --project=analysis analysis/score_m0_ddn.jl                  # archive
+RIKFLOW_DATASET=new julia --startup-file=no --project=analysis analysis/score_m0_ddn.jl   # primary
+```
+
+**What could not be rebased, and why — each is a structural limit, not an omission.**
+
+| stays on paper 2's archive | why |
+|---|---|
+| §3's five-configuration sweep (LinReg1/63/64/73/74) | Only `LinReg1` has a rebaselined counterpart. The other four are h ∈ {10, 40} and λ = 0.01 cells that have never been run on the new system; each needs its own 5 × 100 TU ensemble. |
+| §3's **G1 online acceptance** | G1 *reproduces paper 2's published KS table*. There is nothing to reproduce on a different dynamical system, so it is not run on the new data rather than run and reported as a failure. |
+| the 10 TU clamp census | No 10 TU rebaselined record exists and none is coming: R1 tracked for 100 TU precisely so one record carries both the fit window and D6's IC pool (#58). |
+
+🔴 **The two datasets must never be pooled or compared number-for-number.** The rebaselined runs
+are post-`09954be1`, which changed the Nyquist convention and therefore `∂`, `tau` and `dQ`. They
+are a **different dynamical system**, not a better measurement of the same one. Where a comparison
+is unavoidable it is made against each dataset's own **noise floor**, which is the only quantity
+that transfers. ⚠️ That floor is itself a single unstable draw — it swings by a factor 2.7 with
+where the record is cut (§3) — so it bounds a comparison rather than calibrating one.
 
 **Reproduce it.**
 
@@ -26,10 +51,12 @@ julia --startup-file=no --project=analysis analysis/plot_rebaseline.jl     # -> 
 `plot_rebaseline.jl` prints §4b's three tables in the form §4b quotes them, so the section can be
 diffed against a re-run rather than retyped.
 
-**Data.** HIT. `D1` the 100 TU tracked record, `D3` the 100 TU HF reference (40 001 points),
-`D5` the archived online ensembles, `D8` a split of D3 for the KS noise floor. Paper 2's archive is
-gitignored and lives outside the repository; `RIKFLOW_ARCHIVE` and `RIKFLOW_DEV_ARCHIVE` point at
-it.
+**Data.** HIT, on the rebaselined pipeline: **R1** the 100 TU tracking record
+(`data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3`, Float64, `freeze = 1`, OU seed 333),
+**D3′** the regenerated 100 TU HF reference (40 001 points, 20.72 h, #54), **R2** the six online
+closures, and **D8** a split of D3′ for the KS noise floor. The archive's counterparts keep their
+old names (`D1`, `D3`, `D5`) and are used only where the table above says so; they are gitignored
+and live outside the repository, reached through `RIKFLOW_ARCHIVE` and `RIKFLOW_DEV_ARCHIVE`.
 
 🔴 **Which tracked record, and why it matters.** M0 here is fitted on **`D1`, the 100 TU record**
 (`data_track2_dns512_les64_Re2000.0_tsim100.0`) — it has to be, because only that record has a
@@ -78,49 +105,83 @@ because that is where a change in the model is visible.
 
 ## 1. The records
 
-![HF reference and tracked LF QoIs](figures/fig1_trajectories.png)
+![HF reference and tracked LF QoIs](figures/fig1_trajectories_new.png)
 
 The left column is the 100 TU overview with the training window in blue and the held-out window in
 pink. The right column is the same data at full resolution across the boundary, and it exists
 because the overview shows **one line, not two**: nudging holds the tracked low-fidelity QoIs on
-the reference to
+the regenerated reference to
 
-| | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
+| `rms(track − ref) / sd(ref)` | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
 |---|---|---|---|---|---|---|
-| `rms(track − ref) / sd(ref)` | 8e-5 | 8e-5 | 4e-5 | 3e-5 | 2.3e-3 | 1.4e-3 |
+| **R1, new** | 8.49e-5 | 7.57e-5 | 4.11e-5 | 3.29e-5 | 2.32e-3 | 1.46e-3 |
+| D1, archive | 7.75e-5 | 7.73e-5 | 4.21e-5 | 3.24e-5 | 2.27e-3 | 1.44e-3 |
 
-So the tracked record *is* the reference for practical purposes, and the interesting quantity is
-the correction that holds it there. In the right column the orange dashed predictor `q*` separates
-visibly from the corrected `q` only in the two smallest-scale bands — which is exactly the
-statement that `dQ` is a 0.2–1.5 % correction on the level.
+✅ **Tracking is as tight on the new system as on the old**, band for band, to within a few
+percent of itself. Whatever the merge changed, it did not change how well the nudged LF run can be
+held on its reference. So the tracked record *is* the reference for practical purposes, and the
+interesting quantity is the correction that holds it there. In the right column the orange dashed
+predictor `q*` separates visibly from the corrected `q` only in the two smallest-scale bands —
+the statement that `dQ` is a 0.2–1.5 % correction on the level.
 
-![The SGS correction dQ](figures/fig2_dQ.png)
+![The SGS correction dQ](figures/fig2_dQ_new.png)
 
-### `t_int`, both ways, per QoI
+### Timescales — both definitions, on **both** the correction and the level
 
-🔴 Every archived document says 0.04 TU. Two different timescales were being conflated: an
-exponential fit to the lag-1 autocorrelation, $T_{\exp} = -\Delta t/\ln\rho_1$, and the integral
-$T_{\text{int}} = \Delta t\,(\tfrac12 + \sum_k \rho_k)$ to the first zero crossing. Measured on the
-reference `dQ`:
+🔴 Every archived document said `t_int = 0.04 TU`. Two separate conflations were hiding in that
+number, and the second one still bites.
 
-| QoI | $\rho_1$ | $T_{\exp}$ [TU] | $T_{\text{int}}$ [TU] | `sd(dQ)` |
-|---|---|---|---|---|
-| Z[0,6] | 0.9556 | 0.0551 | 0.1118 | 2.79 |
-| E[0,6] | 0.7435 | 0.0084 | 0.0082 | 8.62e-3 |
-| Z[7,15] | 0.9802 | 0.1253 | 0.0923 | 3.60 |
-| E[7,15] | 0.9899 | 0.2474 | 0.0669 | 5.37e-4 |
-| Z[16,32] | 0.9976 | 1.0560 | 0.2926 | 30.0 |
-| E[16,32] | 0.9964 | 0.7007 | 0.3017 | 6.63e-4 |
+**First: two different statistics.** An exponential fit to the lag-1 autocorrelation,
+`T_exp = -Δt / ln ρ₁`, and the integral `T_int = Δt (½ + Σₖ ρₖ)` taken to the first non-positive
+`ρₖ` (Sokal's window). They are not interchangeable.
 
-**Neither number is 0.04 TU, and they disagree with each other by up to a factor 4 within a single
-QoI** (E[7,15]: 0.247 against 0.067). The median $T_{\text{int}}$ is **0.102 TU**, so the Δρ lag
-used below is **41 steps**. ⚠️ The spread across QoIs is a factor 37 in $T_{\text{int}}$, so a
-single project-wide `t_int` is not a well-defined object; P2c's cost, which scales in it, should be
-quoted per QoI or against the median with the range stated.
+**Second, and load-bearing: two different series.** The **correction** `dQ` and the **level** `q`
+have timescales that differ by a factor 3–60, and the project needs both — D6's forecast grid is
+sized by the *level's* `T_int` (#58), while Δρ's lag below comes from the *correction's*. Quoting
+one for the other mis-sizes either the grid or the temporal metric. Measured on the regenerated
+reference:
 
-⚠️ **`sd(dQ)` spans four orders of magnitude.** Anything that pools QoIs in raw units is an
-enstrophy statistic with the energy bands contributing nothing. Every pooled number below is
-normalised.
+| QoI | ρ₁(dQ) | T_exp(dQ) | T_int(dQ) | ρ₁(q) | T_exp(q) | T_int(q) | sd(dQ) |
+|---|---|---|---|---|---|---|---|
+| Z[0,6] | 0.9566 | 0.0564 | 0.1162 | 0.9998 | 15.91 | 0.2489 | 2.92 |
+| E[0,6] | 0.7430 | 0.0084 | 0.0081 | 0.9992 | 3.00 | 0.4732 | 8.85e-3 |
+| Z[7,15] | 0.9778 | 0.1113 | 0.0589 | 0.9999 | 30.20 | 0.4893 | 3.48 |
+| E[7,15] | 0.9894 | 0.2336 | 0.0666 | 0.9999 | 26.73 | 0.4742 | 5.41e-4 |
+| Z[16,32] | 0.9972 | 0.8816 | 0.3800 ⚠️ | 0.9999 | 34.37 | 0.5431 | 27.9 |
+| E[16,32] | 0.9956 | 0.5614 | 0.3745 ⚠️ | 0.9999 | 32.89 | 0.5395 | 6.09e-4 |
+
+All times in TU. ⚠️ marks a **truncated** integral: the ACF had not reached zero inside the
+500-lag window, so that `T_int` is a **lower bound**, not a measurement. The level uses a 4000-lag
+(10 TU) window and is not truncated. `correlation_time` now returns this flag instead of leaving
+it to be assumed.
+
+🔴 **`T_exp` is meaningless on the level and must never be quoted.** `ρ₁(q) ≈ 0.9999`, so
+`-Δt / ln ρ₁` reads **3–34 TU** — longer than a third of the record. It measures the smoothness of
+a nearly-integrated series, not a decorrelation time. On the level use `T_int`; on the correction
+either, with the truncation caveat.
+
+**Numbers to carry forward.**
+
+- **Correction:** median `T_int` = **0.0914 TU**, so Δρ's lag below is **37 steps** (archive:
+  0.102 TU, 41 steps). Still nothing like 0.04 TU, and the two definitions still disagree by up to
+  a factor 4 within one QoI — E[7,15], 0.234 against 0.067.
+- **Level:** `T_int` spans **0.249–0.543 TU**, median **0.474 TU**.
+
+🔑 **The level decorrelates ~1.6× more slowly on the new reference than on the archive's** —
+0.249–0.543 against 0.255–0.315 TU, medians 0.474 against 0.297. Not a detail: it is what raises
+the KS noise floor in §3 — by about 1.7× on medians, which matches this 1.6× — and that floor
+is what every regime-C number has to be read against.
+
+⚠️ **This is a third estimate of the level's `T_int`, and it does not match memory #58.** That
+entry quotes 0.94–1.08 TU on the new record from `report_marginals`' estimator, then argues down to
+"0.5–0.63 TU stands for both" from the quarter-by-quarter spread. The Sokal-window estimator used
+here gives 0.249–0.543 TU on the reference and 0.249, 0.473, 0.489, 0.474, 0.543, 0.539 on the
+tracked record. **The two estimators disagree by about a factor 2 and nothing here decides which is
+right.** D6's sizing table (#58) is built on the larger figure and is therefore conservative —
+the safe direction — but the discrepancy should be closed before the grid is committed.
+
+⚠️ **`sd(dQ)` spans four orders of magnitude.** Anything pooling QoIs in raw units is an enstrophy
+statistic with the energy bands contributing nothing. Every pooled number below is normalised.
 
 ---
 
@@ -185,7 +246,7 @@ $a_k \propto (k-\tfrac{K+1}{2})^2 - \tfrac{K^2-1}{12}$ for the convexity (disper
 convexity = **U** = under-dispersed; negative = ∩ = over-dispersed. `M = 100`, ties broken at
 random with a recorded RNG, 95 % intervals from a moving-block bootstrap.
 
-![RH-1](figures/fig3_rank_histograms.png)
+![RH-1](figures/fig3_rank_histograms_new.png)
 
 🔑 **The in-sample histogram is the null, and flatness is not.** On the training window M0's
 residual mean is 1e-4 standard deviations and its residual standard deviation matches the fitted
@@ -227,7 +288,7 @@ deviation of 4.9 instead of 1 — but it does not change any number in this tabl
 
 ### Flat is not skilful
 
-![Dynamics against calibration](figures/fig4_dynamics_vs_calibration.png)
+![Dynamics against calibration](figures/fig4_dynamics_vs_calibration_new.png)
 
 The lag-1 autocorrelation of the predicted mean `dQ`: M0 gives 0.735–0.999, tracking the realised
 values; **DDN gives exactly 0.0000 in every band**, because its predictive mean is a constant. Set
@@ -239,22 +300,118 @@ running a single large-λ cell.
 
 ## 3. Marginal and temporal accuracy — regime C (online, coupled)
 
-Scored on the **QoI level** against the HF reference level, with the correction alongside. ⚠️ The
-five archived configurations are **not one experiment**: h ∈ {5, 10} come from paper 2's frozen
-archive (`tsim100.0` family) and h = 40 exists only in the working repository's `_rand_initial_dQ`
-family, a different warm start. LinReg74 has **2 replicas, not 5**.
+Scored on the **QoI level** against the regenerated HF reference, with the correction alongside.
+Six closures, all launched from the same initial field as the tracking record (rel diff ≤ 1.2e-16).
 
-| config | h | λ | M | family | summed KS `q` | ens KS | Δρ₁(q) | Δρ₄₁(q) | summed KS `dQ` | Δρ₁(dQ) | stab |
+![Regime C](figures/fig6_online_new.png)
+
+| closure | h | λ | replicas | stable | summed KS `q` | ens KS | Δρ₁(q) | Δρ₃₇(q) | summed KS `dQ` | Δρ₁(dQ) | clamp |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| LinReg1 | 5 | 0 | 5 | frozen | 0.142–0.371 | 0.198 | 0.000 | 0.051 | 0.170–0.269 | 0.022 | 1.00 |
-| LinReg64 | 10 | 0 | 5 | frozen | 0.213–0.392 | 0.197 | 0.000 | 0.057 | 0.203–0.308 | 0.026 | 1.00 |
-| LinReg63 | 10 | 0.01 | 5 | frozen | 0.400–0.580 | 0.466 | 0.001 | 0.050 | 0.293–0.373 | **3.459** | 1.00 |
-| LinReg74 | 40 | 0 | 2 | dev | 0.281–0.436 | 0.250 | 0.000 | 0.063 | 0.213–0.351 | 0.504 | 1.00 |
-| LinReg73 | 40 | 0.01 | 5 | dev | 0.472–0.694 | 0.603 | 0.003 | 0.162 | 0.740–0.806 | **5.288** | 1.00 |
+| **LinReg1** | 5 | 0 | 5 | 5/5 | 0.586–1.010 | **0.836** | 0.000 | 0.146 | 0.352–0.545 | 0.028 | 1.84% |
+| **LinReg5** | 5 | 1e-5 | 5 | **4/5** | 0.692–0.988 | 0.858 | 0.000 | 0.169 | 0.354–0.497 | 0.030 | 1.25% |
+| **LinReg6** | 5 | 1e-4 | 5 | 5/5 | 0.554–0.945 | **0.810** | 0.000 | 0.161 | 0.322–0.504 | 0.037 | 1.18% |
+| **DDN** | — | — | 5 | 5/5 | 1.285–1.382 | 1.332 | 0.001 | 0.201 | 0.291–0.306 | **5.658** | n/a |
+| no model | — | — | 1 | 1/1 | — | 2.487 | 0.000 | 0.116 | none | none | n/a |
+| Smagorinsky `c_s=0.07` | — | — | 1 | 1/1 | — | 3.710 | 0.001 | 0.322 | none | none | n/a |
 
-![Regime C](figures/fig6_online.png)
+🔴 **THE NOISE FLOOR, AND WHY IT IS NOT A THRESHOLD.**
 
-### #10 / #11 Summed and ensemble KS, and G1's online acceptance
+`ks_noise_floor` (`src/ts_score.jl:671`) splits the HF reference in half at 50 TU, takes the
+two-sample KS distance between the halves per QoI, and sums the six. Both halves are the same
+system, so whatever they show is the record's own sampling noise. Contiguous halves, not resampled,
+because the record is serially correlated.
+
+| | archive | rebaselined |
+|---|---|---|
+| floor at the 50 TU cut | **0.1848** | **0.8179** |
+| floor across cut points, 25–75 TU | 0.166–0.429 | 0.328–0.889 |
+| **median over cut points** | **0.281** | **0.469** |
+
+🔴 **It is ONE DRAW and it is very unstable — do not quote the single number as a threshold.**
+Moving the cut in 5 TU steps swings the archive's floor over 0.166–0.429 and the new record's over
+0.328–0.889. The canonical 50 TU cut happens to land near the **bottom** of the archive's range and
+near the **top** of the new record's, which inflates any archive-vs-new ratio built from the two
+canonical values (4.43×) against the ratio of medians (**1.67×**).
+
+✅ **The direction is real and the magnitude was not.** 1.67× on medians agrees with the
+independently measured ~1.6× slowdown in the level's decorrelation time (§1), which is the
+mechanism: slower decorrelation ⇒ fewer independent samples in 100 TU ⇒ the halves differ more.
+
+⚠️ **It is also not sample-size matched to what it is being compared against.** KS grows as samples
+shrink — median over all disjoint pairs:
+
+| split | points per part | archive | rebaselined |
+|---|---|---|---|
+| 2-way | 20 000 | 0.185 | 0.818 |
+| 4-way | 10 000 | 0.526 | 0.862 |
+| 8-way | 5 000 | 0.640 | 1.262 |
+
+The floor compares 20 000 points against 20 000. A per-replica summed KS compares 40 001 against
+40 001, and the ensemble form pools 5 × 40 001 against 40 001. **So the floor is a yardstick with
+the wrong units, not a calibrated threshold**, and a "ratio to floor" carries both the cut-point
+lottery and a sample-size mismatch.
+
+🔴 **What this means for LinReg1's 0.836 against the archive's 0.198 — the question is STILL OPEN.**
+An earlier version of this section claimed the two were each at their own floor (ratios 1.07 and
+1.02) and that the ~4× gap was therefore explained by the floor moving. **That claim rested on the
+single 50 TU cut and does not survive the cut-point sweep.** Against the *median* floor the archive
+run sits at **0.70×** — below its own floor — and the rebaselined run at **1.78×** — above its own.
+The floor moved in the right direction but nowhere near far enough to absorb the gap.
+
+🔑 **The fix is a proper null, and one already exists in this repository.**
+`analysis/plot_hf_new_vs_archive.jl` uses a **block permutation** null for exactly this comparison
+(#54: per-band 95th percentile 0.094–0.108), which returns a distribution rather than one number and
+respects the serial correlation. Regime C should use it, sampled at the sample sizes actually being
+compared. Until then, quote the floor as a **range with its construction stated**, never as a single
+number, and treat every "ratio to floor" in this report as indicative.
+
+⚠️ **What still stands regardless of the floor.** The DDN (1.332), no model (2.487) and Smagorinsky
+(3.710) are above even the largest floor draw on this record (0.889), so the ordering
+**LRS < DDN < no model < Smagorinsky** is safe. So is the statement that the three LRS cells
+(0.810–0.858) cannot be separated from each other: their spread is far smaller than the floor's own
+swing.
+
+### The λ probe — regularization does not fix the excursions 🆕 2026-09-15
+
+`LinReg5` (λ = 1e-5) and `LinReg6` (λ = 1e-4) were fitted and run to test whether the deployed
+λ = 0 model's downward excursions come from its unresolved coefficient vector (§4). They do not.
+
+| | λ = 0 | λ = 1e-5 | λ = 1e-4 |
+|---|---|---|---|
+| ρ(C̃) | 2.6888 | 1.0031 | 1.0033 |
+| starred gain | 269.80 | 8.01 | 4.10 |
+| ensemble KS | 0.836 | 0.858 | 0.810 |
+| mean ratio, `E[16,32]` | 0.913 | 0.920 | 0.925 |
+| clamp rate, worst replica | 1.84% | 1.25% | 1.18% |
+| stable replicas | 5/5 | **4/5** | 5/5 |
+
+🔴 **The fit-time diagnostics move by a factor 30–65 and the deployed behaviour barely moves.**
+λ = 1e-5 collapses ρ(C̃) from 2.69 to 1.003 and the starred gain from 270 to 8 — reproducing paper
+2's archived operator norms almost exactly — yet the summed KS is unchanged within the floor, the
+low bias improves by less than 1.5 points, and the clamp still fires on over 1% of steps.
+
+🔴 **λ = 1e-5 lost a replica.** `LinReg5` replica 5 diverged at **t = 37.81 TU** with `Z[0,6]`
+reaching **3.0e7** against a reference median near 2000. One replica of five is not evidence that
+regularization *hurts* stability, but it is decisive against the hypothesis that it *cures* the
+excursions. Excluded from every number above; see the guard in `extract_rebaseline.jl`.
+
+🔑 **What this rules out.** ρ(C̃) > 1 on the standalone recursion is **not** what produces the
+excursions — the λ cells have ρ ≈ 1.003 and excurse just as much. Combined with the step-level
+attribution (§4b), which finds `q*` already below the reference minimum on 96.6–99.5% of excursion
+steps, the excursions are a property of the **coupled** LF system rather than of the model's
+open-loop spectrum. The remaining candidates are the changed `tau` (#46) and the reference
+realisation itself; the clamp is ruled out too, since it fires at a similar rate in all three.
+
+### #10 / #11 Summed and ensemble KS, and G1's online acceptance — **ON THE ARCHIVE**
+
+🔴 **This subsection alone stays on paper 2's data, and must.** G1's acceptance is defined as
+*reproducing paper 2's published KS table*; there is nothing to reproduce on a different dynamical
+system. It is also the only place a configuration **sweep** exists — h ∈ {5, 10, 40} and
+λ ∈ {0, 0.01} — because the other four cells have never been run on the rebaselined system. Numbers
+here are archive-vs-archive and **must not be compared with the table above**; each dataset has
+its own floor and both floors are unstable draws (see the rebase table in the header).
+
+The archive figure is `figures/fig6_online.png` (no `_new` suffix).
 
 $$\text{KS}_r = \sum_{i=1}^{N_Q}\sup_x\big|F_i^{(r)}(x) - F_i^{\text{ref}}(x)\big|$$
 
@@ -265,13 +422,13 @@ Both are reported and never averaged together.
 configuration to fall within paper 2 Fig. 6's replica min–max range. Read from the archived
 `ks_dists_*.jld2` tables and compared against this round's level-based numbers:
 
-| config | this round | paper 2's archived table | archived ensemble |
-|---|---|---|---|
-| LinReg1 | 0.142–0.371 | 0.142–0.371 | 0.198 |
-| LinReg63 | 0.400–0.580 | 0.400–0.580 | 0.466 |
-| LinReg64 | 0.213–0.392 | 0.213–0.392 | 0.197 |
-| LinReg73 | 0.472–0.694 | 0.472–0.694 | 0.603 |
-| LinReg74 | 0.281–0.436 | 0.281–0.436 | 0.250 |
+| config | h | λ | this round | paper 2's archived table | archived ensemble |
+|---|---|---|---|---|---|
+| LinReg1 | 5 | 0 | 0.142–0.371 | 0.142–0.371 | 0.198 |
+| LinReg63 | 10 | 0.01 | 0.400–0.580 | 0.400–0.580 | 0.466 |
+| LinReg64 | 10 | 0 | 0.213–0.392 | 0.213–0.392 | 0.197 |
+| LinReg73 | 40 | 0.01 | 0.472–0.694 | 0.472–0.694 | 0.603 |
+| LinReg74 | 40 | 0 | 0.281–0.436 | 0.281–0.436 | 0.250 |
 
 Every range reproduces to the digit and the ensemble values match too — an independent confirmation
 of the KS implementation, the QoI extraction and the replica bookkeeping in one. It is only
@@ -295,7 +452,7 @@ configurations are clearly above it.
 $$\Delta\rho(\tau) = \sum_i\big|\rho_i^{\text{model}}(\tau) - \rho_i^{\text{ref}}(\tau)\big|,
 \qquad \Delta\rho_{\text{int}} = \sum_i\int_0^T\big|\rho_i^{\text{mod}} - \rho_i^{\text{ref}}\big|\,d\tau$$
 
-![Autocorrelation](figures/fig7_autocorr.png)
+![Autocorrelation](figures/fig7_autocorr_new.png)
 
 Where KS asks whether the values are right, Δρ asks whether the order is right.
 
@@ -318,21 +475,25 @@ structure, which the KS column shows they are not.
 
 ### #16 Stability fraction, and what ρ(C̃) does not tell you
 
-**5/5 replicas complete 100 TU for every configuration; 2/2 for LinReg74.** Stability fraction 1.00
-across the board, so this data cannot discriminate on stability at all. Paper 2's own table agrees:
-`n_unstable = 0`.
+**On the rebaselined runs: 5/5 replicas complete 100 TU for LinReg1, LinReg6, the DDN and both
+deterministic baselines — and 4/5 for LinReg5.**
 
-🔑 Set that against **ρ(C̃) = 2.174** for the h = 5, λ = 0 cell (§4). The standalone QoI process has
-a fastest-growing mode more than doubling every step, and the coupled system runs 100 TU without a
-single failure. `plan.md` §8a's caveat — *ρ(C̃) < 1 is neither necessary nor sufficient for coupled
-stability* — is no longer a caveat but a measurement.
+🔴 **The one failure is at λ = 1e-5, not at λ = 0.** `LinReg5` replica 5 diverged at **t = 37.81 TU**
+with `Z[0,6]` reaching **3.0e7** against a reference median near 2000. It is excluded from every
+score; `extract_rebaseline.jl` now refuses any replica shorter than `EXPECTED_STEPS` rather than
+truncating it into the ensemble, because `dQ` is *preallocated* and a short run's tail is zeros that
+a clamp census would otherwise read as 24 883 firings that never happened.
 
-⚠️ **The two halves of that sentence come from different fits, and the conclusion survives it.**
-The 2.174 is this round's refit on the 100 TU record; the 5/5 stable replicas were produced by the
-*archived* model, i.e. by the 10 TU fit, which refits in Float64 to **ρ(C̃) = 2.534** (H∞ gain 60.2
-against 108.6). Either number is ≫ 1, so the measurement stands whichever fit is paired with the
-replicas — but ρ(C̃) is record-dependent as well as precision-dependent and must be quoted with its
-record, never bare. See finding 14.
+🔑 **Set that against ρ(C̃) = 2.6888 for the deployed h = 5, λ = 0 cell (§4).** The standalone QoI
+process has a fastest-growing mode nearly tripling every step, and the coupled system runs 100 TU
+five times out of five without a failure — while the cell with ρ = 1.0031 is the one that lost a
+replica. `plan.md` §8a's caveat — *ρ(C̃) < 1 is neither necessary nor sufficient for coupled
+stability* — is no longer a caveat but a measurement, and now with the sign of the association
+pointing the wrong way for the naive reading.
+
+⚠️ **One failure in five is not evidence that λ hurts stability.** With M = 5 the difference between
+5/5 and 4/5 is one draw. What it does rule out is the claim that λ *cures* the instability, which is
+what the probe was run to test.
 
 ### #18 Climatological spread–skill
 
@@ -365,11 +526,12 @@ measures.
 
 ## 4. Mechanism diagnostics — regime 0 (fit-time)
 
-### 🔴 A precision result that gates three of the metrics below
+### 🔴 A precision result that gates three of the metrics below — and it got larger on the new data
 
-The tracked records are **Float32** and this design has $\kappa(X) = 1.7\times10^6$ (harmonized) to
-$9.5\times10^6$ (faithful), so $\kappa\cdot\varepsilon_{32} = 0.20$: **in single precision the
-coefficient vector is not resolved.**
+R1's record is Float64, but the *design* is what decides resolution, and it has
+`κ(X) = 1.85e6` (harmonized, `:normal`) to `1.02e7` (faithful, `:standardise`), so
+`κ·ε₃₂ = 0.22` to `1.22`: **fitted in single precision the coefficient vector is not resolved at
+all.** Paper 2's archive was fitted that way.
 
 The clean way to see it: at λ = 0 the two normalization conventions differ only by subtracting a
 constant from every design column and from the target, and a least-squares fit carrying an
@@ -377,28 +539,58 @@ intercept is invariant to exactly that, so their slope blocks *must* agree.
 
 | | Float32 | Float64 |
 |---|---|---|
-| slope-block relative difference between conventions | **3.32** | **4.7e-11** |
-| slope-block difference, Float32 vs Float64 | — | **0.993** |
-| ρ(C̃) | 1.012 | **2.174** |
-| H∞ starred-block gain | 25.3 | **108.6** |
-| total block sum ‖S − I‖ | 3.07e-2 | 3.15e-2 |
+| slope-block relative difference between conventions | **2.708** | **1.40e-10** |
+| slope-block difference, Float32 vs Float64 | — | **0.972** |
+| ρ(C̃) | 1.0031 | **2.6888** |
+| H∞ starred-block gain | 14.08 | **269.80** |
+| total block sum ‖S − I‖ | 2.805e-2 | 2.910e-2 |
 
-**Consequences.** Everything reading individual coefficients — #21 ρ(C̃), #22 gain — must be
-computed in Float64, and **cannot be taken from an archived Float32 fit**; ⚠️ nor is Float64 alone
-enough, because those two quantities also move with *which tracked record* the fit came from
-(2.174 against 2.534 — see #21/#22 and finding 14). 1.012 versus 2.174 is
-the difference between "marginally unstable" and "violently unstable" from the same data. Aggregate
-diagnostics survive, because they average the errors away (‖S − I‖ agrees to 3 %). The density
-metrics in §2 also survive — recomputing them in Float64 moved the convexities by at most 1.1 and
-changed no conclusion. This also explains why G1's coefficient reproduction is good (7.6e-5): it
-compares two Float32 fits computed the same way, which agree with each other without either being
-close to the true minimiser. All regime-0 numbers below are Float64.
+🔴 **On the new record the Float32/Float64 gap is bigger than it was on the archive** — ρ(C̃) 1.0031
+against 2.6888 here, 1.012 against 2.174 there; the starred gain 14 against **270** here, 25 against
+109 there. Same conclusion, larger margin.
+
+🔑 **This is the single most consequential difference between the deployed R2 model and every LRS
+that came before it.** Paper 2's archived `LinReg1`, refitted from its own 10 TU record under its
+own Float32 arithmetic, reproduces to **1.6e-4** — so the archive *is* a Float32 fit — and that fit
+has ρ(C̃) = **1.0002** and a starred gain of **10.3**. Refitting the *same data* in Float64 gives
+ρ = **2.534** and gain **60.2**. **Every LRS deployed in this project before R2 was regularized by
+its own round-off**; R2's is the first to run the actual λ = 0 least-squares solution.
+
+Decomposing the deployed-vs-archived coefficient difference (physical affine map, relative):
+
+| comparison | isolates | value |
+|---|---|---|
+| new record vs archive record, both Float64 `:normal` | the **record / system** | **1.23** |
+| archive record, Float64 vs Float32 `:standardise` | **precision** | **12.48** |
+| deployed-new vs archive-as-stored | both | 9.29 |
+
+**Precision dominates the record by an order of magnitude.** The two fits differ mostly because the
+archive's coefficients were never resolved, not because the dynamical system moved.
+
+✅ **The normalization switch is exonerated, decisively.** `:normal` versus `:standardise` at λ = 0
+in Float64 changes the physical slope by **3.0e-10**, the intercept by 4.7e-12 and Σ by 8.0e-14, and
+leaves ρ(C̃) and the starred gain identical to four decimals. It is a mathematical no-op at λ = 0 —
+and it *improves* conditioning by a factor 5.5 (`κ` 1.85e6 against 1.02e7). TODO-0's first half was
+a free win.
+
+⚠️ **And regularizing back to the archive's operator norms does not recover its behaviour.** λ = 1e-5
+restores ρ ≈ 1.003 and gain ≈ 8 at +0.1 % training RMSE, but §3's λ probe shows the deployed summed
+KS, bias and clamp rate barely move. So the precision finding explains why the *coefficients* differ;
+it does not explain the excursions.
+
+**Consequences.** Everything reading individual coefficients — #21 ρ(C̃), #22 gain — must be computed
+in Float64 and **cannot be taken from an archived Float32 fit**; ⚠️ nor is Float64 alone enough,
+because those two also move with *which record* the fit came from (2.534 archive-record against
+2.689 new-record, both Float64). Aggregate diagnostics survive, because they average the errors away
+(‖S − I‖ agrees to 4 %). This also explains why G1's coefficient reproduction looks good: it compares
+two Float32 fits computed the same way, which agree with each other without either being close to the
+true minimiser. All regime-0 numbers below are Float64.
 
 ### #23 Gram spectrum — which of three stories λ tells
 
 $$\alpha_j = \frac{\sigma_j^2}{\sigma_j^2+\lambda}$$
 
-![Gram spectrum](figures/fig5_gram_spectrum.png)
+![Gram spectrum](figures/fig5_gram_spectrum_new.png)
 
 Harmonized (`:normal`) design, N = 3595, 67 features: $\sigma^2_{\max} = 2.03\times10^5$, median
 $2.06\times10^{-2}$, $\sigma^2_{\min} = 7.06\times10^{-8}$, κ = 1.70e6, **full rank 67/67**.
@@ -441,29 +633,31 @@ centred. TODO-0's conclusion stands on #23's spectrum, not on the intercept.
 
 Under closure A (`q^{n*} ≈ q^{n-1}`) and closure B (**same-index pairing**, settled below):
 
-**ρ(C̃) = 2.1741**, ℓ2 starred gain 1.03, **H∞ starred gain 108.6** at ω = 0 — all three on the
-**100 TU** record's refit, in Float64.
+**ρ(C̃) = 2.6888** and **H∞ starred gain 269.80** at ω = 0, on R1's record in Float64 — the
+coefficients actually deployed in R2.
 
-🔴 **Both numbers move with the record, not only with the precision.** Refitting the same
-configuration and window on the **10 TU** record — the one paper 2 fitted, see the header — gives
-**ρ(C̃) = 2.534** and an **H∞ gain of 60.2**. Against the archived Float32 coefficients themselves
-the pair reads 1.0002 and 10.3, which is the precision collapse of §4. Three values of ρ from one
-configuration:
+🔴 **Both move with the record AND with the precision, and the two compound.** Four values of ρ
+from one configuration:
 
 | coefficients | ρ(C̃) | H∞ starred gain |
 |---|---|---|
-| archived `LinReg1`, Float32 promoted | 1.0002 | 10.3 |
-| refit, 10 TU record, Float64 | **2.534** | 60.2 |
-| refit, 100 TU record, Float64 | **2.174** | 108.6 |
+| archived `LinReg1`, as stored (Float32) | 1.0002 | 10.3 |
+| refit, archive 10 TU record, Float32 | 1.0002 | — (reproduces the archive to 1.6e-4) |
+| refit, archive 10 TU record, Float64 | **2.534** | 60.2 |
+| refit, archive 100 TU record, Float64 | **2.174** | 108.6 |
+| **refit, R1 record, Float64 — DEPLOYED** | **2.6888** | **269.80** |
 
-The precision effect (§4) and this realisation effect compound: the design has κ ≈ 1e7 and the
-training target differs by ~1 `dQ` sd between the two records, so the coefficient vector is neither
-well determined nor record-independent. **The aggregate conclusion is robust and the digits are
-not** — quote ρ with its record and its precision, or quote it as a range.
+The design has κ ≈ 1e6–1e7 and the training target differs by ~1 `dQ` sd between records, so the
+coefficient vector is neither well determined nor record-independent. **The aggregate conclusion is
+robust and the digits are not** — quote ρ with its record and its precision, or quote it as a range.
 
-The sweep-adequacy test's free end is therefore already reached at λ = 0 — §8b requires ρ > 1, and
-every one of the Float64 fits gives 2.2–2.5 — so no additional λ points are needed at that end for
-this cell.
+🔴 **ρ(C̃) > 1 does NOT predict the deployed behaviour, and §3's λ probe is the proof.** `LinReg5`
+and `LinReg6` have ρ = 1.0031 and 1.0033 and starred gains of 8.01 and 4.10 — a factor 30–65 below
+the deployed cell on both — and their online summed KS, bias and clamp rate are indistinguishable
+from it. Whatever produces the LRS's downward excursions, it is not the standalone recursion's
+spectral radius. This retires the reading that ρ near 2.7 is a stability warning about the
+deployment; it is a statement about an open-loop operator that deployment never runs, because the
+solver supplies `q*` rather than the model's own previous output (#13).
 
 ### #25 Rank / pinv check — the metric does not work as specified
 
@@ -504,12 +698,7 @@ clamped).
 
 ---
 
-## 4b. The rebaselined pipeline — R1 and R2 on the regenerated reference 🆕 2026-09-15
-
-🔴 **These runs are NOT comparable with §3's numbers.** Everything here is on the regenerated HF
-reference and a new tracking record, i.e. the post-`09954be1` Nyquist convention, which changed `∂`,
-`tau` and therefore the dynamical system (memory #45, #46). §3 scores paper 2's archive against
-paper 2's reference. The two tables measure different systems with the same statistic.
+## 4b. R1's tracking run, and what the online trajectories look like
 
 ### R1 — the tracking run
 
@@ -527,84 +716,65 @@ Tracking error `|q_ref − q| / |q_ref|` over all 40 001 columns:
 | Z[16,32] | **9.338e-4** | 4.99e-4 | 7.85e-4 |
 | E[16,32] | 5.502e-4 | 3.06e-4 | 4.70e-4 |
 
-🔑 **The two top bands track ~60× worse than the other four** — means 3–5e-4 against 4–8e-6. Expected
-in kind (smallest scales, least LF skill) but it is the margin that matters: the driver's gate ships
-at a deliberately loose 1e-1 and the real bound should come from this table.
-
-### R2 — four closures, 100 TU each, scored against the regenerated reference
-
-All stable; all launched from the same initial field as the tracking record (rel diff ≤ 1.2e-16).
-
-| model | replicas | stable | summed KS, per replica | ensemble |
-|---|---|---|---|---|
-| **LinReg1** (h = 5, λ = 0, `:normal`) | 5 | 5/5 | 0.586 – 1.010 | **0.836** |
-| **DDN** | 5 | 5/5 | 1.285 – 1.382 | 1.332 |
-| no model | 1 | 1/1 | — | 2.487 |
-| Smagorinsky `c_s = 0.07` | 1 | 1/1 | — | 3.710 |
-
-Per-band KS, ensemble:
-
-| model | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
-|---|---|---|---|---|---|---|
-| LinReg1 | 0.1448 | 0.1107 | 0.1507 | 0.1513 | 0.1390 | 0.1397 |
-| DDN | 0.1663 | 0.0869 | 0.1530 | 0.1679 | 0.3945 | 0.3639 |
-| no model | 0.1759 | 0.0279 | 0.2120 | 0.3304 | 0.9013 | 0.8396 |
-| Smagorinsky | 0.4658 | 0.3070 | 0.5461 | 0.4758 | 0.9672 | 0.9479 |
-
-**Ordering: LRS < DDN < no model < Smagorinsky.** The LRS beats the DDN on the two top bands by ~2.6×
-and is flat across all six; the DDN and both deterministic baselines fail in `[16,32]`.
+🔑 **The two smallest-scale bands track ~60× worse than the other four** — means 3–5e-4 against
+4–8e-6. Expected in kind (smallest scales, least LF skill) but it is the margin that matters: the
+driver's gate ships at a deliberately loose 1e-1 and the real bound should come from this table.
 
 ### The trajectories, one figure per closure
 
-`analysis/plot_rebaseline.jl` writes four figures, `fig8_online_<model>.png`, each showing that
+`analysis/plot_rebaseline.jl` writes six figures, `fig8_online_<model>.png`, each showing that
 closure's online QoI trajectories against the regenerated reference across all six bands, with the
-marginal the KS statistic actually scores drawn beside each band.
+marginal the KS statistic scores drawn beside each band.
 
-⚠️ **Band naming, because §4b above uses the other convention.** "The two top bands" there means the
-two *highest-wavenumber* ones, `Z[16,32]` and `E[16,32]`. Below they are called **the `[16,32]`
-pair** and the other four **the larger-scale bands**, so that nothing turns on which end of the
-spectrum "top" points at.
+⚠️ **Band naming.** "The two top bands" elsewhere in this file means the two *highest-wavenumber*
+ones, `Z[16,32]` and `E[16,32]`. Below they are called **the `[16,32]` pair** and the other four
+**the larger-scale bands**, so nothing turns on which end of the spectrum "top" points at.
 
-⚠️ **How to read them.** Regime C is free-running — nothing is replayed, `q*` comes from the solver,
-and two runs launched from the same field decorrelate within an eddy turnover (~0.3 TU). So
+⚠️ **How to read them.** Regime C is free-running — nothing is replayed, `q*` comes from the
+solver, and two runs launched from the same field decorrelate within an eddy turnover (~0.3 TU). So
 *pointwise* agreement past the opening is not expected and its absence is not a defect. The
 trajectory panel is read for the **envelope**: does the closure hold the right band of amplitudes,
 does it drift, does it collapse. The marginal beside it carries the claim.
 
 🔑 **The direction of each failure, which KS discards.** KS is a distance and has no sign, so the
-ratio of means is reported beside it — it takes one line and it separates two closures that KS ranks
-adjacently:
+ratio of means is reported beside it:
 
 | model, mean(q) / mean(q_ref) | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
 |---|---|---|---|---|---|---|
-| LinReg1 | 0.941 | 0.943 | 0.926 | 0.928 | 0.911 | 0.913 |
+| LinReg1 (λ=0) | 0.941 | 0.943 | 0.926 | 0.928 | 0.911 | 0.913 |
+| LinReg5 (λ=1e-5) | 0.947 | 0.950 | 0.932 | 0.934 | 0.919 | 0.920 |
+| LinReg6 (λ=1e-4) | 0.949 | 0.952 | 0.936 | 0.938 | 0.924 | 0.925 |
 | DDN | 0.941 | 0.967 | 0.947 | 0.941 | 0.821 | 0.842 |
 | no model | 0.939 | 1.012 | 0.918 | 0.870 | **2.391** | **2.015** |
 | Smagorinsky | **1.169** | **1.157** | **1.206** | **1.166** | **2.153** | **1.942** |
 
-**The two stochastic closures are low everywhere and the two deterministic ones are high in
+**All three TO-LRS cells are low in every band and the two deterministic baselines are high in
 `[16,32]`.** Under-dissipation at the smallest resolved scales is the baselines' failure; the TO
-closures have the opposite sign, and nothing in the summed KS says so.
+closures have the opposite sign, and nothing in the summed KS says so. λ moves the LRS bias by
+about one point per decade — real, monotone, and far too small to matter.
 
 ![LinReg1 online](figures/fig8_online_LinReg1.png)
 
 🔑 **The LRS's error is a modest low bias carried by a left tail.** Its marginal sits on the
-reference's through the body of the distribution — the modes line up in all six bands — but the mean
-runs **6–9% low in every band**, and the trajectories show where that comes from: downward
+reference's through the body of the distribution — the modes line up in all six bands — but the
+mean runs **6–9% low in every band**, and the trajectories show where that comes from: downward
 excursions to values the reference never visits. `Z[16,32]` reaches **181** against a reference
-minimum of **721**; `E[16,32]` reaches **6.2e-3** against **0.0243**. The flat ~0.14 KS profile
-across all six bands is therefore not six independent near-misses but one failure mode expressed six
-times.
+minimum of **721**; `E[16,32]` reaches **6.2e-3** against **0.0243**.
+
+![LinReg6 online](figures/fig8_online_LinReg6.png)
+
+🔴 **λ = 1e-4 does not remove them.** Same left tail, same envelope. Put beside the λ = 0 figure
+this is the clearest statement of the λ probe's negative result: a fit whose standalone recursion
+is 2.7× less explosive produces a visually indistinguishable trajectory.
 
 ![DDN online](figures/fig8_online_DDN.png)
 
 🔑 **The DDN fails differently, and only in `[16,32]`.** Its four larger-scale bands are as good as
-the LRS's or better (`E[0,6]` KS 0.0869 against 0.1107, mean ratio 0.967 against 0.943), but `Z[16,32]` and
-`E[16,32]` both overshoot the reference — max **7 967** against **3 791** — *and* repeatedly collapse
-toward zero: minimum `Z[16,32]` **0.42** and `E[16,32]` **8.4e-6**, the latter more than three orders
-below the reference's own minimum of 0.0243. The marginal is bimodal, with mass piled at the bottom
-of the range where the reference has none. **These are the excursions the stabilizer catches on the
-LRS**, and the DDN has no stabilizer.
+the LRS's or better (`E[0,6]` KS 0.0869 against 0.1107), but `Z[16,32]` and `E[16,32]` both
+overshoot the reference — max **7 967** against **3 791** — *and* repeatedly collapse toward zero:
+minimum `Z[16,32]` **0.42** and `E[16,32]` **8.4e-6**, the latter more than three orders below the
+reference's own minimum of 0.0243. The marginal is bimodal, with mass piled at the bottom of the
+range where the reference has none.
 
 ![no model online](figures/fig8_online_nomodel.png)
 
@@ -612,44 +782,64 @@ LRS**, and the DDN has no stabilizer.
 
 🔴 **The 3.710-against-2.487 ordering does not come from `[16,32]`, where KS is saturated.** Both
 baselines pile up there — no model reaches `Z[16,32]` = **10 170** against the reference's median of
-2 023 — and the KS values (0.84–0.97) sit where the distributions barely overlap either way, so the
-statistic cannot rank them in that band. What the trajectories add is that the eddy viscosity *does*
-cut the pile-up: max `Z[16,32]` **7 135** against **10 170**, mean ratio 2.15 against 2.39.
+2 023 — and the KS values (0.84–0.97) sit where the distributions barely overlap either way. What
+the trajectories add is that the eddy viscosity *does* cut the pile-up: max `Z[16,32]` **7 135**
+against **10 170**, mean ratio 2.15 against 2.39.
 
-**The gap is paid in the four larger-scale bands.** Decomposing the 3.710 − 2.487 = 1.223:
-**1.048 of it (86%) comes from those four** — 1.795 for Smagorinsky against 0.746 for no model —
-and only 0.174 from the saturated `[16,32]` pair. No model is close to the reference there in the
-mean (0.918–1.012 on three of the four, with `E[7,15]` the exception at 0.870, and `E[0,6]` KS
-**0.0279**, the lowest number anywhere in this table); `c_s = 0.07` is biased **16–21% high on all
-four**. A statement about this untuned `c_s` on these kernels, not about Smagorinsky.
-
-🔴 **Three things stop this being a result yet.**
-
-1. **The stabilizer clamp fires on the LRS and cannot fire on the DDN** (memory #59). 160 / 539 / 359
-   / 465 / 736 identically-zero `dQ` columns per replica out of **40 000** — 0.4–1.8% of steps. The
-   clamp lives only in the `LinReg` path (`time_series_methods.jl:162,165,190,193`); `MVG_sampler`
-   never receives `q_star`. So **LinReg1's KS is model + stabilizer, and the LRS/DDN difference
-   carries that asymmetry.**
-   ✅ **Two things sharpened here, both by measurement rather than by re-reading.** `E[16,32]` is
-   under the threshold on **100% of fired steps in all five replicas** — memory #59 checked only
-   the worst one — and no other band is under it on any fired step, in any replica. And the events
-   are **clustered, not a uniform tax**: 13 / 20 / 31 / 20 / 79 contiguous bursts, so replica 1's
-   160 steps are 13 bursts inside a single 0.78 TU window (steps 32 728–33 040). A stabilizer that
-   sits on one excursion is a different object from one that shaves 1% of every step, and only the
-   burst count distinguishes them.
-2. **The threshold is too close to the physics.** The reference's own `E[16,32]` minimum is 0.0243,
-   only 2.4× the 1e-2 clamp. Reconstructed `|q*|` minima: LRS 6.2e-3 – 8.6e-3, DDN down to 4.57e-4.
-   ⚠️ Memory #59 calls the DDN figure *"three orders below the threshold"*; the value is right and
-   the characterisation is not — 1e-2 / 4.57e-4 = **22**. Three orders is the right description of a
-   different quantity, the DDN's minimum on the **level**: `E[16,32]` reaches **8.4e-6** against the
-   reference's own minimum of 0.0243.
-3. 🔴 **LinReg1's 0.836 is ~4× §3's archived 0.198**, well outside the 0.1848 noise floor. Untested
-   candidates: the clamp; the changed `tau`; the split now being a continuation of one record instead
-   of two; a different reference realisation. **Not reportable until understood.**
+**The gap is paid in the four larger-scale bands.** Decomposing 3.710 − 2.487 = 1.223: **1.048 of
+it (86%) comes from those four** — 1.795 for Smagorinsky against 0.746 for no model — and only
+0.174 from the saturated `[16,32]` pair. No model is close to the reference in the mean there
+(0.918–1.012 on three of four, `E[7,15]` the exception at 0.870, and `E[0,6]` KS **0.0279**, the
+lowest number anywhere in this report); `c_s = 0.07` is biased **16–21% high on all four**. A
+statement about this untuned `c_s` on these kernels, not about Smagorinsky.
 
 ⚠️ **Smagorinsky here is an untuned point, not paper 2's baseline.** Paper 2 tuned `c_s` against its
 own reference with its own kernels and reported 0.705; this is `c_s = 0.07` on upstream's rewritten
 kernels against a different reference. Never quote the two side by side.
+
+### Where the excursions come from — the step-level attribution
+
+At every step where the level falls below the reference's own minimum on that band:
+
+| | `q*` already below ref min | median `dQ` share of the shortfall |
+|---|---|---|
+| LinReg1, all bands | **96.6–99.5%** | 0.00 to −0.04 |
+| DDN, `[16,32]` | 88.9–89.2% | −0.18 to −0.22 |
+
+🔑 **At the excursion step the correction is not the proximate cause** — `q*` is already low and
+`dQ` moves it by a few percent of the gap. But cumulatively the correction is doing the work: no
+model runs `[16,32]` at 2.39× the reference, the LRS at 0.91×. Together with the λ probe's negative
+result this locates the excursions in the **coupled** LF system rather than in the model's
+open-loop spectrum.
+
+### The clamp, and the asymmetry that remains
+
+🔴 **The stabilizer fires on every LRS cell and cannot fire on the DDN** (memory #59).
+
+| closure | steps under the 1e-2 threshold, worst replica | can the clamp fire? |
+|---|---|---|
+| LinReg1 (λ=0) | 1.84% | yes — fires |
+| LinReg5 (λ=1e-5) | 1.25% | yes — fires |
+| LinReg6 (λ=1e-4) | 1.18% | yes — fires |
+| **DDN** | **3.45%** | **no — `MVG_sampler` never receives `q*`** |
+
+🔑 **The DDN crosses the threshold nearly twice as often as the λ = 0 LRS and nothing stops it.**
+That is a sharper statement of the asymmetry than a firing count alone: it is not that the DDN
+stays clear of the condition, it is that the condition is never tested for it. The clamp lives only
+in the `LinReg` path (`time_series_methods.jl:162,165,190,193`). So a LRS-vs-DDN difference is
+model *plus* stabilizer, and **either clamp both or neither** before D6 runs.
+
+✅ **`E[16,32]` accounts for 100% of fired steps in all five λ = 0 replicas** — memory #59 checked
+only the worst — and no other band is ever under the threshold on a fired step. The events are
+**clustered, not a uniform tax**: 13 / 20 / 31 / 20 / 79 contiguous bursts, so replica 1's 160
+steps are 13 bursts inside a single 0.78 TU window (steps 32 728–33 040).
+
+⚠️ **The threshold sits close to the physics.** The reference's own `E[16,32]` minimum is 0.0243,
+only 2.4× the 1e-2 clamp. Reconstructed `|q*|` minima: LRS 4.7e-3 – 8.6e-3, DDN down to 4.57e-4.
+Memory #59 calls the DDN figure *"three orders below the threshold"*; the value is right and the
+characterisation is not — 1e-2 / 4.57e-4 = **22**. Three orders is the right description of a
+different quantity, the DDN's minimum on the **level**: `E[16,32]` reaches **8.4e-6** against the
+reference minimum of 0.0243.
 
 ## 5. Findings that change the plan
 
@@ -722,8 +912,7 @@ kernels against a different reference. Never quote the two side by side.
     archived coefficients to **7.6e-5** from the 10 TU record and **0.282** from the 100 TU one.
     Consequences: the M0 scored here is a *different fit of the same configuration*, not paper 2's
     model; `test/test_g1.jl` must keep using the 10 TU record, which is the only one that can
-    reproduce the archive; and **ρ(C̃) and the H∞ gain are record-dependent** — 2.174/108.6 on the
-    100 TU refit against 2.534/60.2 on the 10 TU one. Neither `plan.md` nor `metrics.md`
+    reproduce the archive; and **ρ(C̃) and the H∞ gain are record-dependent** — 2.534/60.2 on the archive 10 TU refit, 2.174/108.6 on the archive 100 TU one, and 2.689/269.8 on R1, all in Float64. Neither `plan.md` nor `metrics.md`
     distinguishes the two records; both should, wherever a coefficient-level number is
     pre-registered.
 
@@ -769,8 +958,10 @@ is band-selective, and the paper can say which mechanism each band needs.
 |---|---|
 | **RH-2** | The archive has `n_replicas = 5` ⇒ 6 bins, 4-dof spread estimate. Computable, not quantitative. |
 | **#17 spread–skill vs lead, RH-3** | Needs D6 (K ≫ 1 initial conditions). Every archived run is one trajectory from one IC. P2c. |
-| **DDN in regime C** | 🔴 **The DDN online runs do not exist.** `7_online_DDN.jl` writes to `output/TO_DDN/`; no such directory or file exists in either archive root, only a precomputed `ks_dists_DDN_smag_lf.jld2`. DDN's offline half — everything in §2 — is complete; its KS, stability and spread–skill would need a re-run of 5 × 100 TU ≈ 51 SBU. |
-| **λ > 0 offline reproduction** | `RegularizedLeastSquares`' ADMM is not in the stdlib-only test environment, so G1's λ = 0.01 *coefficient* acceptance and the QR-vs-ADMM parity at λ ∈ {0, 0.01, 0.1} are not run. λ = 0 is reproduced for all three available configurations. ✅ G1's **online** acceptance is no longer blocked and passes for all five (§3). |
+| **DDN in regime C** | ✅ **CLOSED.** R2 ran the DDN online, 5 × 100 TU, and §3 scores it. The archive never had these runs; these are new measurements, not a reproduction. |
+| **λ > 0 offline reproduction** | 🔴 **The parity check is no longer "not run" — it is RUN and it FAILED.** Measured on R1's record 2026-09-15: against the exact ridge minimiser the `RegularizedLeastSquares` ADMM iterate differs by a relative **0.970 at λ = 1e-5, 0.903 at 1e-4, 0.452 at 1e-2**, and its training RMSE is ~0.00714 at every one of those λ — it is iteration-limited, not λ-limited, so a sweep through it is not a sweep in λ. `5_train_LinReg.jl` now solves `:l2` exactly (`ridge_solver = :exact`) and keeps ADMM only for reproducing paper 2 and for `:nuclear`. G1's λ = 0.01 *coefficient* acceptance against the archive is still not run and now needs the `:admm` path explicitly. λ = 0 is reproduced for all three available configurations, and G1's **online** acceptance passes for all five (§3). |
+| **The h and λ sweep on the new system** | 🔴 Only h = 5 exists rebaselined (λ ∈ {0, 1e-5, 1e-4}). h ∈ {10, 40} and λ = 0.01 have never been run post-merge, so §3's archive subsection is the only place a sweep can be read — on the old system. |
+| **Which `T_int` estimator is right** | ⚠️ The Sokal-window estimator here gives 0.25–0.54 TU on the level; `report_marginals` gives 0.94–1.08 TU on the same record (#58). A factor ~2, and D6's grid is sized on the larger one. |
 | **#5, #6, #3** | Deferred by `metrics.md` §6. |
 | **Channel, Taylor-Green** | Only the channel tracked QoI cache is present; no channel or TG fits or online runs were scored. |
 

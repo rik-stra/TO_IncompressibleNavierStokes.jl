@@ -100,6 +100,37 @@ const CELLS = [
     # 1.129 there but the starred gain spikes to 2362, a transitional regime worth not stepping on.
     (hist_len =  5, lambda = 1e-5),    # LinReg5
     (hist_len =  5, lambda = 1e-4),    # LinReg6
+    # --- appended 2026-09-15: the STRONG-regularization ladder ---------------------------------
+    #
+    # The probe above showed lambda = 1e-5 and 1e-4 tame the fit-time operator (rho 2.69 -> 1.003,
+    # starred gain 270 -> 4) and change nothing deployed. So the interesting range is far higher.
+    # Measured on R1 at h = 5 (exact ridge, Float64, :normal, intercept unpenalized):
+    #
+    #     lambda   rho(Ctilde)   gain   train RMSE   ||S||   sd(eta)
+    #     0            2.6888  269.80      0.00669   1.027    0.0067
+    #     1e-2         1.0034    2.11      0.00685   1.009    0.0069
+    #     1            1.0057    1.13      0.00943   1.019    0.0094
+    #     10           0.9992    1.06      0.01659   1.032    0.0166
+    #     1e2          0.9930    1.04      0.02946   1.024    0.0295
+    #     1e4          0.9793    0.91      0.14909   0.946    0.1491
+    #     1e6          0.5897    0.10      0.85080   0.169    0.8509
+    #
+    # 🔑 **rho crosses 1 between lambda = 1 and 10** -- the first genuinely CONTRACTIVE standalone
+    # operator this project has fitted. That boundary is what these cells are for.
+    #
+    # ⚠️ Collapse to the marginal (#12's large-lambda limit) needs lambda ~ 1e6, not 1e2: the target
+    # is the LEVEL and q^{n+1} is nearly q^{n*}, a near-identity map that ridge barely touches while
+    # the intercept stays free. At 1e4 the model still explains 85% of the target's variation
+    # (sd(eta) 0.149 against the target's own 0.998). So 1e4 is a degraded model, NOT the degenerate
+    # one; do not read it as the i.i.d.-draw limit.
+    #
+    # 🔴 At lambda > 0 the penalty is NOT shift-invariant, so `normalization` and
+    # `penalize_intercept` now change the fit rather than only its conditioning. These cells are
+    # `:normal` with a free intercept, which shrinks toward "predict the climatological mean level".
+    (hist_len =  5, lambda = 1.0),     # LinReg7  -- last cell with rho > 1
+    (hist_len =  5, lambda = 10.0),    # LinReg8  -- first contractive cell, rho = 0.9992
+    (hist_len =  5, lambda = 100.0),   # LinReg9  -- clearly contractive, RMSE 4.4x
+    (hist_len =  5, lambda = 1e4),     # LinReg10 -- ||S|| starts falling; the degraded endpoint
 ]
 
 """

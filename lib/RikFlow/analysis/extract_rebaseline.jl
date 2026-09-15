@@ -36,10 +36,42 @@ const REBASE_ROOT = get(ENV, "RIKFLOW_REBASE_ROOT",
                         normpath(joinpath(@__DIR__, "..", "exp_square_HIT", "output")))
 
 """
+    EXPECTED_STEPS
+
+QoI columns a completed 100 TU run must have: `tsim / dt + 1 = 100 / 2.5e-3 + 1`.
+
+🔴 **A replica that stops early still writes a perfectly valid file, and two of its arrays lie.**
+`q` comes from `stack(outputs.qoihist)` and is genuinely short, but `dQ` and `tau` are
+*preallocated* by `TO_Setup(; nstep)` and keep their full 40 000 columns, with everything past the
+last completed step left at zero. Measured on `LinReg5` replica 5 (2026-09-15): it diverged at
+t = 37.81 TU with `Z[0,6]` reaching 3.0e7, `q` is (6, 15125), and `dQ` columns 15074-40000 are
+identically zero -- which a clamp census reads as **24 883 firings (62% of steps)** that never
+happened. `compute_ks.jl:44` has always guarded this with `length(q_rep[i][1,:]) < 40000`; this
+extractor did not, and every statistic downstream would have been wrong with nothing looking odd.
+"""
+const EXPECTED_STEPS = 40001
+
+"""
+    lrs_cell(key, label)
+
+One TO-LRS entry. 🔴 **`dir` is DERIVED from `key`, never written out.**
+`6_online_TO_LRS.jl:94` writes to `output/TO_LRS/<name>/`, so the directory and the configuration
+name are the same string by construction. Repeating it by hand is how `LinReg5` and `LinReg6` came
+to point at `TO_LRS/LinReg1` -- a directory that already holds the lambda = 0 runs, so the lambda
+probe would have scored LinReg1's trajectories three times and labelled two of them 1e-5 and 1e-4.
+That reads as "lambda makes no difference" and nothing in the output would have looked wrong.
+"""
+lrs_cell(key, label) =
+    (; key, label, dir = joinpath("TO_LRS", key),
+     pattern = r"^data_online_tsim100\.0_replica(\d+)\.jld2$",
+     nominal = 5, stochastic = true, clampable = true)
+
+"""
     REBASE_MODELS
 
-The four closures of R2, in the order `results.md` §4b reports them, which is the ordering of the
-result (best summed KS first) and not alphabetical.
+The closures R2 scores, in the order `results.md` reports them: the ordering of the result
+(best summed KS first), not alphabetical. `LinReg5`/`LinReg6` are the lambda probe and are skipped
+with a warning until their online ensembles land.
 
 `dir`/`pattern` locate the replica files; `nominal` is how many replicas the run was launched with,
 so a missing file reads as an unstable replica rather than as a smaller ensemble -- that is how
@@ -57,9 +89,11 @@ reporting that as "clamped 0 times" beside a closure that clamps on 1.8% of step
 asymmetry backwards (memory #59).
 """
 const REBASE_MODELS = (
-    (key = "LinReg1", label = "LinReg1 (h=5, lambda=0, :normal)",
-     dir = joinpath("TO_LRS", "LinReg1"), pattern = r"^data_online_tsim100\.0_replica(\d+)\.jld2$",
-     nominal = 5, stochastic = true, clampable = true),
+    lrs_cell("LinReg1", "LinReg1 (h=5, lambda=0, :normal)"),
+    # The precision-regularization probe (2026-09-15). Fitted and on disk; the online ensembles are
+    # submitted through `batch_scripts/submit_lrs.sh` and are skipped with a warning until they land.
+    lrs_cell("LinReg5", "LinReg5 (h=5, lambda=1e-5, :normal)"),
+    lrs_cell("LinReg6", "LinReg6 (h=5, lambda=1e-4, :normal)"),
     (key = "DDN", label = "DDN",
      dir = "TO_DDN", pattern = r"^DDN_data_online_tsim100\.0_replica(\d+)\.jld2$",
      nominal = 5, stochastic = true, clampable = false),
@@ -70,7 +104,6 @@ const REBASE_MODELS = (
      dir = "smag", pattern = r"^data_smag_0\.07_tsim100\.0\.jld2$",
      nominal = 1, stochastic = false, clampable = false),
 )
-
 "The spec for `key`, or an error naming what is available."
 function rebase_model(key::AbstractString)
     i = findfirst(m -> m.key == key, REBASE_MODELS)
@@ -133,12 +166,31 @@ function extract_rebaseline(key::AbstractString; force = false)
 
     qs, dQs, taus, srcs, bytes = Matrix{Float64}[], Matrix{Float64}[], Matrix{Float64}[],
                                  String[], Int[]
+    kept = Int[]
+    incomplete = NamedTuple[]
     t0 = time()
     for (i, p) in entries
         @printf("    replica %d  %-52s %.0f MB ... ", i, basename(p), filesize(p) / 2^20)
         flush(stdout)
         d = load(p, "data_online")
-        push!(qs, Array{Float64}(d.q))
+        q = Array{Float64}(d.q)
+        if size(q, 2) < EXPECTED_STEPS
+            # Stopped early. Report it loudly, keep the evidence, and keep it OUT of the ensemble:
+            # `dQ` is preallocated, so this replica's tail is zeros that are not clamp firings, and
+            # a short `q` is not a sample of the same length as the others.
+            peak = maximum(abs, view(q, :, size(q, 2)))
+            push!(incomplete, (; replica = i, nsteps = size(q, 2),
+                               t_end = (size(q, 2) - 1) * 2.5e-3, peak_abs_q = peak,
+                               source = abspath(p)))
+            @printf("q = %s  INCOMPLETE (%.2f of 100 TU, |q|max %.3g) -- EXCLUDED\n",
+                    size(q), (size(q, 2) - 1) * 2.5e-3, peak)
+            flush(stdout)
+            d = nothing
+            GC.gc()
+            continue
+        end
+        push!(qs, q)
+        push!(kept, i)
         if spec.stochastic
             hasproperty(d, :dQ) || error("$p has no dQ but $key is declared stochastic")
             push!(dQs, Array{Float64}(d.dQ))
@@ -146,7 +198,7 @@ function extract_rebaseline(key::AbstractString; force = false)
         end
         push!(srcs, abspath(p))
         push!(bytes, filesize(p))
-        @printf("q = %s\n", size(d.q))
+        @printf("q = %s\n", size(q))
         flush(stdout)
         d = nothing
         GC.gc()                          # 285 MB of velocity snapshots per file
@@ -154,13 +206,18 @@ function extract_rebaseline(key::AbstractString; force = false)
     q_star = spec.stochastic ? [q[:, 2:end] .- dQ for (q, dQ) in zip(qs, dQs)] : Matrix{Float64}[]
 
     jldsave(out; q = qs, dQ = dQs, tau = taus, q_star,
-            replica_index = first.(entries), nominal_replicas = spec.nominal,
+            replica_index = kept, nominal_replicas = spec.nominal,
             missing_replicas = spec.nominal - length(entries),
+            unstable_replicas = length(incomplete), incomplete,
             stochastic = spec.stochastic, clampable = spec.clampable,
             key = spec.key, label = spec.label,
             sources = srcs, source_bytes = bytes, root = abspath(REBASE_ROOT),
             extracted = string(now()))
-    @printf("    %d replica(s) in %.1f s; wrote %s (%.2f MB)\n", length(entries), time() - t0,
+    isempty(incomplete) ||
+        @printf("    %d of %d replica(s) stopped early and were EXCLUDED: %s\n",
+                length(incomplete), length(entries),
+                join((@sprintf("r%d at %.1f TU", c.replica, c.t_end) for c in incomplete), ", "))
+    @printf("    %d complete replica(s) in %.1f s; wrote %s (%.2f MB)\n", length(qs), time() - t0,
             basename(out), filesize(out) / 2^20)
     flush(stdout)
     return out
@@ -181,7 +238,9 @@ function load_rebaseline(key::AbstractString)
     d = load(p)
     return (; q = d["q"], q_star = d["q_star"], dQ = d["dQ"], tau = d["tau"],
             replica_index = d["replica_index"], nominal_replicas = d["nominal_replicas"],
-            missing_replicas = d["missing_replicas"], stochastic = d["stochastic"],
+            missing_replicas = d["missing_replicas"],
+            unstable_replicas = get(d, "unstable_replicas", 0),
+            incomplete = get(d, "incomplete", NamedTuple[]), stochastic = d["stochastic"],
             clampable = d["clampable"], key = d["key"], label = d["label"],
             sources = d["sources"], path = p)
 end

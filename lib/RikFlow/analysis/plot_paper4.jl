@@ -15,7 +15,14 @@ using LinearAlgebra
 
 const HERE = @__DIR__
 const FIGS = joinpath(HERE, "figures")
-const SCORES = joinpath(HERE, "output", "paper4_scores.jld2")
+# Which scoring run to plot. `RIKFLOW_DATASET=new` reads the rebaselined scores and writes
+# `fig*_new.png`, so the two sets sit side by side and `results.md` can embed whichever a section
+# is actually about. The archive figures are still needed: G1's reproduction and the
+# five-configuration regime-C comparison exist only on paper 2's data.
+const DATASET = Symbol(get(ENV, "RIKFLOW_DATASET", "archive"))
+const SUFFIX = DATASET === :new ? "_new" : ""
+const SCORES = joinpath(HERE, "output",
+                        DATASET === :new ? "paper4_scores_new.jld2" : "paper4_scores.jld2")
 
 CairoMakie.activate!(; type = "png", px_per_unit = 2)
 
@@ -108,7 +115,7 @@ function fig_trajectories(d)
           "in the right column is dQ, the correction the model emits; the curves themselves are " *
           "the level q,\nwhich is what the free-running scores are computed on.",
           fontsize = 11)
-    save(joinpath(FIGS, "fig1_trajectories.png"), fig)
+    save(joinpath(FIGS, "fig1_trajectories" * SUFFIX * ".png"), fig)
     return fig
 end
 
@@ -144,7 +151,7 @@ function fig_dQ(d)
 to the reference and cannot separate models. " *
           "Free-running, the level is free and is what the physical claims are about.",
           fontsize = 11)
-    save(joinpath(FIGS, "fig2_dQ.png"), fig)
+    save(joinpath(FIGS, "fig2_dQ" * SUFFIX * ".png"), fig)
     return fig
 end
 
@@ -207,7 +214,7 @@ function fig_rank_histograms(d)
           "negative = cap = over-dispersed.\nThe histogram measures RELIABILITY only, which is " *
           "why CRPS sits beside it: DDN lands on the climatological CRPS in every band, so its " *
           "near-flat panels carry no skill.", fontsize = 11)
-    save(joinpath(FIGS, "fig3_rank_histograms.png"), fig)
+    save(joinpath(FIGS, "fig3_rank_histograms" * SUFFIX * ".png"), fig)
     return fig
 end
 
@@ -250,7 +257,7 @@ function fig_dynamics_vs_calibration(d)
           "DDN's predictive mean is a constant, so its predicted dQ has zero autocorrelation " *
           "against a realised value near 0.94.\nA flat histogram beside that is the whole point " *
           "of the negative control.", fontsize = 11)
-    save(joinpath(FIGS, "fig4_dynamics_vs_calibration.png"), fig)
+    save(joinpath(FIGS, "fig4_dynamics_vs_calibration" * SUFFIX * ".png"), fig)
     return fig
 end
 
@@ -291,7 +298,7 @@ function fig_gram(d)
           "alpha_j near 1: the direction survives. alpha_j near 0: ridge has erased it. " *
           "Where lambda sits in this spectrum decides\nwhether the penalty is a " *
           "rank-deficiency fix, a shrink toward the marginal, or inactive.", fontsize = 11)
-    save(joinpath(FIGS, "fig5_gram_spectrum.png"), fig)
+    save(joinpath(FIGS, "fig5_gram_spectrum" * SUFFIX * ".png"), fig)
     return fig
 end
 
@@ -364,7 +371,7 @@ function fig_online(d)
           "spread. Replicas are separate samples of the summed statistic and are never averaged " *
           "with the pooled one.\nThe spread-skill ratio carries its finite-M correction; at " *
           "M = 5 an uncorrected perfect ensemble would read 0.913.", fontsize = 11)
-    save(joinpath(FIGS, "fig6_online.png"), fig)
+    save(joinpath(FIGS, "fig6_online" * SUFFIX * ".png"), fig)
     return fig
 end
 
@@ -445,7 +452,7 @@ On the level, lag 1 separates " *
           "the configurations by only 0.000-0.003 and the integral-timescale lag by 3x; on " *
           "the correction lag 1 spans 0.02-5.29 -- the level is the target the claims are " *
           "about, the correction is where the diagnostic signal is.", fontsize = 11)
-    save(joinpath(FIGS, "fig7_autocorr.png"), fig)
+    save(joinpath(FIGS, "fig7_autocorr" * SUFFIX * ".png"), fig)
     return fig
 end
 
@@ -454,7 +461,8 @@ end
 function main()
     mkpath(FIGS)
     d = load_scores()
-    println("plotting into ", FIGS)
+    @printf("plotting %s scores into %s
+", DATASET, FIGS)
     for (nm, f) in (("fig1_trajectories", fig_trajectories),
                     ("fig2_dQ", fig_dQ),
                     ("fig3_rank_histograms", fig_rank_histograms),
@@ -466,7 +474,7 @@ function main()
         flush(stdout)
         try
             f(d)
-            p = joinpath(FIGS, nm * ".png")
+            p = joinpath(FIGS, nm * SUFFIX * ".png")
             @printf("ok  (%.0f kB)\n", filesize(p) / 1024)
         catch err
             println("FAILED: ", err)
