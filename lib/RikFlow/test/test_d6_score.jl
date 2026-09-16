@@ -89,8 +89,11 @@ end
     nq, ncol = 6, 40001
     ref = D6Score.planted_truth(nq, ncol)
     for (n_k, ℓ) in ((4100, 0), (4100, 1207), (38600, 33), (17900, 241))
-        @test ref.q[1, D6Score.truth_column(n_k, ℓ)] == n_k + 100 + ℓ
-        @test ref.dQ[1, D6Score.truth_column_dq(n_k, ℓ)] == n_k + 100 + ℓ
+        # The scored set's warm-up was reset from 100 to 220 when the forecast length moved to
+        # the LEVEL's decorrelation time (2026-09-15), and these columns default to it. A literal
+        # 100 here would test the alignment against a warm-up nothing runs.
+        @test ref.q[1, D6Score.truth_column(n_k, ℓ)] == n_k + D6Score.N_WARM + ℓ
+        @test ref.dQ[1, D6Score.truth_column_dq(n_k, ℓ)] == n_k + D6Score.N_WARM + ℓ
     end
 end
 
@@ -184,15 +187,20 @@ end
     @test all(g -> issorted(g) && allunique(g) && all(>=(1), g), leads)
     @test all(g -> maximum(g) <= D6Score.N_LEAD, leads)
 
-    # 🔴 A factor 36.8 in T_int is a factor 36.8 in the grid. One grid could not serve both ends.
-    @test maximum(leads[6]) == 1207                       # 10 x 0.3017 TU, and 1207 <= 1208
-    @test maximum(leads[2]) == 33                         # 10 x 0.0082 TU
-    @test maximum(leads[6]) / maximum(leads[2]) > 30
+    # 🔴 The spread COLLAPSED when the grid moved from the correction's timescales to the level's
+    # (2026-09-16). On `dQ` the six bands spanned a factor 36.8 and that was the whole argument for
+    # a per-QoI grid; on `q` they span only 0.5430/0.2489 = 2.18. The per-QoI grid is kept because
+    # it is still correct and costs nothing, but it is no longer load-bearing -- and if someone
+    # later proposes one shared grid, this is the number that says it would now be defensible.
+    @test maximum(leads[5]) == 2172                       # Z[16,32], 10 x 0.5430 TU = N_LEAD
+    @test maximum(leads[6]) == 2158                       # E[16,32], 10 x 0.5395 TU
+    @test maximum(leads[1]) == 996                        # Z[0,6],   10 x 0.2489 TU, the fastest
+    @test maximum(leads[5]) / maximum(leads[1]) < 2.5     # was > 30 on the correction
 
-    # The longest lead is what set the forecast length: it fits, and one more multiple would not.
-    @test D6Score.lead_grid([0.3017]; dt = D6Score.DT, nlead = 1207) isa Vector
-    @test_throws ArgumentError D6Score.lead_grid([0.3017]; dt = D6Score.DT, nlead = 1206)
-    @test_throws ArgumentError D6Score.lead_grid([0.3017]; dt = D6Score.DT, multipliers = (20,),
+    # The longest lead is what sets the forecast length: it fits, and one more multiple would not.
+    @test D6Score.lead_grid([0.5430]; dt = D6Score.DT, nlead = 2172) isa Vector
+    @test_throws ArgumentError D6Score.lead_grid([0.5430]; dt = D6Score.DT, nlead = 2171)
+    @test_throws ArgumentError D6Score.lead_grid([0.5430]; dt = D6Score.DT, multipliers = (20,),
                                                  nlead = D6Score.N_LEAD)
     @test_throws ArgumentError D6Score.lead_grid([0.0]; dt = D6Score.DT, nlead = 100)
 
@@ -488,13 +496,23 @@ end
     @test !v.ok
     @test v.gate > 1e-2
 
-    # 4. The same perturbation confined to Z[16,32] passes: it is a different quantity today than
-    #    when the archive was written (gotcha #45) and must not be read as a defect.
+    # 4. 🔴 REVERSED 2026-09-16. A perturbation confined to Z[16,32] must now FAIL.
+    #
+    #    It used to pass: the oracle was paper 2's archive, where Z[16,32] is a different quantity
+    #    than it is today (gotcha #45), so the band had to be carved out of the verdict. The oracle
+    #    is now R2's own LinReg1 replica 1 -- same record, same precision, same Nyquist convention,
+    #    same solver -- so there is no code difference left to excuse and nothing is excluded.
+    #    A carve-out that outlives its reason is a blind spot in exactly one band.
     qz = copy(base)
     qz[D6Score.IZ1632, :] .+= 0.1 * sd[D6Score.IZ1632]
     v = D6Score.validation_verdict(qz, base, copy(dqa), dqa, nwarm)
-    @test v.ok
-    @test v.rel_full[D6Score.IZ1632] > 1e-2      # measured and reported, just not gated
+    @test !v.ok
+    @test v.gate > 1e-2
+    @test v.rel_full[D6Score.IZ1632] > 1e-2
+
+    #    The carve-out is still reachable for a deliberate archive comparison, and then it passes.
+    vx = D6Score.validation_verdict(qz, base, copy(dqa), dqa, nwarm; iexcl = D6Score.IZ1632)
+    @test vx.ok
 
     # 5. Agreement over the warm-up followed by separation -- the real run's shape -- passes the
     #    gate and reports where it parted company, past `nwarm`.

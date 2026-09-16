@@ -94,6 +94,13 @@ const REBASE_MODELS = (
     # submitted through `batch_scripts/submit_lrs.sh` and are skipped with a warning until they land.
     lrs_cell("LinReg5", "LinReg5 (h=5, lambda=1e-5, :normal)"),
     lrs_cell("LinReg6", "LinReg6 (h=5, lambda=1e-4, :normal)"),
+    # The strong-regularization ladder (2026-09-15). rho(Ctilde) crosses 1 between LinReg7 and
+    # LinReg8, so LinReg8/9/10 are the first contractive standalone operators fitted here.
+    lrs_cell("LinReg2",  "LinReg2 (h=5, lambda=1e-2, :normal)"),
+    lrs_cell("LinReg7",  "LinReg7 (h=5, lambda=1, :normal)"),
+    lrs_cell("LinReg8",  "LinReg8 (h=5, lambda=10, :normal)"),
+    lrs_cell("LinReg9",  "LinReg9 (h=5, lambda=100, :normal)"),
+    lrs_cell("LinReg10", "LinReg10 (h=5, lambda=1e4, :normal)"),
     (key = "DDN", label = "DDN",
      dir = "TO_DDN", pattern = r"^DDN_data_online_tsim100\.0_replica(\d+)\.jld2$",
      nominal = 5, stochastic = true, clampable = false),
@@ -222,6 +229,21 @@ function extract_rebaseline(key::AbstractString; force = false)
     flush(stdout)
     return out
 end
+
+"""
+    rebase_available(key)
+
+Whether `key` has anything to score: a cache already on disk, or replica files to build one from.
+
+🔴 **A cell enters `REBASE_MODELS` when it is FITTED, not when its ensemble lands.** The fit is
+minutes on a login node; the five 100 TU replicas behind it are hours of GPU queue. Every consumer
+loops over the list, so without this guard adding a rung to the lambda ladder breaks every plotting
+and scoring run until the last replica finishes -- which is exactly when the ladder is most worth
+looking at. `REBASE_MODELS`'s docstring has always promised this skip; this is what makes it true.
+"""
+rebase_available(key::AbstractString) =
+    isfile(joinpath(DATA_DIR, "online_new_$(key)_qois.jld2")) ||
+    !isempty(rebase_replica_files(rebase_model(key)))
 
 """
     load_rebaseline(key)

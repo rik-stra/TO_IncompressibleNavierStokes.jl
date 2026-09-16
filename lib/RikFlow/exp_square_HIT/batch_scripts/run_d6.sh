@@ -21,13 +21,15 @@
 # differ by 10x and neither should be trusted. Then change to --array=1-180 (add %20 to cap
 # concurrency if the queue prefers it) and change nothing else.
 #
-# ~19 s per member is the extrapolation from plan P2's one measured smoke run (1 TU, 400 steps,
-# 5.8 s), so ~3.5 min of compute per task plus Julia startup and compilation. 30 minutes is
-# generous; tighten it once the pilot has measured it.
+# Walltime, re-derived 2026-09-16 for N_LEAD = 2172 (was 1208). Paper 2's Appendix G gives ~4.1 s/TU
+# per member wall including setup and the write; at nt = 2392 steps = 5.98 TU that is ~25 s/member,
+# so ~4 min of stepping for M = 10, plus roughly 6 min of first-member GPU compilation -- about
+# 10 min per task. 30 minutes keeps ~3x margin. Tighten it once the pilot has measured the real
+# rate, and note the pilot's own first task carries the compilation for nothing else.
 
 #SBATCH -J d6
 #SBATCH -t 30:00
-#SBATCH --partition=gpu_a100
+#SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 #SBATCH --array=1-5
 
@@ -36,15 +38,25 @@
 # files before this script body runs, so the `mkdir` below was always too late for them, and logs/
 # is not in the repository.
 
-# Depot with the trailing colon, as every other script in this repository has it. ⚠️ The handoff
-# said /scratch-shared/$USER/.julia_a100: ; the repository's own scripts use $HOME/julia/julia_<gpu>
-# and that is what is followed here.
-export JULIA_DEPOT_PATH=$HOME/julia/julia_a1003:
+# Depot with the trailing colon, as every other script in this repository has it.
+#
+# 🔴 Moved to gpu_h100 + julia_h100 on 2026-09-16 (Rik). This was the only script in the directory
+# on gpu_a100 and the only one on the julia_a1003 depot, while RUNBOOK.md tells the operator to
+# export julia_h100 -- so a task could land on a depot nobody had warmed and precompile from
+# scratch inside the walltime. JULIA_CPU_TARGET multiversioning means one depot serves both
+# partitions, so there was never a reason for the split.
+export JULIA_DEPOT_PATH=$HOME/julia/julia_h100:
 
-# ⚠️ The depot above does not follow this directory's convention: every other script uses
-# $HOME/julia/julia_h100, and JULIA_CPU_TARGET multiversioning means one depot serves both
-# partitions. `julia_a1003` is an artifact and is kept only because the 2026-09-11 D6 run populated
-# it; consolidating is a one-line change whenever someone is willing to pay one precompile.
+# 🔴 Set explicitly, and it is not decoration: the h100 depot's caches were built by the online
+# scripts WITH this target, and Julia validates a cache against the target it was compiled for. A
+# task that omitted it could reject those caches and recompile from scratch inside the walltime --
+# the same failure the depot move above exists to prevent. Identical string to
+# run_online_array.sh and run_train_lrs.sh; keep them in step.
+export JULIA_CPU_TARGET="generic;znver2,clone_all;znver4,clone_all;icelake-server,clone_all"
+
+# (Historical: the handoff said /scratch-shared/$USER/.julia_a100: ; the repository's own scripts
+# use $HOME/julia/julia_<gpu>. `julia_a1003` was this script's own artifact, kept only because the
+# 2026-09-11 D6 run populated it; that run was against the archive and is superseded.)
 mkdir -p output/D6
 
 # Optional; run_d6.jl falls back to output/d6_ics and then to the local analysis build directory.

@@ -66,6 +66,13 @@ end
     hit10() = load_cache("data_track_trackingnoise_std_0.0")
     hit100() = load_cache("data_track2")
 
+    # 🔴 R1's tracking record -- the one D6's IC packages are cut from since 2026-09-15. NOT
+    # `hit100()`: that is paper 2's archived `data_track2`, Float32 and on the pre-`09954be1`
+    # Nyquist convention, i.e. a different dynamical system (memory #45, #46, #60). A D6 test
+    # comparing a package built from R1 against `hit100()` fails on every array, which is exactly
+    # what it should do.
+    hitR1() = load_cache("data_track_dns512")
+
     # ⚠️ The channel tracked record: extracted 2026-09-05 and **called by nothing**, four days
     # before the HIT-only focus (`claude_memory.md` decisions log, 2026-09-09). Kept, not deleted:
     # it is 386 kB in a gitignored directory and remaking it means another 39 MB read of a file that

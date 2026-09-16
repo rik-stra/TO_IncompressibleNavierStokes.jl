@@ -465,7 +465,10 @@ function dataset(which::Symbol)
                 # so one record carries both the fit window and D6's IC pool (#58).
                 rec10 = nothing,
                 q_ref = Float64.(load_new_reference().q_ref),
-                configs = [m.key for m in REBASE_MODELS], load_ens = rebaselined_ensemble,
+                # Only the cells whose ensembles have landed. A rung of the lambda ladder is in
+                # `REBASE_MODELS` from the moment it is fitted, hours before its replicas finish.
+                configs = [m.key for m in REBASE_MODELS if rebase_available(m.key)],
+                load_ens = rebaselined_ensemble,
                 g1 = false, out = "paper4_scores_new.jld2")
     else
         error("RIKFLOW_DATASET must be `archive` or `new`; got $which")

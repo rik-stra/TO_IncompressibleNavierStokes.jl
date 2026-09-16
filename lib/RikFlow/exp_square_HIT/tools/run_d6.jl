@@ -78,6 +78,25 @@ function ic_dir()
 end
 
 model_file() = get(ENV, "D6_MODEL", joinpath(EXP_DIR, "output", "TO_LRS", "LinReg1", "LinReg.jld2"))
+
+"""
+    closure()
+
+Which closure to forecast with: `:lrs` (default) or `:ddn`, from `D6_CLOSURE`.
+
+🔴 **The DDN needs this to enter D6 at all**, and until 2026-09-16 it could not: `MVG_sampler` took
+no `spinnup_data`, so a DDN forecast would have started sampling immediately while the LRS was being
+advanced through `nwarm` recorded steps. The two closures would then forecast from **different
+physical states** and every lead-resolved difference would carry that offset (memory #55).
+"""
+function closure()
+    c = Symbol(lowercase(get(ENV, "D6_CLOSURE", "lrs")))
+    c in (:lrs, :ddn) || error("D6_CLOSURE must be lrs or ddn; got $c")
+    return c
+end
+
+"The DDN's training slice, written once beside the IC packages by `analysis/build_d6_ics.jl`."
+ddn_file() = get(ENV, "D6_DDN_DATA", joinpath(ic_dir(), "d6_ddn_traindata.jld2"))
 out_dir() = get(ENV, "D6_OUT", joinpath(EXP_DIR, "output", "D6"))
 n_members() = parse(Int, get(ENV, "D6_MEMBERS", "10"))
 
@@ -103,7 +122,7 @@ Used only by ordinal 0. Reusing the archive's stream is what makes the validatio
 to the archived trajectory column by column instead of merely in distribution; every *scored*
 member goes through `member_seed` and therefore shares a stream with nothing archived.
 """
-validation_seed(member::Integer) = UInt64(ARCHIVE_SEED_BASE + Int(member))
+validation_seed(member::Integer) = UInt64(DRIVER_SEED_BASE + Int(member))
 
 """
     check_ic_alignment(q0, q_window, offsets; qois, median_tol = 1e-4, margin = 10.0)
@@ -203,7 +222,7 @@ catches an IC set built with a different `K`, `nlead` or record from the one thi
 which would otherwise show up only as a silently misaligned truth at scoring time.
 """
 function load_ic(ordinal::Integer; dir = ic_dir())
-    # 🔑 Ordinal 0 is the validation IC -- `fields[1]` of the 10 TU record, the archived runs' own
+    # 🔑 Ordinal 0 is the validation IC -- `fields[1]` of R1, the initial condition R2's own
     # initial condition. It is not in the manifest and must not be: it sits inside M0's fit window
     # and V28 needs D6's scored set disjoint from it. See `build_validation_ic`.
     if ordinal == 0
@@ -213,6 +232,26 @@ function load_ic(ordinal::Integer; dir = ic_dir())
         pkg = load(p)
         get(pkg, "validation", false) || error("$p is not marked as a validation package")
         pkg["n_k"] == 0 || error("validation IC is at step $(pkg["n_k"]), expected 0")
+
+        # 🔴 **Ordinal 0 used to check NOTHING but those two lines, and it is the one run whose whole
+        # job is catching mistakes.** Scored ordinals cross-check the manifest against `select_ics`
+        # below and fail loudly on a stale IC set; the validation package is not in the manifest, so
+        # it had no equivalent. Measured 2026-09-16: `ic_dir()` prefers
+        # `exp_square_HIT/output/d6_ics`, which still held the **2026-09-10 archive-built** packages
+        # (`data_track_trackingnoise_..._tsim10.0`, Float32, `nwarm = 100, nlead = 1208`). A
+        # validation run picked them up silently, returned Float32 everywhere, and could not have
+        # passed its own `dQ` bit-identity gate -- with nothing in the output saying why.
+        prov = pkg["provenance"]
+        prov.nlead == N_LEAD || error(
+            "validation IC at $p was built with nlead = $(prov.nlead), but this driver is at " *
+            "N_LEAD = $N_LEAD. The IC set is stale -- rebuild with analysis/build_d6_ics.jl, or " *
+            "point D6_IC_DIR at the current one.")
+        prov.nwarm == N_WARM_DRIVER || error(
+            "validation IC at $p was built with nwarm = $(prov.nwarm), expected " *
+            "N_WARM_DRIVER = $N_WARM_DRIVER (what the online drivers replay).")
+        eltype(pkg["u"]) === eltype(pkg["dQ_warm"]) || error(
+            "validation IC mixes precisions: u is $(eltype(pkg["u"])), dQ_warm is " *
+            "$(eltype(pkg["dQ_warm"]))")
         return pkg
     end
     man = load(manifest_path(dir))
@@ -235,11 +274,28 @@ Run all `M` members for one initial condition and write one file per member.
 
 `nlead` shortens the forecast and `od` redirects the output; both exist for `smoke_d6.jl` and must
 be left at their defaults for anything whose numbers are reported. A short run is a pipeline check,
-not a measurement -- the lead grid's longest entry is 1207 steps.
+not a measurement -- the lead grid's longest entry is 2172 steps.
 """
 function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
                 nlead = nothing, od = out_dir())
-    T = Float32
+    # 🔴 **Float64, changed 2026-09-16 (Rik).** It was `Float32`, and that was wrong in three ways at
+    # once on the rebaselined pipeline:
+    #
+    #  1. **It did not set the solver's precision.** `online_sgs` takes `T = typeof(Re)`, and the IC
+    #     package carries R1's `Re = 2000.0` as a **Float64**. So the solver already ran Float64
+    #     while this `T` cast `Δt`, `tsim` and the warm-up down to Float32 around it.
+    #  2. **It broke D6's own acceptance gate.** The gate is `dQ` bit-identity over the replayed
+    #     window (memory #48). `ArrayType{Float32}(dQ_warm)` on a Float64 package is not
+    #     bit-identical to the record -- measured, `Array{Float32}(dQ_warm) == dQ_warm` is `false` --
+    #     so the validation could never have passed.
+    #  3. **It made the two closures replay different warm-ups.** The LRS went through
+    #     `ArrayType{T}(...)` and the DDN through `Array(...)`, so at `T = Float32` they entered the
+    #     forecast from different states -- defeating the whole point of giving `MVG_sampler` a
+    #     warm-up (memory #55, #66).
+    #
+    # Everything the package carries is already Float64: `Re`, `Δt`, `u`, `ou_bodyforce`. This makes
+    # the driver agree with them instead of casting around them.
+    T = Float64
     gpu = CUDA.functional()
     ArrayType = gpu ? CuArray : Array
     backend = gpu ? CUDABackend() : IncompressibleNavierStokes.CPU()
@@ -258,7 +314,7 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     nlead = nlead === nothing ? pkg["provenance"].nlead : Int(nlead)
     nlead == pkg["provenance"].nlead ||
         @warn "forecast shortened to $nlead steps from $(pkg["provenance"].nlead); this is a " *
-              "pipeline check, not a measurement -- the lead grid reaches 1207 steps"
+              "pipeline check, not a measurement -- the lead grid reaches 2172 steps"
 
     Δt = T(params_ic.Δt)
     nt = nwarm + nlead
@@ -269,9 +325,21 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     T(tsim) / nt === Δt || error("tsim/nt = $(T(tsim)/nt) is not Δt = $Δt; the OU replay and the " *
                                  "reference would step the chain differently")
 
-    mdl = model_file()
-    isfile(mdl) || error("no model at $mdl (set D6_MODEL)")
-    hist_len, hist_var = load(mdl, "hist_len", "hist_var")
+    cl = closure()
+    if cl === :lrs
+        mdl = model_file()
+        isfile(mdl) || error("no model at $mdl (set D6_MODEL)")
+        hist_len, hist_var = load(mdl, "hist_len", "hist_var")
+        dQ_train = nothing
+    else
+        mdl = ddn_file()
+        isfile(mdl) || error("no DDN training data at $mdl; run analysis/build_d6_ics.jl " *
+                             "(or set D6_DDN_DATA)")
+        dQ_train = load(mdl, "dQ_train")
+        # The DDN has no history at all -- that is what makes its warm-up "pseudo". Reported as 0
+        # rather than left undefined, so the output file says which closure produced it.
+        hist_len, hist_var = 0, :none
+    end
     nq = size(params_ic.qois, 1)
 
     mkpath(od)
@@ -279,13 +347,15 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     @printf("D6 ordinal %d -> field k = %d, n_k = %d, t_k = %.2f TU\n", ordinal, k, n_k, t_k)
     @printf("  %s, %d members, %d steps (%d warm-up + %d forecast) = %.4f TU, Δt = %g\n",
             gpu ? "GPU (CuArray)" : "CPU (Array)", M, nt, nwarm, nlead, tsim, Δt)
-    @printf("  model %s: hist_len = %d, hist_var = %s\n", basename(mdl), hist_len, hist_var)
+    @printf("  closure %s, model %s: hist_len = %d, hist_var = %s\n", cl,
+            basename(mdl), hist_len, hist_var)
     @printf("  ou_advance = %d, savefreq = %d (> nt, so no fields)\n", n_k, nt + 1)
     if validation
-        println("  🔑 VALIDATION run, not a scored one. This is the archived runs' own initial")
+        println("  🔑 VALIDATION run, not a scored one. This is R2's own online initial")
         println("     condition, so ou_advance = 0 -- the identity point of the replay -- and the")
-        @printf("     model seeds are the archive's, Xoshiro(%d + member). Output goes to\n",
-                ARCHIVE_SEED_BASE)
+        @printf("     model seeds are the driver's, Xoshiro(%d + member). The oracle is R2's\n",
+                DRIVER_SEED_BASE)
+        println("     LinReg1 replica 1, not paper 2's archive. Output goes to")
         println("     d6_valid_ic1_m*.jld2, which the scorer's glob cannot see. Compare it with")
         println("     `compare_validation` in analysis/score_d6.jl.")
     end
@@ -306,10 +376,21 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
         end
 
         seed = validation ? validation_seed(member) : member_seed(k, member)
-        q_hist = ArrayType{T}(zeros(T, nq, hist_len))
-        hist_var == :q_star_q && (q_hist = cat(q_hist, q_hist, dims = 1))
-        sampler = RikFlow.LinReg(mdl, Xoshiro(seed), ArrayType;
-                                 q_hist, spinnup_data = ArrayType{T}(dQ_warm))
+        sampler = if cl === :lrs
+            q_hist = ArrayType{T}(zeros(T, nq, hist_len))
+            hist_var == :q_star_q && (q_hist = cat(q_hist, q_hist, dims = 1))
+            RikFlow.LinReg(mdl, Xoshiro(seed), ArrayType;
+                           q_hist, spinnup_data = ArrayType{T}(dQ_warm))
+        else
+            # 🔑 Same `dQ_warm`, same member seed, same IC. The DDN replays the identical warm-up
+            # the LRS does, so both enter the forecast from the same physical state -- and the
+            # replay does not consume the rng, so this member's first *sampled* dQ is what
+            # `Xoshiro(seed)` would have given with no warm-up at all.
+            # `Array`, not `ArrayType{T}`: `MVG_sampler` is CPU-side (it samples from a
+            # Distributions object and `to_sgs_term` calls `Array(dQ)` anyway). At `T = Float64`
+            # this is the same numbers the LRS replays, which is what the comment above requires.
+            RikFlow.MVG_sampler(dQ_train, Xoshiro(seed); spinnup_data = Array{T}(dQ_warm))
+        end
 
         t0 = time()
         data = online_sgs(; params..., ustart, time_series_method = sampler, ou_advance = n_k)
@@ -342,7 +423,8 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
 
         jldsave(out; q = Array(data.q), dQ = Array(data.dQ), tau = Array(data.tau),
                 k, n_k, t_k, ordinal, member, seed, ou_advance = n_k, validation,
-                nwarm, nlead, M, model = abspath(mdl), hist_len, hist_var,
+                nwarm, nlead, M, model = abspath(mdl), closure = string(cl), hist_len,
+                hist_var,
                 tsim, Δt, wall_seconds = wall,
                 julia = string(VERSION), device = gpu ? "cuda" : "cpu", written = string(now()))
 

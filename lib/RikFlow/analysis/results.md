@@ -20,7 +20,7 @@ RIKFLOW_DATASET=new julia --startup-file=no --project=analysis analysis/score_m0
 
 | stays on paper 2's archive | why |
 |---|---|
-| §3's five-configuration sweep (LinReg1/63/64/73/74) | Only `LinReg1` has a rebaselined counterpart. The other four are h ∈ {10, 40} and λ = 0.01 cells that have never been run on the new system; each needs its own 5 × 100 TU ensemble. |
+| §3's five-configuration sweep (LinReg1/63/64/73/74) | Only `LinReg1` has a rebaselined counterpart. The other four are h ∈ {10, 40} and λ = 0.01 cells that have never been run on the new system; each needs its own 5 × 100 TU ensemble. The rebaselined side sweeps **λ at fixed h = 5** instead (LinReg1/5/6/7/8/9/10), so the two sweeps vary different axes and their orderings are not comparable. |
 | §3's **G1 online acceptance** | G1 *reproduces paper 2's published KS table*. There is nothing to reproduce on a different dynamical system, so it is not run on the new data rather than run and reported as a failure. |
 | the 10 TU clamp census | No 10 TU rebaselined record exists and none is coming: R1 tracked for 100 TU precisely so one record carries both the fit window and D6's IC pool (#58). |
 
@@ -301,18 +301,26 @@ running a single large-λ cell.
 ## 3. Marginal and temporal accuracy — regime C (online, coupled)
 
 Scored on the **QoI level** against the regenerated HF reference, with the correction alongside.
-Six closures, all launched from the same initial field as the tracking record (rel diff ≤ 1.2e-16).
+Ten closures, all launched from the same initial field as the tracking record (rel diff ≤ 1.2e-16).
 
 ![Regime C](figures/fig6_online_new.png)
 
 | closure | h | λ | replicas | stable | summed KS `q` | ens KS | Δρ₁(q) | Δρ₃₇(q) | summed KS `dQ` | Δρ₁(dQ) | clamp |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| **LinReg1** | 5 | 0 | 5 | 5/5 | 0.586–1.010 | **0.836** | 0.000 | 0.146 | 0.352–0.545 | 0.028 | 1.84% |
+| **LinReg1** | 5 | 0 | 5 | 5/5 | 0.586–1.010 | 0.836 | 0.000 | 0.146 | 0.352–0.545 | 0.028 | 1.84% |
 | **LinReg5** | 5 | 1e-5 | 5 | **4/5** | 0.692–0.988 | 0.858 | 0.000 | 0.169 | 0.354–0.497 | 0.030 | 1.25% |
-| **LinReg6** | 5 | 1e-4 | 5 | 5/5 | 0.554–0.945 | **0.810** | 0.000 | 0.161 | 0.322–0.504 | 0.037 | 1.18% |
+| **LinReg6** | 5 | 1e-4 | 5 | 5/5 | 0.554–0.945 | 0.810 | 0.000 | 0.161 | 0.322–0.504 | 0.037 | 1.18% |
+| **LinReg7** | 5 | 1 | 5 | 5/5 | 0.537–0.913 | **0.648** | 0.000 | **0.049** | 0.350–0.514 | 2.740 | **0.00%** |
+| **LinReg8** | 5 | 10 | 5 | 5/5 | 0.716–0.823 | 0.740 | 0.002 | 0.055 | 0.622–0.711 | **4.922** | **0.00%** |
+| **LinReg9** | 5 | 100 | 5 | 5/5 | 1.221–1.375 | 1.297 | 0.018 | 0.126 | 1.154–1.212 | **6.666** | **0.00%** |
+| **LinReg10** | 5 | 1e4 | 5 | 5/5 | 2.245–2.295 | 2.270 | **3.119** | **3.972** | 2.242–2.251 | **8.602** | **0.00%** |
 | **DDN** | — | — | 5 | 5/5 | 1.285–1.382 | 1.332 | 0.001 | 0.201 | 0.291–0.306 | **5.658** | n/a |
 | no model | — | — | 1 | 1/1 | — | 2.487 | 0.000 | 0.116 | none | none | n/a |
 | Smagorinsky `c_s=0.07` | — | — | 1 | 1/1 | — | 3.710 | 0.001 | 0.322 | none | none | n/a |
+
+⚠️ **`LinReg2` (λ = 1e-2) is fitted but not yet run** — the one remaining hole in the ladder, and it
+sits in the two-decade gap between 1e-4 and 1. `plot_rebaseline.jl` and `score_m0_ddn.jl` skip it by
+name until its ensemble lands (`rebase_available`); nothing below interpolates across the gap.
 
 🔴 **THE NOISE FLOOR, AND WHY IT IS NOT A THRESHOLD.**
 
@@ -367,11 +375,28 @@ number, and treat every "ratio to floor" in this report as indicative.
 
 ⚠️ **What still stands regardless of the floor.** The DDN (1.332), no model (2.487) and Smagorinsky
 (3.710) are above even the largest floor draw on this record (0.889), so the ordering
-**LRS < DDN < no model < Smagorinsky** is safe. So is the statement that the three LRS cells
-(0.810–0.858) cannot be separated from each other: their spread is far smaller than the floor's own
-swing.
+**LRS < DDN < no model < Smagorinsky** is safe. So is the statement that the five cells at
+λ ≤ 10 (0.648–0.858) cannot be separated from each other **on this statistic**: their spread is far
+smaller than the floor's own swing, and their per-replica ranges overlap heavily (λ = 1's
+0.537–0.913 and λ = 10's 0.716–0.823 both sit inside λ = 0's 0.586–1.010). The two strong cells are
+a different matter: `LinReg9` at 1.297 and `LinReg10` at 2.270 clear the largest floor draw, so
+**λ ≥ 100 is measurably worse** and that ordering does not depend on the floor's construction.
 
-### The λ probe — regularization does not fix the excursions 🆕 2026-09-15
+🔑 **So the λ = 1 and λ = 10 improvements must be argued from statistics that do not overlap**, and
+three are available, none of them a distributional distance with a floor problem: the clamp fires
+**0 times in 5 × 40 000 steps** against 160–736 at λ = 0; the minimum of `Z[16,32]` rises from
+**181** to 380 (λ = 1) and 587 (λ = 10) against a reference minimum of 721; and the climatological
+spread–skill ratio moves from 1.507, outside S7's band, to **0.982**, inside it. See the ladder
+below.
+
+### The weak λ probe — *small* regularization does not fix the excursions 🆕 2026-09-15
+
+⚠️ **Scope, added after the strong ladder ran.** Everything in this subsection is measured at
+λ ≤ 1e-4 and its negative conclusion holds only there. At λ = 1 the excursions *do* go away — see
+the ladder below, which is the same experiment continued four decades further and reaches the
+opposite answer. The two are kept apart because the weak probe is what motivated the strong one,
+and because "regularization does not help" is exactly the conclusion this report would have shipped
+had the sweep stopped at 1e-4.
 
 `LinReg5` (λ = 1e-5) and `LinReg6` (λ = 1e-4) were fitted and run to test whether the deployed
 λ = 0 model's downward excursions come from its unresolved coefficient vector (§4). They do not.
@@ -401,6 +426,65 @@ attribution (§4b), which finds `q*` already below the reference minimum on 96.6
 steps, the excursions are a property of the **coupled** LF system rather than of the model's
 open-loop spectrum. The remaining candidates are the changed `tau` (#46) and the reference
 realisation itself; the clamp is ruled out too, since it fires at a similar rate in all three.
+
+### The strong λ ladder — λ = 1 is the best closure this project has run 🆕 2026-09-15
+
+The weak probe moved ρ(C̃) by a factor 2.7 and changed nothing deployed, which said the interesting
+range was much higher. `LinReg7/8/9/10` (λ = 1, 10, 100, 1e4) continue the same sweep across the
+point where the standalone operator becomes **contractive** (ρ crosses 1 between λ = 1 and λ = 10;
+`4_setup_search.jl` carries the fit-time table).
+
+| | λ = 0 | λ = 1e-4 | **λ = 1** | λ = 10 | λ = 100 | λ = 1e4 |
+|---|---|---|---|---|---|---|
+| ρ(C̃) | 2.6888 | 1.0033 | **1.0057** | 0.9992 | 0.9930 | 0.9793 |
+| train RMSE | 0.00669 | 0.00671 | **0.00943** | 0.01659 | 0.02946 | 0.14909 |
+| ensemble KS, `q` | 0.836 | 0.810 | **0.648** | 0.740 | 1.297 | 2.270 |
+| Δρ₃₇(q) | 0.146 | 0.161 | **0.049** | 0.055 | 0.126 | 3.972 |
+| mean ratio, `E[16,32]` | 0.913 | 0.925 | **0.940** | 0.954 | 0.973 | 1.018 |
+| min `Z[16,32]` (ref: 721) | 181 | 204 | **380** | 587 | 1244 | 1777 |
+| max `Z[16,32]` (ref: 3791) | 4652 | 4074 | **3700** | 3451 | 2783 | 2417 |
+| clamp rate, worst replica | 1.84% | 1.18% | **0.00%** | 0.00% | 0.00% | 0.00% |
+| spread–skill on `q` | 1.507 | 1.439 | **0.982** | 0.759 | 0.486 | 0.166 |
+| ensemble KS, `dQ` | 0.435 | 0.426 | **0.402** | 0.665 | 1.188 | 2.243 |
+| Δρ₁(dQ) | **0.028** | **0.037** | 2.740 | 4.922 | 6.666 | 8.602 |
+
+🔑 **λ = 1 is the best cell this project has run, and it is best on the correction too.** Summed KS
+**0.648** against 0.836 at λ = 0 — the lowest in the report — on per-band KS of 0.087–0.118, the
+lowest of any closure in five of the six bands. ⚠️ The exception is `E[0,6]`, where it ties the DDN
+at 0.0869 and **no model scores 0.0279**, a third of it: the largest scales are the one place an
+uncorrected LF run is already close to the reference, so no closure earns credit there. The lag-37
+autocorrelation error falls 3×; the 6–9% low
+bias narrows to 4–6%; the stabilizer **never fires once in 5 × 40 000 steps**; and the
+climatological spread–skill ratio lands at **0.982**, the only LRS cell inside S7's [0.8, 1.25]
+band. `dQ`'s ensemble KS **also improves**, 0.435 → 0.402.
+
+🔴 **The level-versus-correction tension is real but it begins at λ = 10, not at λ = 1.** From
+λ = 10 upward the two move in opposite directions: the level keeps improving to 0.740 while `dQ`'s
+KS degrades to 0.665 and its lag-1 autocorrelation error reaches **4.922**, a 176× degradation of
+the quantity the model is actually fitted to emit. λ = 1 is the cell where nothing has to be traded,
+which is why it, and not λ = 10, is the one to deploy. The O7 warning still stands for the rest of
+the ladder: past λ = 1, a λ chosen by how well `dQ` is reproduced picks the wrong cell.
+
+⚠️ **Δρ₁(dQ) is already 2.740 at λ = 1**, against 0.028 at λ = 0 — so the correction's *temporal*
+structure is degraded even in the best cell, while its marginal is not. The ridge shrinks toward
+"predict the climatological mean level", which makes the correction smoother and more persistent
+and injects less variance into the LF system. That is a plausible mechanism for the excursions
+disappearing — less forcing, less chance of driving a band to zero — and it is **not** the same
+claim as "contractivity fixed it".
+
+🔴 **ρ(C̃) < 1 is not what is doing the work, and the ladder now says so twice.** The best cell,
+λ = 1, has ρ = **1.0057**, i.e. *not* contractive — so crossing 1 is not even necessary for the
+optimum. And `LinReg10`, the most contractive cell fitted (ρ = 0.9793), is the second-worst closure
+in the whole table (2.270, beaten only by Smagorinsky): its level autocorrelation is broken outright
+(Δρ₁(q) = 3.119 against ≤ 0.018 everywhere else) and its range has collapsed to 1777..2417 on
+`Z[16,32]` inside a reference spanning 721..3791. It is under-dispersed, not accurate. ρ is neither
+necessary nor sufficient here, and the earlier statement that it does not predict deployed
+behaviour survives this ladder intact.
+
+⚠️ **The optimum is bracketed but still not located.** λ = 1e-2 (`LinReg2`) is fitted and unrun, so
+the measured curve jumps 1e-4 → 1 and the minimum could sit anywhere in those two decades. Nothing
+here claims λ = 1 is *the* optimum, only that it is the best of what has been run. Running
+`LinReg2` (`./batch_scripts/submit_lrs.sh 2`) closes the last gap.
 
 ### #10 / #11 Summed and ensemble KS, and G1's online acceptance — **ON THE ARCHIVE**
 
@@ -475,8 +559,10 @@ structure, which the KS column shows they are not.
 
 ### #16 Stability fraction, and what ρ(C̃) does not tell you
 
-**On the rebaselined runs: 5/5 replicas complete 100 TU for LinReg1, LinReg6, the DDN and both
-deterministic baselines — and 4/5 for LinReg5.**
+**On the rebaselined runs: 5/5 replicas complete 100 TU for LinReg1, LinReg6, LinReg7, LinReg8,
+LinReg9, LinReg10, the DDN and both deterministic baselines — and 4/5 for LinReg5.** Nine of the ten
+closures are at 1.00; the single failure among the 42 launched members (7 LRS cells × 5, the DDN's
+5, and one each for no-model and Smagorinsky) is at λ = 1e-5.
 
 🔴 **The one failure is at λ = 1e-5, not at λ = 0.** `LinReg5` replica 5 diverged at **t = 37.81 TU**
 with `Z[0,6]` reaching **3.0e7** against a reference median near 2000. It is excluded from every
@@ -523,6 +609,41 @@ which eats a third of the lower margin — enough to move LinReg73 from inside t
 The correction is applied above. Labelled climatological and not a lead: these replicas have fully
 decorrelated from their common start, so this tests long-run variance, close to what KS already
 measures.
+
+#### On the rebaselined ladder 🆕 2026-09-15
+
+| config | λ | ratio on `q` | ratio on `dQ` | inside S7's [0.8, 1.25]? |
+|---|---|---|---|---|
+| LinReg1 | 0 | **1.507** | 1.488 | no — over-dispersed |
+| LinReg5 | 1e-5 | **1.368** | 1.387 | no — over-dispersed |
+| LinReg6 | 1e-4 | **1.439** | 1.451 | no — over-dispersed |
+| LinReg7 | 1 | **0.982** | 0.966 | **yes — and nearly perfect** |
+| LinReg8 | 10 | **0.759** | 0.886 | no — marginally over-confident |
+| LinReg9 | 100 | **0.486** | 0.856 | no — over-confident |
+| LinReg10 | 1e4 | **0.166** | 2.067 | no — badly over-confident |
+| DDN | — | 0.979 | 1.004 | **yes** |
+
+🔑 **λ carries the ratio monotonically down through the band, and λ = 1 lands in it.** 1.507 at
+λ = 0 down to 0.166 at λ = 1e4, crossing 1 between 1e-4 and 1. `LinReg7` reads **0.982** on the
+level and 0.966 on the correction — the best-dispersed LRS cell this project has measured, and
+within 2% of perfect on both. λ = 0's 1.507 is outside the band on the over-dispersed side and
+λ = 10's 0.759 just outside on the over-confident side, so the acceptable window in λ is narrow and
+λ = 1 sits in the middle of it.
+
+✅ **Dispersion and KS agree for once, and they agree on λ = 1.** `LinReg7` has the best summed KS
+in the report (0.648) *and* a spread–skill ratio inside the band (0.982). That is worth stating
+explicitly because these two criteria disagree everywhere else here — the DDN is inside the band at
+0.979 while scoring 1.332 on KS, and λ = 0 scores 0.836 on KS while sitting at 1.507 on dispersion.
+
+⚠️ **On dispersion alone `LinReg7` and the DDN are indistinguishable** — 0.982 against 0.979, a
+0.003 gap on a statistic whose finite-M correction is itself 0.087 at M = 5. The separation between
+those two closures comes from KS (0.648 against 1.332), not from this criterion; do not report
+λ = 1 as "better dispersed than the DDN".
+
+⚠️ **`LinReg10` is the one place the `q`/`dQ` agreement breaks, and it breaks hard** — 0.166 on the
+level against 2.067 on the correction, a factor 12. Everywhere else the two agree to within 0.13.
+Read on the correction alone λ = 1e4 looks over-dispersed; on the level it is the most
+over-confident ensemble in the report. Same lesson as LinReg73 above, an order of magnitude louder.
 
 ## 4. Mechanism diagnostics — regime 0 (fit-time)
 
@@ -659,6 +780,23 @@ spectral radius. This retires the reading that ρ near 2.7 is a stability warnin
 deployment; it is a statement about an open-loop operator that deployment never runs, because the
 solver supplies `q*` rather than the model's own previous output (#13).
 
+🔴 **The strong ladder confirms this from the other side, and it is the stronger test.** ρ now runs
+*below* 1 for three fitted-and-run cells — 0.9992, 0.9930, 0.9793 at λ = 10, 100, 1e4 — and their
+deployed quality is 0.740, 1.297, 2.270: **not monotone in ρ, and the most contractive cell is the
+worst of the three.** Meanwhile the *best* cell in the report, λ = 1 at 0.648, has ρ = **1.0057** —
+above 1. So contractivity is neither necessary (the optimum is not contractive) nor sufficient (the
+most contractive cell is nearly the worst). ρ moves over a range of 2.7 across this sweep while
+deployed KS traces a U whose minimum sits on the non-contractive side of the crossing; a diagnostic
+non-monotone in the thing it is meant to predict is not a predictor.
+
+⚠️ **No fit-time scalar in this report orders these cells correctly.** The training residual is
+monotone in λ (RMSE 0.0067, 0.0067, 0.0094, 0.0166, 0.0295, 0.1491) while deployed KS falls then
+rises, so it cannot pick the minimum either; ρ is non-monotone; the starred gain falls monotonically.
+The best deployed cell is neither the best-fitting nor the most contractive — it is the one that
+trades a little fit for a correction small enough not to drive bands to zero, and *how much* is the
+right amount is visible only in the coupled system. Any future criterion for choosing λ has to be
+measured there.
+
 ### #25 Rank / pinv check — the metric does not work as specified
 
 `plan.md` §0 item 11 specifies `‖X\Y − pinv(X)·Y‖`, reasoning that a nonzero gap would reveal that
@@ -722,7 +860,8 @@ driver's gate ships at a deliberately loose 1e-1 and the real bound should come 
 
 ### The trajectories, one figure per closure
 
-`analysis/plot_rebaseline.jl` writes six figures, `fig8_online_<model>.png`, each showing that
+`analysis/plot_rebaseline.jl` writes one figure per closure that has runs on disk, currently ten,
+`fig8_online_<model>.png`, each showing that
 closure's online QoI trajectories against the regenerated reference across all six bands, with the
 marginal the KS statistic scores drawn beside each band.
 
@@ -744,14 +883,30 @@ ratio of means is reported beside it:
 | LinReg1 (λ=0) | 0.941 | 0.943 | 0.926 | 0.928 | 0.911 | 0.913 |
 | LinReg5 (λ=1e-5) | 0.947 | 0.950 | 0.932 | 0.934 | 0.919 | 0.920 |
 | LinReg6 (λ=1e-4) | 0.949 | 0.952 | 0.936 | 0.938 | 0.924 | 0.925 |
+| LinReg7 (λ=1) | 0.961 | 0.964 | 0.950 | 0.953 | 0.938 | 0.940 |
+| LinReg8 (λ=10) | 0.970 | 0.971 | 0.963 | 0.964 | 0.953 | 0.954 |
+| LinReg9 (λ=100) | 0.983 | 0.984 | 0.977 | 0.978 | 0.972 | 0.973 |
+| LinReg10 (λ=1e4) | 1.011 | 1.012 | 1.010 | 1.010 | 1.019 | 1.018 |
 | DDN | 0.941 | 0.967 | 0.947 | 0.941 | 0.821 | 0.842 |
 | no model | 0.939 | 1.012 | 0.918 | 0.870 | **2.391** | **2.015** |
 | Smagorinsky | **1.169** | **1.157** | **1.206** | **1.166** | **2.153** | **1.942** |
 
-**All three TO-LRS cells are low in every band and the two deterministic baselines are high in
-`[16,32]`.** Under-dissipation at the smallest resolved scales is the baselines' failure; the TO
-closures have the opposite sign, and nothing in the summed KS says so. λ moves the LRS bias by
-about one point per decade — real, monotone, and far too small to matter.
+**Every TO-LRS cell below λ = 1e4 is low in every band and the two deterministic baselines are high
+in `[16,32]`.** Under-dissipation at the smallest resolved scales is the baselines' failure; the TO
+closures have the opposite sign, and nothing in the summed KS says so.
+
+🔑 **λ is a monotone dial on this bias and it crosses zero.** Over λ ≤ 1e-4 it moves the LRS bias by
+about one point per decade — real, monotone, and far too small to matter, which is what the weak
+probe concluded. At λ = 1 the same dial has closed a third of the gap (0.913 → 0.940 on
+`E[16,32]`), at λ = 10 half, at λ = 100 three quarters, and at λ = 1e4 it has **overshot to 1.018**.
+So the low bias is removable by regularization alone; what the weak probe actually measured was
+that 1e-4 is four decades short of the range where the dial has travel.
+
+⚠️ **Removing the bias is not the same as fixing the closure**, and λ = 1e4 is the counterexample
+sitting in this very table: its mean ratio is the best of any closure at 1.010–1.019 and its
+summed KS is the second-worst in the report (2.270). A model can match the reference's mean in
+every band while reproducing none of its distribution — which is exactly why the ratio of means is
+reported *beside* KS here and never instead of it.
 
 ![LinReg1 online](figures/fig8_online_LinReg1.png)
 
@@ -764,8 +919,35 @@ minimum of **721**; `E[16,32]` reaches **6.2e-3** against **0.0243**.
 ![LinReg6 online](figures/fig8_online_LinReg6.png)
 
 🔴 **λ = 1e-4 does not remove them.** Same left tail, same envelope. Put beside the λ = 0 figure
-this is the clearest statement of the λ probe's negative result: a fit whose standalone recursion
-is 2.7× less explosive produces a visually indistinguishable trajectory.
+this is the clearest statement of the weak λ probe's negative result: a fit whose standalone
+recursion is 2.7× less explosive produces a visually indistinguishable trajectory.
+
+![LinReg7 online](figures/fig8_online_LinReg7.png)
+
+✅ **λ = 1 all but removes them, and this is the best figure in the set.** `Z[16,32]` bottoms out at
+**380** against the reference's 721, where λ = 0 reached 181 — the minimum is still below the
+reference's, but by a factor 1.9 rather than 4 — and the top of the envelope lands at 3700 against
+the reference's 3791, the closest match of any closure. The excursions are shortened, not abolished;
+what is abolished is the class of them deep enough to trip the 1e-2 stabilizer. Worth reading beside
+`fig8_online_LinReg1.png`: the change lives in the tails, which is exactly what a summed KS
+dominated by the body of the distribution reports only weakly (0.836 → 0.648).
+
+![LinReg8 online](figures/fig8_online_LinReg8.png)
+
+⚠️ **λ = 10 goes one step further and one step too far.** Its `Z[16,32]` minimum, 587, is closer to
+the reference's 721 than λ = 1's 380, so on the left tail alone it looks better — but its *maximum*
+has fallen to 3451, now undershooting the reference's 3791, and its spread–skill ratio has dropped
+to 0.759, outside S7's band. This is the first cell where the envelope is being squeezed from both
+ends rather than lifted from below, and it is why the ladder's optimum is at λ = 1 and not here.
+
+![LinReg10 online](figures/fig8_online_LinReg10.png)
+
+🔴 **λ = 1e4 shows what over-damping looks like, and it is not a left tail.** The envelope has
+collapsed inward from *both* sides — `Z[16,32]` spans 1777..2417 inside a reference spanning
+721..3791 — so the marginal is a narrow spike sitting near the reference's mean. Its mean ratio is
+the best in the report (1.019) and its summed KS the second-worst (2.270). Read this figure and the
+λ = 1 one together: they are the two failure modes regularization moves between — excursions on one
+side, collapse on the other — and λ = 1 is the measured turning point between them.
 
 ![DDN online](figures/fig8_online_DDN.png)
 
@@ -814,20 +996,40 @@ open-loop spectrum.
 
 ### The clamp, and the asymmetry that remains
 
-🔴 **The stabilizer fires on every LRS cell and cannot fire on the DDN** (memory #59).
+🔴 **The stabilizer fires on every weakly regularized LRS cell, cannot fire on the DDN** (memory
+#59), **and stops firing entirely at λ ≥ 10.**
 
-| closure | steps under the 1e-2 threshold, worst replica | can the clamp fire? |
-|---|---|---|
-| LinReg1 (λ=0) | 1.84% | yes — fires |
-| LinReg5 (λ=1e-5) | 1.25% | yes — fires |
-| LinReg6 (λ=1e-4) | 1.18% | yes — fires |
-| **DDN** | **3.45%** | **no — `MVG_sampler` never receives `q*`** |
+| closure | steps under the 1e-2 threshold, worst replica | global min `\|q*\|` | can the clamp fire? |
+|---|---|---|---|
+| LinReg1 (λ=0) | 1.84% | 6.2e-3 | yes — fires |
+| LinReg5 (λ=1e-5) | 1.25% | 4.7e-3 | yes — fires |
+| LinReg6 (λ=1e-4) | 1.18% | 6.9e-3 | yes — fires |
+| LinReg7 (λ=1) | **0.00%** | **1.4e-2** | yes — but never does |
+| LinReg8 (λ=10) | **0.00%** | **2.1e-2** | yes — but never does |
+| LinReg9 (λ=100) | **0.00%** | **4.2e-2** | yes — but never does |
+| LinReg10 (λ=1e4) | **0.00%** | **6.0e-2** | yes — but never does |
+| **DDN** | **3.45%** | 4.6e-4 | **no — `MVG_sampler` never receives `q*`** |
 
 🔑 **The DDN crosses the threshold nearly twice as often as the λ = 0 LRS and nothing stops it.**
 That is a sharper statement of the asymmetry than a firing count alone: it is not that the DDN
 stays clear of the condition, it is that the condition is never tested for it. The clamp lives only
 in the `LinReg` path (`time_series_methods.jl:162,165,190,193`). So a LRS-vs-DDN difference is
 model *plus* stabilizer, and **either clamp both or neither** before D6 runs.
+
+🔑 **λ ≥ 1 gives a fourth option that the weak cells hid: don't need the clamp.** At λ = 1 the
+smallest `\|q*\|` reached anywhere in 5 × 40 000 steps is 1.4e-2 and at λ = 10 it is 2.1e-2 — 1.4×
+and 2.1× *above* the threshold — so the stabilizer is inert rather than merely quiet, and these
+trajectories are what the model produces with no intervention at all. That removes the confound from
+any comparison built on them: `LinReg7`-vs-DDN is model against model, where `LinReg1`-vs-DDN is
+model-plus-clamp against model. If the "clamp both or neither" fix does not land before D6,
+**`LinReg7` is the LRS cell to run it with** — best on KS and on dispersion, and for it the two
+options coincide.
+
+⚠️ **λ = 1's margin is 1.4×, not a comfortable one.** `LinReg8` clears the threshold by 2.1× and
+`LinReg9` by 4.2×, so if D6's initial conditions push further into the left tail than these 100 TU
+free runs did, λ = 1 is the first of the three that could start clamping and stop being a clean
+model-versus-model comparison. Worth re-checking the census on the D6 ensemble rather than assuming
+it carries over.
 
 ✅ **`E[16,32]` accounts for 100% of fired steps in all five λ = 0 replicas** — memory #59 checked
 only the worst — and no other band is ever under the threshold on a fired step. The events are

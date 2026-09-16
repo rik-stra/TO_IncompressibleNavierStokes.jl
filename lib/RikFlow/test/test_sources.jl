@@ -363,3 +363,44 @@ end
     @test !probe("    ex, ey, ez = unit_cartesian_indices(Val(3))")
     @test !probe("unit_cartesian_indices(D) = ntuple(i -> Offset(D)(i), D)")
 end
+
+@testitem "V38 both samplers replay their warm-up before touching the rng" default_imports = false begin
+    using Test
+
+    # code_base/lib/RikFlow/test -> code_base/lib/RikFlow/src
+    src = normpath(joinpath(@__DIR__, "..", "src", "time_series_methods.jl"))
+    @test isfile(src)
+    txt = read(src, String)
+
+    # 🔴 The invariant D6 rests on. `LinReg` and `MVG_sampler` both replay `spinnup_data` for the
+    # first `nwarm` steps so the solver is advanced along the recorded trajectory; the replay must
+    # `return`/branch BEFORE any `rand`, so that a member seed means the same thing with and without
+    # a warm-up and across warm-up lengths. If a future edit draws first and replays second, every
+    # D6 member's noise stream shifts by `nwarm` draws and the two closures stop being comparable --
+    # silently, because the trajectories would still look plausible. (memory #55)
+    for sampler in ("MVG_sampler", "LinReg")
+        i = findfirst("get_next_item_timeseries(time_series_method::$sampler", txt)
+        @test i !== nothing
+        body = txt[first(i):end]
+        # the next top-level `end` at column 1 closes this method
+        stop = findfirst("\nend", body)
+        body = stop === nothing ? body : body[1:first(stop)]
+
+        counter = findfirst("counter[] +=", body)
+        rnd = findfirst("rand(", body)
+        @test counter !== nothing            # it has a replay at all
+        @test rnd !== nothing                # and it does sample, after
+        @test first(counter) < first(rnd)    # replay strictly precedes the draw
+    end
+
+    # And the gate must stay out of the MVG path: `MVG_sampler` never receives `q_star`, so a
+    # TURBULENCE_GATE reference inside its method could not compile. Asserted so the asymmetry
+    # documented in `analysis/results.md` cannot be "fixed" here by accident.
+    let i = findfirst("get_next_item_timeseries(time_series_method::MVG_sampler", txt)
+        body = txt[first(i):end]
+        stop = findfirst("\nend", body)
+        body = stop === nothing ? body : body[1:first(stop)]
+        @test findfirst("TURBULENCE_GATE", body) === nothing
+        @test findfirst("q_star", body) === nothing
+    end
+end

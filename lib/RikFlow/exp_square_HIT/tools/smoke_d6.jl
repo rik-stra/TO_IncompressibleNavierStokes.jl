@@ -19,7 +19,7 @@
 #   julia --project tools/smoke_d6.jl
 #
 # Writes into output/D6_smoke/, which is throwaway. ⚠️ 400 steps is a pipeline check, not a
-# measurement: the lead grid reaches 1207 steps and nothing here may be reported as a result.
+# measurement: the lead grid reaches 2172 steps and nothing here may be reported as a result.
 
 using Random
 using JLD2
@@ -53,7 +53,12 @@ One short forecast from an IC package, returning its `q`. Used only to compare `
 against `ou_advance = n_k` with everything else -- the field, the model, the seed -- held fixed.
 """
 function trajectory(pkg; ou_advance::Int, nlead::Int = 20, seed = 1)
-    T = Float32
+    # 🔴 Float64, and it must match `run_ic`'s (2026-09-16). This helper builds its own `params`
+    # instead of going through `run_ic`, so it carried its own `T` -- and at Float32, with the IC
+    # package's `Re` being Float64, `online_sgs`'s own assertion fires:
+    # `got Δt = 0.0025, tsim/nt = 0.002499999850988388`. The OU replay and the reference would then
+    # step the chain differently, which is exactly what this function exists to test.
+    T = Float64
     gpu = CUDA.functional()
     ArrayType = gpu ? CuArray : Array
     backend = gpu ? CUDABackend() : IncompressibleNavierStokes.CPU()
@@ -131,7 +136,7 @@ function main()
             dev, size(q_on, 2) - 1)
 
     println("\npre-flight passed. ⚠️ 400 steps is a pipeline check, not a measurement — the lead " *
-            "grid\nreaches 1207 steps. Submit batch_scripts/run_d6.sh with --array=1-5 next, and " *
+            "grid\nreaches 2172 steps. Submit batch_scripts/run_d6.sh with --array=1-5 next, and " *
             "write the\nmeasured s/TU into meta_files/handoff_p2c_d6.md section 2.")
     flush(stdout)
     return nothing

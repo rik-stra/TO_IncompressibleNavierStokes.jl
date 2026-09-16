@@ -171,7 +171,9 @@ statistic actually scores, and reading either alone has misled this project befo
 function fig_model(e, ref, sc, census)
     q_ref = ref.q_ref
     dt = ref.dt_sample
-    col = MODEL_COLOUR[e.key]
+    # `get`, not indexing: a newly added configuration should not KeyError a whole plotting run
+    # just because nobody chose it a colour. Every TO-LRS cell shares the blue anyway.
+    col = get(MODEL_COLOUR, e.key, RGBf(0.00, 0.45, 0.70))
     nrep = length(e.q)
     t = (0:STRIDE:(size(q_ref, 2) - 1)) .* dt
 
@@ -281,6 +283,12 @@ function main()
     for spec in REBASE_MODELS
         println()
         println("== ", spec.label)
+        # Fitted-but-not-yet-run cells are a normal state of the lambda ladder, not an error:
+        # `submit_lrs.sh` fits in minutes and queues five 100 TU replicas behind it.
+        if !rebase_available(spec.key)
+            println("   no online ensemble on disk yet -- SKIPPED")
+            continue
+        end
         e = load_rebaseline(spec.key)
         sc = score_model(e, ref.q_ref)
         census = clamp_census(e)

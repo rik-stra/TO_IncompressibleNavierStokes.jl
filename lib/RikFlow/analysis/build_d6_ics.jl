@@ -50,49 +50,110 @@ already seen, so the pool starts strictly after it.
 """
 const FIT_END_TU = 10.0
 
-"Warm-up steps replayed from the record before the forecast starts (the driver's `spinnup_data`)."
-const N_WARM = 100
+"""
+Warm-up steps replayed from the record before the forecast starts (the driver's `spinnup_data`).
+
+🔴 **220 steps = 0.55 TU = 1.01x the slowest LEVEL decorrelation time** (Rik, 2026-09-15). The
+previous 100 steps is 0.25 TU: a full decorrelation time for `Z[0,6]` (T = 0.2489) but only 0.46x
+for `E[16,32]` (T = 0.5395), so the slowest bands entered every forecast still carrying the
+record's state rather than the model's. Costs about one field of IC pool.
+"""
+const N_WARM = 220
 
 """
-Forecast length in steps. 1208 steps = 3.02 TU = 10x the *slowest* QoI's integral timescale.
+    N_WARM_DRIVER
 
-⚠️ `t_int` is not one number: `T_int` spans 0.0082-0.3017 TU across the six QoIs, a factor 36.8
-(`meta_files/claude_memory.md` gotcha #30). 3.02 TU is set by the slowest, so that one set of runs
-brackets saturation for every band; the lead grids the scorer uses are per-QoI and in physical time
-for the same reason.
+The warm-up the **online drivers** use: `dQ_data = data_track.dQ[:, 1:100]`
+(`6_online_TO_LRS.jl`, and `paper_runs/online_sgs.jl:62` for the archive).
+
+🔴 **Fixed by what it reproduces, so it does NOT follow `N_WARM`.** The validation IC exists to
+reproduce a driver run column for column, and that driver replayed 100 steps. Building it with the
+scored set's 220 would mean validating against inputs nobody ever ran -- which is how the check
+would have passed while testing nothing. The scored ICs are free to use a longer warm-up because
+they are a different experiment; the validation is not.
 """
-const N_LEAD = 1208
+const N_WARM_DRIVER = 100
 
-"The slowest QoI's integral timescale in TU -- the yardstick the achieved IC spacing is judged by."
-const T_INT_MAX = 0.3017
+"""
+Forecast length in steps. 2172 steps = 5.43 TU = 10x the slowest **LEVEL** decorrelation time.
 
+🔴 **Set from `T(q)`, not `T(dQ)`** (Rik, 2026-09-15). D6 scores the forecast of the QoI *level*, so
+the level's timescale is what has to saturate; the correction's says nothing about when skill dies.
+The previous value, 1208 steps, was 10x the slowest **dQ** timescale on the **archive**
+(`T_int(dQ) = 0.3017`); that is only 5.6x the level's on R1 -- a forecast that could have ended
+before the slowest band saturated, discoverable only by re-running the whole ensemble.
+
+Measured on R1's tracked record, decay constant per band, in TU:
+
+    level q : 0.2489  0.4732  0.4893  0.4742  0.5430  0.5395   (max 0.5430 = 217 steps)
+    dQ      : 0.1162  0.0081  0.0589  0.0666  0.3800  0.3745   (max 0.3800 = 152 steps)
+
+Cost: the IC pool falls from 346 to 337 fields, and K = 90, M = 10 goes from 6.7 to 12.0 GPU-h.
+Cheap against re-running the ensemble.
+"""
+const N_LEAD = 2172
+
+"""
+The slowest **level** decorrelation time in TU on R1 -- the yardstick for the forecast length and
+for the achieved IC spacing.
+
+⚠️ This is the DECAY CONSTANT `T` in `rho(tau) = exp(-tau/T)`, which is what `N_eff = K*tanh(L/(2TK))`
+is derived for. `plot_hf_new_vs_archive.jl`'s `integrated_time` returns `1 + 2*sum(rho)`, i.e. **2T**,
+and memory #58's "0.94-1.08 TU" is in that convention. Measured ratio between the two estimators on
+all six bands: 1.985-1.997. Feeding 2T into the N_eff formula halves the ceiling.
+"""
+const T_INT_MAX = 0.5430
+
+# 🔴 R1's record, not the archive's. The packages on disk before 2026-09-15 were cut from
+# `data_track2_...` -- paper 2's archived tracked record, on the pre-`09954be1` Nyquist convention
+# and therefore a different dynamical system (memory #45, #46, #60). Nothing in a filename or a
+# directory listing showed it; only `provenance.source` did.
 const DEFAULT_TRACK_FILE = get(ENV, "RIKFLOW_TRACK_FILE",
-    raw"C:\Users\rik\Documents\julia_code\IncompressibleNavierStokes.jl\lib\RikFlow\exp_square_HIT\output\new\data_track2_dns512_les64_Re2000.0_tsim100.0.jld2")
+    normpath(joinpath(@__DIR__, "..", "exp_square_HIT", "output",
+        "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2")))
 
 """
-The **10 TU** tracked record, which is the one the archived online runs launched from.
+    VALIDATION_TRACK_FILE
 
-🔴 Not the same record as `DEFAULT_TRACK_FILE`, and the difference is the whole point of the
-validation IC. `paper_runs/online_sgs.jl:50` reads
-`data_track_trackingnoise_std_0.0_Re2000.0_tsim10.0_replica1.jld2` (line 52 has the 100 TU file
-commented out) and takes `ustart = fields[1].u` and `dQ_data = dQ[:, 1:100]` from it. The two
-records are two realisations whose `dQ` decorrelates to ~1 standard deviation past step 1000
-(`claude_memory.md` gotcha #39), so a validation run built from the 100 TU record could only ever
-agree with the archive approximately. Built from *this* record, the inputs are the archive's own.
+The record ordinal 0's validation IC is cut from: **R1's own**, the same one the scored ICs come
+from.
+
+🔴 **Switched from paper 2's archived 10 TU record on 2026-09-16 (Rik).** The oracle is now **R2's
+`LinReg1` replica 1**, not the archive's. The reason is that the archive is a *different dynamical
+system* -- pre-`09954be1`, Float32, its own reference (memory #45, #46) -- so a failed reproduction
+against it was ambiguous: driver bug, or system difference? The `Z[16,32]` carve-out that
+`validation_verdict` used to need was the symptom of exactly that, and it is gone with this change.
+
+R2's replica 1 is the right oracle because every confound disappears: same record D6's ICs come
+from, same Float64 precision, same Nyquist convention, same solver, same reference. A failed
+reproduction now means the D6 driver is wrong, full stop.
+
+⚠️ **What is given up, and why it does not matter.** The archive comparison was the only thing in D6
+tying back to paper 2's published numbers. G1 already does that job and does it better -- it
+reproduces the archived coefficients to 1.6e-4 and the published KS table to the digit -- so this
+was the weaker of two overlapping checks.
+
+⚠️ `fields[1]` of R1 is `n_k = 0`, `t = 0`, inside the fit window and the identity point of the OU
+replay (`ou_advance = 0`). It is the field R2's online runs launched from, and it stays excluded
+from `select_ics` and from everything scored.
 """
-const VALIDATION_TRACK_FILE = get(ENV, "RIKFLOW_TRACK10_FILE",
-    raw"C:\Users\rik\Documents\julia_code\IncompressibleNavierStokes.jl\lib\RikFlow\exp_square_HIT\paper_runs\output\tracking\tracking\data_track_trackingnoise_std_0.0_Re2000.0_tsim10.0_replica1.jld2")
+const VALIDATION_TRACK_FILE = get(ENV, "RIKFLOW_VALIDATION_TRACK", DEFAULT_TRACK_FILE)
 
 """
-The archived online driver's model-seed base: `Xoshiro(seeds.to + i + 2)` with `seeds.to = 234`
-(`6_online_TO_LRS.jl:37-41,83` and `paper_runs/online_sgs.jl:84`), so replica `i` used
-`Xoshiro(236 + i)`.
+    DRIVER_SEED_BASE
 
-The validation run reuses it — that is what makes the comparison against the archive exact rather
-than merely distributional. D6's scoring runs deliberately do **not**: they use
-`hash((:d6, k, member))`, so no scored member shares a stream with an archived replica.
+The online drivers' model-seed base: `Xoshiro(seeds.to + i + 2)` with `seeds.to = 234`, so replica
+`i` uses `Xoshiro(236 + i)`.
+
+🔑 **Both drivers use the identical expression** -- `6_online_TO_LRS.jl:37-41,83` and the archive's
+`paper_runs/online_sgs.jl:84` -- so the value did not change when ordinal 0's oracle moved from the
+archive to R2 (`VALIDATION_TRACK_FILE`). Only what it is reproducing did.
+
+The validation run reuses this stream, which is what makes the comparison column-by-column rather
+than merely distributional. Every *scored* member goes through `member_seed`, i.e. `hash((:d6, k,
+member))`, and therefore shares a stream with nothing else.
 """
-const ARCHIVE_SEED_BASE = 236
+const DRIVER_SEED_BASE = 236
 
 const DEFAULT_IC_DIR = joinpath(@__DIR__, "output", "d6_ics")
 
@@ -112,7 +173,7 @@ const PARAM_KEYS = (:D, :Re, :lims, :qois, :nles, :Δt, :ou_bodyforce)
 # --------------------------------------------------------------------------------------------
 
 """
-    select_ics(; K = 180, kmin = 42, kmax = 387, nwarm = N_WARM, nlead = N_LEAD, nref = N_REF, ...)
+    select_ics(; K = 180, nwarm = N_WARM, nlead = N_LEAD, nref = N_REF, kmin = ..., kmax = ..., ...)
 
 Choose `K` field indices as evenly spaced over the usable pool as the pool allows, and assert both
 constraints that define the pool for every one of them. Returns
@@ -123,23 +184,38 @@ constraints that define the pool for every one of them. Returns
  1. **The training window.** `t_k > FIT_END_TU`, so `k >= 42`.
  2. 🔴 **The reference length.** Truth is the 40 001-column reference. A run from `n_k` replays
     `nwarm` warm-up steps and then forecasts `nlead`, so it needs `n_k + nwarm + nlead <= nref`,
-    i.e. `n_k <= 38692` and `k <= 387`.
+    i.e. `n_k <= 37608` and `k <= 377` at the current `nwarm = 220, nlead = 2172`.
 
-So the pool is `k in [42, 387]`, **346 fields**, and at exactly 0.5 TU spacing (every second field)
-that yields **K = 173**, not 180. Reaching `K = 180` needs 0.48 TU spacing. Neither answer is
-hard-coded: the bounds are re-derived here from `nwarm`, `nlead`, `nref` and the record's grid, the
+So the pool is `k in [42, 377]`, **336 fields**, and at exactly 0.5 TU spacing (every second field)
+that yields **K = 168**, not 180. Reaching `K = 180` needs 0.47 TU spacing. None of these numbers is
+hard-coded: the bounds are re-derived here from `nwarm`, `nlead`, `nref` and the record's grid, any
 supplied `kmin`/`kmax` are checked against them, and the achieved spacing is reported rather than
-assumed.
+assumed. (Before 2026-09-15 the pool was `[42, 387]`, 346 fields, at `nwarm = 100, nlead = 1208`.)
 
-⚠️ **The achieved spacing is not an independence claim.** 0.48 TU is 1.6x the slowest QoI's
-`T_int = 0.3017`, so the initial conditions are only weakly independent. Every interval over these
-`K` instances needs a block bootstrap over initialisation time with a **QoI-dependent** block
-length, and nothing may claim `K` independent instances (`claude_memory.md` gotcha #30).
+🔴 **At K = 180 the spacing is BELOW the decorrelation time, not above it.** 0.4679 TU against the
+slowest level timescale `T_INT_MAX = 0.5430` is a ratio of **0.86**; on the old dQ-based yardstick
+it read 1.60. So adjacent ICs at K = 180 are genuinely correlated. Every interval over these `K`
+instances needs a block bootstrap over initialisation time with a **QoI-dependent** block length,
+and nothing may claim `K` independent instances.
+
+🔑 **K = 90 is the intended production setting** -- build all 180 packages (cheap, no GPU) and submit
+`--array=1-179:2`. That doubles the spacing to 0.94 TU, i.e. 1.7x the slowest timescale, and
+`select_ics` is strictly monotone so the halved set is exactly every second IC of the full one.
 """
-function select_ics(; K::Integer = 180, kmin::Integer = 42, kmax::Integer = 387,
+# 🔴 `kmin`/`kmax` are DERIVED from the other constants, not written down. They used to be literal
+# 42 and 387, correct for `nwarm = 100, nlead = 1208` and silently wrong for anything else -- and
+# changing `N_LEAD` is exactly what this file is for. The checks below still re-derive and compare,
+# so a caller passing explicit bounds is validated rather than trusted.
+default_kmin(; dt_field = FIELD_DT, tfit_end = FIT_END_TU) = floor(Int, tfit_end / dt_field) + 2
+default_kmax(; nwarm = N_WARM, nlead = N_LEAD, nref = N_REF, nfields = N_FIELDS,
+             nstride = FIELD_STRIDE) = min(nfields, div(nref - nwarm - nlead, nstride) + 1)
+
+function select_ics(; K::Integer = 180,
                     nwarm::Integer = N_WARM, nlead::Integer = N_LEAD, nref::Integer = N_REF,
                     nfields::Integer = N_FIELDS, nstride::Integer = FIELD_STRIDE,
-                    dt_field::Real = FIELD_DT, tfit_end::Real = FIT_END_TU)
+                    dt_field::Real = FIELD_DT, tfit_end::Real = FIT_END_TU,
+                    kmin::Integer = default_kmin(; dt_field, tfit_end),
+                    kmax::Integer = default_kmax(; nwarm, nlead, nref, nfields, nstride))
     K >= 1 || error("select_ics: K must be at least 1, got $K")
 
     step_of(k) = nstride * (k - 1)
@@ -384,21 +460,25 @@ validation_path(dir = DEFAULT_IC_DIR) = joinpath(dir, "d6_ic_validation.jld2")
     build_validation_ic(; track_file = VALIDATION_TRACK_FILE, outdir, nwarm, nlead, force)
 
 Build the one IC that is **not** for scoring: `fields[1]` of the 10 TU tracked record, i.e. the
-initial condition every archived online run launched from.
+initial condition R2's online runs launched from -- `fields[1]` of R1's own tracked record.
 
 🔑 **Why it exists.** A D6 run from here has `n_k = 0`, so `ou_advance = 0` and the OU chain starts
-at zero — which is exactly what the archived driver does, and is the identity point of the whole
-replay mechanism. Give it the archive's model seeds (`ARCHIVE_SEED_BASE`) and its `q` must
-reproduce the archived replica's first `nwarm + nlead + 1` columns. That is a correctness check on
-the entire D6 path — IC packaging, warm-up slicing, `ou_advance`, the driver, the output format —
-against a trajectory produced years earlier by different code.
+at zero, which is exactly what the online driver does and is the identity point of the whole replay
+mechanism. Give it the driver's model seeds (`DRIVER_SEED_BASE`) and its `q` must reproduce **R2's
+`LinReg1` replica 1** over the replayed window. That is a correctness check on the entire D6 path --
+IC packaging, warm-up slicing, `ou_advance`, the driver, the output format -- against a trajectory
+produced by a separate run of the same system.
+
+🔴 **The oracle moved from paper 2's archive to R2 on 2026-09-16** (Rik); see
+`VALIDATION_TRACK_FILE` for why. The archive is a different dynamical system, so a failure against
+it could not distinguish a driver bug from the system difference.
 
 🔴 **It is deliberately kept out of `select_ics` and out of everything scored**, for two
 independent reasons, and merging it in would break both:
 
  1. `t_1 = 0` is **inside** M0's fit window, so its short-lead spread would be measured on data the
     conditional mean has already seen. `select_ics` asserts `t_k > 10` precisely to exclude it.
- 2. V28 requires D6's IC set to be **disjoint** from the archived runs' IC, which is this one.
+ 2. V28 requires D6's IC set to be **disjoint** from the online runs' IC, which is this one.
     `test_d6_ics.jl` asserts `!(1 in select_ics(; K).k)`; that test is only meaningful while this
     package stays outside the selection.
 
@@ -406,7 +486,7 @@ Hence the separate filename, and hence `run_d6.jl` writing its members as `d6_va
 where the scorer's own glob cannot see them.
 """
 function build_validation_ic(; track_file = VALIDATION_TRACK_FILE, outdir = DEFAULT_IC_DIR,
-                             nwarm::Integer = N_WARM, nlead::Integer = N_LEAD,
+                             nwarm::Integer = N_WARM_DRIVER, nlead::Integer = N_LEAD,
                              force::Bool = false)
     isfile(track_file) || error("no such tracking file: $track_file")
     out = validation_path(outdir)
@@ -449,12 +529,72 @@ function build_validation_ic(; track_file = VALIDATION_TRACK_FILE, outdir = DEFA
     jldsave(out; u, n_k = 0, t_k = 0.0, k = 1, ordinal = 0, dQ_warm,
             q_at_ic = Array(d.q[:, ic_q_column(0)]),
             q_window = Array(d.q[:, wcols]), q_window_offsets = collect(woff),
-            params, provenance, validation = true, archive_seed_base = ARCHIVE_SEED_BASE)
+            params, provenance, validation = true, driver_seed_base = DRIVER_SEED_BASE)
 
     @printf("wrote %s (%.2f MB)\n", basename(out), filesize(out) / 2^20)
     println("  ⚠️  validation only: t_1 = 0 is inside M0's fit window and this is the archived " *
             "runs' own IC,\n      so it is excluded from `select_ics` and from everything scored. " *
             "Run it as ordinal 0.")
+    return out
+end
+
+"""
+    DDN_TRAIN_RANGE
+
+The window the DDN's multivariate Gaussian is fitted on: `7_online_DDN.jl:30`, `400:4000`.
+
+🔴 The same window the LRS is fitted on (`5_train_LinReg.jl`, `train_range = (400, 4000)`). Fitting
+the two closures on different data would make every D6 comparison between them a comparison of
+training sets as much as of models.
+"""
+const DDN_TRAIN_RANGE = 400:4000
+
+ddn_path(outdir = DEFAULT_IC_DIR) = joinpath(outdir, "d6_ddn_traindata.jld2")
+
+"""
+    build_ddn_traindata(; track_file, outdir, force)
+
+Write the `dQ` slice the DDN is fitted on, once, beside the IC packages.
+
+🔑 **Why a file and not a field in every package.** `MVG_sampler` fits its Gaussian in its own
+constructor, so a D6 task needs the training `dQ` -- 6 x 3601 Float64, 173 kB. Re-reading the
+2.6 GB tracked record in each of K x M array tasks is out of the question, and copying the same
+slice into all 180 IC packages would waste 31 MB to say one thing 180 times. One small file, read
+by every task.
+
+⚠️ **The slice is stored, not the fitted distribution.** Storing the distribution would create a
+second path into the DDN that could drift from `MVG_sampler`'s constructor; re-fitting a 6-component
+Gaussian from 3601 samples costs microseconds, so there is no reason to have two.
+"""
+function build_ddn_traindata(; track_file = DEFAULT_TRACK_FILE, outdir = DEFAULT_IC_DIR,
+                             force::Bool = false)
+    out = ddn_path(outdir)
+    if isfile(out) && !force
+        @printf("DDN training data exists, skipping: %s (%.2f MB)
+", basename(out),
+                filesize(out) / 2^20)
+        return out
+    end
+    isfile(track_file) || error("no such tracking file: $track_file")
+    mkpath(outdir)
+    @printf("reading %s (%.2f GB) for the DDN training slice ...
+", basename(track_file),
+            filesize(track_file) / 2^30)
+    flush(stdout)
+    dQ_train, params = jldopen(track_file, "r") do io
+        d = io["data_track"]
+        p = io["params_train" in keys(io) ? "params_train" : "params_track"]
+        (Array(d.dQ[:, DDN_TRAIN_RANGE]), NamedTuple(k => getproperty(p, k) for k in PARAM_KEYS))
+    end
+    size(dQ_train, 2) == length(DDN_TRAIN_RANGE) ||
+        error("DDN slice has $(size(dQ_train, 2)) columns, expected $(length(DDN_TRAIN_RANGE))")
+    any(isnan, dQ_train) && error("DDN training slice contains NaN")
+    jldsave(out; dQ_train, train_range = DDN_TRAIN_RANGE, params,
+            provenance = (; source = abspath(track_file), source_bytes = filesize(track_file),
+                          built = string(now())))
+    @printf("wrote %s (%.2f MB), dQ_train = %s
+", basename(out), filesize(out) / 2^20,
+            size(dQ_train))
     return out
 end
 
@@ -470,5 +610,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
         build_d6_ics(; K, force)
         println()
         build_validation_ic(; force)
+        println()
+        build_ddn_traindata(; force)
     end
 end

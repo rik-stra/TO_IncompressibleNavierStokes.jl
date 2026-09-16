@@ -37,6 +37,28 @@ const C_HELD = RGBf(0.80, 0.47, 0.65)
 load_scores() = isfile(SCORES) ? load(SCORES) :
                 error("no scores at $SCORES -- run analysis/score_m0_ddn.jl first")
 
+# `REBASE_MODELS` is the one place the rebaselined closures' reporting order is curated (ascending
+# lambda). Pulled in only for `:new`; the archive's order lives in `ARCHIVED_CONFIGS` and its
+# figures are unchanged by any of this.
+DATASET === :new && include(joinpath(HERE, "extract_rebaseline.jl"))
+
+"""
+    order_online(on)
+
+The closure keys of a regime-C score dict, in reporting order.
+
+⚠️ **Never `sort` these.** `"LinReg10" < "LinReg5"` lexicographically, so a sorted axis puts
+lambda = 1e4 third along what is otherwise a lambda ladder — and a monotone trend read off such a
+figure is an artefact of string collation, not of the sweep. Keys the score file carries but the
+curated list does not mention are appended (sorted), so a new closure still shows up rather than
+silently dropping out of the figure.
+"""
+function order_online(on)
+    DATASET === :new || return sort(collect(keys(on)); by = n -> on[n].name)
+    ranked = [m.key for m in REBASE_MODELS if haskey(on, m.key)]
+    return vcat(ranked, sort([k for k in keys(on) if !(k in ranked)]))
+end
+
 """
     shade_windows!(ax, train, heldout, dt, stride)
 
@@ -309,11 +331,18 @@ end
 function fig_online(d)
     on = d["online"]
     isempty(on) && return nothing
-    names = sort(collect(keys(on)); by = n -> on[n].name)
+    # 🔴 Not `sort`. The keys are a lambda LADDER and a lexicographic sort files `LinReg10` between
+    # `LinReg1` and `LinReg5`, so the x axis walks lambda as 0, 1e4, 1e-5, ... -- a monotone trend
+    # read off this figure would be an artefact of string ordering. `REBASE_MODELS` is already in
+    # ascending lambda (that is what its docstring promises), so use it and append anything the
+    # score file carries that the list does not mention.
+    names = order_online(on)
     floor_ = d["ks_floor"]
 
     fig = Figure(size = (1250, 470))
-    Label(fig[0, 1:3], "Regime C: the archived online ensembles, scored on the QoI level q", fontsize = 17,
+    Label(fig[0, 1:3],
+          "Regime C: the $(DATASET === :new ? "rebaselined" : "archived") online ensembles, " *
+          "scored on the QoI level q", fontsize = 17,
           font = :bold)
 
     # Column 1: the marginal distribution of the LEVEL, which is what the paper claims and what
@@ -384,7 +413,7 @@ function fig_autocorr(d)
     isempty(on) && return nothing
     labels = d["labels"]
     dt = d["dt"]
-    names = sort(collect(keys(on)))
+    names = order_online(on)
     nq = length(labels)
     lag_tau = on[names[1]].lag_tau
 

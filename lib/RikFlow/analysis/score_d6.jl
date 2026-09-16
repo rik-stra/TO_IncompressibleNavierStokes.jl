@@ -25,10 +25,10 @@
 # The correction is reported as secondary because the level's own temporal statistic is null
 # (gotcha #28), so a level-only temporal claim would make every configuration look equally good.
 #
-# **Leads are per QoI and in physical time.** `T_int` spans 0.0082-0.3017 TU across the six bands, a
-# factor 36.8 (gotcha #30), so one grid in units of `t_int` cannot serve them all. The grid is
-# `{0.25, 0.5, 1, 2, 5, 10} x T_int(i)`; the largest entry, 1207 steps, is what set the 1208-step
-# forecast, and short leads are free within a run.
+# **Leads are per QoI and in physical time.** `T_int` spans 0.2489-0.5430 TU across the six bands, so
+# one grid in units of `t_int` cannot serve them all. The grid is `{0.25, 0.5, 1, 2, 5, 10} x
+# T_int(i)`; the largest entry, 2172 steps, is what sets the 2172-step forecast, and short leads are
+# free within a run. 🔴 These are the LEVEL's timescales since 2026-09-16 -- see `T_INT`.
 #
 # **Truth is the high-fidelity reference, not the tracked record.** The ICs are cut from the tracked
 # record's velocity fields, but the tracked run is an LF simulation nudged onto the reference, and
@@ -50,6 +50,8 @@ include(joinpath(HERE, "extract_qois.jl"))
 include(joinpath(HERE, "build_d6_ics.jl"))
 # `load_ensemble`, for the ordinal-0 validation comparison against the archived LinReg1 runs.
 include(joinpath(HERE, "extract_archive.jl"))
+# `load_rebaseline`, for the ordinal-0 validation comparison against R2's own LinReg1 runs.
+include(joinpath(HERE, "extract_rebaseline.jl"))
 
 const OUT = joinpath(HERE, "output")
 const DT = 2.5e-3                      # HIT LES time step, TU
@@ -75,10 +77,22 @@ Integral timescale per QoI, in TU, measured on the reference `dQ` (`analysis/res
 single QoI. Every document in the project said 0.04 TU; neither estimator gives that
 (`claude_memory.md` gotcha #30).
 
-⚠️ They are timescales of the **correction**. The level decorrelates far more slowly, so the level's
-saturation lead may lie beyond `10 x T_int`. That is reported, never extrapolated.
+🔴 **These are the LEVEL's decorrelation times on R1, changed 2026-09-16 (Rik).** They used to be
+the **correction's**, on the **archive**: `[0.1118, 0.0082, 0.0923, 0.0669, 0.2926, 0.3017]`.
+
+D6 scores the forecast of the QoI *level*, so the level's timescale is what has to saturate, and
+the old grid's longest lead (1207 steps) was only 5.6x the slowest level timescale -- a grid that
+could have stopped before the slowest band saturated. The old docstring said as much: *"the level
+decorrelates far more slowly, so the level's saturation lead may lie beyond 10 x T_int"*. It now
+does not.
+
+🔑 `10 x max(T_INT) / dt = 10 x 0.5430 / 2.5e-3 = 2172` steps exactly, which is `N_LEAD`. The two
+constants are derived from the same number and must move together; `build_d6_ics.jl`'s `T_INT_MAX`
+is the other half.
+
+⚠️ Still a decay constant, not `1 + 2*sum(rho)`. See `build_d6_ics.jl`'s `T_INT_MAX`.
 """
-const T_INT = [0.1118, 0.0082, 0.0923, 0.0669, 0.2926, 0.3017]
+const T_INT = [0.2489, 0.4732, 0.4893, 0.4742, 0.5430, 0.5395]
 
 "Which record supplies the verification truth. See the header."
 const TRUTH_SOURCE = get(ENV, "D6_TRUTH", "hf_reference")
@@ -200,7 +214,8 @@ So the check is moved to where it has power. Two windows, and they test differen
 `1:nwarm` are replayed and test nothing about the sampler, and by ~50 columns past `nwarm` the pair
 has decorrelated. Reproducing the archive's *trajectory* is not something this design can ask for.
 
-`iexcl` drops `Z[16,32]` from the verdict: it is a different quantity today than when the archive
+🔴 **`iexcl` defaults to `nothing` since 2026-09-16: NOTHING is excluded.** It existed to drop
+`Z[16,32]`, a different quantity today than when the archive
 was written (gotcha #45), off by ~1.06e-3 relative on an identical velocity field, so including it
 would report a known convention change as a defect. It is still measured and printed.
 
@@ -209,12 +224,13 @@ Returns `(; ok, dq_identical, gate, diverge_col, rel_full, rel_warm, nwarm, n)`.
 function validation_verdict(qr::AbstractMatrix, qa::AbstractMatrix,
                             dqr::AbstractMatrix, dqa::AbstractMatrix, nwarm::Integer;
                             gate_tol::Real = VALID_GATE_TOL,
-                            diverge_tol::Real = VALID_DIVERGE_TOL, iexcl::Integer = IZ1632)
+                            diverge_tol::Real = VALID_DIVERGE_TOL,
+                            iexcl::Union{Integer,Nothing} = nothing)
     n = min(size(qr, 2), size(qa, 2))
     nw = min(Int(nwarm), n)
     sd = vec(std(view(qa, :, 1:n); dims = 2))
     dev(c) = abs.(view(qr, :, c) .- view(qa, :, c)) ./ sd
-    keep = [i for i in axes(qr, 1) if i != iexcl]
+    keep = iexcl === nothing ? collect(axes(qr, 1)) : [i for i in axes(qr, 1) if i != iexcl]
 
     # The exact half: over the replayed window the sampler is emitting stored numbers, so anything
     # but bit-identity means the warm-up slice or the history layout is wrong.
@@ -283,14 +299,14 @@ function compare_validation(; dir = D6_DIR, io = stdout)
         return nothing
     end
     arch = try
-        load_ensemble("LinReg1")
+        load_rebaseline("LinReg1")
     catch err
-        println(io, "no archived LinReg1 ensemble to compare against: ", err)
+        println(io, "no rebaselined LinReg1 ensemble to compare against: ", err)
         return nothing
     end
 
-    println(io, "\nValidation: ordinal 0 against the archived LinReg1 ensemble")
-    @printf(io, "  archive: %s root, %d replicas\n", string(arch.root), length(arch.q))
+    println(io, "\nValidation: ordinal 0 against R2's own LinReg1 ensemble (not the archive)")
+    @printf(io, "  oracle: %s, %d replicas\n", arch.label, length(arch.q))
     rows = NamedTuple[]
     for (member, path) in files
         d = load(path)
@@ -305,11 +321,11 @@ function compare_validation(; dir = D6_DIR, io = stdout)
     isempty(rows) && return rows
 
     nw, n = rows[1].nwarm, rows[1].n
-    println(io, "\n  GATE -- the replayed warm-up, columns 1:$nw. `dQ` is the archive's own slice")
+    println(io, "\n  GATE -- the replayed warm-up, columns 1:$nw. `dQ` is the record's own slice")
     println(io, "  emitted verbatim, so it must be bit-identical; `q` then moves under the solver,")
     println(io, "  the OU forcing and `tau` alone.")
     @printf(io, "  %8s %10s %14s %14s   %s\n",
-            "member", "dQ ident", "max dev ex Z16", "verdict", "per-QoI rel rms over warm-up")
+            "member", "dQ ident", "max deviation", "verdict", "per-QoI rel rms over warm-up")
     for r in rows
         @printf(io, "  %8d %10s %14.3e %14s   %s\n", r.member, r.dq_identical, r.gate,
                 r.ok ? "pass" : "FAIL",
@@ -323,12 +339,10 @@ function compare_validation(; dir = D6_DIR, io = stdout)
     for r in rows
         @printf(io, "  %8d %14s %14.3e   %s%s\n", r.member,
                 r.diverge_col === nothing ? "never" : string(r.diverge_col),
-                maximum(r.rel_full[i] for i in eachindex(r.rel_full) if i != IZ1632),
-                join((@sprintf("%8.1e", x) for x in r.rel_full), " "),
-                r.rel_full[IZ1632] > 1e-4 ?
-                    @sprintf("   [Z16-32 %.1e — gotcha #45, expected]", r.rel_full[IZ1632]) : "")
+                maximum(r.rel_full),
+                join((@sprintf("%8.1e", x) for x in r.rel_full), " "), "")
     end
-    @printf(io, "  scale: two ARCHIVED replicas of this configuration are %.2f apart on the same\n",
+    @printf(io, "  scale: two R2 replicas of this configuration are %.2f apart on the same\n",
             sp.median)
     @printf(io, "         statistic (range %.2f-%.2f over %d pairs), so a full-window rms near that\n",
             sp.lo, sp.hi, sp.npairs)
@@ -354,12 +368,20 @@ the tracked record in either case, because the high-fidelity reference has no co
 """
 function load_truth(source = TRUTH_SOURCE)
     dd = joinpath(HERE, "data")
-    trk = joinpath(dd, "data_track2_dns512_les64_Re2000.0_tsim100.0_qois.jld2")
-    isfile(trk) || error("no extracted tracked record at $trk; run analysis/extract_qois.jl")
+    # 🔴 R1's record and the REGENERATED reference, not the archive's (2026-09-16).
+    #
+    # D6's ICs are cut from R1 (`build_d6_ics.jl`). Scoring forecasts launched from R1 against paper
+    # 2's archived truth would compare a run of one dynamical system against another (memory #45,
+    # #46) -- and nothing about the output would have looked wrong. This was the last place the
+    # rebaselined D6 path still reached into the archive.
+    trk = joinpath(dd, "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2")
+    isfile(trk) || error("no extracted R1 tracked record at $trk; run analysis/extract_qois.jl " *
+                         "on exp_square_HIT/output/data_track_..._f64_lmwray3.jld2")
     t = load(trk)
     if source == "hf_reference"
-        hf = joinpath(dd, "hf_reference_tsim100.0_qois.jld2")
-        isfile(hf) || error("no extracted HF reference at $hf; run analysis/extract_archive.jl")
+        hf = joinpath(dd, "hf_reference_new_tsim100.0_f64_lmwray3_qois.jld2")
+        isfile(hf) || error("no extracted regenerated HF reference at $hf; run " *
+                            "analysis/extract_archive.jl new-reference")
         return (; q = load(hf, "q_ref"), dQ = t["dQ"], source)
     elseif source == "tracked"
         return (; q = t["q"], dQ = t["dQ"], source)
