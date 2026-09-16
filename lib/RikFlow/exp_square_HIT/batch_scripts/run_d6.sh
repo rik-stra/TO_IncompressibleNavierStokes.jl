@@ -29,9 +29,9 @@
 
 #SBATCH -J d6
 #SBATCH -t 30:00
-#SBATCH --partition=gpu_h100
+#SBATCH --partition=gpu_a100
 #SBATCH --gpus=1
-#SBATCH --array=1-5
+#SBATCH --array=0-5
 
 # No -o/-e: on Snellius an array job already gets one slurm-%A_%a.out per task by default (Rik,
 # 2026-09-14), so redirecting into logs/ bought a nicer name and a real trap -- SLURM opens those
@@ -61,6 +61,6 @@ mkdir -p output/D6
 
 # Optional; run_d6.jl falls back to output/d6_ics and then to the local analysis build directory.
 # export D6_IC_DIR=$PWD/output/d6_ics
-# export D6_MODEL=$PWD/output/TO_LRS/LinReg1/LinReg.jld2
+export D6_MODEL=$PWD/output/TO_LRS/LinReg7/LinReg.jld2
 
 julia --project tools/run_d6.jl $SLURM_ARRAY_TASK_ID
