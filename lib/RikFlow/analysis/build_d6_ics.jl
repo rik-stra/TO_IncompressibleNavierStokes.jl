@@ -53,12 +53,30 @@ const FIT_END_TU = 10.0
 """
 Warm-up steps replayed from the record before the forecast starts (the driver's `spinnup_data`).
 
-🔴 **220 steps = 0.55 TU = 1.01x the slowest LEVEL decorrelation time** (Rik, 2026-09-15). The
-previous 100 steps is 0.25 TU: a full decorrelation time for `Z[0,6]` (T = 0.2489) but only 0.46x
-for `E[16,32]` (T = 0.5395), so the slowest bands entered every forecast still carrying the
-record's state rather than the model's. Costs about one field of IC pool.
+🔴 **100 steps, equal to `N_WARM_DRIVER`** (Rik, 2026-09-16). It was 220 from 2026-09-15, chosen as
+`1.01 x T_INT_MAX`, on the argument that at 100 steps "the slowest bands entered every forecast
+still carrying the record's state rather than the model's".
+
+⚠️ **That argument was wrong, and the measurement says so.** The warm-up *replays recorded `dQ`*, so
+while it lasts the run reproduces the tracked record and no model output is used at all. At the end
+of a warm-up of ANY length the state is the record's state -- that is what a replay is. Measured on
+the 50 LinReg7 pilot members, mean absolute deviation from the reference in units of `sd(reference)`:
+
+    column c        1       51      101      221
+    Z[16,32]   0.0022   0.0022   0.0023   0.0020
+    E[16,32]   0.0014   0.0014   0.0015   0.0013
+    other four 0.0000   0.0001   0.0000   0.0000
+
+Flat across the whole warm-up, and equal to the tracking error itself (`results.md` section 1:
+2.32e-3 and 1.46e-3 on those two bands). Length buys nothing. The one thing a warm-up must do is
+fill `q_hist`, and `hist_len = 5`.
+
+✅ **What 100 buys.** D6 then evaluates the configuration the long online runs actually deploy
+(`6_online_TO_LRS.jl:108`, `dQ_data = data_track.dQ[:, 1:100]`); ordinal 0's validation exercises the
+deployed length instead of validating the mechanism at a length nobody runs (#66's caveat is gone);
+and the IC pool gains two fields.
 """
-const N_WARM = 220
+const N_WARM = 100
 
 """
     N_WARM_DRIVER
@@ -67,35 +85,54 @@ The warm-up the **online drivers** use: `dQ_data = data_track.dQ[:, 1:100]`
 (`6_online_TO_LRS.jl`, and `paper_runs/online_sgs.jl:62` for the archive).
 
 🔴 **Fixed by what it reproduces, so it does NOT follow `N_WARM`.** The validation IC exists to
-reproduce a driver run column for column, and that driver replayed 100 steps. Building it with the
-scored set's 220 would mean validating against inputs nobody ever ran -- which is how the check
-would have passed while testing nothing. The scored ICs are free to use a longer warm-up because
-they are a different experiment; the validation is not.
+reproduce a driver run column for column, and that driver replayed 100 steps. If `N_WARM` ever moves
+again, this must not move with it: building the validation IC with the scored set's length would mean
+validating against inputs nobody ever ran, which is how the check would have passed while testing
+nothing.
+
+✅ Since 2026-09-16 the two happen to be **equal**, which is the point -- see `N_WARM`. They stay
+separate constants because they answer different questions, not because they differ.
 """
 const N_WARM_DRIVER = 100
 
 """
-Forecast length in steps. 2172 steps = 5.43 TU = 10x the slowest **LEVEL** decorrelation time.
+Forecast length in steps. **1200 steps = 3.00 TU**, set directly in physical time.
 
-🔴 **Set from `T(q)`, not `T(dQ)`** (Rik, 2026-09-15). D6 scores the forecast of the QoI *level*, so
-the level's timescale is what has to saturate; the correction's says nothing about when skill dies.
-The previous value, 1208 steps, was 10x the slowest **dQ** timescale on the **archive**
-(`T_int(dQ) = 0.3017`); that is only 5.6x the level's on R1 -- a forecast that could have ended
-before the slowest band saturated, discoverable only by re-running the whole ensemble.
+🔴 **Set from the ACF, not from a multiple of `T_int`** (Rik, 2026-09-16). The previous value,
+2172 steps = 5.43 TU, was `10 x T_INT_MAX`. `results.md` section 1's autocorrelation figure
+(`analysis/plot_acf.jl`) shows that rule was sizing the run off a statistic that does not measure
+memory: the level's ACF is **not an exponential**. It falls to 0.1 within 0.43-0.60 TU and then
+*rings* between about -0.2 and +0.2 with a period near 1 TU, so `T_int` -- an integral over that
+ringing -- is not a decorrelation time, and `10 x T_int` landed **5.8-9.5x past the 0.1 crossing**.
+Residual autocorrelation on the reference at the old grid's 2x, 5x and 10x leads is 0.03-0.21
+against a +-2 Bartlett standard error band of 0.114-0.132: indistinguishable from zero at every
+one of them.
 
-Measured on R1's tracked record, decay constant per band, in TU:
+Past ~1 x T_int the truth at the lead is independent of the truth the forecast started from, so no
+information carried by the initial condition survives and any apparent skill there is climatology
+-- what regime C's free-running KS already measures, and what #61 shows is underpowered. 3.00 TU
+covers every lead out to `5 x T_INT_MAX = 2.715 TU` with margin: the whole informative range plus
+one saturation anchor.
 
-    level q : 0.2489  0.4732  0.4893  0.4742  0.5430  0.5395   (max 0.5430 = 217 steps)
-    dQ      : 0.1162  0.0081  0.0589  0.0666  0.3800  0.3745   (max 0.3800 = 152 steps)
+Measured on R1's tracked record, in TU:
 
-Cost: the IC pool falls from 346 to 337 fields, and K = 90, M = 10 goes from 6.7 to 12.0 GPU-h.
-Cheap against re-running the ensemble.
+    level q, T_int : 0.2489  0.4732  0.4893  0.4742  0.5430  0.5395   (max 0.5430 = 217 steps)
+    level q, 1/e   : 0.290   0.302   0.333   0.325   0.355   0.352
+    level q, at 0.1: 0.430   0.590   0.517   0.503   0.600   0.590
+
+Gain: 2392 -> 1300 steps per member (with `N_WARM` at 100, below), a **1.84x shorter run**, and
+the IC pool rises from 336 to 347 fields. 🔴 `score_d6.jl`'s `MULTIPLIERS` is the other half of
+this constant -- the `10x` entry no longer fits inside the run and was dropped. The two must move
+together.
 """
-const N_LEAD = 2172
+const N_LEAD = 1200
 
 """
-The slowest **level** decorrelation time in TU on R1 -- the yardstick for the forecast length and
-for the achieved IC spacing.
+The slowest **level** `T_int` in TU on R1 -- the yardstick for the achieved IC spacing.
+
+⚠️ **No longer sets the forecast length.** `N_LEAD` was `10 x T_INT_MAX` until 2026-09-16 and is
+now 3.00 TU set from the ACF directly; see `N_LEAD`. This constant survives because IC spacing is
+still quoted against it, and because `score_d6.jl`'s `MULTIPLIERS` are multiples of `T_INT`.
 
 ⚠️ This is the DECAY CONSTANT `T` in `rho(tau) = exp(-tau/T)`, which is what `N_eff = K*tanh(L/(2TK))`
 is derived for. `plot_hf_new_vs_archive.jl`'s `integrated_time` returns `1 + 2*sum(rho)`, i.e. **2T**,
@@ -184,16 +221,17 @@ constraints that define the pool for every one of them. Returns
  1. **The training window.** `t_k > FIT_END_TU`, so `k >= 42`.
  2. 🔴 **The reference length.** Truth is the 40 001-column reference. A run from `n_k` replays
     `nwarm` warm-up steps and then forecasts `nlead`, so it needs `n_k + nwarm + nlead <= nref`,
-    i.e. `n_k <= 37608` and `k <= 377` at the current `nwarm = 220, nlead = 2172`.
+    i.e. `n_k <= 38580` and `k <= 386` at the current `nwarm = 220, nlead = 1200`.
 
-So the pool is `k in [42, 377]`, **336 fields**, and at exactly 0.5 TU spacing (every second field)
-that yields **K = 168**, not 180. Reaching `K = 180` needs 0.47 TU spacing. None of these numbers is
-hard-coded: the bounds are re-derived here from `nwarm`, `nlead`, `nref` and the record's grid, any
-supplied `kmin`/`kmax` are checked against them, and the achieved spacing is reported rather than
-assumed. (Before 2026-09-15 the pool was `[42, 387]`, 346 fields, at `nwarm = 100, nlead = 1208`.)
+So the pool is `k in [42, 388]`, **347 fields**, and at exactly 0.5 TU spacing (every second field)
+that yields **K = 174**, not 180. Reaching `K = 180` needs 0.4832 TU spacing. None of these numbers
+is hard-coded: the bounds are re-derived here from `nwarm`, `nlead`, `nref` and the record's grid,
+any supplied `kmin`/`kmax` are checked against them, and the achieved spacing is reported rather
+than assumed. (Before 2026-09-16 the pool was `[42, 377]`, 336 fields, at `nwarm = 220,
+nlead = 2172`; before 2026-09-15, `[42, 387]`, 346 fields, at `nwarm = 100, nlead = 1208`.)
 
-🔴 **At K = 180 the spacing is BELOW the decorrelation time, not above it.** 0.4679 TU against the
-slowest level timescale `T_INT_MAX = 0.5430` is a ratio of **0.86**; on the old dQ-based yardstick
+🔴 **At K = 180 the spacing is BELOW the decorrelation time, not above it.** 0.4832 TU against the
+slowest level timescale `T_INT_MAX = 0.5430` is a ratio of **0.89**; on the old dQ-based yardstick
 it read 1.60. So adjacent ICs at K = 180 are genuinely correlated. Every interval over these `K`
 instances needs a block bootstrap over initialisation time with a **QoI-dependent** block length,
 and nothing may claim `K` independent instances.

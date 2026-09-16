@@ -274,7 +274,7 @@ Run all `M` members for one initial condition and write one file per member.
 
 `nlead` shortens the forecast and `od` redirects the output; both exist for `smoke_d6.jl` and must
 be left at their defaults for anything whose numbers are reported. A short run is a pipeline check,
-not a measurement -- the lead grid's longest entry is 2172 steps.
+not a measurement -- the lead grid's longest entry is 1086 steps.
 """
 function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
                 nlead = nothing, od = out_dir())
@@ -314,7 +314,7 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     nlead = nlead === nothing ? pkg["provenance"].nlead : Int(nlead)
     nlead == pkg["provenance"].nlead ||
         @warn "forecast shortened to $nlead steps from $(pkg["provenance"].nlead); this is a " *
-              "pipeline check, not a measurement -- the lead grid reaches 2172 steps"
+              "pipeline check, not a measurement -- the lead grid reaches 1086 steps"
 
     Δt = T(params_ic.Δt)
     nt = nwarm + nlead

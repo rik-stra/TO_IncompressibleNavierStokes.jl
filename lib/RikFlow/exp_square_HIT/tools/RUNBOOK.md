@@ -15,10 +15,10 @@ paper 2's archive and is wrong in every quantity that matters.** What changed:
 | | was (≤ 2026-09-11) | is now |
 |---|---|---|
 | record the ICs are cut from | paper 2's archived `data_track2` | **R1**, `data_track_..._f64_lmwray3` |
-| forecast length `N_LEAD` | 1208 steps (3.02 TU) | **2172 steps (5.43 TU)** |
-| warm-up `N_WARM` | 100 steps | **220 steps** |
-| timescale setting both | the **correction's**, on the archive | the **level's**, on R1 |
-| IC pool | `k ∈ [42, 387]`, 346 fields | **`k ∈ [42, 377]`, 336 fields** |
+| forecast length `N_LEAD` | 1208 steps (3.02 TU) | **1200 steps (3.00 TU)** |
+| warm-up `N_WARM` | 100 steps | **100 steps** (was 220 between 2026-09-15 and 2026-09-16) |
+| what sets the forecast length | `10 × T_int` of the **correction**, on the archive | the **reference's ACF**, measured (`plot_acf.jl`) |
+| IC pool | `k ∈ [42, 387]`, 346 fields | **`k ∈ [42, 388]`, 347 fields** |
 | ordinal 0's oracle | paper 2's archived LinReg1 | **R2's own LinReg1 replica 1** |
 | `Z[16,32]` carve-out in the verdict | present | **removed** |
 | closures that can run D6 | LRS only | **LRS and DDN** (`D6_CLOSURE`) |
@@ -47,14 +47,14 @@ That writes into `lib/RikFlow/analysis/output/d6_ics/`:
 | file | size | why |
 |---|---|---|
 | `d6_ic_manifest.jld2` | 21 kB | 🔑 **not optional.** `ic_dir()` locates the directory *by* this file, and `load_ic` cross-checks it against `select_ics` — that check is what catches an IC set built with a different `K`, `nlead` or record from the one the driver assumes |
-| `d6_ic_<k>.jld2` | 6.61 MB each | one per IC, `k = 42 … 377`; **1.19 GB** for all 180 |
+| `d6_ic_<k>.jld2` | 6.61 MB each | one per IC, `k = 42 … 388`; **1.19 GB** for all 180 |
 | `d6_ic_validation.jld2` | 6.60 MB | ordinal 0 — R2's own online initial condition |
 | `d6_ddn_traindata.jld2` | 0.18 MB | the `dQ` slice the DDN fits on; needed only for `D6_CLOSURE=ddn` |
 
 Plus the fitted model for whichever closure you are running:
 
-- **LRS:** `exp_square_HIT/output/TO_LRS/LinReg1/LinReg.jld2` (15 kB). Any other `LinReg<n>` works
-  via `D6_MODEL`.
+- **LRS:** `exp_square_HIT/output/TO_LRS/LinReg1/LinReg.jld2` and `.../LinReg7/LinReg.jld2` (15 kB
+  each) — the two production cells. Any other `LinReg<n>` works via `D6_MODEL`.
 - **DDN:** nothing extra — `d6_ddn_traindata.jld2` above is it.
 
 **Deliberately not copied.** The 2.6 GB tracked record and the 2.6 GB HF reference: **scoring
@@ -94,10 +94,10 @@ julia --project -e 'using Pkg; Pkg.instantiate()'
 ```
 
 ✅ **Every GPU batch script in this directory is now on `gpu_h100` + `julia_h100` with the same
-`JULIA_CPU_TARGET`** (`run_d6.sh` was moved there 2026-09-16; it had been the only one on
-`gpu_a100`/`julia_a1003`). `JULIA_CPU_TARGET` multiversioning means one depot serves both
+`JULIA_CPU_TARGET`** (`run_d6.sh` was moved there 2026-09-16; it had been the only one on `gpu_a100`/`julia_a1003`, and its `--partition` line had been missed when the depot was switched). The three production scripts
+`run_d6_linreg1.sh`, `run_d6_linreg7.sh`, `run_d6_ddn.sh` were written to match. `JULIA_CPU_TARGET` multiversioning means one depot serves both
 partitions, so warm this one and every script benefits. ⚠️ Keep the target string identical across
-`run_d6.sh`, `run_online_array.sh` and `run_train_lrs.sh` — Julia validates a compile cache against
+`run_d6.sh`, the three `run_d6_*.sh`, `run_online_array.sh` and `run_train_lrs.sh` — Julia validates a compile cache against
 the target it was built for, so a mismatch silently recompiles inside the walltime.
 
 ### 1 · Smoke test — first, and it is cheap
@@ -159,9 +159,10 @@ So the criterion is two-part (#48):
   columns verbatim, so anything else means the warm-up slice or the history layout is wrong.
 - **After it**, a gate on `q` at the start and everything else *reported*, not gated.
 
-⚠️ Ordinal 0 replays **100** warm-up steps (`N_WARM_DRIVER`), matching what R2's driver ran, while
-the scored set replays **220**. It validates the mechanism — replay, `ou_advance`, seeding — not a
-length-specific off-by-one at 220.
+✅ Ordinal 0 replays **100** warm-up steps (`N_WARM_DRIVER`), matching what R2's driver ran, and
+since 2026-09-16 the scored set replays the same 100 (`N_WARM`). The validation therefore exercises
+the deployed length, not just the mechanism. They remain separate constants: if `N_WARM` moves again,
+`N_WARM_DRIVER` must not follow it, or the validation would check inputs nobody ever ran.
 
 ### 3 · Pilot
 
@@ -183,27 +184,56 @@ replayed window, no scored number from the same path means anything.
 ### 5 · Full run
 
 ```bash
-scp analysis/output/d6_ics/d6_ic_*.jld2 $SNEL:$D/d6_ics/    # all 180; 1.19 GB
-# in batch_scripts/run_d6.sh: --array=1-5 -> --array=1-179:2   (K = 90, the intended setting)
-sbatch batch_scripts/run_d6.sh
+scp analysis/output/d6_ics/d6_ic_*.jld2 $SNEL:$D/d6_ics/    # all 180; 1.19 GB, rebuilt 2026-09-16
+
+sbatch --array=0 batch_scripts/run_d6_linreg1.sh            # validation, one task — check it first
+sbatch batch_scripts/run_d6_linreg1.sh                      # K = 90, M = 10 -> output/D6_LinReg1
+sbatch batch_scripts/run_d6_linreg7.sh                      #                -> output/D6_LinReg7
+sbatch batch_scripts/run_d6_ddn.sh                          #                -> output/D6_DDN
 ```
+
+🔴 **One directory per closure, and the three scripts already set it** (`D6_OUT`). The scorer globs
+`d6_online_ic*_m*.jld2` and cannot tell which model wrote a file, so a shared directory silently
+pools three closures into one ensemble. Score each separately:
+
+```bash
+for m in LinReg1 LinReg7 DDN; do
+  D6_OUT=analysis/output/D6_$m julia --startup-file=no --project=analysis analysis/score_d6.jl
+done
+```
+
+🔑 **All three use the same `--array=1-179:2`, and that is the point.** D6 is *paired*: every closure
+forecasts from the same 90 initial conditions, so realisation variance cancels in the comparison.
+Changing the range in one script without the others silently breaks the pairing.
+
+🔴 **The validation belongs to LinReg1 only.** Ordinal 0's oracle is R2's own LinReg1 replica 1.
+Under LinReg7 or the DDN the warm-up gate still passes — the replayed `dQ` is model-independent —
+but the post-warm-up comparison is then against a different model's trajectory, which reads as
+divergence that is really chaos plus a model difference. That is what the 2026-09-16 pilot did.
 
 🔑 **`--array=1-179:2` gives K = 90, and that is the production setting, not a shortcut.**
 `select_ics` is strictly monotone, so every second ordinal is exactly the half-density IC set —
-spacing 0.94 TU, **1.7× the slowest level timescale**. At the full K = 180 the spacing is 0.4679 TU,
-which is **0.86×** that timescale: adjacent ICs are genuinely correlated. `--array=2-180:2` is the
+spacing 0.97 TU, **1.8× the slowest level timescale**. At the full K = 180 the spacing is 0.4832 TU,
+which is **0.89×** that timescale: adjacent ICs are genuinely correlated. `--array=2-180:2` is the
 fill-in if the extra density is ever wanted.
 
-**Nothing else changes.** The ordinal → `k` map is `select_ics`'s and is deterministic, so the
-pilot's five stay the same five and no result is renumbered.
+🔴 **The ordinal → `k` map MOVED on 2026-09-16.** `select_ics` derives it from `kmin`/`kmax`, and a
+shorter `nlead` and a shorter `nwarm` free 11 more fields at the end of the record, so the pool grew
+to `[42, 388]` and the selection re-spaced: ordinals 1–4 are still `k = 42, 44, 46, 48` but ordinal 5
+is now **`k = 50`**, not 49, and every later ordinal shifts.
+The 60 LinReg7 pilot outputs on disk stay scoreable — `load_members` reads each run's own
+`nwarm`, and a 2172-lead run contains every lead of a 1200-lead grid — but their ICs are the old
+selection, so
+they are not paired with anything produced after the change. Rebuild the packages before the full run.
 
-⚠️ The 9.65 GPU-hour figure in the old file was measured at `nlead = 1208`. At 2172 the per-member
-cost is ~1.8× that; **budget from the pilot's measured rate, not from this paragraph.**
+⚠️ The 9.65 GPU-hour figure in the old file was measured at `nlead = 1208`. At 1200 the per-member
+cost is within a few percent of it, but GPU compilation now dominates a task; **budget from the
+pilot's measured rate, not from this paragraph.**
 
 ### Running the DDN
 
 ```bash
-D6_CLOSURE=ddn sbatch batch_scripts/run_d6.sh
+sbatch batch_scripts/run_d6_ddn.sh      # D6_CLOSURE=ddn and D6_OUT=output/D6_DDN are set in it
 ```
 
 New on 2026-09-16 and it is what makes the LRS-vs-DDN comparison meaningful: `MVG_sampler` now takes
@@ -246,15 +276,17 @@ read rather than trusted. The grids — `{0.25, 0.5, 1, 2, 5, 10} × T_int(i)`, 
 
 | QoI | `T_int` [TU] | leads [steps] |
 |---|---|---|
-| Z[0,6] | 0.2489 | 25, 50, 100, 199, 498, 996 |
-| E[0,6] | 0.4732 | 47, 95, 189, 379, 946, 1893 |
-| Z[7,15] | 0.4893 | 49, 98, 196, 391, 979, 1957 |
-| E[7,15] | 0.4742 | 47, 95, 190, 379, 948, 1897 |
-| Z[16,32] | 0.5430 | 54, 109, 217, 434, 1086, **2172** |
-| E[16,32] | 0.5395 | 54, 108, 216, 432, 1079, 2158 |
+| Z[0,6] | 0.2489 | 25, 50, 100, 199, 498 |
+| E[0,6] | 0.4732 | 47, 95, 189, 379, 946 |
+| Z[7,15] | 0.4893 | 49, 98, 196, 391, 979 |
+| E[7,15] | 0.4742 | 47, 95, 190, 379, 948 |
+| Z[16,32] | 0.5430 | 54, 109, 217, 434, **1086** |
+| E[16,32] | 0.5395 | 54, 108, 216, 432, 1079 |
 
-**32 distinct leads in the union; the longest is 2172 of the 2172 available**, which is what sets the
-forecast length — one more multiple of `T_int` would not fit.
+**26 distinct leads in the union; the longest is 1086 of the 1200 available.** The `10 × T_int`
+column was dropped on 2026-09-16: the reference's own autocorrelation is inside its ±2 Bartlett band
+from `2 × T_int` onward (`results.md` §1), so the `5×` and `10×` leads measure climatology, not
+forecast skill. `5×` is kept as the single saturation anchor for the spread–skill ratio.
 
 🔴 **These are the LEVEL's decorrelation times, not the correction's** (Rik, 2026-09-15). D6 scores
 the forecast of the QoI *level*, so the level's timescale is what has to saturate. The old grid used

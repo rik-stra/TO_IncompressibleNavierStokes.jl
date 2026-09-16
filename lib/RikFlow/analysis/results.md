@@ -176,9 +176,123 @@ is what every regime-C number has to be read against.
 entry quotes 0.94–1.08 TU on the new record from `report_marginals`' estimator, then argues down to
 "0.5–0.63 TU stands for both" from the quarter-by-quarter spread. The Sokal-window estimator used
 here gives 0.249–0.543 TU on the reference and 0.249, 0.473, 0.489, 0.474, 0.543, 0.539 on the
-tracked record. **The two estimators disagree by about a factor 2 and nothing here decides which is
-right.** D6's sizing table (#58) is built on the larger figure and is therefore conservative —
-the safe direction — but the discrepancy should be closed before the grid is committed.
+tracked record. **The two estimators disagree by about a factor 2**, and the ACF below says why:
+the level's autocorrelation is not an exponential, so an integral-based timescale is not a
+well-defined property of this series. D6's sizing table (#58) is built on the larger figure and is
+therefore conservative — the safe direction — but see the lead-grid finding below, where being
+conservative in that direction turns out to be expensive.
+
+### The curves themselves — and what they say about D6's lead grid
+
+![Autocorrelation of the level and the correction](figures/fig1b_acf.png)
+
+`analysis/plot_acf.jl`. Left: the level `q` out to 10 TU, with D6's lead grid for that band drawn
+in orange (the solid line is the 10× point that fixes `N_LEAD`). Right: the correction `dQ` out to
+1 TU. The grey band is ±2 Bartlett standard errors under the null that the series is uncorrelated
+past its 0.1 crossing — inside it an autocorrelation is not distinguishable from zero.
+
+🔑 **The factor-2 estimator disagreement is explained, though not adjudicated.** The level's ACF is
+**not a decaying exponential.** It falls steeply to ~0.1 within half a TU and then *rings*,
+oscillating between roughly −0.2 and +0.2 with a period near 1 TU, all the way to the end of the
+10 TU window. "The" decorrelation time is therefore not a well-defined property of this series, and
+any estimator that integrates the ACF is integrating that ringing — which is precisely why a Sokal
+window and `report_marginals`' estimator can differ by 2× without either being wrong. The robust
+statistics are the crossings, and they are shorter than either `T_int`:
+
+| reference, level `q` | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
+|---|---|---|---|---|---|---|
+| lag at ρ = 1/e | 0.290 | 0.302 | 0.333 | 0.325 | 0.355 | 0.352 |
+| lag at ρ = 0.1 | 0.430 | 0.590 | 0.517 | 0.503 | 0.600 | 0.590 |
+| `T_int`, Sokal | 0.249 | 0.473 | 0.489 | 0.474 | 0.543 | 0.539 |
+| ±2 Bartlett se | 0.119 | 0.114 | 0.128 | 0.126 | 0.132 | 0.132 |
+
+All in TU. The 1/e time is **0.29–0.36 TU on every band** — a factor 1.2–2.2 below `T_int` and a
+factor 3 below memory #58's 0.94–1.08 TU. Note how tight the six are: on the level the 1/e times
+span only **1.22×**, against the 2.18× that `T_int` spans and the 36.8× the correction spans. The
+per-QoI lead grid is buying almost nothing on this series.
+
+🔴 **D6's lead grid runs far past the point where the reference remembers its own state.** The grid
+is `(0.25, 0.5, 1, 2, 5, 10) × T_int`; the reference's residual autocorrelation at each of those
+leads is
+
+| ρ(q) at lead | 0.25×T | 0.5×T | 1×T | 2×T | 5×T | 10×T |
+|---|---|---|---|---|---|---|
+| Z[0,6] | 0.941 | 0.811 | 0.470 | 0.031 | 0.147 | 0.054 |
+| E[0,6] | 0.742 | 0.484 | 0.166 | 0.149 | 0.055 | 0.084 |
+| Z[7,15] | 0.859 | 0.569 | 0.123 | 0.185 | 0.065 | 0.077 |
+| E[7,15] | 0.862 | 0.574 | 0.124 | 0.170 | 0.062 | 0.074 |
+| Z[16,32] | 0.852 | 0.542 | 0.124 | 0.212 | 0.061 | −0.038 |
+| E[16,32] | 0.851 | 0.545 | 0.123 | 0.212 | 0.063 | −0.036 |
+
+Read that against the ±2 se row above (0.114–0.132): **every lead from 2×T onward is inside the
+band, on every band.** At 1×T only `Z[0,6]` (0.470) is clearly outside; the other five sit at
+0.123–0.166, which is marginal. Past ~1×T_int ≈ 0.5 TU the truth at the lead is statistically
+independent of the truth the forecast was initialised on, so *no* information carried from the
+initial condition can help there. Whatever skill a model shows at 5× or 10× is its **climatology**
+matching the reference's — which is exactly what regime C's free-running marginal KS already
+measures, and what §3/#61 show is the underpowered statistic D6 was built to escape.
+
+⚠️ **The long leads are not worthless, but they are over-sampled.** Spread at saturation is a real
+diagnostic — does the ensemble variance converge to the climatological variance? — and the pilot
+does answer it (ratio 0.55–1.3 at long leads). But that needs *one or two* anchor points, not half
+the grid, and the run length is set by the largest lead.
+
+✅ **The pilot's own numbers land where this predicts.** LinReg7's worst spread–skill departures
+are at leads 380–434 = **0.95–1.09 TU ≈ 2×T_int** (ratio 2.1–2.5), and the fans in
+`fig9b_d6_fans_by_ic.png` are fully open by about 2 TU past the warm-up. The informative region is
+the short and medium leads; the tail is confirming climatology at full price.
+
+✅ **Decision (Rik, 2026-09-16): `N_LEAD` cut to 1200 steps = 3.00 TU, and it is now set in
+physical time from the ACF rather than as `10 × T_INT_MAX`.** `score_d6.jl` grew its own
+`MULTIPLIERS = (0.25, 0.5, 1, 2, 5)`; the `10×` entry no longer fits and was dropped, and `5×` is
+kept as the single saturation anchor so the spread–skill ratio still has a point past decorrelation.
+The longest lead is now `5 × 0.5430 = 1086` of 1200 available steps, 26 distinct leads in the union
+(was 32, longest 2172 of 2172).
+
+| | was | is |
+|---|---|---|
+| `N_LEAD` | 2172 steps, 5.43 TU | **1200 steps, 3.00 TU** |
+| `N_WARM` | 220 steps, 0.55 TU | **100 steps, 0.25 TU** |
+| multipliers | `0.25, 0.5, 1, 2, 5, 10` | **`0.25, 0.5, 1, 2, 5`** |
+| longest lead | 2172 (`Z[16,32]`) | **1086** |
+| steps per member | 2392 | **1300** (1.84× shorter) |
+| IC pool | `k ∈ [42, 377]`, 336 fields | **`k ∈ [42, 388]`, 347 fields** |
+| spacing at K = 180 | 0.4679 TU (0.86 × `T_INT_MAX`) | **0.4832 TU (0.89 ×)** |
+
+### The warm-up went with it: 220 → 100
+
+🔑 **The warm-up replays recorded `dQ`, so while it lasts the run *is* the tracked record — and its
+length therefore changes nothing but where the forecast starts.** Measured on the 50 LinReg7 pilot
+members, mean absolute deviation from the reference in units of `sd(reference)`:
+
+| column `c` | 1 | 51 | 101 | 221 |
+|---|---|---|---|---|
+| `Z[16,32]` | 0.0022 | 0.0022 | 0.0023 | 0.0020 |
+| `E[16,32]` | 0.0014 | 0.0014 | 0.0015 | 0.0013 |
+| the other four | 0.0000 | 0.0001 | 0.0000 | 0.0000 |
+
+Flat across the whole warm-up, and equal to §1's tracking error (2.32e-3, 1.46e-3 on those two
+bands). 🔴 **So the recorded rationale for 220 was wrong as written** — *"the slowest bands entered
+every forecast still carrying the record's state rather than the model's"*. At the end of a warm-up
+of any length the state is the record's, because that is what a replay is; no model output is used
+during it. The only thing a warm-up must do is fill `q_hist`, and `hist_len = 5`.
+
+✅ 100 is what the long online runs deploy (`6_online_TO_LRS.jl:108`, `dQ_data = data_track.dQ[:,
+1:100]`), so D6 now scores the deployed configuration; ordinal 0's validation exercises the deployed
+length instead of only the mechanism (#66's caveat is retired); and the IC pool gains two fields.
+`N_WARM_DRIVER` stays a separate constant even though the two now coincide — if `N_WARM` moves
+again, the validation must not move with it.
+
+🔴 **The ordinal → `k` map moved.** A shorter forecast and a shorter warm-up free 11 more fields at
+the end of the record, so `select_ics` re-spaced: ordinals 1–4 are still `k = 42, 44, 46, 48`,
+ordinal 5 is now `k = 50` (was 49), and later ordinals shift. All 180 packages were rebuilt; those no
+longer selected were moved to `analysis/output/d6_ics_stale/` rather than deleted.
+
+⚠️ **The LinReg7 pilot on disk stays readable but is no longer paired.** A 2172-lead run contains
+every lead of a 1200-lead grid, so `score_d6.jl` scores those 60 files unchanged. Their ICs are the
+old selection, so they cannot be compared member-for-member against anything produced after the
+change.
+
 
 ⚠️ **`sd(dQ)` spans four orders of magnitude.** Anything pooling QoIs in raw units is an enstrophy
 statistic with the energy bands contributing nothing. Every pooled number below is normalised.

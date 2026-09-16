@@ -123,10 +123,10 @@ docstring saying what set it:
 |---|---|---|
 | `FIELD_STRIDE`, `FIELD_DT`, `N_FIELDS` | 100, 0.25, 401 | the tracking record's field grid, asserted rather than assumed |
 | `N_REF` | 40000 | reference steps |
-| `N_WARM` | 220 | warm-up replayed before the forecast — 1.01× the slowest **level** decorrelation time |
-| `N_WARM_DRIVER` | 100 | what the online drivers replay. Deliberately does **not** follow `N_WARM`: the validation IC exists to reproduce a driver run column for column |
-| `N_LEAD` | 2172 | forecast length, 10× the slowest **level** decorrelation time |
-| `T_INT_MAX` | 0.5430 | that timescale, as the decay constant `T` in `ρ(τ) = exp(-τ/T)` |
+| `N_WARM` | 100 | warm-up replayed before the forecast. Length only moves the start point — the replay reproduces the record (measured drift flat across 220 steps), so it is set equal to `N_WARM_DRIVER`. Was 220 until 2026-09-16 |
+| `N_WARM_DRIVER` | 100 | what the online drivers replay. Deliberately a **separate** constant from `N_WARM` even though they now coincide: the validation IC must reproduce a driver run column for column |
+| `N_LEAD` | 1200 | forecast length, 3.00 TU, set from the reference's ACF (see `plot_acf.jl`); was `10 × T_INT_MAX` = 2172 until 2026-09-16 |
+| `T_INT_MAX` | 0.5430 | the slowest level `T_int`, as the decay constant `T` in `ρ(τ) = exp(-τ/T)`. Sets `score_d6.jl`'s `MULTIPLIERS`, no longer `N_LEAD` |
 | `DDN_TRAIN_RANGE` | `400:4000` | the DDN's training slice |
 | `DRIVER_SEED_BASE` | 236 | the archived driver's seed base, `seeds.to + 2` |
 

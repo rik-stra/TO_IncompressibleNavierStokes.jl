@@ -89,9 +89,9 @@ end
     nq, ncol = 6, 40001
     ref = D6Score.planted_truth(nq, ncol)
     for (n_k, ℓ) in ((4100, 0), (4100, 1207), (38600, 33), (17900, 241))
-        # The scored set's warm-up was reset from 100 to 220 when the forecast length moved to
-        # the LEVEL's decorrelation time (2026-09-15), and these columns default to it. A literal
-        # 100 here would test the alignment against a warm-up nothing runs.
+        # These columns default to `N_WARM`, which has been 100, then 220, then 100 again. A literal
+        # here would test the alignment against whichever value was current when it was written, so
+        # the constant is referenced rather than repeated.
         @test ref.q[1, D6Score.truth_column(n_k, ℓ)] == n_k + D6Score.N_WARM + ℓ
         @test ref.dQ[1, D6Score.truth_column_dq(n_k, ℓ)] == n_k + D6Score.N_WARM + ℓ
     end
@@ -182,8 +182,8 @@ end
 
 @testitem "V28 lead grids are per QoI, in physical time, and inside the run" default_imports = false setup = [D6Score] begin
     using Test
-    leads = D6Score.lead_grid(D6Score.T_INT; dt = D6Score.DT, nlead = D6Score.N_LEAD)
-    @test length(leads) == 6
+    leads = D6Score.lead_grid(D6Score.T_INT; dt = D6Score.DT,
+                              multipliers = D6Score.MULTIPLIERS, nlead = D6Score.N_LEAD)
     @test all(g -> issorted(g) && allunique(g) && all(>=(1), g), leads)
     @test all(g -> maximum(g) <= D6Score.N_LEAD, leads)
 
@@ -192,14 +192,20 @@ end
     # a per-QoI grid; on `q` they span only 0.5430/0.2489 = 2.18. The per-QoI grid is kept because
     # it is still correct and costs nothing, but it is no longer load-bearing -- and if someone
     # later proposes one shared grid, this is the number that says it would now be defensible.
-    @test maximum(leads[5]) == 2172                       # Z[16,32], 10 x 0.5430 TU = N_LEAD
-    @test maximum(leads[6]) == 2158                       # E[16,32], 10 x 0.5395 TU
-    @test maximum(leads[1]) == 996                        # Z[0,6],   10 x 0.2489 TU, the fastest
+    @test maximum(leads[5]) == 1086                      # Z[16,32], 5 x 0.5430 TU, the longest
+    @test maximum(leads[6]) == 1079                      # E[16,32], 5 x 0.5395 TU
+    @test maximum(leads[1]) == 498                       # Z[0,6],   5 x 0.2489 TU, the fastest
     @test maximum(leads[5]) / maximum(leads[1]) < 2.5     # was > 30 on the correction
 
-    # The longest lead is what sets the forecast length: it fits, and one more multiple would not.
-    @test D6Score.lead_grid([0.5430]; dt = D6Score.DT, nlead = 2172) isa Vector
-    @test_throws ArgumentError D6Score.lead_grid([0.5430]; dt = D6Score.DT, nlead = 2171)
+    # 🔴 `N_LEAD` no longer follows the grid -- it is 1200 steps = 3.00 TU set from the reference's
+    # ACF (2026-09-16), and the grid has to fit inside it with room to spare. Both directions are
+    # pinned: the longest lead fits, and the dropped `10x` entry does not.
+    @test maximum(D6Score.union_grid(leads)) == 1086 <= D6Score.N_LEAD
+    @test D6Score.MULTIPLIERS == (0.25, 0.5, 1, 2, 5)
+    @test D6Score.lead_grid([0.5430]; dt = D6Score.DT, multipliers = D6Score.MULTIPLIERS,
+                            nlead = D6Score.N_LEAD) isa Vector
+    @test_throws ArgumentError D6Score.lead_grid([0.5430]; dt = D6Score.DT,
+                                                 multipliers = (10,), nlead = D6Score.N_LEAD)
     @test_throws ArgumentError D6Score.lead_grid([0.5430]; dt = D6Score.DT, multipliers = (20,),
                                                  nlead = D6Score.N_LEAD)
     @test_throws ArgumentError D6Score.lead_grid([0.0]; dt = D6Score.DT, nlead = 100)
@@ -425,7 +431,8 @@ end
                 # below the climatological level in the wrong direction: the reported saturation is
                 # either a real lead or the -1 sentinel, never a silent zero.
                 @test all(s -> s == -1 || s in D6Score.union_grid(D6Score.lead_grid(
-                             D6Score.T_INT; dt = D6Score.DT, nlead = D6Score.N_LEAD)),
+                             D6Score.T_INT; dt = D6Score.DT, multipliers = D6Score.MULTIPLIERS,
+                             nlead = D6Score.N_LEAD)),
                           out[:level].saturation)
             end
         end

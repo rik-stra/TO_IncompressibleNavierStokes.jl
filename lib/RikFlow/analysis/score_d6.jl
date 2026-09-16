@@ -26,8 +26,8 @@
 # (gotcha #28), so a level-only temporal claim would make every configuration look equally good.
 #
 # **Leads are per QoI and in physical time.** `T_int` spans 0.2489-0.5430 TU across the six bands, so
-# one grid in units of `t_int` cannot serve them all. The grid is `{0.25, 0.5, 1, 2, 5, 10} x
-# T_int(i)`; the largest entry, 2172 steps, is what sets the 2172-step forecast, and short leads are
+# one grid in units of `t_int` cannot serve them all. The grid is `{0.25, 0.5, 1, 2, 5} x
+# T_int(i)`; the largest entry, 1086 steps, sits inside the 1200-step forecast, and short leads are
 # free within a run. 🔴 These are the LEVEL's timescales since 2026-09-16 -- see `T_INT`.
 #
 # **Truth is the high-fidelity reference, not the tracked record.** The ICs are cut from the tracked
@@ -86,13 +86,34 @@ could have stopped before the slowest band saturated. The old docstring said as 
 decorrelates far more slowly, so the level's saturation lead may lie beyond 10 x T_int"*. It now
 does not.
 
-🔑 `10 x max(T_INT) / dt = 10 x 0.5430 / 2.5e-3 = 2172` steps exactly, which is `N_LEAD`. The two
-constants are derived from the same number and must move together; `build_d6_ics.jl`'s `T_INT_MAX`
-is the other half.
+🔑 **`N_LEAD` is no longer derived from these** (Rik, 2026-09-16). It is 1200 steps = 3.00 TU, set
+from the reference's autocorrelation directly -- see `build_d6_ics.jl`'s `N_LEAD`. What these still
+set is `MULTIPLIERS`, and the largest of those, `5 x 0.5430 = 1086` steps, has to stay inside
+`N_LEAD`. The `10x` entry did not, and was dropped.
 
 ⚠️ Still a decay constant, not `1 + 2*sum(rho)`. See `build_d6_ics.jl`'s `T_INT_MAX`.
 """
 const T_INT = [0.2489, 0.4732, 0.4893, 0.4742, 0.5430, 0.5395]
+
+"""
+    MULTIPLIERS
+
+Lead grid, as multiples of each band's `T_INT`. `lead_grid`'s own default still carries the `10x`
+entry this drops: that default is the published grid paper 2's runs were built on and other callers
+use it, so D6 passes its own rather than changing it underneath them.
+
+🔴 **`10x` was dropped 2026-09-16, not shortened away by accident.** `results.md` section 1 measures
+the reference's residual autocorrelation at these leads as 0.941 down to 0.031 across `0.25x`-`2x`,
+and 0.036-0.147 at `5x` and `10x`, against a +-2 Bartlett standard error band of 0.114-0.132.
+Everything from `2x` on is already inside that band, so `10x` was buying a second look at
+climatology for more than half the run's cost. `5x` is kept as the one saturation anchor -- the
+spread-skill ratio at saturation is a real diagnostic even where the ensemble mean carries no
+information.
+
+⚠️ `maximum(MULTIPLIERS) * maximum(T_INT) / DT` must stay `<= N_LEAD`. `lead_grid` raises if it does
+not, rather than clipping -- a clipped lead reads as a saturated one.
+"""
+const MULTIPLIERS = (0.25, 0.5, 1, 2, 5)
 
 "Which record supplies the verification truth. See the header."
 const TRUTH_SOURCE = get(ENV, "D6_TRUTH", "hf_reference")
@@ -512,7 +533,7 @@ end
 The lead grids themselves, which are a result: they say what the runs can and cannot resolve.
 """
 function report_grids(leads; io = stdout)
-    println(io, "\nLead grids -- {0.25, 0.5, 1, 2, 5, 10} x T_int(i), per QoI, in physical time")
+    println(io, "\nLead grids -- ", MULTIPLIERS, " x T_int(i), per QoI, in physical time")
     @printf(io, "  %-10s %8s   %s\n", "QoI", "T_int", "leads [steps]")
     for i in eachindex(leads)
         @printf(io, "  %-10s %8.4f   %s\n", LABELS[i], T_INT[i], join(leads[i], ", "))
@@ -572,7 +593,7 @@ What the scorer will do, without any runs: the lead grids, and the index alignme
 one IC so the arithmetic can be read rather than trusted.
 """
 function preview(; io = stdout)
-    leads = lead_grid(T_INT; dt = DT, nlead = N_LEAD)
+    leads = lead_grid(T_INT; dt = DT, multipliers = MULTIPLIERS, nlead = N_LEAD)
     report_grids(leads; io)
     sel = select_ics(; K = 180)
     k, n_k = sel.k[1], sel.n[1]
@@ -605,7 +626,7 @@ members. That matters more than it looks: without it, the first execution of `ma
 pilot data, which is to say after GPU time had already been spent.
 """
 function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = stdout)
-    leads = lead_grid(T_INT; dt = DT, nlead = N_LEAD)
+    leads = lead_grid(T_INT; dt = DT, multipliers = MULTIPLIERS, nlead = N_LEAD)
     ens = preview_only ? nothing : load_members(dir)
     if ens === nothing
         preview(; io)

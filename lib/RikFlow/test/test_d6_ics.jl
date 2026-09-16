@@ -32,63 +32,67 @@ end
         # The tightest instance of each constraint, stated as the numbers rather than as a relation,
         # so a change to nlead or to the record length has to come through this file.
         @test first(sel.t) >= 10.25
-        @test last(sel.n) <= 38692
+        @test last(sel.n) <= 38700        # = N_REF - N_WARM - N_LEAD = 40000 - 100 - 1200
     end
 end
 
 @testitem "V29 K = 180 comes out at 0.48 TU, not the nominal 0.5" default_imports = false setup = [D6] begin
     using Test
-    # The pool is k in [42, 377], 336 fields -- shorter than the old [42, 387] because N_LEAD went
-    # from 1208 to 2172 steps when the forecast length was reset from the LEVEL's decorrelation time
-    # (Rik, 2026-09-15). Every second field is 0.5 TU and yields 168 ICs; 180 needs 0.47.
+    # The pool is k in [42, 388], 347 fields. It grew twice on 2026-09-16: N_LEAD was cut from 2172
+    # to 1200 steps (3.00 TU, set from the reference's ACF -- Rik) and N_WARM from 220 to 100 (the
+    # warm-up replays the record, so its length changes nothing but the start point -- Rik). It was
+    # [42, 377] before that, and [42, 387] before 2026-09-15. Every second field is 0.5 TU and
+    # yields 174 ICs; 180 needs 0.48.
     #
-    # 🔴 **The spacing is now BELOW the slowest QoI's decorrelation time, not above it.** 0.4679 TU
-    # against T(q)_max = 0.5430 is a ratio of 0.86; on the old constants it was 1.60 against the
+    # 🔴 **The spacing is still BELOW the slowest QoI's decorrelation time, not above it.** 0.4832 TU
+    # against T(q)_max = 0.5430 is a ratio of 0.89; on the old constants it was 1.60 against the
     # dQ-based 0.3017. So at K = 180 adjacent ICs are genuinely correlated and the block bootstrap
     # over initialisation time is not merely advisable but load-bearing. K = 90 (`--array=1-179:2`)
-    # doubles the spacing to 1.7x and is the intended production setting.
+    # doubles the spacing to 1.8x and is the intended production setting.
     sel = D6.select_ics(; K = 180)
-    @test sel.pool == 336
-    @test sel.spacing_tu ≈ 0.46788 atol = 1e-4
+    @test sel.pool == 347
+    @test sel.spacing_tu ≈ 0.48324 atol = 1e-4
     @test sel.spacing_tu < 0.5
-    @test sel.spacing_tu / D6.T_INT_MAX ≈ 0.8617 atol = 5e-3
+    @test sel.spacing_tu / D6.T_INT_MAX ≈ 0.8900 atol = 5e-3
     @test sel.spacing_tu / D6.T_INT_MAX < 1                     # the ICs are NOT independent
 
-    # 168 is what every second field yields, and the spacing lands within 0.3% of the nominal
-    # 0.5 TU. It is not exactly 0.5: the selection includes both ends of the pool, so 168 indices
-    # span 335 fields rather than 334 and every gap is 2 or 3 fields.
-    s168 = D6.select_ics(; K = 168)
-    @test s168.spacing_tu ≈ 0.5 atol = 2e-3
-    @test first(s168.k) == 42
-    @test last(s168.k) == 377
-    @test all(d -> d in (2, 3), diff(s168.k))
+    # 174 is what every second field yields on the [42, 388] pool, and there the spacing is exactly
+    # 0.5 TU: 174 indices span 346 fields, so every gap is 2. (At the old pool this was K = 168 over
+    # 335 fields, which cannot divide evenly and landed 0.3% off with gaps of 2 and 3.)
+    s174 = D6.select_ics(; K = 174)
+    @test s174.spacing_tu ≈ 0.5 atol = 1e-9
+    @test first(s174.k) == 42
+    @test last(s174.k) == 388
+    @test all(==(2), diff(s174.k))
 
     # `report_ics` must print the spacing and the warning, since that is the only place a reader
     # meets either number.
     io = IOBuffer()
     D6.report_ics(sel; io)
     out = String(take!(io))
-    @test occursin("0.4679", out)
+    @test occursin("0.4832", out)
     @test occursin("0.5430", out)
     @test occursin("block bootstrap", out)
 end
 
 @testitem "V29 an impossible K fails loudly rather than silently returning fewer" default_imports = false setup = [D6] begin
     using Test
-    # The pool is 336. 337 and 400 must both raise; 336 must not.
-    @test length(D6.select_ics(; K = 336).k) == 336
-    @test_throws ErrorException D6.select_ics(; K = 337)
+    # The pool is 347. 348 and 400 must both raise; 347 must not.
+    @test length(D6.select_ics(; K = 347).k) == 347
+    @test_throws ErrorException D6.select_ics(; K = 348)
     @test_throws ErrorException D6.select_ics(; K = 400)
     @test_throws ErrorException D6.select_ics(; K = 0)
 
     # The bounds themselves are re-derived, so a stale kmin/kmax is caught too.
     @test_throws ErrorException D6.select_ics(; K = 10, kmin = 41)   # t_41 = 10.0, not > 10
-    @test_throws ErrorException D6.select_ics(; K = 10, kmax = 378)  # overruns the reference
+    @test_throws ErrorException D6.select_ics(; K = 10, kmax = 389)  # overruns the reference
 
     # 🔑 The regression this whole derivation exists for: `kmin`/`kmax` used to be literal 42/387,
-    # correct only for nwarm = 100, nlead = 1208. Passing the OLD default against the CURRENT
-    # constants must fail rather than forecast past the end of the truth.
-    @test_throws ErrorException D6.select_ics(; K = 10, kmax = 387)
+    # correct only for nwarm = 100, nlead = 1208. ⚠️ `nwarm` is 100 again since 2026-09-16, so 387 is
+    # now only 2 short of the derived 389 -- still wrong, still caught, but no longer wrong by much.
+    # 389 is the first value that overruns; pin both sides so a future change cannot make 387 legal.
+    @test_throws ErrorException D6.select_ics(; K = 10, kmax = 389)
+    @test D6.select_ics(; K = 10, kmax = 388) isa NamedTuple
 
     # A longer forecast shrinks the pool further, and the default must track it.
     @test_throws ErrorException D6.select_ics(; K = 10, nlead = 3000, kmax = D6.default_kmax())
@@ -118,7 +122,7 @@ end
     # field it launches from is `fields[1]`, i.e. n = 0. A generalisation that does not reproduce
     # that exactly is wrong.
     @test D6.warmup_range(0, D6.N_WARM_DRIVER) == 1:100
-    @test D6.warmup_range(0) == 1:D6.N_WARM          # the scored set's own, longer, warm-up
+    @test D6.warmup_range(0) == 1:D6.N_WARM          # the scored set's own, now the same length
     @test collect(D6.warmup_range(0, D6.N_WARM_DRIVER)) == collect(1:100)
 
     # And the general form: step n_k, first solver step at n_k + 1.
@@ -289,14 +293,20 @@ end
     # These constants are quoted in the handoff, in `metrics.md` section 5 and in the run driver, and
     # a change to any of them silently changes what D6 measures. Pin them here so the change has to
     # be deliberate.
-    # 🔴 Reset 2026-09-15 from the LEVEL's decorrelation time, not the correction's (Rik). D6 scores
-    # the forecast of the level, so the level's timescale is what has to saturate.
-    @test D6.N_LEAD == 2172
-    @test D6.N_LEAD * D6.FIELD_DT / D6.FIELD_STRIDE ≈ 5.43 atol = 1e-9   # 2172 steps = 5.43 TU
-    @test D6.N_LEAD * 2.5e-3 ≈ 10 * D6.T_INT_MAX atol = 5e-3             # 10 x the slowest T(q)
+    # 🔴 The LEVEL's decorrelation time, not the correction's (Rik, 2026-09-15). D6 scores the
+    # forecast of the level, so the level's timescale is what has to saturate.
+    @test D6.N_LEAD == 1200
+    @test D6.N_LEAD * D6.FIELD_DT / D6.FIELD_STRIDE ≈ 3.00 atol = 1e-9   # 1200 steps = 3.00 TU
+    # 🔴 No longer `10 x T_INT_MAX` (2026-09-16). What it must satisfy is that the lead grid fits:
+    # `5 x T_INT_MAX / dt = 1086 <= 1200`, with the dropped `10 x` entry not fitting.
+    @test 5 * D6.T_INT_MAX / 2.5e-3 <= D6.N_LEAD
+    @test 10 * D6.T_INT_MAX / 2.5e-3 > D6.N_LEAD
     @test D6.T_INT_MAX ≈ 0.5430 atol = 1e-4                              # the LEVEL's, on R1
-    @test D6.N_WARM == 220
-    @test D6.N_WARM * 2.5e-3 ≈ D6.T_INT_MAX atol = 1e-2                  # ~1 x the slowest T(q)
+    # 🔴 100 again since 2026-09-16, and now EQUAL to N_WARM_DRIVER: the warm-up replays the record,
+    # so its length moves the forecast's start point and nothing else (measured drift flat at
+    # 0.0000-0.0023 sd across 220 steps). Equal, but still two constants -- see N_WARM_DRIVER.
+    @test D6.N_WARM == 100
+    @test D6.N_WARM == D6.N_WARM_DRIVER
     @test D6.N_WARM_DRIVER == 100                                        # what the drivers replay
     @test D6.N_REF == 40000
     @test D6.N_FIELDS == 401

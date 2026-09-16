@@ -19,7 +19,7 @@
 #   julia --project tools/smoke_d6.jl
 #
 # Writes into output/D6_smoke/, which is throwaway. ⚠️ 400 steps is a pipeline check, not a
-# measurement: the lead grid reaches 2172 steps and nothing here may be reported as a result.
+# measurement: the lead grid reaches 1086 steps and nothing here may be reported as a result.
 
 using Random
 using JLD2
@@ -136,7 +136,7 @@ function main()
             dev, size(q_on, 2) - 1)
 
     println("\npre-flight passed. ⚠️ 400 steps is a pipeline check, not a measurement — the lead " *
-            "grid\nreaches 2172 steps. Submit batch_scripts/run_d6.sh with --array=1-5 next, and " *
+            "grid\nreaches 1086 steps. Submit batch_scripts/run_d6.sh with --array=1-5 next, and " *
             "write the\nmeasured s/TU into meta_files/handoff_p2c_d6.md section 2.")
     flush(stdout)
     return nothing
