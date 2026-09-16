@@ -28,6 +28,8 @@
 #   D6_OUT         where the run outputs are (default exp_square_HIT/output/D6)
 #   D6_FAN_STRIDE  display stride in steps (default 2 = 0.005 TU)
 #   D6_FAN_PAD     TU of reference drawn before the first IC and after the last forecast (default 1)
+#   D6_FAN_MAX     draw only the first N initial conditions (default 0 = all)
+#   D6_FAN_TAG     suffix for the figure names and titles, e.g. the closure
 
 using CairoMakie
 using JLD2
@@ -40,6 +42,24 @@ const D6_DIR = get(ENV, "D6_OUT",
                    normpath(joinpath(HERE, "..", "exp_square_HIT", "output", "D6")))
 const STRIDE = parse(Int, get(ENV, "D6_FAN_STRIDE", "2"))
 const PAD_TU = parse(Float64, get(ENV, "D6_FAN_PAD", "1.0"))
+"How many initial conditions to draw, after striding. 0 means all of them."
+const FAN_MAX = parse(Int, get(ENV, "D6_FAN_MAX", "0"))
+"""
+    FAN_EVERY
+
+Draw every Nth initial condition. **0 (the default) derives the smallest N whose fans do not
+overlap**, from the fans actually loaded.
+
+🔑 At K = 90 the ICs sit 0.97 TU apart while a fan runs `nlead * dt` = 3.25 TU, so consecutive fans
+cover each other more than three deep and only the first turnover of each is ever legible. Every
+3rd still overlaps, by 0.33 TU; every 4th clears it with 0.64 TU to spare. That arithmetic moves
+with `N_LEAD` and with K, so it is computed rather than written down.
+"""
+const FAN_EVERY = parse(Int, get(ENV, "D6_FAN_EVERY", "0"))
+"Columns in the per-IC figure. 23 non-overlapping fans would make 138 unreadable panels."
+const FAN_PANELS = parse(Int, get(ENV, "D6_FAN_PANELS", "8"))
+"Tag put in the figure names and titles, so two closures do not overwrite each other's output."
+const TAG = get(ENV, "D6_FAN_TAG", "")
 
 # The reference carries its own sampling interval (`extract_new_reference` stores `dt_sample`
 # from the run's `savefreq * dt` rather than assuming it), so this is a CHECK, not the source of
@@ -59,6 +79,18 @@ const C_REF = RGBf(0.10, 0.10, 0.12)
 const C_IC = [RGBf(0.00, 0.45, 0.70), RGBf(0.84, 0.37, 0.00), RGBf(0.00, 0.62, 0.45),
               RGBf(0.80, 0.47, 0.65), RGBf(0.34, 0.71, 0.91), RGBf(0.94, 0.89, 0.26),
               RGBf(0.35, 0.35, 0.35)]
+
+"""
+    fan_colors(n)
+
+One colour per initial condition.
+
+Okabe-Ito while it lasts, because up to seven fans the eye separates them best by hue. Past seven
+a recycled palette would give two fans the same colour, so it switches to a sequential ramp -- which
+also happens to encode what the categorical palette cannot, that the ICs are ordered in time.
+"""
+fan_colors(n::Integer) = n <= length(C_IC) ? C_IC[1:n] :
+                         [get(cgrad(:viridis), x) for x in range(0.0, 0.88; length = n)]
 
 """
     load_fans(dir)
@@ -97,6 +129,33 @@ function load_fans(dir = D6_DIR)
 end
 
 """
+    stride_fans(fans, dt)
+
+Thin `fans` so the drawn ones do not cover each other, and say what was chosen.
+
+Returns `(kept, every)`. With `FAN_EVERY = 0` the stride is the smallest that separates consecutive
+start points by at least one fan length; a fan length is read off the data rather than assumed, so
+this stays right when `N_LEAD` changes.
+"""
+function stride_fans(fans, dt)
+    length(fans) < 2 && return fans, 1
+    span = (size(first(first(fans).q), 2) - 1) * dt            # one fan, in TU
+    gaps = diff([f.n_k for f in fans]) .* dt
+    every = FAN_EVERY > 0 ? FAN_EVERY : max(1, ceil(Int, span / minimum(gaps)))
+    kept = fans[1:every:end]
+    FAN_MAX > 0 && (kept = kept[1:min(FAN_MAX, length(kept))])
+    @printf("fan length %.2f TU, IC spacing %.2f TU (min %.2f) -> every %d%s
+",
+            span, mean(gaps), minimum(gaps), every,
+            FAN_EVERY > 0 ? " (forced by D6_FAN_EVERY)" : " (derived: smallest non-overlapping)")
+    @printf("  %d of %d fans drawn; consecutive start points %.2f TU apart, fan length %.2f TU%s
+",
+            length(kept), length(fans), every * minimum(gaps), span,
+            every * minimum(gaps) >= span ? " -- no overlap" : " -- ⚠️ STILL OVERLAPPING")
+    return kept, every
+end
+
+"""
     ref_columns(fan)
 
 The reference columns member column `c` corresponds to: `n_k + c`.
@@ -113,7 +172,7 @@ function main()
     dt = Float64(ref.dt_sample)
     isapprox(dt, DT_EXPECTED; rtol = 1e-9) ||
         error("reference sampled at dt = $dt, not the expected $DT_EXPECTED")
-    fans = load_fans()
+    fans, every = stride_fans(load_fans(), dt)
     nq = size(q_ref, 1)
 
     @printf("%d initial conditions from %s\n", length(fans), D6_DIR)
@@ -139,15 +198,20 @@ function main()
     c1 = min(size(q_ref, 2), round(Int, t1 / dt))
     tref = ((c0:STRIDE:c1) .- 1) .* dt
 
-    fig = Figure(size = (1500, 1500))
-    Label(fig[0, 1], "D6: the reference trajectory with each initial condition's 10-member " *
-          "ensemble on top", fontsize = 18, font = :bold)
+    fancols = fan_colors(length(fans))
+    M = length(first(fans).q)
+
+    # Non-overlapping fans span the whole record, so a fixed width would squeeze each one to a
+    # few pixels. Budget width per fan instead, and cap it at what a PNG viewer will take.
+    fig = Figure(size = (clamp(150 * length(fans) + 350, 1500, 5200), 1500))
+    Label(fig[0, 1], "D6$(isempty(TAG) ? "" : " — " * TAG): the reference trajectory with each " *
+          "initial condition's $(M)-member ensemble on top", fontsize = 18, font = :bold, tellwidth = false)
 
     for i = 1:nq
         ax = Axis(fig[i, 1]; ylabel = LABELS[i], xlabel = i == nq ? "t [TU]" : "",
                   xgridvisible = false, ygridvisible = false)
         for (j, f) in enumerate(fans)
-            col = C_IC[mod1(j, length(C_IC))]
+            col = fancols[j]
             cols = ref_columns(f)
             t = ((cols[1]:STRIDE:cols[end]) .- 1) .* dt
             for q in f.q
@@ -167,12 +231,12 @@ function main()
     Label(fig[nq + 1, 1],
           "Dots mark each IC on the reference; the dashed line of the same colour is where its " *
           "replayed warm-up ends and the forecast begins.\nBefore that line the $(first(fans).nwarm) " *
-          "warm-up steps emit the recorded dQ verbatim, so all 10 members are the same run and lie " *
-          "on the reference —\nspread before it would be a bug, not confidence. Displayed at " *
-          "stride $(STRIDE) (= $(STRIDE * dt) TU).", fontsize = 11)
+          "warm-up steps emit the recorded dQ verbatim, so all $(M) members are the same run and " *
+          "lie on the reference —\nspread before it would be a bug, not confidence. Displayed at " *
+          "stride $(STRIDE) (= $(STRIDE * dt) TU).", fontsize = 11, tellwidth = false)
 
     mkpath(FIGS)
-    out = joinpath(FIGS, "fig9_d6_fans.png")
+    out = joinpath(FIGS, "fig9_d6_fans$(isempty(TAG) ? "" : "_" * TAG).png")
     save(out, fig)
     @printf("\nwrote %s (%.2f MB)\n", basename(out), filesize(out) / 2^20)
 
@@ -191,17 +255,22 @@ Panels in a row share a y-axis so growth is comparable across ICs at a glance, a
 **ensemble mean** -- the quantity `score_d6.jl`'s skill term is built from, and the one whose
 departure from the reference is error rather than spread.
 """
-function by_ic_figure(q_ref, fans, dt)
+function by_ic_figure(q_ref, fans_all, dt)
     nq = size(q_ref, 1)
+    fans = fans_all[1:min(FAN_PANELS, length(fans_all))]
     nic = length(fans)
-    fig = Figure(size = (2000, 1700))
+    fancols = fan_colors(nic)
+    M = length(first(fans).q)
+    fig = Figure(size = (max(2000, 260 * nic + 220), 1700))
     Label(fig[0, 1:nic],
-          "D6: each initial condition's ensemble against the reference, over its own lead window",
-          fontsize = 18, font = :bold)
+          "D6$(isempty(TAG) ? "" : " — " * TAG): each initial condition's ensemble against the " *
+          "reference, over its own lead window" *
+          (nic < length(fans_all) ? "  (first $nic of $(length(fans_all)) drawn)" : ""),
+          fontsize = 18, font = :bold, tellwidth = false)
 
     rows = [Axis[] for _ = 1:nq]
     for i = 1:nq, (j, f) in enumerate(fans)
-        col = C_IC[mod1(j, length(C_IC))]
+        col = fancols[j]
         cols = ref_columns(f)
         t = ((cols[1]:STRIDE:cols[end]) .- 1) .* dt
         ax = Axis(fig[i, j];
@@ -228,13 +297,13 @@ function by_ic_figure(q_ref, fans, dt)
 
     nstep = size(first(first(fans).q), 2) - 1
     Label(fig[nq + 1, 1:nic],
-          "Thin lines: the 10 members. Thick coloured line: the ensemble mean. Black: the HF " *
+          "Thin lines: the $(M) members. Thick coloured line: the ensemble mean. Black: the HF " *
           "reference. Dashed: the end of the replayed warm-up, where the forecast starts.\n" *
           "Panels in a row share a y-axis. Each window is $(nstep) steps = " *
           "$(round(nstep * dt; digits = 2)) TU, of which the first $(first(fans).nwarm) are replay.",
-          fontsize = 11)
+          fontsize = 11, tellwidth = false)
 
-    out = joinpath(FIGS, "fig9b_d6_fans_by_ic.png")
+    out = joinpath(FIGS, "fig9b_d6_fans_by_ic$(isempty(TAG) ? "" : "_" * TAG).png")
     save(out, fig)
     return out
 end

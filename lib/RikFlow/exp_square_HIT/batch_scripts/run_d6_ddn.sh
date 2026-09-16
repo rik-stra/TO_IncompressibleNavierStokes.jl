@@ -24,6 +24,14 @@
 # ⚠️ The DDN has no turbulence gate. That is a real defect on Taylor-Green and secondary on HIT,
 # which starts from a spun-up field; see claude_memory.md gotcha #65.
 #
+# 🔑 **To rerun individual ordinals** (a diverged member, a lost task), override the array on
+# the command line so this script's own D6_OUT and closure config are reused:
+#
+#     sbatch --array=<ordinals> batch_scripts/run_d6_ddn.sh
+#
+# `run_ic` skips members whose files exist, before the seed is derived, so only the missing
+# ones run and every member keeps its seed. DDN had no divergences on 2026-09-16.
+#
 # Sizing, walltime and the depot rationale are in batch_scripts/run_d6.sh and tools/RUNBOOK.md;
 # they are not repeated here, so that three production scripts cannot drift apart from each other.
 

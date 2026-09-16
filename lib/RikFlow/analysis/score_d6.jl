@@ -9,7 +9,7 @@
 #   julia --startup-file=no --project=analysis analysis/score_d6.jl            # score what is there
 #   julia --startup-file=no --project=analysis analysis/score_d6.jl --preview  # design only, no runs
 #
-# Writes `analysis/output/d6_scores.jld2` and prints the tables that go into
+# Writes `analysis/output/d6_scores_<run dir>.jld2` and prints the tables that go into
 # `analysis/results.md`. ⚠️ The report belongs in `results.md`, beside the script that made it --
 # not in `meta_files/`, and not left in `analysis/output/`, which `.gitignore:12` excludes.
 #
@@ -162,6 +162,24 @@ truth_column_dq(n_k::Integer, lead::Integer; nwarm::Integer = N_WARM) = n_k + nw
 # ---------------------------------------------------------------------------------------------
 
 """
+    EXCLUDE_ICS
+
+Initial conditions to drop, as a comma-separated list of `k` in `D6_EXCLUDE_ICS`.
+
+🔴 **The only legitimate use is keeping the closures paired.** D6's power comes from every closure
+forecasting from the *same* initial conditions, so a comparison must run over the intersection of
+what the closures actually produced. When one run loses array tasks, the fix is to drop those ICs
+from **every** closure, not to score each on whatever it happens to have -- which would silently
+compare different experiments.
+
+⚠️ It is not a way to drop initial conditions a model did badly on. Exclusions are a property of
+which runs completed, never of what they contain, and the list is recorded in the score file so a
+reader can check that.
+"""
+const EXCLUDE_ICS = Set(isempty(get(ENV, "D6_EXCLUDE_ICS", "")) ? Int[] :
+                        parse.(Int, split(ENV["D6_EXCLUDE_ICS"], ",")))
+
+"""
     load_members(dir = D6_DIR)
 
 Every `d6_online_ic<k>_m<member>.jld2` in `dir`, grouped by IC and sorted by member.
@@ -180,15 +198,65 @@ function load_members(dir = D6_DIR)
               (parse(Int, m[2]), joinpath(dir, f)))
     end
     isempty(byic) && return nothing
+    for k in EXCLUDE_ICS
+        delete!(byic, k)
+    end
+    isempty(byic) && return nothing
+
+    # 🔴 DIVERGED MEMBERS ARE DROPPED FROM THE ENSEMBLE AND COUNTED, NEVER SCORED.
+    #
+    # `run_d6.jl` writes a truncated trajectory with `diverged = true` rather than aborting the task
+    # (2026-09-16). Such a member has no value at most leads, so it cannot enter a skill or spread
+    # estimate -- but it is metric #16's raw material and must not vanish either. It is removed here
+    # and returned in `divergences`; the IC it belonged to then falls short of the modal `M` and is
+    # dropped from scoring by the ragged rule below, which is the honest outcome: that IC's ensemble
+    # no longer exists.
+    #
+    # ⚠️ Files written before 2026-09-16 have no `diverged` key. They were complete or the run would
+    # have raised, so a missing key reads as `false`.
+    divergences = Dict{Int,Vector{Int}}()
+    for (k, entries) in byic
+        bad = [mid for (mid, path) in entries if get(load(path), "diverged", false) === true]
+        isempty(bad) && continue
+        divergences[k] = sort(bad)
+        filter!(e -> !(first(e) in bad), entries)
+    end
+    filter!(p -> !isempty(p.second), byic)
+    isempty(byic) && return nothing
+
     ks = sort(collect(keys(byic)))
     Ms = [length(byic[k]) for k in ks]
-    allequal(Ms) || error("ragged ensemble: members per IC are $(sort(unique(Ms))). " *
-                          "The finite-M correction is a function of M; fix the runs, do not average.")
+    # The modal member count is the intended `M`.
+    Mmode = argmax(m -> count(==(m), Ms), unique(Ms))
+
+    # 🔴 An IC is dropped only when its shortfall is EXPLAINED by recorded divergences. Raggedness
+    # with no divergence to account for it still raises, because that is the case the check was
+    # written for: a half-copied directory, an interrupted rsync, a run that is still going. Losing
+    # that guard to accommodate divergence would trade a known failure mode for a silent one.
+    incomplete = Int[]
+    unexplained = Int[]
+    for (k, m) in zip(ks, Ms)
+        m == Mmode && continue
+        (m + length(get(divergences, k, Int[])) == Mmode ? incomplete : unexplained) |>
+            v -> push!(v, k)
+    end
+    isempty(unexplained) ||
+        error("ragged ensemble: IC(s) $(unexplained) have $(join([length(byic[k]) for k in unexplained], ", ")) " *
+              "members against a modal M = $Mmode, and no recorded divergence accounts for it. " *
+              "The finite-M correction is a function of M; fix the runs, do not average. " *
+              "(If the members are genuinely gone, name the ICs in D6_EXCLUDE_ICS.)")
+    for k in incomplete
+        delete!(byic, k)
+    end
+    ks = sort(collect(keys(byic)))
+    Ms = [length(byic[k]) for k in ks]
+    allequal(Ms) || error("ragged ensemble after dropping IC(s) broken by divergence: " *
+                          "members per IC are $(sort(unique(Ms))).")
     for k in ks
         sort!(byic[k], by = first)
         first.(byic[k]) == collect(1:Ms[1]) || error("IC $k has member ids $(first.(byic[k]))")
     end
-    return (; ks, M = Ms[1], files = byic)
+    return (; ks, M = Ms[1], files = byic, divergences, incomplete)
 end
 
 "Relative deviation, in units of each QoI's own sd, allowed across the replayed warm-up window."
@@ -618,7 +686,7 @@ end
 """
     main(; dir = D6_DIR, preview_only = false, outdir = OUT, io = stdout)
 
-Score whatever runs are in `dir`, print the tables to `io`, and write `d6_scores.jld2` under
+Score whatever runs are in `dir`, print the tables to `io`, and write `d6_scores_<dir>.jld2` under
 `outdir`.
 
 `outdir` and `io` are parameters so `test/test_d6_score.jl` can drive this whole path on synthetic
@@ -636,7 +704,30 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
     grid = union_grid(leads)
     truth = load_truth()
     report_grids(leads; io)
-    @printf(io, "\nD6: %d initial conditions x %d members from %s\n", length(ens.ks), ens.M, dir)
+
+    # 🔴 METRIC #16, printed before any skill number, because a skill table computed on the ICs a
+    # model survived is conditioned in that model's favour and must never be read alone.
+    ndiv = sum(length(v) for v in values(ens.divergences); init = 0)
+    if ndiv == 0 && isempty(ens.incomplete)
+        @printf(io, "stability: no diverged members; every IC kept its full ensemble\n")
+    else
+        @printf(io, "🔴 stability (metric #16): %d diverged member(s) across %d IC(s)\n",
+                ndiv, length(ens.divergences))
+        for k in sort(collect(keys(ens.divergences)))
+            @printf(io, "     k = %-4d members %s\n", k, join(ens.divergences[k], ", "))
+        end
+        # ⚠️ Reported even when `ndiv == 0`. Runs from before 2026-09-16 aborted the task on a
+        # divergence, so the offending member was never written and there is no `diverged` flag to
+        # find -- the only surviving trace is that the IC is short. Saying "every IC kept its full
+        # ensemble" there would be false, and it is exactly the LinReg1 production run.
+        if !isempty(ens.incomplete)
+            @printf(io, "   %d IC(s) DROPPED, ensemble short of M = %d: %s\n",
+                    length(ens.incomplete), ens.M, join(ens.incomplete, ", "))
+            ndiv == 0 && println(io, "     (no `diverged` flag on disk -- pre-2026-09-16 runs ",
+                                 "aborted the task, so the failing member was never written)")
+        end
+        @printf(io, "   ⚠️ the tables below are conditioned on the ICs this closure SURVIVED\n")
+    end
     @printf(io, "truth: %s\n", truth.source)
 
     # The validation run first: if the D6 path does not reproduce the archived trajectory from the
@@ -686,7 +777,9 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
     end
 
     mkpath(outdir)
-    p = joinpath(outdir, "d6_scores.jld2")
+    # 🔴 Named after the run directory. A fixed name meant scoring three closures in a row left
+    # only the last one on disk, with no sign anything had been lost.
+    p = joinpath(outdir, "d6_scores_$(basename(rstrip(dir, ['/', '\\'])))"* ".jld2")
     # Named explicitly rather than splatted: `jldsave`'s keywords must be symbols, and a `Dict`
     # splat is the kind of thing that works until the dictionary's key type changes.
     jldsave(p; level = out[:level], correction = out[:correction],

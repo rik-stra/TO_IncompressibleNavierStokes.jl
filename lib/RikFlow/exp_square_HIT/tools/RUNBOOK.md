@@ -202,6 +202,27 @@ for m in LinReg1 LinReg7 DDN; do
 done
 ```
 
+### Rerunning individual ordinals
+
+```bash
+sbatch --array=67,81,141 batch_scripts/run_d6_linreg1.sh    # the 2026-09-16 divergences
+```
+
+`--array` on the command line overrides the `#SBATCH` directive, so the closure's own `D6_OUT` and
+`D6_MODEL` are reused — never copy the config into a separate rerun script. `run_ic` skips members
+whose files already exist, and the skip happens **before the seed is derived**, so only the missing
+members run and every member keeps the seed it would have had.
+
+🔴 **Ordinals 67, 81, 141 (`k` = 170, 197, 313) diverged**; the pre-2026-09-16 driver raised on the
+short `q` and aborted the task, losing 14 unattempted members to 3 divergences. The patched driver
+writes the truncated trajectory with `diverged = true` and continues, so the rerun measures what
+metric #16 needs. The divergences **will** reproduce — the seeds and the IC are identical — and that
+is the point, not a failure of the rerun.
+
+⚠️ **Afterwards, drop `D6_EXCLUDE_ICS` when scoring.** It exists only to keep the three closures on a
+common IC set while LinReg1 was short; once its ensembles are complete, all three score at K = 90.
+
+
 🔑 **All three use the same `--array=1-179:2`, and that is the point.** D6 is *paired*: every closure
 forecasts from the same 90 initial conditions, so realisation variance cancels in the comparison.
 Changing the range in one script without the others silently breaks the pairing.

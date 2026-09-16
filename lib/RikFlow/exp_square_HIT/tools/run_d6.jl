@@ -366,6 +366,7 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
 
     t_all = time()
     walls = Float64[]                  # per-member wall time; member 1 carries the compilation
+    diverged_members = Int[]           # metric #16's raw material; see the short-`q` branch
     for member in 1:M
         out = joinpath(od, validation ? "d6_valid_ic$(k)_m$(member).jld2" :
                                         "d6_online_ic$(k)_m$(member).jld2")
@@ -410,8 +411,29 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
         all(f -> f.n == 0, data.fields) ||
             error("member $member saved a field at step(s) $([f.n for f in data.fields]); only " *
                   "the t = 0 snapshot is expected at savefreq = $(nt + 1)")
-        size(data.q, 2) == nt + 1 ||
-            error("q has $(size(data.q, 2)) columns, expected nt + 1 = $(nt + 1)")
+        # 🔴 A SHORT `q` IS A DIVERGED MEMBER, AND IT IS A RESULT -- NOT AN ERROR.
+        #
+        # Until 2026-09-16 this raised, which aborted the whole task: `run_ic` runs members
+        # sequentially, so one blow-up destroyed every member after it. That cost 14 unattempted
+        # runs from 3 divergences in the LinReg1 production run and made the per-IC stability
+        # fraction a bound rather than a measurement -- on the very metric (#16) the failure is
+        # evidence for. Now the partial trajectory is written, marked, and the loop continues.
+        #
+        # The divergence itself is upstream: `qoisaver` sets `nans_detected` when any QoI exceeds
+        # `nan_limit` (`RikFlow.jl:576`) and `solve_unsteady` then stops. `qoi_hist` is `push!`-based
+        # so `q` is exactly as long as the run got.
+        nstep_run = size(data.q, 2) - 1          # `q` carries the t = 0 state in column 1
+        diverged = nstep_run < nt
+        nstep_run <= nt ||
+            error("q has $(size(data.q, 2)) columns, MORE than nt + 1 = $(nt + 1); " *
+                  "that is not divergence, it is a bookkeeping bug")
+        if diverged
+            @printf("  member %2d/%d: 🔴 DIVERGED after %d of %d steps (lead %d, %.3f TU past warm-up)\n",
+                    member, M, nstep_run, nt, nstep_run - nwarm, (nstep_run - nwarm) * Δt)
+            println("               writing the partial trajectory and continuing to the next member")
+            flush(stdout)
+        end
+
         # The run's first `q` column is the QoIs of `ustart`, so it must be the reference column the
         # package was cut from. This is the non-circular half of "the package and the record agree
         # on what step the IC is at" -- the package carries the record's value, this compares it
@@ -421,22 +443,47 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
         chk.ok || error(chk.message)
         member == 1 && print(chk.report)
 
-        jldsave(out; q = Array(data.q), dQ = Array(data.dQ), tau = Array(data.tau),
+        # 🔴 TRUNCATE `dQ` AND `tau`. `allocate_arrays_outputs` builds them as
+        # `Array{T}(undef, N_qois, nstep)` -- **uninitialised**, not zeros -- so on a short run the
+        # tail past `nstep_run` is whatever was in that memory. Writing it would hand every consumer
+        # garbage that looks like data: a clamp census would read it as firings, a spectrum as
+        # content. `q` needs no truncation (`push!`-based) but is sliced too, so the three arrays
+        # cannot drift apart.
+        jldsave(out; q = Array(data.q)[:, 1:(nstep_run + 1)],
+                dQ = Array(data.dQ)[:, 1:nstep_run], tau = Array(data.tau)[:, 1:nstep_run],
                 k, n_k, t_k, ordinal, member, seed, ou_advance = n_k, validation,
                 nwarm, nlead, M, model = abspath(mdl), closure = string(cl), hist_len,
                 hist_var,
+                # 🔑 `diverged` is the flag every consumer must branch on; `nstep` says where it
+                # stopped. A complete member carries `diverged = false` and `nstep = nt`, so the
+                # keys exist unconditionally and no reader needs a `haskey` fallback.
+                diverged, nstep = nstep_run,
                 tsim, Δt, wall_seconds = wall,
                 julia = string(VERSION), device = gpu ? "cuda" : "cpu", written = string(now()))
 
         push!(walls, wall)
-        @printf("  member %2d/%d: %.1f s, q0 median rel %.1e, %.0f kB\n",
-                member, M, wall, chk.median_rel, filesize(out) / 1024)
+        diverged && push!(diverged_members, member)
+        @printf("  member %2d/%d: %.1f s, q0 median rel %.1e, %.0f kB%s\n",
+                member, M, wall, chk.median_rel, filesize(out) / 1024,
+                diverged ? @sprintf("  🔴 partial, %d/%d steps", nstep_run, nt) : "")
         flush(stdout)
     end
 
     total = time() - t_all
     @printf("done: ordinal %d (k = %d), %d members in %.1f s (%.1f s/member)\n",
             ordinal, k, M, total, total / M)
+
+    # 🔴 Metric #16, per IC, printed where the operator will see it. A run that says nothing about
+    # divergence is indistinguishable from one that had none, which is how the LinReg1 failures
+    # went unnoticed until the SLURM logs were read.
+    if isempty(diverged_members)
+        println("  stability: all $M members completed $nt steps")
+    else
+        @printf("  🔴 stability: %d of %d members DIVERGED (members %s)\n",
+                length(diverged_members), M, join(diverged_members, ", "))
+        println("     their files carry `diverged = true` and a truncated trajectory; the scorer ",
+                "drops them from the ensemble and counts them as metric #16")
+    end
 
     # 🔴 Cost reporting, and why it is not `total / (M * tsim)`.
     #

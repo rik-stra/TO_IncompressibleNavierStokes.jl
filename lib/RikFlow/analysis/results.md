@@ -6,6 +6,11 @@
 file is the measurement and they are the prediction.
 
 🔴 **REBASED ON THE NEW DATA, 2026-09-15. Read this before any number below.**
+🆕 **D6 ran 2026-09-16 and §4c is the first paired measurement in this file.** It is the only
+section whose comparisons are not confounded by realisation variance, and it **reverses §3's
+ranking of the two LRS cells**. Where §3 and §4c disagree, §4c is the higher-powered experiment
+(#61) — but see §7 for the validation that has not been run.
+
 
 Every section is now computed on **P2r's rebaselined pipeline** — R1's tracking record, the
 regenerated HF reference and R2's online ensembles — unless the section says otherwise. The
@@ -1157,6 +1162,135 @@ characterisation is not — 1e-2 / 4.57e-4 = **22**. Three orders is the right d
 different quantity, the DDN's minimum on the **level**: `E[16,32]` reaches **8.4e-6** against the
 reference minimum of 0.0243.
 
+## 4c. D6 — the paired, multi-IC forecast experiment
+
+**Run 2026-09-16.** Three closures, each forecasting from the **same** initial conditions:
+`LinReg1` (h = 5, λ = 0), `LinReg7` (h = 5, λ = 1) and the `DDN`. K = 90 ICs × M = 10 members ×
+1200 lead steps, `nwarm = 100`, Float64, on `gpu_h100`.
+
+🔴 **Scored on 87 ICs, not 90, because THREE LinReg1 MEMBERS DIVERGED.** Confirmed from
+`slurm-26795092_67.out` (Rik, 2026-09-16), member 7 of `k` = 170:
+
+```
+[ Info: t = 1.75   Δt = 0.0025   umax = 2.2
+┌ Warning: Unreasonable large QoI at n = 712     (RikFlow.jl:576)
+┌ Warning: NaNs detected in the solution. Stopping the simulation.
+ERROR: q has 713 columns, expected nt + 1 = 1301  (run_d6.jl:413)
+```
+
+Run step 712 is **lead 612 = 1.53 TU past the warm-up — inside the scored grid**.
+
+⚠️ **The driver then aborts the whole task, so one divergence costs the rest of the IC.**
+`run_d6.jl:413` raises on the short `q`, and members after the failing one are never attempted:
+
+| IC | completed | diverged | never attempted |
+|---|---|---|---|
+| 170 | 1–6 | **7** (confirmed) | 8–10 |
+| 197 | 1–2 | **3** (inferred, same signature) | 4–10 |
+| 313 | 1–5 | **6** (inferred) | 7–10 |
+
+**Stability, metric #16:**
+
+| | LinReg1 | LinReg7 | DDN |
+|---|---|---|---|
+| diverged members / attempted | **3 / 886 = 0.34%** | 0 / 900 | 0 / 900 |
+| **member stability fraction** | **0.9966** | **1.0000** | **1.0000** |
+| ICs containing a divergence | **≥ 3 of 90** | 0 | 0 |
+| IC stability fraction | **≤ 0.967** (bound) | 1.000 | 1.000 |
+
+The IC figure is a **bound, not a measurement**: 14 members were never tested, so more of those three
+ICs might have failed. 🔴 **This is a measurement defect as well as a robustness one** — stability
+fraction is metric #16, and the driver currently destroys the data needed to estimate it. It should
+record the member as diverged and continue to the next, not abort the task.
+
+🔑 **`umax` was DECREASING into the blow-up — 5.0 → 3.4 → 2.2.** This is not a velocity CFL runaway.
+The flow was decaying and the *QoI* exploded, which is the signature of the TO correction
+over-draining until `src_Q` gets small and `tau = dQ/src_Q` blows up. 🔴 **And `k` = 170 has the
+2nd-highest turbulence-gate rate of all 90 ICs (3.32%)** — the gate was firing there and did not
+prevent it. That is a limit of the gate, not a case it missed.
+
+🔴 **So the skill and calibration tables below are conditional on the ICs LinReg1 survived, which
+flatters LinReg1.** The three ICs are excluded from **all three** closures (`D6_EXCLUDE_ICS`),
+because a paired comparison must run over the intersection of what the closures produced — but for
+LinReg1 that intersection is not a random subset, it is "the ICs where the model did not break".
+Read the skill table with the stability table above it, never on its own. `load_members` refuses a
+ragged ensemble outright — the finite-M correction is a function of M — so nothing was silently
+averaged.
+
+| | LinReg1 | LinReg7 | DDN |
+|---|---|---|---|
+| **mean skill**, all 30 (band, lead) cells | **0.5521** | 0.5666 | 0.9284 |
+| short leads (0.25, 0.5 × T_int) | **0.2908** | 0.3135 | 0.7655 |
+| long leads (2, 5 × T_int) | 0.7767 | **0.7735** | 1.0611 |
+| **spread–skill inside S7's [0.8, 1.25]** | **23 of 30** | 2 of 30 | 3 of 30 |
+| median spread–skill ratio | **0.974** | 0.600 | 0.405 |
+| clamp firing rate | 0.392% | 0% | 0% |
+| bands saturating inside the grid | 0 of 6 | 0 of 6 | 2 of 6 |
+
+Skill is the RMSE of the ensemble mean as a fraction of the climatological level, so **1.0 is
+"no better than climatology"** and lower is better.
+
+### 🔴 D6 inverts the free-running ranking, which is the result this experiment was built to get
+
+On free-running 100 TU marginal KS, LinReg7 (λ = 1) was the best cell at 0.648 against LinReg1's
+0.836 (§3). **Paired, LinReg1 wins on skill at 9 of the 10 short- and mid-lead cells and is
+calibrated where LinReg7 is not** — 23 of 30 cells inside S7's band against 2, and a median ratio
+of 0.974 against 0.600. LinReg7 is systematically **under-dispersed**: its ensemble is too narrow
+for the error it actually makes.
+
+🔑 That is exactly the failure mode #61 predicted. Free-running marginal KS compares *climatologies*
+and carries 90–170 independent samples; it cannot see calibration at all, and it ranked the two
+cells backwards. The λ ladder's "null result" (#63) now reads as a null on the *wrong statistic*.
+
+### The DDN is not a weak model here; it is worse than climatology in the small scales
+
+| skill / climatology | lead 0.25×T | 1×T | 5×T |
+|---|---|---|---|
+| `Z[16,32]` LinReg1 / DDN | 0.105 / **1.432** | 0.608 / **1.770** | 0.793 / **1.647** |
+| `E[16,32]` LinReg1 / DDN | 0.110 / **1.129** | 0.610 / **1.445** | 0.800 / **1.407** |
+
+The DDN exceeds 1.0 at **every** lead in both smallest-scale bands, reaching 1.98 — it is the only
+configuration that would be improved by replacing its forecast with the climatological mean, and
+it is the only one whose bands saturate inside the grid (`Z[16,32]`, `E[16,32]`, both at lead 54).
+The LRS ratio `LR1/DDN` there runs **0.073–0.57**: a factor 3–14 better.
+
+![D6 fans, LinReg1](figures/fig9_d6_fans_LinReg1.png)
+![D6 fans, DDN](figures/fig9_d6_fans_DDN.png)
+
+`analysis/plot_d6_fans.jl`, 4 initial conditions at the derived non-overlapping stride (fans are
+3.25 TU, the minimum IC gap is 0.75 TU, so every 5th). The mechanism is visible: in the DDN figure
+**all four fans drive `Z[16,32]` and `E[16,32]` to zero** and hold them there for ~1 TU, then
+overshoot to ~6400 against a reference maximum of 3791. LinReg1's fans stay inside the reference's
+own envelope in every band. Over all 90 ICs the DDN sits below the reference's own minimum on
+**19.5%** of `Z[16,32]` steps and **13.5%** of `E[16,32]` steps, reaching 0.234 and 1.13e-5 against
+reference minima of 720.6 and 0.0243 — factors of 3075 and 2147.
+
+⚠️ **Part of that gap is a missing gate, not the noise model.** All four `TURBULENCE_GATE` sites are
+inside `LinReg`'s `get_next_item_timeseries`; `MVG_sampler`'s method takes **no `q_star` argument**
+(`src/time_series_methods.jl:111`), so the DDN cannot gate even in principle, and it fired on 0 of
+276 000 steps. Counterfactually an LRS run in the same states would have zeroed `dQ` on **6436 of
+276 000 forecast steps (2.33%), affecting 115 of 230 runs (50%)**, first trip at a median lead of
+447 steps (1.12 TU), always triggered by `E[16,32]`. So the small-scale comparison is not
+step-for-step apples-to-apples. The 2.33% bounds it; only a gated DDN re-run would separate the two.
+
+### Where the LRS does not win
+
+⚠️ **`E[0,6]` is the DDN's band.** It is better there at every lead — `LR1/DDN` runs 1.04–1.27 and
+`LR7/DDN` 1.01–1.21. That is one of six bands, it is the band with the shortest correction
+timescale (`T_int(dQ)` = 0.0081 TU, effectively white), and it is the one place where an i.i.d.
+sampler is the right model of the correction. Worth stating rather than averaging away.
+
+⚠️ **No band saturates inside the grid for either LRS cell** (0 of 6), so every LRS number here is a
+pre-saturation measurement and the grid does not bound how much further the error would grow.
+Reported, not extrapolated. The DDN saturates only in the two bands where it is already worse than
+climatology.
+
+⚠️ **The validation was never run** (`--array=0`): all three directories contain 0 `d6_valid_*`
+files. `compare_validation` is the correctness check on the whole D6 path against a trajectory
+produced by different code years earlier, and it costs one task. It should be run against LinReg1,
+whose oracle is R2's own LinReg1 replica 1, before these numbers are quoted anywhere final.
+
+
 ## 5. Findings that change the plan
 
 1. **SC-48 is settled: same-index pairing.** The lag-*k* block is `(q^{n-k}, q_star^{n-k})`, the
@@ -1245,6 +1379,30 @@ reference minimum of 0.0243.
 
 ---
 
+16. 🆕 🔴 **D6 REVERSES THE FREE-RUNNING RANKING, and that is the point of the experiment** (§4c).
+    On 100 TU marginal KS, LinReg7 (λ = 1) beat LinReg1 (λ = 0), 0.648 against 0.836. Paired over
+    87 shared initial conditions, **LinReg1 is better on skill at 9 of 10 short- and mid-lead cells
+    and is calibrated where LinReg7 is not**: 23 of 30 (band, lead) cells inside S7's [0.8, 1.25]
+    against 2, median spread–skill ratio 0.974 against 0.600. LinReg7 is systematically
+    under-dispersed. ⇒ **#61's diagnosis is confirmed by a positive result, not just by a power
+    argument**: the free-running statistic ranked the two cells backwards, and the λ ladder's "null"
+    (#63) was a null on the wrong statistic. Any cell selection made on marginal KS must be redone
+    on D6 before it enters the paper.
+    🔴 **RESOLVED 2026-09-16: they diverged** (`slurm-26795092_67.out`). So the finding is **S2′'s
+    stability–accuracy Pareto front, not a clean win.** LinReg1 is more skilful and better
+    calibrated *on the ICs it survives*, and it is the only cell that breaks: member stability
+    fraction **0.9966 against 1.0000** for LinReg7 and the DDN, ≥3 of 90 ICs affected. Since the
+    excluded ICs are exactly the ones LinReg1 broke on, the skill table is conditioned in LinReg1's
+    favour and must never be quoted without the stability numbers beside it.
+
+17. 🆕 **The DDN is worse than climatology in both smallest-scale bands** (§4c): skill/climatology
+    1.13–1.98 at every lead in `Z[16,32]` and `E[16,32]`, the only configuration for which that is
+    true and the only one saturating inside the grid. ⚠️ Part of the gap is structural rather than
+    the noise model — `MVG_sampler` cannot apply `TURBULENCE_GATE` (its method takes no `q_star`),
+    and an LRS run would have gated 2.33% of steps in 50% of runs. ⇒ Report the DDN's small-scale
+    deficit with that census attached, or re-run a gated DDN; do not quote the raw gap alone.
+
+
 ## 6. Verdict on `plan.md` §9's branch
 
 §9 asks whether M0's RH-1 is U-shaped (L2's motivation is measured), flat (**stop — talk to Rik**,
@@ -1273,11 +1431,14 @@ is band-selective, and the paper can say which mechanism each band needs.
 | | Blocker |
 |---|---|
 | **RH-2** | The archive has `n_replicas = 5` ⇒ 6 bins, 4-dof spread estimate. Computable, not quantitative. |
-| **#17 spread–skill vs lead, RH-3** | Needs D6 (K ≫ 1 initial conditions). Every archived run is one trajectory from one IC. P2c. |
+| **#17 spread–skill vs lead, RH-3** | ✅ **CLOSED 2026-09-16.** D6 ran three closures at K = 90, M = 10; §4c reports spread–skill by lead and the rank histograms for all three. Scored on the 87 ICs common to all of them. |
 | **DDN in regime C** | ✅ **CLOSED.** R2 ran the DDN online, 5 × 100 TU, and §3 scores it. The archive never had these runs; these are new measurements, not a reproduction. |
 | **λ > 0 offline reproduction** | 🔴 **The parity check is no longer "not run" — it is RUN and it FAILED.** Measured on R1's record 2026-09-15: against the exact ridge minimiser the `RegularizedLeastSquares` ADMM iterate differs by a relative **0.970 at λ = 1e-5, 0.903 at 1e-4, 0.452 at 1e-2**, and its training RMSE is ~0.00714 at every one of those λ — it is iteration-limited, not λ-limited, so a sweep through it is not a sweep in λ. `5_train_LinReg.jl` now solves `:l2` exactly (`ridge_solver = :exact`) and keeps ADMM only for reproducing paper 2 and for `:nuclear`. G1's λ = 0.01 *coefficient* acceptance against the archive is still not run and now needs the `:admm` path explicitly. λ = 0 is reproduced for all three available configurations, and G1's **online** acceptance passes for all five (§3). |
 | **The h and λ sweep on the new system** | 🔴 Only h = 5 exists rebaselined (λ ∈ {0, 1e-5, 1e-4}). h ∈ {10, 40} and λ = 0.01 have never been run post-merge, so §3's archive subsection is the only place a sweep can be read — on the old system. |
 | **Which `T_int` estimator is right** | ⚠️ The Sokal-window estimator here gives 0.25–0.54 TU on the level; `report_marginals` gives 0.94–1.08 TU on the same record (#58). A factor ~2, and D6's grid is sized on the larger one. |
+| **D6's validation** | 🔴 **NOT RUN.** All three run directories hold 0 `d6_valid_*` files — the `--array=0` task was never submitted. `compare_validation` checks the whole D6 path against a trajectory produced by different code years earlier, and it costs one task. It belongs to LinReg1, whose oracle is R2's own LinReg1 replica 1. §4c's numbers are unvalidated until it runs. |
+| **LinReg1 diverges on ~0.3% of members** | 🔴 **CONFIRMED 2026-09-16**, not infrastructure: `Unreasonable large QoI at n = 712` then NaNs (`slurm-26795092_67.out`), at lead 612 = 1.53 TU, inside the scored grid. 3 of 886 attempted members; LinReg7 and DDN 0 of 900. ⚠️ `run_d6.jl:413` aborts the whole task on one bad member, so 14 more were never attempted and the per-IC stability fraction is a bound (≤0.967), not a measurement. **Fix the driver to record and continue before re-running.** ⚠️ The gate does not prevent it — `k` = 170 has the 2nd-highest gate rate of 90. |
+| **A gated DDN** | ⚠️ `MVG_sampler` cannot apply `TURBULENCE_GATE`; see §4c. Either report the 2.33% / 50% counterfactual census alongside the DDN's small-scale deficit, or re-run the DDN with a gate. Open decision. |
 | **#5, #6, #3** | Deferred by `metrics.md` §6. |
 | **Channel, Taylor-Green** | Only the channel tracked QoI cache is present; no channel or TG fits or online runs were scored. |
 

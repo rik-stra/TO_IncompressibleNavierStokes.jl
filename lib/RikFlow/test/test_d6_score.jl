@@ -410,7 +410,7 @@ end
                 out = D6Score.main(; dir, outdir = od, io = devnull)
                 @test out !== nothing
                 @test Set(keys(out)) == Set([:level, :correction])
-                p = joinpath(od, "d6_scores.jld2")
+                p = joinpath(od, "d6_scores_$(basename(dir)).jld2")   # named after the run dir
                 @test isfile(p)
                 d = load(p)
                 @test d["labels"] == D6Score.LABELS

@@ -22,6 +22,39 @@
 # validates nothing past the warm-up: the replayed dQ is model-independent and the gate still
 # passes, but the post-warm-up comparison is then against a different model's trajectory.
 #
+# ---------------------------------------------------------------------------------------------
+# RERUN of the three ordinals LinReg1 lost on 2026-09-16
+# ---------------------------------------------------------------------------------------------
+#
+#     sbatch --array=67,81,141 batch_scripts/run_d6_linreg1.sh
+#
+# `--array` on the command line overrides the #SBATCH directive below, so this reuses this script's
+# own D6_OUT, D6_MODEL and D6_MEMBERS. 🔴 Do not copy the config into a separate rerun script: the
+# one thing a rerun must not get wrong is which model wrote which directory.
+#
+# Ordinals 67, 81, 141 are `k` = 170, 197, 313. Each diverged partway through a member
+# (`Unreasonable large QoI`, then NaNs) and the OLD driver raised on the short `q`, which aborted
+# the whole task and left members 7-10, 3-10 and 6-10 unattempted — 14 runs lost to 3 divergences.
+#
+# 🔑 **This is safe to run over the existing output, and it is cheap.** `run_ic` skips a member
+# whose file already exists (`force = false`, hard-coded in the CLI) and the skip happens *before*
+# the seed is derived, so skipping consumes no RNG and every member keeps the seed it would have
+# had. Only the missing members run.
+#
+# 🔑 **The divergences will reproduce.** `member_seed(k, member)` is deterministic and the IC is
+# byte-identical, so the same members blow up again — which is the point. The patched driver now
+# writes their truncated trajectory with `diverged = true`, then continues, so the run finally
+# measures what metric #16 needs: how many members diverge, not just that at least one did.
+#
+# ⚠️ **After it completes, drop the exclusion when scoring.** While these ICs were short, all three
+# closures were scored with `D6_EXCLUDE_ICS=170,197,313` to keep the comparison paired. Once LinReg1
+# has its full ensembles the exclusion is no longer needed for LinReg7 and the DDN either, and
+# dropping it restores K = 90:
+#
+#     D6_OUT=analysis/output/D6_LinReg1 julia --project=analysis analysis/score_d6.jl
+#
+# The scorer counts the diverged members and prints them as metric #16 before any skill table.
+#
 # Sizing, walltime and the depot rationale are in batch_scripts/run_d6.sh and tools/RUNBOOK.md;
 # they are not repeated here, so that three production scripts cannot drift apart from each other.
 
