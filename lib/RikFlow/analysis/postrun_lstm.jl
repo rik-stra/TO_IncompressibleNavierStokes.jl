@@ -44,6 +44,11 @@
 #     the very comparison M4 exists for while every other number still looks fine.
 
 using RikFlow
+# ⚠️ All three, and all three are needed: `RikFlowLuxExt` is triggered by Lux + Optimisers +
+# Zygote *together*, and the IWAE bound lives in it. Loading only `RikFlow` leaves the extension
+# dormant and the likelihood silently unreported -- which is exactly what happened the first time
+# this driver was run.
+using Lux, Optimisers, Zygote
 using JLD2
 using Random
 using Statistics
