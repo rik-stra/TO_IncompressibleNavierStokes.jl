@@ -67,6 +67,18 @@ lrs_cell(key, label) =
      nominal = 5, stochastic = true, clampable = true)
 
 """
+    lstm_cell(key, label)
+
+The same, for M4. `12_online_StochLSTM.jl` writes the identical replica file name under
+`output/TO_LSTM/<name>/`, so only the directory differs -- and for the same reason as above, the
+directory is derived from the key rather than repeated by hand.
+"""
+lstm_cell(key, label) =
+    (; key, label, dir = joinpath("TO_LSTM", key),
+     pattern = r"^data_online_tsim100\.0_replica(\d+)\.jld2$",
+     nominal = 5, stochastic = true, clampable = true)
+
+"""
     REBASE_MODELS
 
 The closures R2 scores, in the order `results.md` reports them: the ordering of the result
@@ -104,6 +116,18 @@ const REBASE_MODELS = (
     (key = "DDN", label = "DDN",
      dir = "TO_DDN", pattern = r"^DDN_data_online_tsim100\.0_replica(\d+)\.jld2$",
      nominal = 5, stochastic = true, clampable = false),
+    # M4, the stochastic LSTM. `12_online_StochLSTM.jl` writes to `output/TO_LSTM/<name>/` with the
+    # same replica file name the LRS cells use, so only the directory differs.
+    #
+    # ⚠️ `clampable = true` because M4 sits in the `q*`-consuming path and therefore inherits
+    # `TURBULENCE_GATE`, exactly as `LinReg` does -- unlike the DDN, which never receives `q*` and
+    # has no gate at all. The clamp census means the same thing for M4 as for an LRS cell.
+    #
+    # 🔴 Extracting an M4 run does NOT make it comparable to the LRS cells on every metric.
+    # `rho(Ctilde)`, the starred-block gain and the exact NLL are undefined for a model with no
+    # linear mean and no closed-form predictive density; a scorer that folds M4 in must emit
+    # `missing` for those, never `0`.
+    lstm_cell("StochLSTM4", "StochLSTM4 (VRNN, h=1)"),
     (key = "nomodel", label = "no model",
      dir = "no_model", pattern = r"^data_no_sgs_tsim100\.0\.jld2$",
      nominal = 1, stochastic = false, clampable = false),
