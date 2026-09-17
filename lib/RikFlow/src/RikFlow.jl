@@ -303,6 +303,10 @@ export segment_indices, gauss_logpdf, kl_diag_gaussian, kl_to_standard_normal, i
 # `needs_qstar` and `get_next_item_timeseries` already exist to take a new method.
 include("ts_lstm_online.jl")
 export StochLSTM
+
+# The one M4 file that needs JLD2, hence separate from the two stdlib ones above.
+include("ts_lstm_io.jl")
+export save_stochlstm, load_stochlstm
 # ⚠️ `reset!`, `n_input`, `n_output`, `n_cell_input`, `n_encoder_out` and `check_shapes` are
 # deliberately NOT exported: all six are names Lux, NNlib or IncompressibleNavierStokes could
 # plausibly define, and the training environment loads RikFlow and Lux into the same session.

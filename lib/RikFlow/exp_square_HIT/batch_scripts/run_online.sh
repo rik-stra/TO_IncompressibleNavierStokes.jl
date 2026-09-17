@@ -12,6 +12,11 @@
 #     sbatch batch_scripts/run_online.sh ddn       # 5 DDN replicas
 #     sbatch batch_scripts/run_online.sh smag      # Smagorinsky, c_s = 0.07
 #     sbatch batch_scripts/run_online.sh nomodel   # no SGS model
+#     sbatch batch_scripts/run_online.sh lstm 4    # deploy StochLSTM<n>, 5 online replicas
+#
+# ⚠️ The `lstm` case does NOT train. M4's fit runs under a different Julia project (the Lux
+# extension) so it cannot share this job's environment; use `run_train_lstm.sh` first, or
+# `submit_lstm.sh` which chains the two with the right dependency.
 #
 # 🔴 Run `julia --project 4_setup_search.jl` ONCE first (it is instant and needs no GPU) to write
 # output/TO_LRS/inputs_example.jld2. `lrs 1` is h = 5, lambda = 0 -- paper 2's headline
@@ -40,9 +45,9 @@ CASE=${1:-}
 INDEX=${2:-1}
 
 case "$CASE" in
-    lrs|ddn|smag|nomodel) ;;
+    lrs|ddn|smag|nomodel|lstm) ;;
     *)
-        echo "run_online.sh: first argument must be one of lrs | ddn | smag | nomodel" >&2
+        echo "run_online.sh: first argument must be one of lrs | ddn | smag | nomodel | lstm" >&2
         echo "  e.g. sbatch batch_scripts/run_online.sh lrs 1" >&2
         exit 1
         ;;
@@ -96,5 +101,20 @@ case "$CASE" in
     nomodel)
         echo "== running no-SGS online, 100 TU"
         julia --project "$EXP/9_no_sgs.jl"
+        ;;
+    lstm)
+        # 🔴 M4 IN THE SOLVER. Barthel Sørensen et al. apply this architecture as a post-run
+        # corrector, outside the solver, and say that is why theirs is "long-term stable by
+        # design". This case is the other thing, and the exposure-bias risk it takes on is real.
+        # `analysis/postrun_lstm.jl` is the faithful post-processing comparison, and the two must
+        # not be mixed when M4 is compared with M0.
+        #
+        # ⚠️ Deploys only -- `--project` here has no Lux, by design. Fit with run_train_lstm.sh.
+        if [ ! -f "$EXP/output/TO_LSTM/inputs_lstm.jld2" ]; then
+            echo "run_online.sh: no M4 config table; run 10_setup_lstm.jl first" >&2
+            exit 1
+        fi
+        echo "== running StochLSTM$INDEX online, 5 replicas x 100 TU"
+        julia --project "$EXP/12_online_StochLSTM.jl" "$INDEX"
         ;;
 esac
