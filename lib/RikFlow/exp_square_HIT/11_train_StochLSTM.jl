@@ -78,7 +78,10 @@ qss = RF.scale_input(rec.q_star[:, a:(b - 1)], in_scaling)
 X, Y, steps = RF.build_history(hist, qss, qs)
 @info "regressor built" rows=size(X, 1) features=size(X, 2) span=(first(steps), last(steps))
 
-spec = RF.LSTMSpec(; hist, cfg.n_hidden, cfg.n_latent, cfg.n_encoder, cfg.arch, cfg.uclip)
+# `emission` is read with a fallback so a table written before it existed still loads and keeps the
+# behaviour it had.
+spec = RF.LSTMSpec(; hist, cfg.n_hidden, cfg.n_latent, cfg.n_encoder, cfg.arch, cfg.uclip,
+                   emission = get(cfg, :emission, :state_dependent))
 
 # `build_history` is row-major (one row per step) because the linear cells solve a least-squares
 # system with it; the recurrence wants time last.
