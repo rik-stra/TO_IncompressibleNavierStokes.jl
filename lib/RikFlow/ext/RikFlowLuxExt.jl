@@ -251,12 +251,21 @@ function RF.elbo(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3}, Ytrue
     B = size(X, 3)
     ns = length(score) * B            # scored steps summed over the batch
 
-    U = out.LOGD[:, score, :]
-    Rres = (Ytrue[:, score, :] .- out.Y[:, score, :]) ./ exp.(U)
-    A = _precision_factor(ps.Araw)
-    quad = sum(abs2, A * reshape(Rres, nout, :))
-    logdet_term = 2 * sum(U) - 2 * ns * sum(log.(diag(A)))
-    nll = T(0.5) * (nout * ns * T(log(2 * pi)) + logdet_term + quad)
+    # 🔴 `:none` is a deterministic decoder, so there is no density to evaluate and the
+    # reconstruction term is a plain sum of squares -- the source's objective. `Wd`, `bd` and
+    # `Araw` never enter the loss, so their gradients are zero and they stay at their zero
+    # initialisation; nothing needs to be frozen by hand.
+    recon = if RF.emission_noise(spec)
+        U = out.LOGD[:, score, :]
+        Rres = (Ytrue[:, score, :] .- out.Y[:, score, :]) ./ exp.(U)
+        A = _precision_factor(ps.Araw)
+        quad = sum(abs2, A * reshape(Rres, nout, :))
+        logdet_term = 2 * sum(U) - 2 * ns * sum(log.(diag(A)))
+        T(0.5) * (nout * ns * T(log(2 * pi)) + logdet_term + quad)
+    else
+        T(0.5) * sum(abs2, Ytrue[:, score, :] .- out.Y[:, score, :])
+    end
+    nll = recon
 
     kl = if RF.latent_sampled(spec)
         S = out.SIG[:, score, :]
@@ -467,6 +476,13 @@ histogram beside it -- those two read the same on every cell of the ladder, whic
 function RF.iwae_nll(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T},
                      Y::AbstractMatrix, score::AbstractUnitRange;
                      K::Int = 64, rng::AbstractRNG = Xoshiro(0)) where {T}
+    # 🔴 `emission = :none` has a deterministic decoder, so there is no observation density and no
+    # likelihood to bound. Refusing is the honest behaviour: the alternative is a number that looks
+    # like an NLL and is not one. Score these cells with `crps_ensemble` and the rank histogram,
+    # which are defined for them and read the same on every cell of the ladder.
+    RF.emission_noise(spec) || error(
+        "iwae_nll: emission = :none has no predictive density, so no likelihood is defined. " *
+        "Use crps_ensemble and the rank histogram, or fit with emission = :constant.")
     nout = RF.n_output(spec)
     A = _precision_factor(ps.Araw)
     logdetA = sum(log.(diag(A)))

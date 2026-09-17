@@ -101,18 +101,48 @@ Base.@kwdef struct LSTMSpec
     n_latent::Int = 60
     n_encoder::Int = 60
     arch::Symbol = :vrnn
+    emission::Symbol = :state_dependent
     uclip::Union{Nothing,Tuple{Float64,Float64}} = nothing
 
-    function LSTMSpec(hist, n_hidden, n_latent, n_encoder, arch, uclip)
+    function LSTMSpec(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip)
         arch in (:lstm, :vaernn, :storn, :vrnn) ||
             error("LSTMSpec: arch must be one of :lstm, :vaernn, :storn, :vrnn; got $(arch)")
+        emission in (:none, :constant, :state_dependent) ||
+            error("LSTMSpec: emission must be :none, :constant or :state_dependent; got $(emission)")
+        (emission !== :none || arch !== :lstm) || error(
+            "LSTMSpec: arch = :lstm with emission = :none is a deterministic point predictor -- " *
+            "it has no stochasticity at all and cannot produce an ensemble.")
         n_hidden > 0 || error("LSTMSpec: n_hidden must be positive")
         n_encoder >= 0 || error("LSTMSpec: n_encoder must be >= 0 (0 = linear encoder)")
         (arch === :lstm || n_latent > 0) ||
             error("LSTMSpec: arch $(arch) has a latent path, so n_latent must be positive")
-        new(hist, n_hidden, n_latent, n_encoder, arch, uclip)
+        new(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip)
     end
 end
+
+"""
+    emission_noise(spec)
+
+Whether the decoder adds observation noise on top of the latent path.
+
+🔑 **`:none` is the source's design and removes the competing noise channel.** Barthel Sørensen et
+al.'s decoder is deterministic: `z` is their *only* stochasticity. A state-dependent emission head
+gives the model a second way to produce spread, with nothing in the objective allocating between
+them -- so "the noise is in the latent state" can stop being true of the *fitted* model even where
+the architecture flag says it is.
+
+| `emission` | `Sigma` | reconstruction term | predictive spread comes from |
+|---|---|---|---|
+| `:none` | — | mean squared error | the latent path **only** |
+| `:constant` | `D R D`, `D` constant | Gaussian log-density | latent + a fixed output scale |
+| `:state_dependent` | `D(h_t) R D(h_t)` | Gaussian log-density | latent + a state-dependent scale |
+
+🔴 **`:none` has no predictive density, so it has no likelihood** — `iwae_nll` is undefined and
+refuses rather than returning a number. Ensemble scoring is unaffected: drawing `z` still gives an
+ensemble, so `crps_ensemble`, the rank histogram and spread--skill all read normally. That is the
+trade: the source's design, scored the way the rest of the ladder is scored, minus the likelihood.
+"""
+emission_noise(spec::LSTMSpec) = spec.emission !== :none
 
 """
     latent_sampled(spec)
@@ -395,6 +425,13 @@ function lstm_step!(
     end
 
     # --- emission log-scale head ------------------------------------------------------------
+    # `:none` has no emission noise at all, so there is no scale to compute. `:constant` needs no
+    # branch: its `Wd` is identically zero, so the same matrix product returns `bd`.
+    if !emission_noise(spec)
+        fill!(st.logd, zero(T))
+        st.nstep += 1
+        return st.y, st.logd, st.z
+    end
     mul!(st.logd, w.Wd, st.h)
     @inbounds for k in eachindex(st.logd)
         st.logd[k] += w.bd[k]
@@ -411,7 +448,7 @@ function lstm_step!(
 end
 
 """
-    sample_emission!(out, st, w, rng)
+    sample_emission!(out, st, w, spec, rng)
 
 Draw one realisation of `q^n` given the step just taken: `out = y + D * LR * eps` with
 `D = diag(exp.(logd))` and `eps ~ N(0, I)`.
@@ -420,7 +457,14 @@ The covariance realised is `Sigma = D R D` with `R = LR * LR'`, which is the con
 correlation form of `methods_overview.tex` §"State dependent covariance" -- positive definite
 whenever `R` is and the scales are finite, so the log link needs no constraint.
 """
-function sample_emission!(out::AbstractVector{T}, st::LSTMState{T}, w::LSTMWeights{T}, rng) where {T}
+function sample_emission!(out::AbstractVector{T}, st::LSTMState{T}, w::LSTMWeights{T},
+                          spec::LSTMSpec, rng) where {T}
+    # 🔴 `:none` is a deterministic decoder: the prediction IS the mean, and all the spread in an
+    # ensemble comes from the latent draw upstream. Nothing is added here and the rng is untouched.
+    if !emission_noise(spec)
+        copyto!(out, st.y)
+        return out
+    end
     n = length(out)
     @inbounds for k in 1:n
         out[k] = T(randn(rng))

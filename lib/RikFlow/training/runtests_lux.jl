@@ -263,6 +263,51 @@ const RF = RikFlow
         end
     end
 
+    # -----------------------------------------------------------------------------------------
+    # V51 -- emission = :none is the source's design: the latent path is the ONLY noise
+    # -----------------------------------------------------------------------------------------
+    @testset "V51 emission = :none removes the second noise channel" begin
+        T = Float32
+        spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = 6), n_hidden = 16,
+                           n_latent = 4, n_encoder = 0, arch = :storn, emission = :none)
+        @test !RF.emission_noise(spec)
+        ps = RF.init_lstm_params(Xoshiro(31), spec; T)
+
+        L, B, nin, nz, nout = 12, 3, RF.n_input(spec), spec.n_latent, RF.n_output(spec)
+        X = randn(Xoshiro(32), T, nin, L, B)
+        Y = randn(Xoshiro(33), T, nout, L, B)
+        E = randn(Xoshiro(34), T, nz, L, B)
+        sc = 5:L
+
+        # the reconstruction term is a plain sum of squares, and beta still scales only the KL
+        out = RF.lstm_forward(spec, ps, X, E)
+        ns = length(sc) * B
+        expect = 0.5 * sum(abs2, Y[:, sc, :] .- out.Y[:, sc, :]) / ns
+        @test RF.elbo(spec, ps, X, Y, sc, E; beta = 0.0) ≈ expect rtol = 1e-4
+        @test RF.elbo(spec, ps, X, Y, sc, E; beta = 1.0) > expect      # the KL is positive
+
+        # 🔴 no predictive density means no likelihood, and it refuses rather than inventing one
+        @test_throws ErrorException RF.iwae_nll(spec, ps, X[:, :, 1], Y[:, :, 1], sc)
+
+        # the deployed step: log-scale is identically zero and the emission draw is the mean,
+        # so the ONLY source of ensemble spread is the latent draw
+        w = RF.LSTMWeights(ps, spec)
+        st = RF.LSTMState(spec, T)
+        rng = Xoshiro(35)
+        y, logd, _ = RF.lstm_step!(st, w, spec, view(X, :, 1, 1); rng, sample_latent = true)
+        @test all(iszero, logd)
+        outv = zeros(T, nout)
+        before = copy(rng)
+        RF.sample_emission!(outv, st, w, spec, rng)
+        @test outv == y                       # the prediction IS the mean
+        @test rand(rng) == rand(before)       # and nothing was drawn
+
+        # a deterministic backbone with no emission noise has no stochasticity at all, and is
+        # refused at construction rather than silently producing a zero-spread "ensemble"
+        @test_throws ErrorException RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = 6),
+                                                arch = :lstm, emission = :none)
+    end
+
     @testset "iwae_nll runs and tightens with K" begin
         spec = mkspec(:vrnn)
         T = Float32

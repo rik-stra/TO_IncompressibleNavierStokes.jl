@@ -128,7 +128,7 @@ function run_ensemble(spec, w, Xc, N, burn, nq, M)
         draw = zeros(Float32, nq)
         for t in 1:N
             RF.lstm_step!(st, w, spec, view(Xc, :, t); rng, sample_latent = true)
-            RF.sample_emission!(draw, st, w, rng)
+            RF.sample_emission!(draw, st, w, spec, rng)
             t > burn && (ens[t - burn, :, m] .= draw)
             # KL( q(z|x) || N(0,I) ) per dimension -- the posterior-collapse diagnostic.
             # Accumulated on member 1 only: mu and sigma depend on the recorded input alone, so
@@ -171,7 +171,10 @@ end
 # 🔴 Reported as `nll_iwae` and NEVER in a column with an exact NLL. It is a lower bound on log p,
 # so an upper bound on the NLL, and M0's number is exact -- the two are not on the same scale.
 nll_iwae = missing
-if Base.get_extension(RikFlow, :RikFlowLuxExt) === nothing
+if !RF.emission_noise(spec)
+    @info "emission = :none has a deterministic decoder, so there is no likelihood to bound. " *
+          "CRPS and the rank histogram above are the scores for this cell."
+elseif Base.get_extension(RikFlow, :RikFlowLuxExt) === nothing
     @info "no Lux extension loaded, so no IWAE bound (run under --project=lib/RikFlow/training)"
 elseif !haskey(fit.extras, :ps)
     @info "this fit predates `ps` being stored, so no IWAE bound; refit to get one"

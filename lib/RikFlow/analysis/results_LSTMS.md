@@ -357,8 +357,12 @@ at `N_Q = 6`. That is the more meaningful test, but the paper must say which of 
 | LSTM hidden | **16** (fallback 32) |
 | latent | **4** (fallback 8) |
 | decoder | linear, `V1 h_t + V2 z_t + c` |
-| emission | Gaussian, `Sigma = D R D` — see §8.6 Q1, the choice I am least sure about |
+| emission | **`:none`** — deterministic decoder, ✅ resolved in §8.6 Q1. `z` is the only stochasticity, as in the source |
 | parameters | **~2 976** at 16/4, ~8 464 at 32/8 |
+
+🔴 **With `emission = :none` there is no predictive density**, so these cells have no likelihood and
+`iwae_nll` refuses. They are scored by **ensemble CRPS and the rank histogram**, which are defined
+for them and are what `plan.md` §9 makes ladder-wide anyway.
 
 ### 8.3 Which variants, and why
 
@@ -366,17 +370,24 @@ at `N_Q = 6`. That is the more meaningful test, but the paper must say which of 
 that beat the others are the ones that feed `z` *into the recurrence*. So the first experiment is
 those two:
 
-| run | `arch` | `z` into cell | `z` into decoder | role |
-|---|---|---|---|---|
-| **A** | `:storn` | ✅ | — | upstream stochasticity, no output skip |
-| **B** | `:vrnn` | ✅ | ✅ | upstream stochasticity + skip |
-| **C** | `:lstm` | — | — | **control** |
+| run | `arch` | `emission` | `z` into cell | `z` into decoder | role |
+|---|---|---|---|---|---|
+| **A** | `:storn` | `:none` | ✅ | — | upstream stochasticity, no output skip |
+| **B** | `:vrnn` | `:none` | ✅ | ✅ | upstream stochasticity + skip |
+| **C** | `:lstm` | `:constant` | — | — | **control** |
 
-⚠️ **I would keep C even though it is not one of the two.** Without a deterministic control there is
-no statement to make: *"the latent path helped"* is only meaningful against a model that has none,
-and C costs three minutes. `:vaernn` (output-only noise) is the one I would **drop** from the first
-pass — it is the variant their result argues against, and it can be added later if A/B look
-promising.
+⚠️ **I would keep C even though it is not one of the two.** Without a control there is no statement
+to make: *"the latent path helped"* is only meaningful against a model that has none, and C costs
+three minutes.
+
+🔴 **C must use `emission = :constant`, not `:none`.** A deterministic backbone with no emission
+noise has no stochasticity at all — it is a point predictor, cannot produce an ensemble, and
+`LSTMSpec` refuses the combination at construction. So the control's spread comes from a constant
+`Sigma`, which is also the honest comparison: *"noise upstream"* against *"noise at the output,
+state-independent"* — the latter being the DDN's design one level down.
+
+`:vaernn` (output-only, state-dependent noise) is the one I would **drop** from the first pass. It
+is the variant their result argues against, and it can be added later if A/B look promising.
 
 ### 8.4 Training setup
 
@@ -395,62 +406,94 @@ promising.
 ### 8.5 🔑 Segment length and burn-in should come from the measured ACF, and currently do not
 
 Current defaults are `L = 200`, `burn = 50`. At `dt = 2.5e-3` those are **0.5 TU** and **0.125 TU**.
-Against `results.md` §1's measured timescales for the **level** `q`, which is what the model
-predicts:
 
-| quantity | measured | in steps |
+⚠️ **Do not size these with `T_int`.** `results.md` §1 is explicit about why, and an earlier draft
+of this section got it wrong: **the level's ACF is not a decaying exponential.** It falls to ~0.1
+within half a TU and then *rings* between roughly −0.2 and +0.2 with a period near 1 TU, out to the
+end of the 10 TU window. Any integral-based timescale is integrating that ringing, so "the"
+decorrelation time is not a well-defined property of this series. `results.md` also settles a
+factor-2 convention between the two integral estimators (#58) and notes that `T_exp` is meaningless
+on the level, `ρ₁(q) ≈ 0.9999` giving 3–34 TU.
+
+**The robust statistics are the crossings**, and they are what to size with (level `q`, all six
+bands, from `results.md` §1):
+
+| statistic | range over bands | in steps |
 |---|---|---|
-| `T_int(q)`, median | 0.474 TU | **~190** |
-| `T_int(q)`, range | 0.249–0.543 TU | 100–217 |
-| 1/e time of `q` | 0.29–0.36 TU | **116–144** |
-| *(for contrast)* `T_int(dQ)`, median | 0.0914 TU | 37 |
+| lag at ρ = 1/e | **0.290–0.355 TU** | **116–142** |
+| lag at ρ = 0.1 | 0.430–0.600 TU | 172–240 |
+| ringing period | ≈ 1 TU | ≈ 400 |
+| ±2 Bartlett se | 0.114–0.132 | — |
 
-🔴 **`burn = 50` is shorter than the level's 1/e time on every band, and about a quarter of its
-`T_int`.** The hidden state is therefore being scored before it has seen one correlation time of
-history — precisely the cold-start contamination the burn-in exists to remove. And `L = 200` leaves
-only 150 scored steps, under one `T_int`.
+Note how tight the 1/e times are — they span only **1.22×** across bands, against 2.18× for `T_int`
+— so a single `burn` serves every QoI.
 
-**Proposed instead: `L = 400`, `burn = 150`** (1.0 TU and 0.375 TU; the burn-in is then ~0.8
-`T_int` and past the 1/e time on every band). Cost is roughly unchanged: with `stride = L - burn`
-the total number of scored steps per epoch is nearly the same — the same data cut into fewer,
-longer pieces.
+🔴 **`burn = 50` is shorter than the 1/e crossing on every band**, so the hidden state is scored
+before it has seen even one decay time of history — precisely the cold-start contamination the
+burn-in exists to remove.
+
+🔑 **And `L = 200` is half a ringing period, which is the more interesting problem.** A recurrence
+is one of the few model classes that *can* represent an oscillating memory kernel — it is why
+`methods_overview.tex` reaches for a Hankel basis over a bank of real-pole exponentials, citing
+Gouasmi's decaying-sinusoid MZ kernel. At `L = 200` the model never sees a full period and cannot
+distinguish a ring from a decay, so it is denied the one thing the architecture is good for.
+
+**Proposed instead: `L = 400`, `burn = 150`** — one full ringing period, with the burn-in past the
+1/e crossing on every band, leaving 250 scored steps. Cost is roughly unchanged: with
+`stride = L - burn` the total scored steps per epoch is nearly the same, the same data cut into
+fewer, longer pieces.
 
 ⚠️ **The same argument applies to the online warm-up.** `nwarm = 100` (0.25 TU) is about half the
 level's `T_int`. It was inherited from the linear cells, where the lag window is the only state;
 M4 also has to charge `(h, c)`. That is prerequisite P1 in
 `meta_files/handoff_m4_stochastic_lstm.md` §12.1, and it is not optional.
 
-### 8.6 Open questions — what I would like comments on
+### 8.6 Open questions — ✅ four resolved 2026-09-17, two still open
 
-**Q1 — the emission head is a second noise channel, and it may undercut the whole point.**
-🔴 The clearest issue in the current design. Sørensen's decoder is **deterministic**: the latent
-path is their only stochasticity. I added a state-dependent Gaussian head (`log d` linear in `h_t`)
-because this project selects on likelihood and has a calibrated-spread criterion (S7). But that
-gives the model **two** ways to produce spread, with nothing in the objective allocating between
-them — so *"the noise is in the latent state"* may stop being true of the fitted model even though
-the architecture flag says it is.
-Options: **(a)** constant `Sigma` — freeze `Wd = 0`, leave `bd` free, so the latent is the **only**
-state-dependent noise source; **(b)** keep the state-dependent head; **(c)** run both.
-**Recommendation: (a) first.** It is closest to their design while still giving a likelihood, and
-it makes the latent path's contribution unambiguous. (b) then becomes a second rung with a clean
-interpretation rather than a confound.
+**Q1 — the emission head. ✅ RESOLVED: removed.** It was a second noise channel competing with the
+latent path, so *"the noise is in the latent state"* could stop being true of the fitted model even
+with the architecture flag set. `LSTMSpec` now takes `emission ∈ (:none, :constant,
+:state_dependent)` and **the experiment uses `:none`** — the source's design, where `z` is the only
+stochasticity and the decoder is deterministic.
 
-**Q2 — `beta`.** At the source's `1e-4` the KL contributes ~0.01 to a loss of order 10, so the
-latent is almost unregularised and can carry arbitrary spread. If the claim is about the latent
-path, `beta` is a model parameter and not a detail. Sweep `{0, 1e-4, 1e-2}`, or something else?
+Consequences, all stated rather than discovered later:
 
-**Q3 — latent dimension relative to `N_Q = 6`.** 4 (under-complete, forces compression), 6
-(matched), or 8? No strong prior here; their 60-for-a-field gives no guidance at this scale.
+- The reconstruction term becomes a plain sum of squares, which is the source's objective.
+- 🔴 **There is no predictive density, so there is no likelihood.** `iwae_nll` refuses for these
+  cells rather than returning a number that looks like an NLL and is not one.
+- **Ensemble scoring is unaffected**: drawing `z` still gives an ensemble, so `crps_ensemble`, the
+  rank histogram with Jolliffe–Primo contrasts and spread–skill all read normally — and those are
+  the metrics `plan.md` §9 makes ladder-wide precisely because they survive this kind of model.
+- `:constant` remains one keyword away if a likelihood is wanted back for a particular comparison.
+- ⚠️ `arch = :lstm` with `emission = :none` is refused at construction: it has no stochasticity at
+  all and cannot produce an ensemble. So **the control C is `:lstm` with `emission = :constant`** —
+  see §8.3's note below.
 
-**Q4 — `h`.** `h = 1`, on the grounds that the recurrence is supposed to carry the memory? Or
-`h = 5` to match M0's regressor exactly so the data budget is like-for-like? Both are cheap.
+**Q2 — `beta`. ⏳ STILL OPEN.** At the source's `1e-4` the KL contributes ~0.01 to a loss of order
+10, so the latent is almost unregularised and can carry arbitrary spread. Now that it is the *only*
+noise channel this matters more, not less. Proposed sweep `{0, 1e-4, 1e-2}`.
 
-**Q5 — `L = 400`, `burn = 150`?** §8.5's argument, for confirmation or correction.
+**Q3 — latent dimension relative to `N_Q = 6`. ⏳ STILL OPEN.** 4 (under-complete, forces
+compression), 6 (matched), or 8?
 
-**Q6 — which record?** Currently the tracking record's `(q*, q)`, the same pairing M0 is fitted to.
-The literal Sørensen setup instead maps a *free-running* LF trajectory to HF, which would use
-`9_no_sgs.jl`'s output and is a different dataset. Worth doing, or out of scope?
+**Q4 — what it was, and the answer. ✅ RESOLVED: `h = 1`.** `h` is the length of the **explicit lag
+window in the regressor** — how many past `(q, q*)` pairs are stacked into `x_t` alongside the
+current `q*`. M0/TO-LRS uses `h = 5`. The question was whether to let the recurrence carry the
+memory (`h = 1`) or hand the model the same explicit window M0 gets (`h = 5`) so the inputs match.
 
+§8.5's measurement answers it: the level's 1/e time is **116–142 steps**. An `h = 5` lag window is
+**five** steps — 0.0125 TU, about 4% of one decay time. It is negligible either way, so the
+recurrence has to do the memory work regardless and `h = 5` buys nothing but 48 extra input
+features. **`h = 1`.**
+
+**Q5 — `L` and `burn`. ✅ RESOLVED: `L = 400`, `burn = 150`**, on §8.5's corrected reasoning — one
+full ringing period, burn past the 1/e crossing on every band. ⚠️ The same argument says the online
+warm-up `nwarm = 100` (0.25 TU) is under the 1/e crossing too; P1 measures it properly.
+
+**Q6 — which record. ✅ RESOLVED: out of scope.** Stay with the tracking record's `(q*, q)`, the
+same pairing M0 is fitted to. The literal Sørensen setup — a free-running LF trajectory mapped to
+HF — is a different dataset and a different question; **our application is the closure**, and the
+tracking record is what a closure is fitted to.
 ### 8.7 Cost, measured
 
 | configuration | params | s/epoch | 300 epochs |
