@@ -10,8 +10,21 @@ cut list. Design and build notes live in `meta_files/handoff_m4_stochastic_lstm.
 only the measurements.
 
 **Status, 2026-09-17.** The architecture, the training code and both deployment drivers are built
-and tested. 🔴 **There are no valid architecture results yet.** A first run was made and its
-conclusions were **retracted** — see §5.1. A corrected run is what §5.2 reports.
+and tested; the experiment in §8 is approved, encoded in the config table and verified by
+construction. 🔴 **Nothing has been fitted since the training loop was repaired, so there are no
+architecture results at all.** The one run that was made had its conclusions **retracted** (§5.1),
+and §5.2 is deliberately empty rather than filled with numbers from a superseded loop.
+
+**To produce §5.2** (~7 minutes, see §4):
+
+```bash
+for i in 1 2 3 4 5 6 7; do
+  RIKFLOW_QOI_CACHE=... julia --project=lib/RikFlow/training \
+    lib/RikFlow/exp_square_HIT/11_train_StochLSTM.jl $i 1
+done
+```
+
+then `analysis/postrun_lstm.jl <i>` for each, and re-run the winning β at all five seeds.
 
 ---
 
@@ -188,31 +201,47 @@ cannot run here at all.**
 The model is tiny: ~10⁴ parameters on 6 QoIs. Training is CPU-bound Julia; no GPU is involved, and
 `11_train_StochLSTM.jl` never touches CUDA.
 
-**Measured on this laptop**, fitting `StochLSTM4` (VRNN, h=1, hidden/latent/encoder 60) on R1's
-tracked QoIs over `train_range = (400, 4000)` — 3599 rows, 19 features, `L = 200`, `burn = 50`:
+**Measured on this laptop**, on R1's tracked QoIs over `train_range = (400, 4000)` — 3599 rows,
+19 features. The number moved a long way during the build, and the steps are worth recording
+because three of them are lessons rather than tuning:
 
-| epochs | wall |
-|---|---|
-| 10 | 186 s |
-| 110 | 528 s |
+| state | s/epoch | note |
+|---|---|---|
+| as first written, 60/60/60, `L = 200` | 3.42 | one `L`-step loop per segment |
+| + segments batched through one recurrence | 2.05 | `B` GEMVs become one GEMM (V50) |
+| + right-sized net, 16/4/no encoder | 0.58 | 43 128 → 2 976 parameters (§8.1) |
+| **+ O(L) reverse pass, at `L = 400`** | **0.178** | the per-step slice was O(L²) — see below |
 
-⇒ **3.42 s per epoch marginal**, with ~152 s of fixed overhead per process (Julia start, Zygote
-compilation, reading the QoI cache). From which:
+🔴 **The last step was the big one and it was a bug, not a tuning knob.** `GX[:, t, :]` inside the
+recurrence looks free, but Zygote's pullback for a slice allocates a *parent-sized* zero array and
+scatters into it — so an `L`-step loop did `L` allocations of `4H × L × B`, making the reverse pass
+quadratic in `L` while the forward pass was linear. One gradient step allocated 172 MiB for a
+forward pass allocating 3.8 MiB. Slicing once behind an adjoint that accumulates into a single
+buffer restored O(L): 246 ms → 51 ms, and reverse/forward from 26× down to 5.8×.
+
+Note the last row is at **`L = 400`**, double the sequence length of the rows above it — so per
+unit of sequence the improvement is about **13×**.
+
+### The approved configuration, timed
+
+| run | `arch` | `emission` | params | s/epoch | 300 epochs |
+|---|---|---|---|---|---|
+| A | `:storn` | `:none` | 2 952 | 0.178 | **0.9 min** |
+| B | `:vrnn` | `:none` | 2 976 | 0.185 | **0.9 min** |
+| C | `:lstm` | `:constant` | 2 696 | 0.245 | **1.2 min** |
 
 | unit of work | cost |
 |---|---|
-| one fit, 300 epochs | **~20 min** |
-| one cell, 5 seeds (S6), sequential in one process | ~88 min |
-| **4 architectures × 5 seeds × 300 epochs, 4 processes in parallel** | **~90 min** |
-| the full 11-row config table × 5 seeds, 4 at a time | ~4 h |
+| the six-point β scan at one seed, plus the control | **~7 min** |
+| one cell at all 5 seeds (S6) | ~5 min |
+| the full 10-row table × 5 seeds | **~50 min** |
 
-🔑 **So the whole configured offline protocol is an overnight job at worst and a lunch break at
-best.** There is no reason to run the offline phase on a cluster, and no reason to economise on
-seeds or epochs — §5.1 is what economising cost.
+🔑 **The offline programme is an experimentation loop, not a batch job.** There is no reason to run
+it on a cluster and no reason to economise on seeds or epochs — §5.1 is what economising cost.
 
-⚠️ One practical note: run the parallel processes with `OPENBLAS_NUM_THREADS=1`. Four Julia
-processes each spawning a full BLAS pool contend badly enough to be slower than running them
-sequentially.
+⚠️ If several fits are ever run in parallel, set `OPENBLAS_NUM_THREADS=1`: Julia processes each
+spawning a full BLAS pool contend badly enough to be slower than running sequentially. At these
+speeds parallelism is not needed.
 
 ### Online — not feasible locally
 
@@ -496,17 +525,16 @@ HF — is a different dataset and a different question; **our application is the
 tracking record is what a closure is fitted to.
 ### 8.7 Cost, measured
 
-| configuration | params | s/epoch | 300 epochs |
-|---|---|---|---|
-| source dims (60/60/60) | 43 128 | 2.05 | 10.2 min |
-| 32 / 8 / no encoder | 8 464 | 1.26 | 6.3 min |
-| **16 / 4 / no encoder** | **2 976** | **0.58** | **2.9 min** |
-| 16 / 4 / no encoder, `:storn` | 2 952 | 0.63 | 3.1 min |
+See §4 for the full table and how it got there. At the approved settings —
+hidden 16 / latent 4 / no encoder, `L = 400`, `burn = 150` — a 300-epoch fit is **0.9 min**
+(`:storn`, `:vrnn`) or **1.2 min** (the `:constant` control), so:
 
-Runs A + B + C at 3 seeds is therefore **~30 minutes** — an experimentation loop rather than an
-overnight job.
+| unit of work | cost |
+|---|---|
+| the β scan, 6 points at one seed + the control | **~7 min** |
+| the winner re-run at all 5 seeds | ~5 min |
 
-⚠️ Note the shape of that speedup: 14x fewer parameters buys only 3.5x less time, because the cost
-is dominated by Zygote's per-timestep overhead over the `L`-step recurrence rather than by
-arithmetic. Raising `L` to 400 will therefore cost closer to linearly in `L` than the flop count
-suggests. If this loop ever needs to be faster, the thing to fix is the AD overhead, not the model.
+⚠️ Sizing the network down bought 3.5×, not the 14× the parameter count suggests — the cost was
+dominated by Zygote's per-timestep overhead, not arithmetic. The remaining 3.3× came from fixing an
+**O(L²) reverse pass**, which is a different kind of problem entirely and is the reason `L = 400`
+is now affordable at all. Both are in §4.
