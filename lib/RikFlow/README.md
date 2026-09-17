@@ -46,13 +46,21 @@ back to physical space.
 The tracking run (`:TRACK_REF`) is the training-data generator: the `dQ` it had to take in order to
 stay on the reference is the target every closure is fitted to.
 
-The two closures actually deployed here are:
+The closures actually deployed here are:
 
 - **M0 / TO-LRS** — a linear regression on a lagged history of `q` and `q*`, plus a multivariate
   Gaussian residual. Paper 2's model. Fitted by `5_train_LinReg.jl`, deployed by
   `RikFlow.LinReg`.
 - **DDN** — paper 1's data-driven noise model: one multivariate Gaussian fitted to `dQ` and
   sampled i.i.d. every step, state-independent by construction. `RikFlow.MVG_sampler`.
+- **M4 / stochastic LSTM** — an LSTM with a latent path drawn upstream of the recurrence
+  (STORN / VRNN, after Barthel Sørensen et al.), with a Gaussian emission head. Fitted by
+  `11_train_StochLSTM.jl` under the Lux extension, deployed by `RikFlow.StochLSTM`.
+  ⚠️ **Off-grid and exploratory** (`plan.md` §3): it enters no attribution difference, is never
+  the confirmatory cell, and is first on the cut list. 🔴 The source applies this architecture as a
+  **post-run corrector, outside the solver**; `analysis/postrun_lstm.jl` is that setting and
+  `12_online_StochLSTM.jl` is the in-solver one, and **M4 and M0 must be compared in the same
+  mode**.
 
 Baselines: Smagorinsky (`8_smag_online.jl`) and no model at all (`9_no_sgs.jl`).
 
@@ -64,8 +72,10 @@ Baselines: Smagorinsky (`8_smag_online.jl`) and no model at all (`9_no_sgs.jl`).
 |---|---|
 | `src/` | the package. Solver bridge, TO machinery, closure types, and the stdlib-only `ts_*` layer |
 | `src/HIT_setups/` | the three HIT drivers as library functions: `create_ref_data`, `spinnup`, `track_ref`, `online_sgs`, plus disk preflight (`storage.jl`) |
-| `ext/` | `RikFlowMakieExt.jl`, the weak-dependency plotting extension |
-| `exp_square_HIT/` | the HIT experiment: numbered driver scripts `1_…` … `9_…`, probes, and outputs |
+| `ext/` | `RikFlowMakieExt.jl` (plotting) and `RikFlowLuxExt.jl` (M4's training), both weak-dependency extensions |
+| `training/` | the environment and test suite for M4's fit — the only place Lux is loaded |
+| `attic/` | code kept for reference and **not loaded**: currently the retired `ANN.jl` |
+| `exp_square_HIT/` | the HIT experiment: numbered driver scripts `1_…` … `12_…`, probes, and outputs |
 | `exp_square_HIT/batch_scripts/` | SLURM submission scripts (Snellius), one per stage |
 | `exp_square_HIT/tools/` | D6 driver and pre-flight, acceptance tests, the merge differential test, and `RUNBOOK.md` |
 | `analysis/` | the measurement layer: extraction, offline fits, scoring, plots, and `results.md` |
@@ -75,13 +85,20 @@ Baselines: Smagorinsky (`8_smag_online.jl`) and no model at all (`9_no_sgs.jl`).
 Generated data is gitignored: `analysis/figures`, `analysis/data`, and the per-experiment
 `output/` trees.
 
-Three separate Julia environments, and the separation is deliberate:
+Four separate Julia environments, and the separation is deliberate:
 
 ```bash
 julia --project                  # lib/RikFlow — drivers, needs CUDA + IncompressibleNavierStokes
 julia --project=analysis         # analysis drivers — plotting, no CUDA/INS (ts_* is included by path)
 julia --project=test             # the test suite — stdlib + Distributions/PDMats only
+julia --project=training         # M4's fit — the ONLY environment with Lux/Optimisers/Zygote
 ```
+
+🔑 **M4's split is the same principle one level down.** Training needs Lux and lives in
+`ext/RikFlowLuxExt.jl`; what runs *inside the solver* is `lstm_step!` in `src/ts_lstm.jl`, on plain
+arrays, with no Lux anywhere. That is what lets the stdlib-only suite test the deployed path, keeps
+the ~900 M0/M1/M2 jobs from paying Lux load time, and makes the per-step cost controllable — see
+`tools/m4_cost_probe.jl`.
 
 ---
 
@@ -101,6 +118,9 @@ Every stage below is 64³ LF / 512³ HF, `Re = 2000`, Float64, `LMWray3`, unless
 | 6 | `7_online_DDN.jl` | `run_online.sh ddn` | `output/TO_DDN/DDN_data_online_tsim100.0_replica<i>.jld2` |
 | 7 | `8_smag_online.jl` | `run_online.sh smag` | `output/smag/data_smag_0.07_tsim100.0.jld2` |
 | 8 | `9_no_sgs.jl` | `run_online.sh nomodel` | `output/no_model/data_no_sgs_tsim100.0.jld2` |
+| 9 | `10_setup_lstm.jl` | *(none — instant, no GPU)* | `output/TO_LSTM/inputs_lstm.jld2` |
+| 10 | `11_train_StochLSTM.jl <i> [seed]` | `run_train_lstm.sh <i> [seed]` | `output/TO_LSTM/StochLSTM<i>/StochLSTM_seed<s>.jld2`, `seed_summary.jld2` |
+| 11 | `12_online_StochLSTM.jl <i> [replica]` | `run_online.sh lstm <i>` | `output/TO_LSTM/StochLSTM<i>/data_online_tsim100.0_replica<r>.jld2` |
 
 `submit_lrs.sh <i> [array_spec]` chains stages 4 and 5 on the login node with
 `--dependency=afterok`, so the ensemble array never starts on a failed fit. Use it rather than
@@ -255,11 +275,35 @@ findings and blockers, §8 test coverage.
 
 ---
 
+**M4 — the stochastic LSTM.** Two drivers, two different experiments, and they are not
+interchangeable:
+
+| driver | environment | is |
+|---|---|---|
+| `analysis/postrun_lstm.jl <i>` | `--project=training` | **D-post** — the model as a post-run corrector, teacher-forced on the recorded history. The faithful Sørensen setting: no feedback, no exposure bias, no solver time. Reports ensemble CRPS, the rank histogram, the IWAE bound and the posterior-collapse diagnostic |
+| `exp_square_HIT/12_online_StochLSTM.jl <i>` | `--project` | **D-online** — the model as a closure, inside `to_sgs_term`. What this project needs and what the source never did |
+
+🔴 **M4 and M0 must be compared in the same mode.** An M4 scored as a post-processor against an M0
+scored in-solver is not a comparison — it is the confound `plan.md` §22 item 9 exists to name.
+
+🔴 **M4 has no closed-form one-step predictive density**, so exact NLL, closed-form CRPS and
+`companion`/ρ(C̃) are undefined for it. Held-out likelihood becomes an **IWAE bound**, which is a
+*lower* bound on `log p` and therefore **never shares a column with M0's exact NLL**. The
+ensemble rank histogram is the metric that reads the same on both, which is exactly why §9 makes it
+the ladder-wide calibration axis.
+
+---
+
 ## 5. Tests
 
 ```bash
-julia --startup-file=no --project=test test/runtests.jl
+julia --startup-file=no --project=test test/runtests.jl              # the ts_* layer, stdlib only
+julia --startup-file=no --project=training training/runtests_lux.jl  # M4's training side
 ```
+
+The second suite is separate because it needs Lux. A failure there means M4 cannot be *trained*; a
+failure in the first means M4 cannot be *run*, which is the more serious of the two — and it is the
+reason the deployed `lstm_step!` was kept stdlib rather than written against Lux.
 
 Run it directly, **not** through `Pkg.test`. The suite deliberately has no dependency on RikFlow:
 the `ts_*.jl` files are stdlib-only and the tests `include` them by path, so the whole suite runs
@@ -283,6 +327,8 @@ Two caveats, both real as of this writing:
 - **The registry only covers V0–V28.** V29–V38 are used by the tests but have no row in
   `plan.md` §14. V29/V30 appear in `results.md` §8 as statuses; V31, V34–V37 appear only in prose
   in the meta files; V32, V33 and V38 appear nowhere outside the test files themselves.
+  ⚠️ **V39–V44 (M4) continue that unregistered sequence** and need rows adding when the gap is
+  closed.
 - **V23 and V25 are overloaded.** `plan.md` §14 numbers them for other things (chunked QR in
   `solve_C`; `load_qois` equivalence). The suite uses them for the Gram spectrum and the
   rank/`pinv` check — which are **metric** numbers #23 and #25 from `meta_files/metrics.md` §3.
@@ -310,6 +356,12 @@ Roughly, what the suite covers:
 | V32 | D6's validation verdict | `test_d6_score.jl` |
 | V33, V34 | OU forcer type-genericity; setup fields stay GPU-kernel-safe | `test_ou.jl` |
 | V38 | both samplers replay their warm-up before touching the RNG | `test_sources.jl` |
+| V39 | M4's BPTT segmentation: coverage, burn-in mask, never crossing a record discontinuity | `test_lstm.jl` |
+| V40 | `lstm_step!` against an independent reference forward, zero allocation per step, and the online closure against a batch pass | `test_lstm.jl`, `test_lstm_online.jl` |
+| V41 | the **training** forward equals the **deployed** forward, across all four architectures and both encoder forms, including the covariance reparametrisation | `training/runtests_lux.jl` |
+| V42 | M4's warm-up draws no randomness — V38 extended to a closure that cannot satisfy it by returning early | `test_lstm.jl`, `test_lstm_online.jl` |
+| V43 | the likelihood arithmetic: Gaussian log-density, both KL forms, IWAE ≥ ELBO, architecture nesting | `test_lstm.jl` |
+| V44 | M4's replayed warm-up is bit-identical and unconverted; the turbulence gate; the deterministic mode | `test_lstm_online.jl` |
 | G1 | reproduction of paper 2's archived fits (`plan.md` §12) | `test_g1.jl` |
 
 Several items are conditional: the `G1` items skip unless `RIKFLOW_ARCHIVE` /

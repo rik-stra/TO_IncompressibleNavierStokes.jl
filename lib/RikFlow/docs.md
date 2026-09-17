@@ -199,9 +199,15 @@ because JLD2 stores the record as one compound dataset.
 
 ## 2. Closure types (`src/time_series_methods.jl`)
 
-All five implement `get_next_item_timeseries`, dispatched on the type; the two that use the
-current predictor take it as a second argument. `to_sgs_term`'s `:ONLINE` branch decides which
-call to make by type.
+All six implement `get_next_item_timeseries`, dispatched on the type; the three that use the
+current predictor take it as a second argument.
+
+🔑 **Which ones those are is declared by the `needs_qstar` trait, next to each closure.** It used
+to be two literal type lists inside `to_sgs_term`, so adding a closure meant editing a branch
+buried in the SGS assembly — the same shape of hazard as the live `model_index = 2` of
+`claude_memory.md` #55. 🔴 There is deliberately **no `::Any` fallback**: an unregistered closure
+raises `MethodError: no method matching needs_qstar(::Foo)`, naming exactly what is missing,
+instead of silently taking the no-predictor branch and failing later about something else.
 
 | type | signature | state | what it returns |
 |---|---|---|---|
@@ -210,6 +216,7 @@ call to make by type.
 | `Resampler` | `(m)` | RNG | a uniformly drawn column of a stored `dQ` set |
 | `ANN` | `(m, q_star)` | history buffer, counter | a Lux network's prediction. See the note below |
 | `LinReg` | `(m, q_star)` | history buffer, counter, RNG | linear regression on the lagged history plus a Gaussian residual. **M0 / TO-LRS** |
+| `StochLSTM` | `(m, q_star)` | history buffer, **LSTM `(h, c)`**, counter, RNG | an LSTM with a latent path drawn upstream of the recurrence, plus a state-dependent Gaussian emission head. **M4** |
 
 **How they differ, in one line each.**
 
@@ -243,15 +250,43 @@ knowing:
 - The gate lives **only** in the `LinReg`/`ANN` path. `MVG_sampler` never receives `q_star`, so the
   DDN has no laminar-start gate at all, and the two closures are not treated alike.
 
-⚠️ `ANN` is currently not constructible: `src/ANN.jl` defines `load_ANN` but is **not** `include`d
-by `src/RikFlow.jl`, and the Lux dependencies are commented out at the top of the module. Treat the
-`ANN` branch as dormant.
+⚠️ `ANN` is not constructible and never was: it calls `load_ANN`, which lived in `src/ANN.jl`,
+which `src/RikFlow.jl` never `include`d. The file has been **moved to `attic/`** (its `dev` was
+undefined, it had zero call sites, and its `in_size = n_qois*(1+hist_len)` cannot express
+`:q_star_q`). The `ANN` type is kept only so the trait table above stays honest about what once
+existed; **`StochLSTM` is its replacement.**
+
+### `StochLSTM` — M4
+
+The one closure with **recurrent** state, and that changes the warm-up.
+
+`LinReg` and `MVG_sampler` both replay `spinnup_data` before predicting, and their replays do at
+most two jobs: return the recorded `dQ` so the solver follows the recorded trajectory, and (for
+`LinReg`) fill the lag window. 🔑 **M4's replay does a third — it drives the recurrence, so
+`(h, c)` are charged before the first prediction.** The cell is stepped on the recorded inputs,
+teacher-forced, and its output discarded.
+
+🔴 **The replay still draws nothing from the RNG.** That is V38's invariant — a member seed has to
+mean the same thing across closures and across warm-up lengths — and M4 cannot satisfy it by
+returning early the way the other two do. It satisfies it instead by using the posterior mean
+(`sample_latent = false`). Replayed columns are returned **unconverted**, for D6's bit-identity
+gate.
+
+⚠️ `nwarm` therefore has to cover the recurrence's memory, not just the lag window. It is inherited
+at 100 from the linear cells, where it was sized from the measured ACF; **M4's requirement is its
+own and has not been measured.**
+
+Split across three files, deliberately: `ts_lstm.jl` (the cell, stdlib), `ts_lstm_online.jl` (this
+closure, stdlib), `ts_lstm_io.jl` (JLD2). Training is `ext/RikFlowLuxExt.jl` and is the only part
+that needs Lux — the deployed cell is hand-written on plain arrays, which is what keeps it inside
+the S4 budget (43.9 µs/step of a 278 µs allowance, `tools/m4_cost_probe.jl`) and testable by the
+stdlib-only suite.
 
 ---
 
 ## 3. The `ts_*` layer
 
-Seven files in `src/`, `include`d by `RikFlow.jl` but written to be usable on their own:
+Nine files in `src/`, `include`d by `RikFlow.jl` but written to be usable on their own:
 
 | file | what it holds |
 |---|---|
@@ -262,6 +297,11 @@ Seven files in `src/`, `include`d by `RikFlow.jl` but written to be usable on th
 | `ts_score.jl` | every offline metric: KS, Δρ, spread–skill, rank histograms, CRPS, NLL, clamp census |
 | `ts_rollout.jl` | free-running (uncoupled) rollout of a fitted model, plus `closed_loop_matrix` / `spectral_radius` |
 | `ts_spectrum.jl` | fit-time mechanism diagnostics: Gram spectrum, coefficient blocks, companion, starred gain |
+| `ts_lstm.jl` | M4's cell: `LSTMSpec`, `LSTMWeights`, the in-place `lstm_step!`, BPTT segmentation, and the likelihood arithmetic (Gaussian log-density, both KL forms, the IWAE bound) |
+| `ts_lstm_online.jl` | `StochLSTM`, M4 as `to_sgs_term` sees it |
+
+⚠️ `ts_lstm_io.jl` is a tenth M4 file and is **not** part of this layer: it needs JLD2, which is
+not stdlib, which is exactly why save/load was kept out of the two above.
 
 ### It is deliberately stdlib-only
 
@@ -388,6 +428,16 @@ environment override.
 | `RIKFLOW_DATASET` | `analysis/score_m0_ddn.jl`, `analysis/plot_paper4.jl` | `archive` (default) or `new`; selects which dataset is scored and which output file is written |
 | `RIKFLOW_NEW_REFERENCE` | `tools/check_ref_401.jl` | path to a regenerated reference to check; empty by default |
 | `HF_REF_QOIS` | `analysis/plot_hf_new_vs_archive.jl` | override for the archive QoI source |
+| `RIKFLOW_QOI_CACHE` | `11_train_StochLSTM.jl`, `analysis/postrun_lstm.jl` | an extracted QoI cache to read instead of the 2.7 GB tracking record. Preferred when present |
+
+### M4 — the stochastic LSTM
+
+| variable | read by | default |
+|---|---|---|
+| `RIKFLOW_M4_EPOCHS` | `11_train_StochLSTM.jl` | the configuration's `epochs`. ⚠️ A **smoke-test override** — it warns when it fires, and it is not a way to run the experiment |
+| `RIKFLOW_M4_NWARM` | `12_online_StochLSTM.jl` | `100`, inherited from the linear cells. ⚠️ M4's warm-up also has to charge the recurrence, so its requirement is its own and has not been measured |
+| `RIKFLOW_M4_MEMBERS` | `analysis/postrun_lstm.jl` | `50` ensemble members for CRPS and the rank histogram |
+| `RIKFLOW_M4_IWAE_K` | `analysis/postrun_lstm.jl` | `64` importance samples for the IWAE bound |
 
 ### Gates and run control
 

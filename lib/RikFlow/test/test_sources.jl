@@ -165,6 +165,12 @@ end
     #   analysis/ou_replay.jl -- IncompressibleNavierStokes, genuinely needed for its CPU mini-solve.
     #     `analysis/Project.toml` excludes INS on purpose, so this one script must run under
     #     `lib/RikFlow`'s project. Deliberate, and recorded here so it is not "fixed".
+    #   analysis/postrun_lstm.jl -- Lux, and the SECOND deliberate exception of ou_replay.jl's
+    #     shape. M4's IWAE bound lives in `RikFlowLuxExt`, which is triggered by Lux + Optimisers +
+    #     Zygote together, so the driver must load all three and must run under
+    #     `lib/RikFlow/training`. Its own header says so. 🔴 Removing this `using` does not "fix"
+    #     anything: it silently leaves the extension dormant and the likelihood unreported, which
+    #     is exactly what happened the first time the driver was run.
     sep = Base.Filesystem.path_separator
     known = Set(replace.([
         "exp_square_HIT/1_spinnup.jl: using CairoMakie",
@@ -173,6 +179,7 @@ end
         "exp_square_HIT/figs_paper.jl: using CairoMakie",
         "exp_square_HIT/plot_spinnup_output.jl: using CairoMakie",
         "analysis/ou_replay.jl: using IncompressibleNavierStokes",
+        "analysis/postrun_lstm.jl: using Lux",
     ], "/" => sep))
     novel = setdiff(Set(bad), known)
 
