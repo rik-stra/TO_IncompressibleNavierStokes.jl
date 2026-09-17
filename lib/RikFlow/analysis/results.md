@@ -6,10 +6,20 @@
 file is the measurement and they are the prediction.
 
 🔴 **REBASED ON THE NEW DATA, 2026-09-15. Read this before any number below.**
-🆕 **D6 ran 2026-09-16 and §4c is the first paired measurement in this file.** It is the only
-section whose comparisons are not confounded by realisation variance, and it **reverses §3's
-ranking of the two LRS cells**. Where §3 and §4c disagree, §4c is the higher-powered experiment
-(#61) — but see §7 for the validation that has not been run.
+🆕 🔴 **D6 ran 2026-09-16, and §4c is both the first paired measurement in this file and the
+headline result.** It is the only section whose comparisons are not confounded by realisation
+variance. Two things come out of it:
+
+1. **S2′'s Pareto front, measured** — `LinReg1` (λ = 0) and `LinReg7` (λ = 1) are two non-dominated
+   points; the `DDN` is **dominated**. 🔒 Accepted by Rik as the intended result: report the front,
+   do not stabilise LinReg1, keep the DDN ungated.
+2. **It reverses §3's ranking of the two LRS cells.** Where §3 and §4c disagree, §4c is the
+   higher-powered experiment (#61) — §3's free-running marginal KS cannot see calibration and
+   ranked them backwards.
+
+⚠️ Read §4c's skill table together with its stability table: the skill columns are measured on the
+87 ICs LinReg1 survived, the stability column on all 90. And see §7 — the `--array=0` validation
+has still not been run.
 
 
 Every section is now computed on **P2r's rebaselined pipeline** — R1's tracking record, the
@@ -1180,28 +1190,38 @@ ERROR: q has 713 columns, expected nt + 1 = 1301  (run_d6.jl:413)
 
 Run step 712 is **lead 612 = 1.53 TU past the warm-up — inside the scored grid**.
 
-⚠️ **The driver then aborts the whole task, so one divergence costs the rest of the IC.**
-`run_d6.jl:413` raises on the short `q`, and members after the failing one are never attempted:
+⚠️ **The pre-2026-09-16 driver aborted the whole task on a short `q`**, so members after the failing
+one were never attempted — 14 runs lost to 3 divergences, which made the per-IC stability fraction a
+bound rather than a measurement, on the very metric the failure is evidence for. `run_d6.jl` now
+writes the truncated trajectory with `diverged = true` and continues; `score_d6.jl` drops those
+members from the ensemble and counts them.
 
-| IC | completed | diverged | never attempted |
-|---|---|---|---|
-| 170 | 1–6 | **7** (confirmed) | 8–10 |
-| 197 | 1–2 | **3** (inferred, same signature) | 4–10 |
-| 313 | 1–5 | **6** (inferred) | 7–10 |
+✅ **Reran ordinals 67, 81, 141 on the patched driver (2026-09-16). The count is now measured.** The
+three divergences reproduced exactly — same seeds, same ICs — and the 14 previously unattempted
+members all completed:
 
-**Stability, metric #16:**
+| IC | diverged member | stopped at step | lead | past warm-up |
+|---|---|---|---|---|
+| 170 | 7 | 712 | 612 | **1.530 TU** |
+| 197 | 3 | 431 | 331 | **0.828 TU** |
+| 313 | 6 | 738 | 638 | **1.595 TU** |
+
+All three are **inside the scored grid** (longest lead 1086). None is near the end of the window, so
+this is not a slow drift that runs out of room — it is a blow-up at 0.8–1.6 TU of free running.
+
+**Stability, metric #16 — measured, not bounded:**
 
 | | LinReg1 | LinReg7 | DDN |
 |---|---|---|---|
-| diverged members / attempted | **3 / 886 = 0.34%** | 0 / 900 | 0 / 900 |
-| **member stability fraction** | **0.9966** | **1.0000** | **1.0000** |
-| ICs containing a divergence | **≥ 3 of 90** | 0 | 0 |
-| IC stability fraction | **≤ 0.967** (bound) | 1.000 | 1.000 |
+| diverged members / attempted | **3 / 900 = 0.33%** | 0 / 900 | 0 / 900 |
+| **member stability fraction** | **0.9967** | **1.0000** | **1.0000** |
+| ICs containing a divergence | **3 of 90** | 0 | 0 |
+| **IC stability fraction** | **0.9667** | **1.0000** | **1.0000** |
 
-The IC figure is a **bound, not a measurement**: 14 members were never tested, so more of those three
-ICs might have failed. 🔴 **This is a measurement defect as well as a robustness one** — stability
-fraction is metric #16, and the driver currently destroys the data needed to estimate it. It should
-record the member as diverged and continue to the next, not abort the task.
+🔑 **One member in ten, in three ICs — not whole ICs failing.** Each affected IC lost exactly one of
+its ten members and the other nine ran to completion. So divergence is a property of the *member* —
+its sampled noise realisation — rather than of the initial condition, which is what a stochastic
+closure sitting near a stability boundary should look like.
 
 🔑 **`umax` was DECREASING into the blow-up — 5.0 → 3.4 → 2.2.** This is not a velocity CFL runaway.
 The flow was decaying and the *QoI* exploded, which is the signature of the TO correction
@@ -1209,13 +1229,16 @@ over-draining until `src_Q` gets small and `tau = dQ/src_Q` blows up. 🔴 **And
 2nd-highest turbulence-gate rate of all 90 ICs (3.32%)** — the gate was firing there and did not
 prevent it. That is a limit of the gate, not a case it missed.
 
-🔴 **So the skill and calibration tables below are conditional on the ICs LinReg1 survived, which
-flatters LinReg1.** The three ICs are excluded from **all three** closures (`D6_EXCLUDE_ICS`),
-because a paired comparison must run over the intersection of what the closures produced — but for
-LinReg1 that intersection is not a random subset, it is "the ICs where the model did not break".
-Read the skill table with the stability table above it, never on its own. `load_members` refuses a
-ragged ensemble outright — the finite-M correction is a function of M — so nothing was silently
-averaged.
+🔴 **The skill and calibration tables below remain conditional on the ICs LinReg1 survived, which
+flatters LinReg1.** All three closures are scored with the same three ICs excluded
+(`D6_EXCLUDE_ICS`), because a paired comparison must run over the intersection of what they
+produced — but for LinReg1 that intersection is not a random subset, it is "the ICs where the model
+did not break". Read the skill table with the stability table above it, never on its own.
+
+⚠️ The census is computed **before** the exclusion is applied, deliberately: `EXCLUDE_ICS` names
+what is kept out of the *scored* set, while the census describes **the run** — and an excluded IC is
+exactly the kind that diverged. Applying the exclusion first reported "no diverged members" for the
+one closure that had them.
 
 | | LinReg1 | LinReg7 | DDN |
 |---|---|---|---|
@@ -1271,7 +1294,41 @@ inside `LinReg`'s `get_next_item_timeseries`; `MVG_sampler`'s method takes **no 
 276 000 steps. Counterfactually an LRS run in the same states would have zeroed `dQ` on **6436 of
 276 000 forecast steps (2.33%), affecting 115 of 230 runs (50%)**, first trip at a median lead of
 447 steps (1.12 TU), always triggered by `E[16,32]`. So the small-scale comparison is not
-step-for-step apples-to-apples. The 2.33% bounds it; only a gated DDN re-run would separate the two.
+step-for-step apples-to-apples. The 2.33% bounds it. ✅ **Decision (Rik, 2026-09-16): keep the DDN as it is.** It is paper 1's published model and the gate is not part of it; a gated DDN would be a different model, not a fairer measurement of this one. The census is reported alongside the deficit so the bound is always visible, and the DDN's position is unchanged either way — it is dominated by LinReg7 on stability *and* skill *and* calibration, so no correction of this size moves it onto the front.
+
+### ✅ The S2′ Pareto front, which is what D6 was for (Rik, 2026-09-16)
+
+**This is the intended result, not a defect to be engineered away.** LinReg1 is not "unstable and
+therefore disqualified" and LinReg7 is not "stable and therefore better" — they are two points on
+the stability–accuracy front, and the front is the claim (`claude_memory.md` #17, S2′).
+
+| | IC stability | mean skill | in-band (S7) | on the front? |
+|---|---|---|---|---|
+| **LinReg1** (λ = 0) | 0.9667 | **0.5521** | **23/30** | ✅ |
+| **LinReg7** (λ = 1) | **1.0000** | 0.5666 | 2/30 | ✅ |
+| **DDN** | **1.0000** | 0.9284 | 3/30 | ❌ **dominated** |
+
+🔑 **The DDN is not on the front.** LinReg7 matches its perfect stability and beats it on skill by a
+factor 1.64 and on calibration 2 cells to 3 — so no trade-off buys the DDN anything, on this testbed.
+That is the strongest form the negative-control result can take: not "worse on average" but
+*dominated*.
+
+🔑 **The front has exactly two points, and the trade is one-dimensional.** LinReg1 beats LinReg7 on
+**both** accuracy (0.5521 against 0.5666) and calibration (23 against 2 of 30); LinReg7 beats
+LinReg1 on **stability alone** (1.0000 against 0.9667). So on this testbed **λ buys stability and
+pays for it in both accuracy and calibration** — and the calibration price is far the larger, a
+factor 11 in cells inside S7's band against a 2.6% difference in skill.
+
+⚠️ **The skill and calibration columns are measured on the 87 ICs LinReg1 survived**, so the front's
+accuracy axis is read in LinReg1's favour by construction. The stability column is measured on all
+90. Both are correct; they are not measured on the same set, and the table says so.
+
+🔴 **The obvious extension is one more front point.** Both cells on the front have ρ(C̃) > 1
+(2.6888 and, at λ = 1, still above 1 — ρ crosses 1 between λ = 1 and 10, #63). `LinReg8` (λ = 10) is
+the **first contractive cell**, ρ = 0.9992, and is fitted and on disk but has never been run through
+D6. It would say whether contractivity buys anything past λ = 1 or merely costs more accuracy — i.e.
+whether the front continues or stops.
+
 
 ### Where the LRS does not win
 
@@ -1389,9 +1446,9 @@ whose oracle is R2's own LinReg1 replica 1, before these numbers are quoted anyw
     (#63) was a null on the wrong statistic. Any cell selection made on marginal KS must be redone
     on D6 before it enters the paper.
     🔴 **RESOLVED 2026-09-16: they diverged** (`slurm-26795092_67.out`). So the finding is **S2′'s
-    stability–accuracy Pareto front, not a clean win.** LinReg1 is more skilful and better
-    calibrated *on the ICs it survives*, and it is the only cell that breaks: member stability
-    fraction **0.9966 against 1.0000** for LinReg7 and the DDN, ≥3 of 90 ICs affected. Since the
+    stability–accuracy Pareto front, not a clean win — ✅ **and that is the intended result** (Rik,
+    2026-09-16), not a defect to engineer away.** LinReg1 is more skilful and better
+    fraction **0.9967 against 1.0000**, IC stability **0.9667 against 1.0000**, 3 of 90 ICs. Since the
     excluded ICs are exactly the ones LinReg1 broke on, the skill table is conditioned in LinReg1's
     favour and must never be quoted without the stability numbers beside it.
 
@@ -1400,7 +1457,7 @@ whose oracle is R2's own LinReg1 replica 1, before these numbers are quoted anyw
     true and the only one saturating inside the grid. ⚠️ Part of the gap is structural rather than
     the noise model — `MVG_sampler` cannot apply `TURBULENCE_GATE` (its method takes no `q_star`),
     and an LRS run would have gated 2.33% of steps in 50% of runs. ⇒ Report the DDN's small-scale
-    deficit with that census attached, or re-run a gated DDN; do not quote the raw gap alone.
+    deficit with that census attached. ✅ **Decision (Rik, 2026-09-16): the DDN stays as published** — a gated DDN would be a different model. The conclusion is unaffected: LinReg7 matches the DDN's perfect stability and beats it on skill (1.64×) and calibration, so the DDN is **dominated** and is not on the front at all.
 
 
 ## 6. Verdict on `plan.md` §9's branch
@@ -1410,6 +1467,14 @@ L2 demotes to confirmatory) or ∩-shaped (check the clamp census and tracking-n
 first).
 
 **It is U-shaped in four of six QoIs and biased in the other two — read against the correct null,
+
+🆕 **D6 corroborates this online, on the other regime.** §9's branch is an *offline* (regime A)
+question, and §4c answers the matching online one: `LinReg1`'s spread–skill sits inside S7's band in
+**23 of 30** (band, lead) cells with a median ratio of 0.974, so the λ = 0 cell is well calibrated
+under free running too. `LinReg7` (λ = 1) reads **2 of 30**, median 0.600 — strongly under-dispersed.
+So ridge does not repair the dispersion defect L2 was proposed for; it makes it worse while buying
+stability. That is a point *for* L2, on the axis L2 was proposed for, and it is now measured in both
+regimes rather than one.
 with the two ∩-candidates ruled out.**
 
 - The four smaller-scale bands are under-dispersed: held-out residual 14–18 % wider than the fitted
@@ -1435,10 +1500,11 @@ is band-selective, and the paper can say which mechanism each band needs.
 | **DDN in regime C** | ✅ **CLOSED.** R2 ran the DDN online, 5 × 100 TU, and §3 scores it. The archive never had these runs; these are new measurements, not a reproduction. |
 | **λ > 0 offline reproduction** | 🔴 **The parity check is no longer "not run" — it is RUN and it FAILED.** Measured on R1's record 2026-09-15: against the exact ridge minimiser the `RegularizedLeastSquares` ADMM iterate differs by a relative **0.970 at λ = 1e-5, 0.903 at 1e-4, 0.452 at 1e-2**, and its training RMSE is ~0.00714 at every one of those λ — it is iteration-limited, not λ-limited, so a sweep through it is not a sweep in λ. `5_train_LinReg.jl` now solves `:l2` exactly (`ridge_solver = :exact`) and keeps ADMM only for reproducing paper 2 and for `:nuclear`. G1's λ = 0.01 *coefficient* acceptance against the archive is still not run and now needs the `:admm` path explicitly. λ = 0 is reproduced for all three available configurations, and G1's **online** acceptance passes for all five (§3). |
 | **The h and λ sweep on the new system** | 🔴 Only h = 5 exists rebaselined (λ ∈ {0, 1e-5, 1e-4}). h ∈ {10, 40} and λ = 0.01 have never been run post-merge, so §3's archive subsection is the only place a sweep can be read — on the old system. |
+| **A third point on the front** | ⚠️ Both front cells have ρ(C̃) > 1. `LinReg8` (λ = 10, ρ = 0.9992, the first contractive cell) is fitted and on disk but has never been through D6. Running it would say whether contractivity buys anything past λ = 1 or only costs accuracy — i.e. whether the front continues or stops. One `sbatch`, same IC packages. |
 | **Which `T_int` estimator is right** | ⚠️ The Sokal-window estimator here gives 0.25–0.54 TU on the level; `report_marginals` gives 0.94–1.08 TU on the same record (#58). A factor ~2, and D6's grid is sized on the larger one. |
 | **D6's validation** | 🔴 **NOT RUN.** All three run directories hold 0 `d6_valid_*` files — the `--array=0` task was never submitted. `compare_validation` checks the whole D6 path against a trajectory produced by different code years earlier, and it costs one task. It belongs to LinReg1, whose oracle is R2's own LinReg1 replica 1. §4c's numbers are unvalidated until it runs. |
-| **LinReg1 diverges on ~0.3% of members** | 🔴 **CONFIRMED 2026-09-16**, not infrastructure: `Unreasonable large QoI at n = 712` then NaNs (`slurm-26795092_67.out`), at lead 612 = 1.53 TU, inside the scored grid. 3 of 886 attempted members; LinReg7 and DDN 0 of 900. ⚠️ `run_d6.jl:413` aborts the whole task on one bad member, so 14 more were never attempted and the per-IC stability fraction is a bound (≤0.967), not a measurement. **Fix the driver to record and continue before re-running.** ⚠️ The gate does not prevent it — `k` = 170 has the 2nd-highest gate rate of 90. |
-| **A gated DDN** | ⚠️ `MVG_sampler` cannot apply `TURBULENCE_GATE`; see §4c. Either report the 2.33% / 50% counterfactual census alongside the DDN's small-scale deficit, or re-run the DDN with a gate. Open decision. |
+| **LinReg1 diverges on 0.33% of members** | 🔴 **MEASURED 2026-09-16** after the patched driver and a rerun of ordinals 67, 81, 141: **3 of 900 members, in 3 of 90 ICs** — member stability 0.9967, IC stability 0.9667, against 1.0000/1.0000 for LinReg7 and the DDN. Blow-ups at leads 612, 331, 638 (0.83–1.60 TU past warm-up), all inside the scored grid, one member per affected IC. `Unreasonable large QoI` then NaNs, with `umax` *decreasing* — the correction over-drains and `tau = dQ/src_Q` explodes, not a CFL runaway. ⚠️ The gate does not prevent it (`k` = 170 has the 2nd-highest gate rate of 90). ✅ **CLOSED (Rik, 2026-09-16): report it as S2′'s Pareto front.** LinReg1 and LinReg7 are the two front points; do not stabilise LinReg1. |
+| **A gated DDN** | ✅ **CLOSED (Rik, 2026-09-16): keep the DDN as published.** `MVG_sampler` cannot apply `TURBULENCE_GATE` and will not be given one — that would be a different model. The 2.33% / 50% counterfactual census is reported beside the small-scale deficit so the bound stays visible. The DDN is dominated by LinReg7 regardless, so it is not on the front. |
 | **#5, #6, #3** | Deferred by `metrics.md` §6. |
 | **Channel, Taylor-Green** | Only the channel tracked QoI cache is present; no channel or TG fits or online runs were scored. |
 

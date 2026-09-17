@@ -198,10 +198,6 @@ function load_members(dir = D6_DIR)
               (parse(Int, m[2]), joinpath(dir, f)))
     end
     isempty(byic) && return nothing
-    for k in EXCLUDE_ICS
-        delete!(byic, k)
-    end
-    isempty(byic) && return nothing
 
     # 🔴 DIVERGED MEMBERS ARE DROPPED FROM THE ENSEMBLE AND COUNTED, NEVER SCORED.
     #
@@ -222,6 +218,15 @@ function load_members(dir = D6_DIR)
         filter!(e -> !(first(e) in bad), entries)
     end
     filter!(p -> !isempty(p.second), byic)
+    isempty(byic) && return nothing
+
+    # 🔴 Applied AFTER the divergence scan, deliberately. `EXCLUDE_ICS` names the ICs kept out of the
+    # *scored* set to hold the closures on a common footing; the census describes **the run**, and an
+    # excluded IC is exactly the kind that diverged. Excluding first would have reported "no diverged
+    # members" for the one closure that had them.
+    for k in EXCLUDE_ICS
+        delete!(byic, k)
+    end
     isempty(byic) && return nothing
 
     ks = sort(collect(keys(byic)))
