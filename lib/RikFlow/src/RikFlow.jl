@@ -298,6 +298,11 @@ include("ts_lstm.jl")
 export LSTMSpec, LSTMWeights, LSTMState, lstm_step!, sample_emission!
 export latent_sampled, latent_to_cell, latent_to_decoder
 export segment_indices, gauss_logpdf, kl_diag_gaussian, kl_to_standard_normal, iwae_bound
+
+# M4 as a deployed closure. Also stdlib-only, and included AFTER time_series_methods.jl so that
+# `needs_qstar` and `get_next_item_timeseries` already exist to take a new method.
+include("ts_lstm_online.jl")
+export StochLSTM
 # ⚠️ `reset!`, `n_input`, `n_output`, `n_cell_input`, `n_encoder_out` and `check_shapes` are
 # deliberately NOT exported: all six are names Lux, NNlib or IncompressibleNavierStokes could
 # plausibly define, and the training environment loads RikFlow and Lux into the same session.

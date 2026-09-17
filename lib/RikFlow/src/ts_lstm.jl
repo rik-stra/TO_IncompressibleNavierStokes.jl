@@ -574,6 +574,64 @@ function kl_to_standard_normal(mu::AbstractVector, sig::AbstractVector)
     return acc
 end
 
+# ---------------------------------------------------------------------------------------------
+# Training entry points -- implemented in ext/RikFlowLuxExt.jl
+# ---------------------------------------------------------------------------------------------
+#
+# Declared here so the extension has something to add methods to, and so that calling one without
+# the extension loaded says what is missing instead of raising a bare MethodError about a name the
+# reader has never seen.
+
+const _LUX_EXT_HINT = """
+RikFlow: this is implemented in the Lux extension, which is not loaded. Run under
+`lib/RikFlow/training` (or any environment with Lux, Optimisers and Zygote) and
+
+    using RikFlow, Lux, Optimisers, Zygote
+
+Training deliberately lives outside the package: the online path is stdlib-only so that the ~900
+M0/M1/M2 jobs, and the verification suite, never pay Lux load time.
+"""
+
+"""
+    init_lstm_params(rng, spec; T = Float32)
+
+Initial training parameters for an M4 model, as a NamedTuple of plain arrays.
+Implemented in the Lux extension.
+"""
+init_lstm_params(args...; kwargs...) = error(_LUX_EXT_HINT)
+
+"""
+    lstm_forward(spec, ps, X, epsz)
+
+Non-mutating, AD-shaped forward pass over a whole segment. The training counterpart of
+[`lstm_step!`](@ref); V41 is the test that the two agree. Implemented in the Lux extension.
+"""
+lstm_forward(args...; kwargs...) = error(_LUX_EXT_HINT)
+
+"""
+    elbo(spec, ps, X, Y, score, epsz; beta)
+
+Negative ELBO on one segment, averaged over its scored columns. Implemented in the Lux extension.
+"""
+elbo(args...; kwargs...) = error(_LUX_EXT_HINT)
+
+"""
+    train_stochlstm(spec, X, Y, steps; kwargs...)
+
+Fit an M4 model. Implemented in the Lux extension.
+"""
+train_stochlstm(args...; kwargs...) = error(_LUX_EXT_HINT)
+
+"""
+    iwae_nll(spec, ps, X, Y, score; K, rng)
+
+Held-out negative log-likelihood, as an IWAE-K bound. Implemented in the Lux extension.
+
+🔴 A **lower** bound on `log p`, so an **upper** bound on the NLL. Not comparable to M0's exact
+NLL and never in the same column as one.
+"""
+iwae_nll(args...; kwargs...) = error(_LUX_EXT_HINT)
+
 """
     iwae_bound(logw)
 

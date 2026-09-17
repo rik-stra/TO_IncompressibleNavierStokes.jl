@@ -23,6 +23,7 @@
     # verification matrix has to be able to reach. Training lives in `ext/RikFlowLuxExt.jl` and is
     # not loaded here.
     include(joinpath(SRC, "ts_lstm.jl"))
+    include(joinpath(SRC, "ts_lstm_online.jl"))
     include(joinpath(SRC, "ts_fit.jl"))
     include(joinpath(SRC, "ts_score.jl"))
     include(joinpath(SRC, "ts_rollout.jl"))

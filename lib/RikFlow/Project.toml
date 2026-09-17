@@ -21,19 +21,29 @@ RegularizedLeastSquares = "1e9c538a-f78c-5de5-8ffb-0b6dbe892d23"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 
 [weakdeps]
+Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 Makie = "ee78f7c6-11fb-53f2-987a-cfe4a2b5a57a"
+Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 
 [sources]
 IncompressibleNavierStokes = {path = "../.."}
 
 [extensions]
 RikFlowMakieExt = ["Makie"]
+# M4's training side. Weak, and triggered by all three together, because the M0/M1/M2 runs are the
+# bulk of ~900 jobs and must not pay Lux load time -- `plan.md` §13 P1.0b. The online path needs
+# none of this: it is `lstm_step!` in src/ts_lstm.jl, on plain arrays.
+RikFlowLuxExt = ["Lux", "Optimisers", "Zygote"]
 
 [compat]
 Adapt = "4.3.0"
 Distributions = "=0.25.117"
 LinearAlgebra = "1"
+Lux = "1"
 Makie = "0.21, 0.22, 0.23, 0.24"
+Optimisers = "0.4"
 PDMats = "=0.11.32"
 Random = "1.11.0"
 RegularizedLeastSquares = "0.16.7"
+Zygote = "0.7"

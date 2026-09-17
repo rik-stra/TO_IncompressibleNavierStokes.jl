@@ -1,0 +1,198 @@
+# V41 and the extension's own acceptance tests.
+#
+# Run as
+#
+#     julia --startup-file=no --project=lib/RikFlow/training lib/RikFlow/training/runtests_lux.jl
+#
+# 🔑 Separate from `test/runtests.jl` on purpose, and the separation is the same one the whole
+# package is built around: `test/` is stdlib-only so it stays cheap and runs without a GPU, and
+# everything that needs Lux lives here. A failure here means M4 cannot be *trained*; a failure
+# there means M4 cannot be *run*, which is the more serious of the two.
+
+using Test
+using RikFlow
+using Lux, Optimisers, Zygote
+using Random, LinearAlgebra, Statistics
+
+const RF = RikFlow
+
+@testset "M4 Lux extension" begin
+
+    @testset "the extension actually loaded" begin
+        # 🔴 `hasmethod` is NOT the check. The fallbacks in ts_lstm.jl are `(args...; kwargs...)`,
+        # so `hasmethod(RF.init_lstm_params, Tuple{Xoshiro, LSTMSpec})` is true whether the
+        # extension loaded or not -- this assertion was written that way first and passed while
+        # every test below it errored on the stub. Ask the module system instead.
+        @test Base.get_extension(RikFlow, :RikFlowLuxExt) !== nothing
+        # and belt-and-braces: the stub errors, so a successful call proves the real method ran
+        @test RF.init_lstm_params(Xoshiro(1),
+                                  RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = 2))) isa
+              NamedTuple
+    end
+
+    mkspec(arch; n_qoi = 3, h = 2, n_hidden = 5, n_latent = 4, n_encoder = 5, uclip = nothing) =
+        RF.LSTMSpec(; hist = RF.HistorySpec(; h, n_qoi), n_hidden, n_latent, n_encoder, arch,
+                    uclip)
+
+    # -----------------------------------------------------------------------------------------
+    # V41 -- the training forward pass and the deployed one are the same model
+    # -----------------------------------------------------------------------------------------
+
+    @testset "V41 lstm_forward == lstm_step! ($arch, n_encoder=$ne)" for
+            arch in (:lstm, :vaernn, :storn, :vrnn), ne in (0, 5)
+
+        spec = mkspec(arch; n_encoder = ne)
+        T = Float32
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+
+        # perturb away from the initialisation, or Wd = 0 and Araw = 0 make the test trivial
+        ps = merge(ps, (; Wd = randn(Xoshiro(11), T, RF.n_output(spec), spec.n_hidden) ./ 5,
+                        bd = randn(Xoshiro(12), T, RF.n_output(spec)) ./ 5,
+                        Araw = randn(Xoshiro(13), T, RF.n_output(spec), RF.n_output(spec)) ./ 5))
+
+        L = 7
+        X = randn(Xoshiro(21), T, RF.n_input(spec), L)
+        epsz = zeros(T, spec.n_latent, L)          # z = mu, i.e. the `sample_latent = false` path
+
+        out = RF.lstm_forward(spec, ps, X, epsz)
+        w = RF.LSTMWeights(ps, spec)
+        @test RF.check_shapes(w, spec)
+
+        st = RF.LSTMState(spec, T)
+        for t in 1:L
+            y, logd, _ = RF.lstm_step!(st, w, spec, view(X, :, t); sample_latent = false)
+
+            # the MEAN must agree exactly -- nothing is reparametrised on this path
+            @test y ≈ out.Y[:, t] rtol = 1e-5
+
+            # the log-scales do NOT agree: training carries a free precision factor and the
+            # deployed form carries a correlation matrix, so `bd` absorbs a per-coordinate
+            # constant. What has to agree is the DENSITY.
+            r = randn(Xoshiro(100 + t), T, RF.n_output(spec))
+            dep = RF.gauss_logpdf(r, logd, w.LR)
+
+            A = ps.Araw .* [i > j ? one(T) : zero(T) for i in 1:RF.n_output(spec),
+                                                         j in 1:RF.n_output(spec)] .+
+                Diagonal(exp.(diag(ps.Araw)))
+            u = out.LOGD[:, t]
+            train = -0.5 * (RF.n_output(spec) * log(2pi) + 2 * sum(u) - 2 * sum(log.(diag(A))) +
+                            sum(abs2, A * (r ./ exp.(u))))
+            @test dep ≈ train rtol = 1e-4
+        end
+    end
+
+    @testset "V41 the covariance conversion produces a genuine correlation matrix" begin
+        spec = mkspec(:vrnn)
+        T = Float32
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        ps = merge(ps, (; Araw = randn(Xoshiro(31), T, RF.n_output(spec), RF.n_output(spec)) ./ 3))
+        w = RF.LSTMWeights(ps, spec)
+        R = w.LR * w.LR'
+        @test all(isapprox.(diag(R), 1; atol = 1e-5))      # unit diagonal
+        @test issymmetric(round.(R; digits = 6))
+        @test isposdef(Symmetric(Float64.(R)))
+    end
+
+    @testset "V41 uclip survives the round trip" begin
+        spec = mkspec(:vrnn; uclip = (-0.3, 0.3))
+        T = Float32
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        ps = merge(ps, (; Wd = randn(Xoshiro(41), T, RF.n_output(spec), spec.n_hidden)))
+        X = randn(Xoshiro(42), T, RF.n_input(spec), 4)
+        out = RF.lstm_forward(spec, ps, X, zeros(T, spec.n_latent, 4))
+        # ⚠️ compare in Float32. `spec.uclip` is Float64 and the clamp happens at T = Float32, and
+        # Float32(0.3) is one ulp ABOVE Float64(0.3) -- so a correctly clamped value fails a
+        # Float64 bound. The clip is doing its job; the naive assertion was wrong.
+        @test all(T(-0.3) .<= out.LOGD .<= T(0.3))
+        @test any(abs.(out.LOGD) .> T(0.29))       # and it is actually binding, not vacuous
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # the objective and the loop
+    # -----------------------------------------------------------------------------------------
+
+    @testset "elbo is finite, and beta scales only the KL" begin
+        spec = mkspec(:vrnn)
+        T = Float32
+        ps = RF.init_lstm_params(Xoshiro(5), spec; T)
+        L = 12
+        X = randn(Xoshiro(51), T, RF.n_input(spec), L)
+        Y = randn(Xoshiro(52), T, RF.n_output(spec), L)
+        epsz = randn(Xoshiro(53), T, spec.n_latent, L)
+
+        l0 = RF.elbo(spec, ps, X, Y, 4:L, epsz; beta = 0.0)
+        l1 = RF.elbo(spec, ps, X, Y, 4:L, epsz; beta = 1.0)
+        l2 = RF.elbo(spec, ps, X, Y, 4:L, epsz; beta = 2.0)
+        @test isfinite(l0) && isfinite(l1)
+        @test l1 > l0                                # the KL is positive
+        @test (l2 - l1) ≈ (l1 - l0) rtol = 1e-4      # and enters linearly in beta
+
+        # :lstm has no latent path, so beta does nothing at all
+        sl = mkspec(:lstm)
+        pl = RF.init_lstm_params(Xoshiro(5), sl; T)
+        @test RF.elbo(sl, pl, X, Y, 4:L, epsz; beta = 0.0) ==
+              RF.elbo(sl, pl, X, Y, 4:L, epsz; beta = 5.0)
+    end
+
+    @testset "gradients flow to every trained block" begin
+        spec = mkspec(:vrnn)
+        T = Float32
+        ps = RF.init_lstm_params(Xoshiro(7), spec; T)
+        L = 10
+        X = randn(Xoshiro(61), T, RF.n_input(spec), L)
+        Y = randn(Xoshiro(62), T, RF.n_output(spec), L)
+        epsz = randn(Xoshiro(63), T, spec.n_latent, L)
+
+        g = Zygote.gradient(p -> RF.elbo(spec, p, X, Y, 3:L, epsz; beta = 1e-4), ps)[1]
+        for k in (:Wx, :Wh, :b, :We, :be, :Bmu, :Bsig, :V1, :V2, :cdec, :Wd, :bd, :Araw)
+            @test getproperty(g, k) !== nothing
+            @test any(!iszero, getproperty(g, k))
+        end
+    end
+
+    @testset "training reduces the loss on a learnable signal" begin
+        # A stream with real temporal structure: an AR(1) the recurrence can actually latch on to.
+        # The assertion is only that the optimiser moves downhill -- this is a smoke test for the
+        # loop, not a claim about M4's skill.
+        T = Float32
+        nq, N = 3, 900
+        rng = Xoshiro(71)
+        q = zeros(Float64, nq, N)
+        for t in 2:N
+            q[:, t] = 0.85 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        spec = mkspec(:storn; n_qoi = nq, h = 1, n_hidden = 8, n_latent = 4, n_encoder = 8)
+        hs = spec.hist
+        X, Yb, steps = RF.build_history(hs, q[:, 1:(N - 1)], q)
+        ps, hist = RF.train_stochlstm(spec, permutedims(X), permutedims(Yb), steps;
+                                      L = 60, burn = 15, epochs = 12, batch = 4, lr = 5e-3,
+                                      seed = 2, verbose = false, T)
+        @test length(hist.train) == 12
+        @test all(isfinite, hist.train)
+        @test mean(hist.train[end-2:end]) < mean(hist.train[1:3])
+    end
+
+    @testset "iwae_nll runs and tightens with K" begin
+        spec = mkspec(:vrnn)
+        T = Float32
+        ps = RF.init_lstm_params(Xoshiro(9), spec; T)
+        L = 8
+        X = randn(Xoshiro(81), T, RF.n_input(spec), L)
+        Y = randn(Xoshiro(82), T, RF.n_output(spec), L) ./ 4
+
+        n1 = RF.iwae_nll(spec, ps, X, Y, 3:L; K = 1, rng = Xoshiro(1))
+        n64 = RF.iwae_nll(spec, ps, X, Y, 3:L; K = 64, rng = Xoshiro(1))
+        @test isfinite(n1) && isfinite(n64)
+        # more samples => a tighter lower bound on log p => a smaller (better) NLL bound
+        @test n64 <= n1
+    end
+
+    @testset "train_stochlstm refuses a record it cannot segment" begin
+        spec = mkspec(:vrnn)
+        X = randn(Xoshiro(91), Float64, RF.n_input(spec), 20)
+        Y = randn(Xoshiro(92), Float64, RF.n_output(spec), 20)
+        @test_throws ErrorException RF.train_stochlstm(spec, X, Y, collect(1:20);
+                                                       L = 200, burn = 150, verbose = false)
+        @test_throws ErrorException RF.train_stochlstm(spec, X, Y, collect(1:19); verbose = false)
+    end
+end
