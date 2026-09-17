@@ -276,4 +276,34 @@ function get_next_item_timeseries(time_series_method::LinReg, q_star)
 end
 
 
+# ---------------------------------------------------------------------------------------------
+# Which closures are handed the current predictor
+# ---------------------------------------------------------------------------------------------
+
+"""
+    needs_qstar(time_series_method)
+
+Whether `to_sgs_term` must compute the current predictor `q*` and pass it on to
+[`get_next_item_timeseries`](@ref).
+
+🔑 **This trait replaces a literal type list that used to sit inside `to_sgs_term`**
+(`typeof(...) in [MVG_sampler, Resampler]` / `[ANN, LinReg]`). Adding a closure meant editing a
+branch buried in the middle of the SGS assembly, which is the same shape of hazard as the live
+`model_index = 2` that once let training and deployment disagree silently (`claude_memory.md` #55).
+Adding a closure is now one line **here**, next to the docstring that says so.
+
+🔴 **There is deliberately no fallback method.** An unregistered closure raises
+`MethodError: no method matching needs_qstar(::Foo)`, which names exactly what is missing. A
+`needs_qstar(::Any) = false` default would instead silently pick the no-predictor branch and fail
+later, deep inside `get_next_item_timeseries`, with a message about the wrong thing.
+"""
+function needs_qstar end
+
+needs_qstar(::Reference_reader) = false
+needs_qstar(::MVG_sampler) = false
+needs_qstar(::Resampler) = false
+needs_qstar(::ANN) = true
+needs_qstar(::LinReg) = true
+
 export get_next_item_timeseries, Reference_reader, MVG_sampler, Resampler, ANN
+export needs_qstar

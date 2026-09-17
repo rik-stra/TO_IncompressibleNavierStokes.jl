@@ -292,6 +292,17 @@ export HistorySpec, build_history, HistoryBuffer, inputvec
 include("ts_models.jl")
 export JointModel, pacf_to_ar, ar_roots, decorrelation_time
 
+# M4's inference core. Stdlib-only on purpose -- training lives in `ext/RikFlowLuxExt.jl` and
+# nothing here loads Lux. See the header of ts_lstm.jl for why the split runs this way round.
+include("ts_lstm.jl")
+export LSTMSpec, LSTMWeights, LSTMState, lstm_step!, sample_emission!
+export latent_sampled, latent_to_cell, latent_to_decoder
+export segment_indices, gauss_logpdf, kl_diag_gaussian, kl_to_standard_normal, iwae_bound
+# ⚠️ `reset!`, `n_input`, `n_output`, `n_cell_input`, `n_encoder_out` and `check_shapes` are
+# deliberately NOT exported: all six are names Lux, NNlib or IncompressibleNavierStokes could
+# plausibly define, and the training environment loads RikFlow and Lux into the same session.
+# Reach them as `RikFlow.n_input(spec)`.
+
 include("ts_fit.jl")
 export fit_ridge, fit_joint
 
@@ -598,13 +609,14 @@ function to_sgs_term(u, setup, to_setup, stepper)
         q_ref = get_next_item_timeseries(to_setup.time_series_method)
         dQ = q_ref-q_star
     elseif to_setup.to_mode == :ONLINE
-        if typeof(to_setup.time_series_method) in [MVG_sampler, Resampler]
-            dQ = get_next_item_timeseries(to_setup.time_series_method)
-        elseif typeof(to_setup.time_series_method) in [ANN, LinReg]
+        # Which closures see `q*` is a property OF THE CLOSURE, declared next to its definition --
+        # see `needs_qstar` in time_series_methods.jl. This used to be two literal type lists here.
+        if needs_qstar(to_setup.time_series_method)
             q_star = rf_arraytype(setup)(compute_QoI(u_hat, w_hat, to_setup,setup))
             dQ = get_next_item_timeseries(to_setup.time_series_method, q_star)
+        else
+            dQ = get_next_item_timeseries(to_setup.time_series_method)
         end
-        
     end
     dQ = Array(dQ)
     to_setup.outputs.dQ[:,stepper.n] = dQ

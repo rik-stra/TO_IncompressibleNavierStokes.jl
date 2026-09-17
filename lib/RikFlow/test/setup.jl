@@ -18,6 +18,11 @@
     include(joinpath(SRC, "ts_scaling.jl"))
     include(joinpath(SRC, "ts_history.jl"))
     include(joinpath(SRC, "ts_models.jl"))
+    # M4's inference core. It is in this list, and not behind a Lux guard, because that is the
+    # entire point of the split: `lstm_step!` is what runs inside the solver, so it is what the
+    # verification matrix has to be able to reach. Training lives in `ext/RikFlowLuxExt.jl` and is
+    # not loaded here.
+    include(joinpath(SRC, "ts_lstm.jl"))
     include(joinpath(SRC, "ts_fit.jl"))
     include(joinpath(SRC, "ts_score.jl"))
     include(joinpath(SRC, "ts_rollout.jl"))
