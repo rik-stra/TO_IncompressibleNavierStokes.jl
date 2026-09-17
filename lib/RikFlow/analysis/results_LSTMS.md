@@ -51,6 +51,11 @@ what makes the architecture deployable at all.
 Hidden 60, latent 60, encoder 60 — the source's. ⚠️ The latent dimension is **not** `N_Q`; an early
 reading assumed it matched the output width and it does not.
 
+🔴 **These are the source's dimensions and we do not propose to use them.** At `h = 1` they give
+43 128 parameters against 21 594 training target values — twice as many parameters as data. Their
+60 units predict a QG *field*; we predict six scalars. **§8 is the sizing argument and the
+architecture actually proposed for testing.**
+
 The input `x_t` is **the same regressor every other cell on the ladder uses** — `build_history`
 with a `HistorySpec`, so `q^{n*}` plus `h` lags of `(q, q*)` plus a bias. M4 introduces no new
 input layout, which is what lets V1/V2 cover it and keeps the data budget comparable. At `h = 1`,
@@ -120,7 +125,7 @@ comparison uses the IWAE bound (§3) and ensemble CRPS.
 |---|---|
 | optimiser | Adam, `lr = 1e-3`, decayed by `0.3` after `patience = 20` epochs without validation improvement, floor `1e-5` |
 | batching | segments, not rows — `batch = 8` segments per step |
-| segments | length `L = 200`, burn-in `burn = 50`, stride `L - burn` |
+| segments | length `L = 200`, burn-in `burn = 50`, stride `L - burn` — ⚠️ **both under review, see §8.5**: `burn = 50` is shorter than the level's 1/e time on every band |
 | epochs | 300 |
 | seeds | 5 per cell (S6: neural cells are fitted with five seeds, spread reported, **median seed deployed**) |
 | precision | Float32 weights; the record is Float64 |
@@ -313,3 +318,152 @@ kill criterion, not a target, and it is not the binding constraint here.
 
 ⚠️ This measures the closure only — not the FFTs, the QoI computation or the host/device round
 trip, all of which are already inside the 1.85 ms.
+
+---
+
+## 8. Proposed experiment — ⚠️ FOR REVIEW, nothing has been run
+
+Written 2026-09-17 for comment **before** any fitting. Every number below is either measured or a
+choice; the choices are collected in §8.6 so they can be argued with individually.
+
+### 8.1 Why the network shrinks
+
+The source's dimensions are hidden 60, latent 60, encoder 60. Carried across unchanged, that is:
+
+| configuration | parameters |
+|---|---|
+| source dims, `h = 1` | **43 128** |
+| source dims, `h = 5` | 57 528 |
+| hidden 60, latent 6, no encoder | 21 672 |
+| **hidden 32, latent 8, no encoder** | **8 464** |
+| **hidden 16, latent 4, no encoder** | **2 976** |
+
+against **21 594 training target values** (3599 rows x 6 QoIs) on the `t in [1,10]` TU window.
+
+🔴 **At the source's dimensions there are twice as many parameters as target values.** Their 60
+units predict a quasi-geostrophic *field* — two channels over an `Ny x Nx` grid. We predict **six
+scalars**. Copying the width across is copying a number, not the architecture.
+
+⚠️ **Consequence for the write-up:** shrinking means we are **not reproducing their model**. We are
+testing their *architectural claim* — that stochasticity injected upstream beats the alternatives —
+at `N_Q = 6`. That is the more meaningful test, but the paper must say which of the two it did.
+
+### 8.2 The proposed architecture
+
+| | |
+|---|---|
+| input | the shared `build_history` regressor, `h = 1` → **19 features** (`q*^n`, `q^{n-1}`, `q*^{n-1}`, bias) |
+| encoder | **none** (`n_encoder = 0`) — the linear encoder `methods_overview.tex` writes, not the repository's dense `tanh` layer |
+| LSTM hidden | **16** (fallback 32) |
+| latent | **4** (fallback 8) |
+| decoder | linear, `V1 h_t + V2 z_t + c` |
+| emission | Gaussian, `Sigma = D R D` — see §8.6 Q1, the choice I am least sure about |
+| parameters | **~2 976** at 16/4, ~8 464 at 32/8 |
+
+### 8.3 Which variants, and why
+
+🔑 **Sørensen et al.'s conclusion is that the noise belongs in the latent state** — the variants
+that beat the others are the ones that feed `z` *into the recurrence*. So the first experiment is
+those two:
+
+| run | `arch` | `z` into cell | `z` into decoder | role |
+|---|---|---|---|---|
+| **A** | `:storn` | ✅ | — | upstream stochasticity, no output skip |
+| **B** | `:vrnn` | ✅ | ✅ | upstream stochasticity + skip |
+| **C** | `:lstm` | — | — | **control** |
+
+⚠️ **I would keep C even though it is not one of the two.** Without a deterministic control there is
+no statement to make: *"the latent path helped"* is only meaningful against a model that has none,
+and C costs three minutes. `:vaernn` (output-only noise) is the one I would **drop** from the first
+pass — it is the variant their result argues against, and it can be added later if A/B look
+promising.
+
+### 8.4 Training setup
+
+| | value | note |
+|---|---|---|
+| objective | negative ELBO, Gaussian reconstruction + `beta * KL(q || N(0,I))` | §2 |
+| `beta` | **sweep {0, 1e-4, 1e-2}** | 1e-4 is theirs; at that weight the KL is nearly inactive — Q2 |
+| optimiser | Adam, `lr = 1e-3` | decayed x0.3 after 20 epochs without improvement, floor 1e-5 |
+| epochs | 300 | **best-validation iterate returned, not the last** (§3) |
+| seeds | **3 for exploration, 5 for the record** | S6: spread reported, median seed deployed |
+| batch | 8 segments | batched through one recurrence; V50 says this is a pure speed change |
+| precision | Float32 weights | the record is Float64 |
+| train window | `t in [1, 10]` TU, `train_range = (400, 4000)` | the window the M0 cells use |
+| selection window | `t in [10, 19]` TU | disjoint from training **and** from the online reference |
+
+### 8.5 🔑 Segment length and burn-in should come from the measured ACF, and currently do not
+
+Current defaults are `L = 200`, `burn = 50`. At `dt = 2.5e-3` those are **0.5 TU** and **0.125 TU**.
+Against `results.md` §1's measured timescales for the **level** `q`, which is what the model
+predicts:
+
+| quantity | measured | in steps |
+|---|---|---|
+| `T_int(q)`, median | 0.474 TU | **~190** |
+| `T_int(q)`, range | 0.249–0.543 TU | 100–217 |
+| 1/e time of `q` | 0.29–0.36 TU | **116–144** |
+| *(for contrast)* `T_int(dQ)`, median | 0.0914 TU | 37 |
+
+🔴 **`burn = 50` is shorter than the level's 1/e time on every band, and about a quarter of its
+`T_int`.** The hidden state is therefore being scored before it has seen one correlation time of
+history — precisely the cold-start contamination the burn-in exists to remove. And `L = 200` leaves
+only 150 scored steps, under one `T_int`.
+
+**Proposed instead: `L = 400`, `burn = 150`** (1.0 TU and 0.375 TU; the burn-in is then ~0.8
+`T_int` and past the 1/e time on every band). Cost is roughly unchanged: with `stride = L - burn`
+the total number of scored steps per epoch is nearly the same — the same data cut into fewer,
+longer pieces.
+
+⚠️ **The same argument applies to the online warm-up.** `nwarm = 100` (0.25 TU) is about half the
+level's `T_int`. It was inherited from the linear cells, where the lag window is the only state;
+M4 also has to charge `(h, c)`. That is prerequisite P1 in
+`meta_files/handoff_m4_stochastic_lstm.md` §12.1, and it is not optional.
+
+### 8.6 Open questions — what I would like comments on
+
+**Q1 — the emission head is a second noise channel, and it may undercut the whole point.**
+🔴 The clearest issue in the current design. Sørensen's decoder is **deterministic**: the latent
+path is their only stochasticity. I added a state-dependent Gaussian head (`log d` linear in `h_t`)
+because this project selects on likelihood and has a calibrated-spread criterion (S7). But that
+gives the model **two** ways to produce spread, with nothing in the objective allocating between
+them — so *"the noise is in the latent state"* may stop being true of the fitted model even though
+the architecture flag says it is.
+Options: **(a)** constant `Sigma` — freeze `Wd = 0`, leave `bd` free, so the latent is the **only**
+state-dependent noise source; **(b)** keep the state-dependent head; **(c)** run both.
+**Recommendation: (a) first.** It is closest to their design while still giving a likelihood, and
+it makes the latent path's contribution unambiguous. (b) then becomes a second rung with a clean
+interpretation rather than a confound.
+
+**Q2 — `beta`.** At the source's `1e-4` the KL contributes ~0.01 to a loss of order 10, so the
+latent is almost unregularised and can carry arbitrary spread. If the claim is about the latent
+path, `beta` is a model parameter and not a detail. Sweep `{0, 1e-4, 1e-2}`, or something else?
+
+**Q3 — latent dimension relative to `N_Q = 6`.** 4 (under-complete, forces compression), 6
+(matched), or 8? No strong prior here; their 60-for-a-field gives no guidance at this scale.
+
+**Q4 — `h`.** `h = 1`, on the grounds that the recurrence is supposed to carry the memory? Or
+`h = 5` to match M0's regressor exactly so the data budget is like-for-like? Both are cheap.
+
+**Q5 — `L = 400`, `burn = 150`?** §8.5's argument, for confirmation or correction.
+
+**Q6 — which record?** Currently the tracking record's `(q*, q)`, the same pairing M0 is fitted to.
+The literal Sørensen setup instead maps a *free-running* LF trajectory to HF, which would use
+`9_no_sgs.jl`'s output and is a different dataset. Worth doing, or out of scope?
+
+### 8.7 Cost, measured
+
+| configuration | params | s/epoch | 300 epochs |
+|---|---|---|---|
+| source dims (60/60/60) | 43 128 | 2.05 | 10.2 min |
+| 32 / 8 / no encoder | 8 464 | 1.26 | 6.3 min |
+| **16 / 4 / no encoder** | **2 976** | **0.58** | **2.9 min** |
+| 16 / 4 / no encoder, `:storn` | 2 952 | 0.63 | 3.1 min |
+
+Runs A + B + C at 3 seeds is therefore **~30 minutes** — an experimentation loop rather than an
+overnight job.
+
+⚠️ Note the shape of that speedup: 14x fewer parameters buys only 3.5x less time, because the cost
+is dominated by Zygote's per-timestep overhead over the `L`-step recurrence rather than by
+arithmetic. Raising `L` to 400 will therefore cost closer to linearly in `L` than the flop count
+suggests. If this loop ever needs to be faster, the thing to fix is the AD overhead, not the model.

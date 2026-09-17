@@ -216,6 +216,53 @@ const RF = RikFlow
         @test all(hplateau.lr .>= 1e-5)
     end
 
+    # -----------------------------------------------------------------------------------------
+    # V50 -- batching segments is a SPEED change and nothing else
+    # -----------------------------------------------------------------------------------------
+    #
+    # The recurrence runs over `H x B` matrices so a chunk of segments costs `L` traced steps
+    # instead of `B * L`. That is only legitimate if the numbers are unchanged, so: the batched
+    # forward must equal the per-segment forward on every segment, and the batched objective must
+    # equal the per-segment objective averaged with the right weights.
+    @testset "V50 batched == per-segment ($arch)" for arch in (:lstm, :vaernn, :storn, :vrnn)
+        spec = mkspec(arch)
+        T = Float32
+        ps = RF.init_lstm_params(Xoshiro(15), spec; T)
+        ps = merge(ps, (; Wd = randn(Xoshiro(16), T, RF.n_output(spec), spec.n_hidden) ./ 5,
+                        Araw = randn(Xoshiro(17), T, RF.n_output(spec), RF.n_output(spec)) ./ 5))
+
+        L, B, nin, nz, nout = 9, 4, RF.n_input(spec), spec.n_latent, RF.n_output(spec)
+        X = randn(Xoshiro(18), T, nin, L, B)
+        Y = randn(Xoshiro(19), T, nout, L, B)
+        E = randn(Xoshiro(20), T, nz, L, B)
+        sc = 4:L
+
+        ob = RF.lstm_forward(spec, ps, X, E)
+        for b in 1:B
+            os = RF.lstm_forward(spec, ps, X[:, :, b], E[:, :, b])
+            @test os.Y ≈ ob.Y[:, :, b] rtol = 1e-5
+            @test os.LOGD ≈ ob.LOGD[:, :, b] rtol = 1e-5
+            @test os.Hm ≈ ob.Hm[:, :, b] rtol = 1e-5
+        end
+
+        # the objective: per-scored-step normalisation makes the batch the plain mean here,
+        # because every segment contributes the same number of scored steps
+        lb = RF.elbo(spec, ps, X, Y, sc, E; beta = 1e-3)
+        ls = mean(RF.elbo(spec, ps, X[:, :, b], Y[:, :, b], sc, E[:, :, b]; beta = 1e-3)
+                  for b in 1:B)
+        @test lb ≈ ls rtol = 1e-4
+
+        # and the gradients agree, which is what actually trains the model
+        gb = Zygote.gradient(p -> RF.elbo(spec, p, X, Y, sc, E; beta = 1e-3), ps)[1]
+        gs = Zygote.gradient(ps) do p
+            mean(RF.elbo(spec, p, X[:, :, b], Y[:, :, b], sc, E[:, :, b]; beta = 1e-3)
+                 for b in 1:B)
+        end[1]
+        for k in (:Wx, :Wh, :b, :V1, :cdec, :Wd, :bd, :Araw)
+            @test getproperty(gb, k) ≈ getproperty(gs, k) rtol = 1e-3
+        end
+    end
+
     @testset "iwae_nll runs and tightens with K" begin
         spec = mkspec(:vrnn)
         T = Float32
