@@ -182,27 +182,33 @@ end
 
 @testitem "V28 lead grids are per QoI, in physical time, and inside the run" default_imports = false setup = [D6Score] begin
     using Test
-    leads = D6Score.lead_grid(D6Score.T_INT; dt = D6Score.DT,
-                              multipliers = D6Score.MULTIPLIERS, nlead = D6Score.N_LEAD)
+    leads = D6Score.d6_leads()
     @test all(g -> issorted(g) && allunique(g) && all(>=(1), g), leads)
     @test all(g -> maximum(g) <= D6Score.N_LEAD, leads)
 
-    # 🔴 The spread COLLAPSED when the grid moved from the correction's timescales to the level's
-    # (2026-09-16). On `dQ` the six bands spanned a factor 36.8 and that was the whole argument for
-    # a per-QoI grid; on `q` they span only 0.5430/0.2489 = 2.18. The per-QoI grid is kept because
-    # it is still correct and costs nothing, but it is no longer load-bearing -- and if someone
-    # later proposes one shared grid, this is the number that says it would now be defensible.
-    @test maximum(leads[5]) == 1086                      # Z[16,32], 5 x 0.5430 TU, the longest
-    @test maximum(leads[6]) == 1079                      # E[16,32], 5 x 0.5395 TU
-    @test maximum(leads[1]) == 498                       # Z[0,6],   5 x 0.2489 TU, the fastest
-    @test maximum(leads[5]) / maximum(leads[1]) < 2.5     # was > 30 on the correction
+    # 🔴 ONE GRID FOR EVERY BAND since 2026-09-17 (Rik). The per-QoI grid was sized by `T_int` of
+    # the CORRECTION, where the six bands span a factor 36.8; D6 scores the LEVEL, where they span
+    # 2.18 on `T_int`, 1.40 on the rho = 0.1 crossing and only 1.22 on the 1/e time. So the old
+    # grid varied the leads about twice as much as the decorrelation it was tracking, and it did so
+    # through the one statistic that is not well defined here -- the level's ACF rings rather than
+    # decays. It also made the columns incomparable: `0.25 x T_int` pooled 25 steps with 54.
+    @test all(==(leads[1]), leads)                       # identical, band for band
+    @test leads[1] == [25, 50, 100, 200, 400, 1000]      # 0.0625 .. 2.5 TU
+    @test D6Score.union_grid(leads) == leads[1]          # 6 leads, where the old grid needed 26
 
-    # 🔴 `N_LEAD` no longer follows the grid -- it is 1200 steps = 3.00 TU set from the reference's
-    # ACF (2026-09-16), and the grid has to fit inside it with room to spare. Both directions are
-    # pinned: the longest lead fits, and the dropped `10x` entry does not.
-    @test maximum(D6Score.union_grid(leads)) == 1086 <= D6Score.N_LEAD
-    @test D6Score.MULTIPLIERS == (0.25, 0.5, 1, 2, 5)
-    @test D6Score.lead_grid([0.5430]; dt = D6Score.DT, multipliers = D6Score.MULTIPLIERS,
+    # The grid brackets the level's decorrelation from both sides: 1/e at 0.290-0.355 TU and
+    # rho = 0.1 at 0.430-0.600 TU (`results.md` section 1), against leads at 0.25 and 0.5 TU.
+    @test 100 * D6Score.DT ≈ 0.25
+    @test 200 * D6Score.DT ≈ 0.5
+    @test maximum(leads[1]) * D6Score.DT ≈ 2.5           # the single saturation anchor
+
+    # 🔴 `N_LEAD` does not follow the grid -- 1200 steps = 3.00 TU from the reference's ACF -- and
+    # the grid has to fit inside it with room to spare.
+    @test maximum(D6Score.union_grid(leads)) <= D6Score.N_LEAD
+
+    # `lead_grid` itself stays tested and stays exported: it is still the right tool for a series
+    # whose bands really do decorrelate at different rates, which is anything scored on `dQ`.
+    @test D6Score.lead_grid([0.5430]; dt = D6Score.DT, multipliers = (0.25, 0.5, 1, 2, 5),
                             nlead = D6Score.N_LEAD) isa Vector
     @test_throws ArgumentError D6Score.lead_grid([0.5430]; dt = D6Score.DT,
                                                  multipliers = (10,), nlead = D6Score.N_LEAD)
@@ -430,9 +436,7 @@ end
                 # Members drawn independently of the truth have no skill, so nothing saturates
                 # below the climatological level in the wrong direction: the reported saturation is
                 # either a real lead or the -1 sentinel, never a silent zero.
-                @test all(s -> s == -1 || s in D6Score.union_grid(D6Score.lead_grid(
-                             D6Score.T_INT; dt = D6Score.DT, multipliers = D6Score.MULTIPLIERS,
-                             nlead = D6Score.N_LEAD)),
+                @test all(s -> s == -1 || s in D6Score.union_grid(D6Score.d6_leads()),
                           out[:level].saturation)
             end
         end

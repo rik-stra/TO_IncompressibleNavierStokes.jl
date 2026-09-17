@@ -86,34 +86,67 @@ could have stopped before the slowest band saturated. The old docstring said as 
 decorrelates far more slowly, so the level's saturation lead may lie beyond 10 x T_int"*. It now
 does not.
 
-🔑 **`N_LEAD` is no longer derived from these** (Rik, 2026-09-16). It is 1200 steps = 3.00 TU, set
-from the reference's autocorrelation directly -- see `build_d6_ics.jl`'s `N_LEAD`. What these still
-set is `MULTIPLIERS`, and the largest of those, `5 x 0.5430 = 1086` steps, has to stay inside
-`N_LEAD`. The `10x` entry did not, and was dropped.
+🔑 **`N_LEAD` is no longer derived from these** (Rik, 2026-09-16), and since 2026-09-17 neither is
+the lead grid -- see `LEADS`. `N_LEAD` is 1200 steps = 3.00 TU, set from the reference's
+autocorrelation directly (`build_d6_ics.jl`). These timescales are still reported, because they are
+what says the bands decorrelate at nearly the same rate on the level and therefore what justifies a
+single grid; they no longer *set* anything.
 
 ⚠️ Still a decay constant, not `1 + 2*sum(rho)`. See `build_d6_ics.jl`'s `T_INT_MAX`.
 """
 const T_INT = [0.2489, 0.4732, 0.4893, 0.4742, 0.5430, 0.5395]
 
 """
-    MULTIPLIERS
+    LEADS
 
-Lead grid, as multiples of each band's `T_INT`. `lead_grid`'s own default still carries the `10x`
-entry this drops: that default is the published grid paper 2's runs were built on and other callers
-use it, so D6 passes its own rather than changing it underneath them.
+The lead grid, in **steps**, and it is **the same for every band** (Rik, 2026-09-17).
 
-🔴 **`10x` was dropped 2026-09-16, not shortened away by accident.** `results.md` section 1 measures
-the reference's residual autocorrelation at these leads as 0.941 down to 0.031 across `0.25x`-`2x`,
-and 0.036-0.147 at `5x` and `10x`, against a +-2 Bartlett standard error band of 0.114-0.132.
-Everything from `2x` on is already inside that band, so `10x` was buying a second look at
-climatology for more than half the run's cost. `5x` is kept as the one saturation anchor -- the
-spread-skill ratio at saturation is a real diagnostic even where the ensemble mean carries no
-information.
+    25, 50, 100, 200, 400, 1000  =  0.0625, 0.125, 0.25, 0.5, 1.0, 2.5 TU
 
-⚠️ `maximum(MULTIPLIERS) * maximum(T_INT) / DT` must stay `<= N_LEAD`. `lead_grid` raises if it does
-not, rather than clipping -- a clipped lead reads as a saturated one.
+🔴 **Why one grid replaced the per-QoI one.** The per-QoI grid came from gotcha #30 -- `T_int` spans
+a factor **36.8** across the six QoIs -- but that was measured on the **correction**, and D6 scores
+the **level**. On the level the spread is 2.18x on `T_int`, 1.40x on the `rho = 0.1` crossing and
+only **1.22x** on the 1/e time (0.290-0.355 TU). So the old grid varied the leads by 2.18x to track
+a decorrelation that varies by 1.22x: it was *adding* spread rather than removing it, and it did so
+through `T_int`, the one statistic that is not well defined here because the level's ACF rings
+rather than decays (`plan.md` O5, `results.md` section 1).
+
+🔑 **And it made the columns incomparable.** Under the old grid the `0.25 x T_int` column pooled
+`Z[0,6]` at 25 steps (0.0625 TU) with `Z[16,32]` at 54 (0.135 TU) -- a factor 2.2 in physical
+horizon, averaged into one number. A common grid means a column label denotes one forecast horizon.
+
+🔑 **Where these leads sit:** 0.25 and 0.5 TU bracket the 1/e time (0.290-0.355) and the `rho = 0.1`
+crossing (0.430-0.600) from both sides; 1.0 TU is past decorrelation on every band; 2.5 TU is the
+single saturation anchor, which is a real diagnostic even where the ensemble mean carries no
+information. The union is **6** leads, where the per-QoI grid needed 26 to express 5.
+
+⚠️ `maximum(LEADS)` must stay `<= N_LEAD`; the guard below raises rather than clipping, because a
+clipped lead reads as a saturated one.
+
+⚠️ **`T_INT` above no longer sets this.** It is kept because the timescales are still reported and
+still size `N_LEAD`'s justification, not because the grid is derived from it.
 """
-const MULTIPLIERS = (0.25, 0.5, 1, 2, 5)
+const LEADS = let s = get(ENV, "D6_LEADS", "")
+    v = isempty(s) ? [25, 50, 100, 200, 400, 1000] : parse.(Int, split(s, ","))
+    issorted(v) && allunique(v) && all(>=(1), v) ||
+        error("D6_LEADS must be sorted, unique and positive, got $v")
+    maximum(v) <= N_LEAD ||
+        error("D6_LEADS asks for lead $(maximum(v)) but the forecast is $N_LEAD steps. " *
+              "Lengthen the run or drop the lead; never extrapolate past the grid.")
+    v
+end
+
+"""
+    d6_leads(nq = length(T_INT))
+
+`LEADS` in the per-QoI shape the scorer and `ts_score.jl` take, which is one vector per band.
+
+The shape is kept even though every entry is now identical: `spread_skill_by_lead` and
+`rank_histogram_by_lead` report a per-QoI subset of the union grid, `saturation_lead` still answers
+per band, and `lead_grid` is still the right tool for a series whose bands really do decorrelate at
+different rates -- the channel's, or anything scored on `dQ`.
+"""
+d6_leads(nq::Integer = length(T_INT)) = [copy(LEADS) for _ in 1:nq]
 
 "Which record supplies the verification truth. See the header."
 const TRUTH_SOURCE = get(ENV, "D6_TRUTH", "hf_reference")
@@ -180,12 +213,104 @@ const EXCLUDE_ICS = Set(isempty(get(ENV, "D6_EXCLUDE_ICS", "")) ? Int[] :
                         parse.(Int, split(ENV["D6_EXCLUDE_ICS"], ",")))
 
 """
+    THIN_MEMBERS
+
+`(IC, member)` pairs to drop from **every** closure, as `D6_THIN_MEMBERS="170:7,197:3,313:6"`.
+
+🔴 **The narrow alternative to `EXCLUDE_ICS`, and the reason it exists.** A divergence is a property
+of the *member* -- its sampled noise realisation -- and not of the initial condition: each affected
+IC lost exactly one of its ten members and the other nine ran to completion. Dropping the whole IC
+therefore discards nine sound forecasts to account for one that failed, and it discards them at
+exactly the ICs the failing closure found hardest, so the surviving skill table is conditioned in
+that closure's favour.
+
+Naming the pairs here instead removes the same **seed** from every closure:
+`member_seed(k, member) = hash((:d6, k, member))` (`tools/run_d6.jl:113`) does not depend on the
+model, so the closures stay paired member-for-member rather than merely IC-for-IC.
+
+⚠️ **It then thins every remaining IC to the smallest surviving member count**, dropping the highest
+member ids. That is what keeps the ensemble rectangular, which `spread_skill`'s single finite-`M`
+factor and `rank_histogram`'s `M+1` bins both require -- neither is defined instance by instance.
+Members are exchangeable by construction (shared IC, shared forcing, distinct seed;
+`tools/run_d6.jl:40`), so which index goes carries no information -- but it is recorded per IC in
+the score file anyway, because "exchangeable" is an argument and the ids are a fact.
+
+⚠️ **What it does NOT remove.** A diverged member has no value past its blow-up, so it cannot enter
+a skill estimate there whatever the policy. Member-level survivorship therefore remains; what goes
+is the IC-level survivorship, which is the part that was selecting on the outcome.
+
+⚠️ Mutually exclusive with `EXCLUDE_ICS`: one drops ICs, the other keeps them and drops members, and
+setting both would silently do both.
+"""
+const THIN_MEMBERS = let s = get(ENV, "D6_THIN_MEMBERS", "")
+    d = Dict{Int,Set{Int}}()
+    for tok in (isempty(s) ? String[] : split(s, ","))
+        parts = split(strip(tok), ":")
+        length(parts) == 2 ||
+            error("D6_THIN_MEMBERS: expected `ic:member` pairs, got $(repr(String(tok)))")
+        push!(get!(d, parse(Int, parts[1]), Set{Int}()), parse(Int, parts[2]))
+    end
+    d
+end
+
+"""
+    THIN_TO
+
+Member count to thin **every** IC down to, via `D6_THIN_TO=9`. `0` derives it from the data as the
+smallest surviving ensemble, which is what `THIN_MEMBERS` alone wants.
+
+🔴 **Needed because "the smallest surviving count" has nothing to bite on once the diverged ICs are
+excluded.** The isolation control is `EXCLUDE_ICS` (the 3 ICs go) *plus* a forced `M = 9`; derived
+from the data it would come back 10 and silently re-run the published policy under a new filename.
+Naming the target also makes the member-level policy state its `M` rather than infer it.
+"""
+const THIN_TO = parse(Int, get(ENV, "D6_THIN_TO", "0"))
+
+"""
+    BOTH_POLICIES
+
+Opt-in to applying `EXCLUDE_ICS` **and** `THIN_MEMBERS` together, via `D6_POLICY_CONTROL=1`.
+
+🔴 **Not a policy -- the control that makes the other two comparable.** They differ in two things
+at once: the member-level policy scores 3 more ICs *and* one fewer member. A difference between
+them is therefore `K` and `M` confounded, and a spread-skill ratio is not `M`-free for an ensemble
+that is not perfectly reliable. Running both gives the middle point, `K = 87` at `M = 9`, so
+`87@10 -> 87@9` isolates `M` and `87@9 -> 90@9` isolates the initial conditions.
+
+⚠️ Refused unless asked for by name, because doing both *silently* is neither policy and would read
+as either one.
+"""
+const BOTH_POLICIES = get(ENV, "D6_POLICY_CONTROL", "") == "1"
+
+const THINNING = !isempty(THIN_MEMBERS) || THIN_TO > 0
+
+isempty(EXCLUDE_ICS) || !THINNING || BOTH_POLICIES ||
+    error("D6_EXCLUDE_ICS and the member-level settings (D6_THIN_MEMBERS, D6_THIN_TO) are " *
+          "mutually exclusive: the first drops whole initial conditions, the second keeps them " *
+          "and drops members. Setting both does both, which is neither policy. Set " *
+          "D6_POLICY_CONTROL=1 if you want the isolation control.")
+
+"""
+    POLICY_TAG
+
+Suffix distinguishing the score file one exclusion policy writes from another's.
+
+🔴 Without it the two policies collide on `d6_scores_<dir>.jld2` and the second run silently
+replaces the first -- the same defect a fixed filename already caused once when three closures were
+scored in a row (2026-09-16).
+"""
+const POLICY_TAG = !THINNING ? "" : isempty(EXCLUDE_ICS) ? "_thin" : "_thin_k87"
+
+"""
     load_members(dir = D6_DIR)
 
 Every `d6_online_ic<k>_m<member>.jld2` in `dir`, grouped by IC and sorted by member.
 
 Refuses a ragged ensemble: `spread_skill`'s finite-`M` correction is a function of `M`, so an IC
-with fewer members than the rest would be silently down-weighted and its correction wrong.
+with fewer members than the rest would be silently down-weighted and its correction wrong. The two
+ways of *avoiding* raggedness after a divergence are [`EXCLUDE_ICS`](@ref) -- drop the IC -- and
+[`THIN_MEMBERS`](@ref) -- keep it and drop the member from every closure. They are policies, not
+mechanisms, and the score file records which one produced it.
 """
 function load_members(dir = D6_DIR)
     isdir(dir) || return nothing
@@ -229,6 +354,49 @@ function load_members(dir = D6_DIR)
     end
     isempty(byic) && return nothing
 
+    # 🔴 MEMBER-LEVEL EXCLUSION -- the narrow policy. See `THIN_MEMBERS` for why it exists and for
+    # what it does not fix. Also applied after the divergence scan, for the same reason: the census
+    # describes the run, and the members named here are exactly the ones that diverged.
+    thinned = Dict{Int,Vector{Int}}()
+    for (k, ms) in THIN_MEMBERS
+        # Under the isolation control (`BOTH_POLICIES`) the named IC has already been deleted by
+        # `EXCLUDE_ICS` above. That is the point of the control and not a mismatched spec; every
+        # *surviving* IC is still thinned by one below, which is what isolates `M`.
+        k in EXCLUDE_ICS && continue
+        haskey(byic, k) ||
+            error("D6_THIN_MEMBERS names IC $k, which $dir does not contain")
+        for m in sort(collect(ms))
+            if any(e -> first(e) == m, byic[k])
+                filter!(e -> first(e) != m, byic[k])
+                push!(get!(thinned, k, Int[]), m)
+            elseif m in get(divergences, k, Int[])
+                # Already gone: this is the closure the pair was read off, and the loss the other
+                # closures are being equalised against. Not an error, and not a second drop.
+            else
+                error("D6_THIN_MEMBERS names member $m of IC $k, which $dir neither holds nor " *
+                      "recorded as diverged -- the spec does not match this run")
+            end
+        end
+    end
+    if THINNING
+        # Rectangular at the named count, or at the smallest surviving one. `spread_skill`'s finite-`M` factor is one
+        # scalar per call (`ts_score.jl:815`) and `rank_histogram`'s bins are `M+1`
+        # (`ts_score.jl:554-560`), so a per-IC `M` is not something either statistic can carry.
+        Mtarget = THIN_TO > 0 ? THIN_TO : minimum(length(v) for v in values(byic))
+        for (k, v) in byic
+            length(v) >= Mtarget ||
+                error("D6_THIN_TO = $Mtarget, but IC $k has only $(length(v)) members; " *
+                      "thinning removes members, it cannot invent them")
+        end
+        for (k, v) in byic
+            sort!(v, by = first)
+            while length(v) > Mtarget
+                push!(get!(thinned, k, Int[]), first(pop!(v)))
+            end
+        end
+        foreach(sort!, values(thinned))
+    end
+
     ks = sort(collect(keys(byic)))
     Ms = [length(byic[k]) for k in ks]
     # The modal member count is the intended `M`.
@@ -259,9 +427,17 @@ function load_members(dir = D6_DIR)
                           "members per IC are $(sort(unique(Ms))).")
     for k in ks
         sort!(byic[k], by = first)
-        first.(byic[k]) == collect(1:Ms[1]) || error("IC $k has member ids $(first.(byic[k]))")
+        ids = first.(byic[k])
+        allunique(ids) || error("IC $k has duplicate member ids $ids")
+        # ⚠️ Contiguous `1:M` only when nothing was thinned. Under `THIN_MEMBERS` the surviving ids
+        # are a subset -- IC 170 keeps member 10 and drops 7, a clean IC drops 10 and keeps 7 -- so
+        # the ids differ *between ICs* by construction. What pairing needs is that they agree
+        # between *closures* at the same IC, which they do: the spec is the same for all three and
+        # the thinning rule is deterministic. `member_ids` below is what lets a reader check it.
+        THINNING || (ids == collect(1:Ms[1]) || error("IC $k has member ids $ids"))
     end
-    return (; ks, M = Ms[1], files = byic, divergences, incomplete)
+    return (; ks, M = Ms[1], files = byic, divergences, incomplete, thinned,
+            member_ids = Dict(k => first.(byic[k]) for k in ks))
 end
 
 "Relative deviation, in units of each QoI's own sd, allowed across the replayed warm-up window."
@@ -606,11 +782,15 @@ end
 The lead grids themselves, which are a result: they say what the runs can and cannot resolve.
 """
 function report_grids(leads; io = stdout)
-    println(io, "\nLead grids -- ", MULTIPLIERS, " x T_int(i), per QoI, in physical time")
-    @printf(io, "  %-10s %8s   %s\n", "QoI", "T_int", "leads [steps]")
-    for i in eachindex(leads)
-        @printf(io, "  %-10s %8.4f   %s\n", LABELS[i], T_INT[i], join(leads[i], ", "))
+    println(io, "\nLead grid -- ONE grid for every band, in physical time (Rik, 2026-09-17).")
+    println(io, "  The per-QoI grid was sized by T_int of the CORRECTION (spread 36.8x); on the")
+    println(io, "  LEVEL the 1/e times span only 1.22x, so it added spread rather than removing it.")
+    @printf(io, "  %-14s %10s\n", "lead [steps]", "TU")
+    for l in LEADS
+        @printf(io, "  %-14d %10.4f\n", l, l * DT)
     end
+    @printf(io, "  T_int(level) per band, reported but no longer setting the grid: %s\n",
+            join((@sprintf("%.4f", t) for t in T_INT), ", "))
     @printf(io, "  union: %d distinct leads, longest %s of %d available\n",
             length(union_grid(leads)), fmt_lead(maximum(union_grid(leads))), N_LEAD)
 end
@@ -666,7 +846,7 @@ What the scorer will do, without any runs: the lead grids, and the index alignme
 one IC so the arithmetic can be read rather than trusted.
 """
 function preview(; io = stdout)
-    leads = lead_grid(T_INT; dt = DT, multipliers = MULTIPLIERS, nlead = N_LEAD)
+    leads = d6_leads()
     report_grids(leads; io)
     sel = select_ics(; K = 180)
     k, n_k = sel.k[1], sel.n[1]
@@ -699,7 +879,7 @@ members. That matters more than it looks: without it, the first execution of `ma
 pilot data, which is to say after GPU time had already been spent.
 """
 function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = stdout)
-    leads = lead_grid(T_INT; dt = DT, multipliers = MULTIPLIERS, nlead = N_LEAD)
+    leads = d6_leads()
     ens = preview_only ? nothing : load_members(dir)
     if ens === nothing
         preview(; io)
@@ -731,7 +911,32 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
             ndiv == 0 && println(io, "     (no `diverged` flag on disk -- pre-2026-09-16 runs ",
                                  "aborted the task, so the failing member was never written)")
         end
-        @printf(io, "   ⚠️ the tables below are conditioned on the ICs this closure SURVIVED\n")
+        if isempty(THIN_MEMBERS)
+            @printf(io, "   ⚠️ the tables below are conditioned on the ICs this closure SURVIVED\n")
+        end
+    end
+    # 🔴 The exclusion policy, printed whether or not it is in force. A skill table means a
+    # different thing under each one, and the two are a factor 1/9 apart in `M` and 3 ICs apart in
+    # `K` -- neither visible in the numbers themselves.
+    if !THINNING
+        @printf(io, "policy: IC-level%s -- whole ICs kept out of the scored set\n",
+                isempty(EXCLUDE_ICS) ? " (none named)" :
+                " (D6_EXCLUDE_ICS = " * join(sort(collect(EXCLUDE_ICS)), ",") * ")")
+    else
+        nth = sum(length, values(ens.thinned); init = 0)
+        @printf(io, "policy: MEMBER-level (D6_THIN_MEMBERS) -- %d member(s) dropped across %d IC(s), all %d ICs kept\n",
+                nth, length(ens.thinned), length(ens.ks))
+        for k in sort(collect(keys(THIN_MEMBERS)))
+            # Under the isolation control the named ICs are excluded, so they have no scored
+            # members to print. Say so rather than indexing a key that is deliberately absent.
+            @printf(io, "     k = %-4d named %s -> %s\n", k,
+                    join(sort(collect(THIN_MEMBERS[k])), ", "),
+                    haskey(ens.member_ids, k) ?
+                    "scored members " * join(ens.member_ids[k], ", ") :
+                    "IC excluded (D6_EXCLUDE_ICS)")
+        end
+        println(io, "     ⚠️ member-level survivorship remains: a diverged member has no value ",
+                "past its blow-up\n        under any policy. What is gone is the IC-level conditioning.")
     end
     @printf(io, "truth: %s\n", truth.source)
 
@@ -784,12 +989,21 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
     mkpath(outdir)
     # 🔴 Named after the run directory. A fixed name meant scoring three closures in a row left
     # only the last one on disk, with no sign anything had been lost.
-    p = joinpath(outdir, "d6_scores_$(basename(rstrip(dir, ['/', '\\'])))"* ".jld2")
+    p = joinpath(outdir, "d6_scores_$(basename(rstrip(dir, ['/', '\\'])))" * POLICY_TAG * ".jld2")
     # Named explicitly rather than splatted: `jldsave`'s keywords must be symbols, and a `Dict`
     # splat is the kind of thing that works until the dictionary's key type changes.
+    #
+    # 🔴 `policy`, `excluded_ics`, `thinned_members` and `member_ids` are saved because a skill
+    # table is not interpretable without them: the same three closures under the two policies
+    # differ in `K`, in `M` and in what the ICs were selected on.
     jldsave(p; level = out[:level], correction = out[:correction],
             labels = LABELS, T_int = T_INT, dt = DT, truth = truth.source,
             ics = ens.ks, clamp_nfired = cl.nfired, clamp_nsteps = cl.nsteps,
+            policy = !THINNING ? "ic_level" :
+                     isempty(EXCLUDE_ICS) ? "member_level" : "isolation_control",
+            excluded_ics = sort(collect(EXCLUDE_ICS)),
+            thinned_members = ens.thinned, member_ids = ens.member_ids,
+            divergences = ens.divergences,
             written = string(now()))
     @printf(io, "\nwrote %s (%.1f kB)\n", p, filesize(p) / 1024)
     println(io, "⚠️  The report goes into `analysis/results.md`, not into meta_files/ and not left " *

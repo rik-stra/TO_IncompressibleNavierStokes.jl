@@ -18,8 +18,10 @@ variance. Two things come out of it:
    ranked them backwards.
 
 ⚠️ Read §4c's skill table together with its stability table: the skill columns are measured on the
-87 ICs LinReg1 survived, the stability column on all 90. And see §7 — the `--array=0` validation
-has still not been run.
+87 ICs LinReg1 survived, the stability column on all 90. 🆕 ✅ **That conditioning is now measured
+rather than warned about: it is worth +0.4% on LinReg1's mean skill, and the front's accuracy
+ordering survives it with the gap widening from 2.9% to 3.4%** (§4c, *What the exclusion is worth*).
+And see §7 — the `--array=0` validation has still not been run.
 
 
 Every section is now computed on **P2r's rebaselined pipeline** — R1's tracking record, the
@@ -65,6 +67,25 @@ julia --startup-file=no --project=analysis analysis/plot_rebaseline.jl     # -> 
 
 `plot_rebaseline.jl` prints §4b's three tables in the form §4b quotes them, so the section can be
 diffed against a re-run rather than retyped.
+
+§4c is a third pipeline, one scoring run per closure plus an aggregator:
+
+```bash
+for m in LinReg1 LinReg7 DDN; do                                     # the published policy
+  D6_OUT=exp_square_HIT/output/D6_$m julia --startup-file=no --project=analysis analysis/score_d6.jl
+done
+julia --startup-file=no --project=analysis analysis/d6_delta.jl      # §4c's summary rows + the policy delta
+julia --startup-file=no --project=analysis analysis/plot_d6_rh.jl    # RH-3 -> figures/fig10*.png
+julia --startup-file=no --project=analysis analysis/plot_d6_fans.jl  # -> figures/fig9_d6_fans_*.png
+```
+
+🆕 🔑 **`d6_delta.jl` is why §4c's summary rows are now reproducible at all.** Until 2026-09-17 the
+mean skill, the short- and long-lead means, the in-band count and the median ratio existed only as
+numbers read off `score_d6.jl`'s printed tables by hand — so they could not be regenerated and a
+change of policy could not be diffed, only re-read. The script reproduces every published figure in
+§4c exactly from the saved `d6_scores_*.jld2`, which is what licenses the deltas beside them. The
+two alternative policies are `D6_THIN_MEMBERS=170:7,197:3,313:6` and, for the isolation control,
+that plus `D6_EXCLUDE_ICS=170,197,313 D6_THIN_TO=9 D6_POLICY_CONTROL=1`.
 
 **Data.** HIT, on the rebaselined pipeline: **R1** the 100 TU tracking record
 (`data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3`, Float64, `freeze = 1`, OU seed 333),
@@ -187,15 +208,11 @@ either, with the truncation caveat.
 the KS noise floor in §3 — by about 1.7× on medians, which matches this 1.6× — and that floor
 is what every regime-C number has to be read against.
 
-⚠️ **This is a third estimate of the level's `T_int`, and it does not match memory #58.** That
-entry quotes 0.94–1.08 TU on the new record from `report_marginals`' estimator, then argues down to
-"0.5–0.63 TU stands for both" from the quarter-by-quarter spread. The Sokal-window estimator used
-here gives 0.249–0.543 TU on the reference and 0.249, 0.473, 0.489, 0.474, 0.543, 0.539 on the
-tracked record. **The two estimators disagree by about a factor 2**, and the ACF below says why:
-the level's autocorrelation is not an exponential, so an integral-based timescale is not a
-well-defined property of this series. D6's sizing table (#58) is built on the larger figure and is
-therefore conservative — the safe direction — but see the lead-grid finding below, where being
-conservative in that direction turns out to be expensive.
+✅ **The factor-2 disagreement between estimators is a convention, not a dispute, and it is settled**
+(#58): `correlation_time` returns the decay constant `Δt(½ + Σρ) ≈ T`, `integrated_time` returns
+`Δt(1 + 2Σρ) ≈ 2T`, measured ratio 1.985–1.997 on all six bands. Use the decay constant. It is also
+moot for sizing, because the ACF below is not an exponential at all — no integral-based timescale is
+well defined on a ringing ACF — and `N_LEAD` is now set from the crossings in physical time (#67).
 
 ### The curves themselves — and what they say about D6's lead grid
 
@@ -206,13 +223,11 @@ in orange (the solid line is the 10× point that fixes `N_LEAD`). Right: the cor
 1 TU. The grey band is ±2 Bartlett standard errors under the null that the series is uncorrelated
 past its 0.1 crossing — inside it an autocorrelation is not distinguishable from zero.
 
-🔑 **The factor-2 estimator disagreement is explained, though not adjudicated.** The level's ACF is
-**not a decaying exponential.** It falls steeply to ~0.1 within half a TU and then *rings*,
-oscillating between roughly −0.2 and +0.2 with a period near 1 TU, all the way to the end of the
-10 TU window. "The" decorrelation time is therefore not a well-defined property of this series, and
-any estimator that integrates the ACF is integrating that ringing — which is precisely why a Sokal
-window and `report_marginals`' estimator can differ by 2× without either being wrong. The robust
-statistics are the crossings, and they are shorter than either `T_int`:
+🔑 **The level's ACF is not a decaying exponential.** It falls steeply to ~0.1 within half a TU and
+then *rings*, between roughly −0.2 and +0.2 with a period near 1 TU, out to the end of the 10 TU
+window. So "the" decorrelation time is not a well-defined property of this series and any estimator
+that integrates the ACF is integrating that ringing. The robust statistics are the crossings, and
+they are shorter than either `T_int`:
 
 | reference, level `q` | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
 |---|---|---|---|---|---|---|
@@ -226,87 +241,54 @@ factor 3 below memory #58's 0.94–1.08 TU. Note how tight the six are: on the l
 span only **1.22×**, against the 2.18× that `T_int` spans and the 36.8× the correction spans. The
 per-QoI lead grid is buying almost nothing on this series.
 
-🔴 **D6's lead grid runs far past the point where the reference remembers its own state.** The grid
-is `(0.25, 0.5, 1, 2, 5, 10) × T_int`; the reference's residual autocorrelation at each of those
-leads is
+🔴 **The old lead grid ran far past the point where the reference remembers its own state.** Against
+the ±2 se row above (0.114–0.132), the reference's residual autocorrelation is **inside the band at
+every lead from 2×T onward, on every band**; at 1×T only `Z[0,6]` (0.470) is clearly outside, the
+other five sitting at a marginal 0.123–0.166. Past ~1×T_int ≈ 0.5 TU the truth at the lead is
+statistically independent of the state the forecast was initialised on, so nothing carried from the
+initial condition can help there and any apparent skill is **climatology** — which is what regime
+C's marginal KS already measures, and what #61 shows is the underpowered statistic D6 exists to
+escape. Spread at saturation is still a real diagnostic, but it needs one anchor point, not half the
+grid, and the run length is set by the largest lead.
 
-| ρ(q) at lead | 0.25×T | 0.5×T | 1×T | 2×T | 5×T | 10×T |
-|---|---|---|---|---|---|---|
-| Z[0,6] | 0.941 | 0.811 | 0.470 | 0.031 | 0.147 | 0.054 |
-| E[0,6] | 0.742 | 0.484 | 0.166 | 0.149 | 0.055 | 0.084 |
-| Z[7,15] | 0.859 | 0.569 | 0.123 | 0.185 | 0.065 | 0.077 |
-| E[7,15] | 0.862 | 0.574 | 0.124 | 0.170 | 0.062 | 0.074 |
-| Z[16,32] | 0.852 | 0.542 | 0.124 | 0.212 | 0.061 | −0.038 |
-| E[16,32] | 0.851 | 0.545 | 0.123 | 0.212 | 0.063 | −0.036 |
+✅ **Decision (Rik, 2026-09-16): `N_LEAD` cut to 1200 steps = 3.00 TU, set in physical time from the
+ACF rather than as `10 × T_INT_MAX`**, dropping the `10 ×` lead and keeping `5 ×` as the single
+saturation anchor.
 
-Read that against the ±2 se row above (0.114–0.132): **every lead from 2×T onward is inside the
-band, on every band.** At 1×T only `Z[0,6]` (0.470) is clearly outside; the other five sit at
-0.123–0.166, which is marginal. Past ~1×T_int ≈ 0.5 TU the truth at the lead is statistically
-independent of the truth the forecast was initialised on, so *no* information carried from the
-initial condition can help there. Whatever skill a model shows at 5× or 10× is its **climatology**
-matching the reference's — which is exactly what regime C's free-running marginal KS already
-measures, and what §3/#61 show is the underpowered statistic D6 was built to escape.
-
-⚠️ **The long leads are not worthless, but they are over-sampled.** Spread at saturation is a real
-diagnostic — does the ensemble variance converge to the climatological variance? — and the pilot
-does answer it (ratio 0.55–1.3 at long leads). But that needs *one or two* anchor points, not half
-the grid, and the run length is set by the largest lead.
-
-✅ **The pilot's own numbers land where this predicts.** LinReg7's worst spread–skill departures
-are at leads 380–434 = **0.95–1.09 TU ≈ 2×T_int** (ratio 2.1–2.5), and the fans in
-`fig9b_d6_fans_by_ic.png` are fully open by about 2 TU past the warm-up. The informative region is
-the short and medium leads; the tail is confirming climatology at full price.
-
-✅ **Decision (Rik, 2026-09-16): `N_LEAD` cut to 1200 steps = 3.00 TU, and it is now set in
-physical time from the ACF rather than as `10 × T_INT_MAX`.** `score_d6.jl` grew its own
-`MULTIPLIERS = (0.25, 0.5, 1, 2, 5)`; the `10×` entry no longer fits and was dropped, and `5×` is
-kept as the single saturation anchor so the spread–skill ratio still has a point past decorrelation.
-The longest lead is now `5 × 0.5430 = 1086` of 1200 available steps, 26 distinct leads in the union
-(was 32, longest 2172 of 2172).
+🆕 ✅ **And the multiplier framing itself went, 2026-09-17 (Rik): one grid for every band, in TU.**
+The crossings above are why — the six bands' 1/e times span **1.22×**, so a grid that varies with
+`T_int` (2.18×) was adding spread rather than tracking it, through the estimator this very
+subsection shows is ill-defined on a ringing ACF. `score_d6.jl` now owns
+`LEADS = 25, 50, 100, 200, 400, 1000` steps = 0.0625–2.5 TU, the same for all six. See §4c.
 
 | | was | is |
 |---|---|---|
 | `N_LEAD` | 2172 steps, 5.43 TU | **1200 steps, 3.00 TU** |
 | `N_WARM` | 220 steps, 0.55 TU | **100 steps, 0.25 TU** |
-| multipliers | `0.25, 0.5, 1, 2, 5, 10` | **`0.25, 0.5, 1, 2, 5`** |
-| longest lead | 2172 (`Z[16,32]`) | **1086** |
+| lead grid | `{0.25 … 10} × T_int`, per QoI | **`25, 50, 100, 200, 400, 1000` steps, shared** |
+| distinct leads in the union | 32, then 26 | **6** |
+| longest lead | 2172 (`Z[16,32]`) | **1000 (2.5 TU)** |
 | steps per member | 2392 | **1300** (1.84× shorter) |
 | IC pool | `k ∈ [42, 377]`, 336 fields | **`k ∈ [42, 388]`, 347 fields** |
 | spacing at K = 180 | 0.4679 TU (0.86 × `T_INT_MAX`) | **0.4832 TU (0.89 ×)** |
 
 ### The warm-up went with it: 220 → 100
 
-🔑 **The warm-up replays recorded `dQ`, so while it lasts the run *is* the tracked record — and its
-length therefore changes nothing but where the forecast starts.** Measured on the 50 LinReg7 pilot
-members, mean absolute deviation from the reference in units of `sd(reference)`:
+🔑 **The warm-up replays recorded `dQ`, so while it lasts the run *is* the tracked record — its
+length changes nothing but where the forecast starts.** Measured on the 50 LinReg7 pilot members,
+mean absolute deviation from the reference is **flat across the whole warm-up** and equal to §1's
+tracking error: at columns 1 / 51 / 101 / 221 it reads 0.0022–0.0023 on `Z[16,32]`, 0.0013–0.0015 on
+`E[16,32]` and 0.0000–0.0001 on the other four. 🔴 **So the recorded rationale for 220 was wrong as
+written** — *"the slowest bands entered every forecast still carrying the record's state rather than
+the model's"*. At the end of a replay of *any* length the state is the record's; that is what a
+replay is. The only job a warm-up has is filling `q_hist`, and `hist_len = 5`.
 
-| column `c` | 1 | 51 | 101 | 221 |
-|---|---|---|---|---|
-| `Z[16,32]` | 0.0022 | 0.0022 | 0.0023 | 0.0020 |
-| `E[16,32]` | 0.0014 | 0.0014 | 0.0015 | 0.0013 |
-| the other four | 0.0000 | 0.0001 | 0.0000 | 0.0000 |
-
-Flat across the whole warm-up, and equal to §1's tracking error (2.32e-3, 1.46e-3 on those two
-bands). 🔴 **So the recorded rationale for 220 was wrong as written** — *"the slowest bands entered
-every forecast still carrying the record's state rather than the model's"*. At the end of a warm-up
-of any length the state is the record's, because that is what a replay is; no model output is used
-during it. The only thing a warm-up must do is fill `q_hist`, and `hist_len = 5`.
-
-✅ 100 is what the long online runs deploy (`6_online_TO_LRS.jl:108`, `dQ_data = data_track.dQ[:,
-1:100]`), so D6 now scores the deployed configuration; ordinal 0's validation exercises the deployed
-length instead of only the mechanism (#66's caveat is retired); and the IC pool gains two fields.
-`N_WARM_DRIVER` stays a separate constant even though the two now coincide — if `N_WARM` moves
-again, the validation must not move with it.
-
-🔴 **The ordinal → `k` map moved.** A shorter forecast and a shorter warm-up free 11 more fields at
-the end of the record, so `select_ics` re-spaced: ordinals 1–4 are still `k = 42, 44, 46, 48`,
-ordinal 5 is now `k = 50` (was 49), and later ordinals shift. All 180 packages were rebuilt; those no
-longer selected were moved to `analysis/output/d6_ics_stale/` rather than deleted.
-
-⚠️ **The LinReg7 pilot on disk stays readable but is no longer paired.** A 2172-lead run contains
-every lead of a 1200-lead grid, so `score_d6.jl` scores those 60 files unchanged. Their ICs are the
-old selection, so they cannot be compared member-for-member against anything produced after the
-change.
+✅ 100 is what the long online runs deploy (`6_online_TO_LRS.jl:108`), so D6 now scores the deployed
+configuration and ordinal 0 validates the deployed length rather than only the mechanism.
+`N_WARM_DRIVER` stays a separate constant even though the two coincide — if `N_WARM` moves again the
+validation must not follow. 🔴 **The ordinal → `k` map moved with it**: ordinals 1–4 are still
+`k = 42, 44, 46, 48`, ordinal 5 is `k = 50` (was 49), later ordinals shift. All 180 packages rebuilt;
+those no longer selected moved to `analysis/output/d6_ics_stale/`, not deleted.
 
 
 ⚠️ **`sd(dQ)` spans four orders of magnitude.** Anything pooling QoIs in raw units is an enstrophy
@@ -406,14 +388,13 @@ DDN's convexity is +0.8 to +2.3 in five bands — nearly flat, as a climatologic
 with a slope of −2.6 to −2.8 in the smallest scales where its constant mean does not match the
 held-out mean.
 
-⚠️ **The $N_{\text{eff}}$ correction turns out to be a no-op here, and that is worth recording.**
-`plan.md` and `metrics.md` both insist on it, correctly in principle. Measured: the *rank* series
-has $N_{\text{eff}}$ of 34 300–36 000 against `N = 35 994`, and a bootstrap block length of 1–2
-steps. The QoIs are strongly serially correlated ($\rho_1 \approx 0.94$–0.998) but the ranks are
-nearly white, because the rank depends on where truth falls relative to the model's own spread and
-the model tracks the QoI. So the raw and corrected contrasts agree to about 1 % on this data. The
-machinery is still needed — on a synthetic AR(1) null the uncorrected contrast has a standard
-deviation of 4.9 instead of 1 — but it does not change any number in this table.
+⚠️ **The $N_{\text{eff}}$ correction is a no-op here, which is worth recording.** The *rank* series
+has $N_{\text{eff}}$ = 34 300–36 000 against `N` = 35 994 and a bootstrap block length of 1–2 steps:
+the QoIs are strongly serially correlated ($\rho_1 \approx 0.94$–0.998) but the ranks are nearly
+white, because a rank depends on where truth falls relative to the model's own spread and the model
+tracks the QoI. Raw and corrected contrasts agree to ~1 % here. The machinery is still needed — on a
+synthetic AR(1) null the uncorrected contrast has sd 4.9 instead of 1 — but it moves no number in
+this table.
 
 ### Flat is not skilful
 
@@ -464,17 +445,16 @@ because the record is serially correlated.
 | floor across cut points, 25–75 TU | 0.166–0.429 | 0.328–0.889 |
 | **median over cut points** | **0.281** | **0.469** |
 
-🔴 **It is ONE DRAW and it is very unstable — do not quote the single number as a threshold.**
-Moving the cut in 5 TU steps swings the archive's floor over 0.166–0.429 and the new record's over
-0.328–0.889. The canonical 50 TU cut happens to land near the **bottom** of the archive's range and
-near the **top** of the new record's, which inflates any archive-vs-new ratio built from the two
-canonical values (4.43×) against the ratio of medians (**1.67×**).
+🔴 **It is ONE DRAW and very unstable — never quote the single number as a threshold.** Moving the
+cut in 5 TU steps swings the archive's floor over 0.166–0.429 and the new record's over 0.328–0.889.
+The canonical 50 TU cut lands near the **bottom** of the archive's range and the **top** of the new
+record's, which inflates the archive-vs-new ratio built from the two canonical values (4.43×)
+against the ratio of medians (**1.67×**). ✅ **The direction is real and the magnitude was not**:
+1.67× on medians agrees with the independently measured ~1.6× slowdown in the level's decorrelation
+(§1), which is the mechanism — slower decorrelation ⇒ fewer independent samples in 100 TU ⇒ the
+halves differ more.
 
-✅ **The direction is real and the magnitude was not.** 1.67× on medians agrees with the
-independently measured ~1.6× slowdown in the level's decorrelation time (§1), which is the
-mechanism: slower decorrelation ⇒ fewer independent samples in 100 TU ⇒ the halves differ more.
-
-⚠️ **It is also not sample-size matched to what it is being compared against.** KS grows as samples
+⚠️ **It is also not sample-size matched to what it is compared against.** KS grows as samples
 shrink — median over all disjoint pairs:
 
 | split | points per part | archive | rebaselined |
@@ -483,24 +463,21 @@ shrink — median over all disjoint pairs:
 | 4-way | 10 000 | 0.526 | 0.862 |
 | 8-way | 5 000 | 0.640 | 1.262 |
 
-The floor compares 20 000 points against 20 000. A per-replica summed KS compares 40 001 against
-40 001, and the ensemble form pools 5 × 40 001 against 40 001. **So the floor is a yardstick with
-the wrong units, not a calibrated threshold**, and a "ratio to floor" carries both the cut-point
-lottery and a sample-size mismatch.
+The floor compares 20 000 against 20 000; a per-replica summed KS compares 40 001 against 40 001 and
+the ensemble form pools 5 × 40 001. **So it is a yardstick with the wrong units, not a calibrated
+threshold**, and every "ratio to floor" here carries both the cut-point lottery and a sample-size
+mismatch.
 
-🔴 **What this means for LinReg1's 0.836 against the archive's 0.198 — the question is STILL OPEN.**
-An earlier version of this section claimed the two were each at their own floor (ratios 1.07 and
-1.02) and that the ~4× gap was therefore explained by the floor moving. **That claim rested on the
-single 50 TU cut and does not survive the cut-point sweep.** Against the *median* floor the archive
-run sits at **0.70×** — below its own floor — and the rebaselined run at **1.78×** — above its own.
-The floor moved in the right direction but nowhere near far enough to absorb the gap.
+🔴 **LinReg1's 0.836 against the archive's 0.198 is STILL OPEN.** Against the *median* floor the
+archive run sits at **0.70×** — below its own floor — and the rebaselined one at **1.78×**. The floor
+moved in the right direction, nowhere near far enough to absorb the gap. ⚠️ Do not re-derive the
+retired explanation: that the two each sat at their own floor rested on the single 50 TU cut and
+does not survive the sweep.
 
-🔑 **The fix is a proper null, and one already exists in this repository.**
-`analysis/plot_hf_new_vs_archive.jl` uses a **block permutation** null for exactly this comparison
-(#54: per-band 95th percentile 0.094–0.108), which returns a distribution rather than one number and
-respects the serial correlation. Regime C should use it, sampled at the sample sizes actually being
-compared. Until then, quote the floor as a **range with its construction stated**, never as a single
-number, and treat every "ratio to floor" in this report as indicative.
+🔑 **The fix is a proper null and one already exists in-repo**: `plot_hf_new_vs_archive.jl`'s block
+permutation (#54, per-band 95th percentile 0.094–0.108) returns a distribution and respects the
+serial correlation. It needs extending to unequal group sizes. Until then quote the floor as a range
+with its construction stated.
 
 ⚠️ **What still stands regardless of the floor.** The DDN (1.332), no model (2.487) and Smagorinsky
 (3.710) are above even the largest floor draw on this record (0.889), so the ordering
@@ -520,15 +497,13 @@ below.
 
 ### The weak λ probe — *small* regularization does not fix the excursions 🆕 2026-09-15
 
-⚠️ **Scope, added after the strong ladder ran.** Everything in this subsection is measured at
-λ ≤ 1e-4 and its negative conclusion holds only there. At λ = 1 the excursions *do* go away — see
-the ladder below, which is the same experiment continued four decades further and reaches the
-opposite answer. The two are kept apart because the weak probe is what motivated the strong one,
-and because "regularization does not help" is exactly the conclusion this report would have shipped
-had the sweep stopped at 1e-4.
+⚠️ **Scope: everything here is measured at λ ≤ 1e-4 and the negative conclusion holds only there.**
+At λ = 1 the excursions *do* go away (the ladder below is the same experiment continued four decades
+further, reaching the opposite answer). Kept as its own subsection because *"regularization does not
+help"* is exactly what this report would have shipped had the sweep stopped at 1e-4.
 
-`LinReg5` (λ = 1e-5) and `LinReg6` (λ = 1e-4) were fitted and run to test whether the deployed
-λ = 0 model's downward excursions come from its unresolved coefficient vector (§4). They do not.
+`LinReg5` (λ = 1e-5) and `LinReg6` (λ = 1e-4) test whether the λ = 0 model's downward excursions
+come from its unresolved coefficient vector (§4). They do not.
 
 | | λ = 0 | λ = 1e-5 | λ = 1e-4 |
 |---|---|---|---|
@@ -648,11 +623,10 @@ of the KS implementation, the QoI extraction and the replica bookkeeping in one.
 checkable because regime C is scored on the level; a `dQ`-based score has nothing to compare
 against.
 
-⚠️ Two caveats belonging to the archive rather than to the comparison. `compute_ks.jl` decides
-which replicas are stable by testing `data_online_tsim100.0_replica<i>.jld2` with `isfile` and then
-loads `..._rand_initial_dQ.jld2` — a different family — so the published table pairs a stability
-check on one set of runs with distances computed on another. And the tables are split by
-configuration index across several files, so absence from one file is not absence from the archive.
+⚠️ Two archive quirks, neither affecting the comparison: `compute_ks.jl` runs its stability check on
+one filename and loads another (harmless — they are the same runs, §5 item 15), and the tables are
+split by configuration index across several files, so absence from one is not absence from the
+archive.
 
 🔑 **The noise floor changes the reading.** A reference-vs-reference split of D3 (D8) gives a summed
 KS of **0.1848 on the level** (0.1328 on the correction). LinReg1's replicas span 0.142–0.371, so
@@ -799,12 +773,11 @@ intercept is invariant to exactly that, so their slope blocks *must* agree.
 against 2.6888 here, 1.012 against 2.174 there; the starred gain 14 against **270** here, 25 against
 109 there. Same conclusion, larger margin.
 
-🔑 **This is the single most consequential difference between the deployed R2 model and every LRS
-that came before it.** Paper 2's archived `LinReg1`, refitted from its own 10 TU record under its
-own Float32 arithmetic, reproduces to **1.6e-4** — so the archive *is* a Float32 fit — and that fit
-has ρ(C̃) = **1.0002** and a starred gain of **10.3**. Refitting the *same data* in Float64 gives
-ρ = **2.534** and gain **60.2**. **Every LRS deployed in this project before R2 was regularized by
-its own round-off**; R2's is the first to run the actual λ = 0 least-squares solution.
+🔑 **The single most consequential difference between the deployed R2 model and every LRS before
+it.** Paper 2's archived `LinReg1` refits from its own 10 TU record under Float32 to **1.6e-4** — so
+the archive *is* a Float32 fit — and that fit has ρ(C̃) = **1.0002**, starred gain **10.3**. The same
+data in Float64 gives **2.534** and **60.2**. **Every LRS deployed here before R2 was regularized by
+its own round-off**; R2's is the first to run the actual λ = 0 solution.
 
 Decomposing the deployed-vs-archived coefficient difference (physical affine map, relative):
 
@@ -945,23 +918,23 @@ not.
 
 $$\text{rate} = \#\{n : \exists i,\ |q_i^{n*}| < 10^{-2}\}\,/\,n_{\text{steps}}$$
 
-**Zero. Everywhere.**
+🔴 **Zero on the ARCHIVE — and this subsection is archive-only. The rebaselined runs fire; see §4b.**
 
-| record | firing rate | global min |q*| |
+| archived record | firing rate | global min `\|q*\|` |
 |---|---|---|
 | tracked 10 TU | 0.000 over 4 000 steps | 3.99e-2 |
 | tracked 100 TU | 0.000 over 40 000 steps | 2.95e-2 |
 | channel tracked | 0.000 over 2 000 steps | 3.67e-1 |
 | online LinReg1 … 74 | 0.000 over 40 000 steps × 5 configs | 2.19e-2 (LinReg1) |
 
-🔑 **The inherited stabiliser never fires anywhere in the available HIT or channel data**, on
-tracked *or* free-running records, and the closest approach is a factor 2.2 above the threshold.
-`plan.md` §0 item 12 — *"until its firing rate is known, no stability or accuracy number in this
-lineage is cleanly attributable to the model"* — **closes for these records**: every number in this
-report is attributable to the model. The item stays open only for configurations not archived here,
-and for Taylor-Green, whose training path additionally drops rows at a **different** threshold
-(0.5e-2 against deployment's 1e-2, a factor 2 apart, with rows in between trained on and then
-clamped).
+🔑 The closest approach on the archive is a factor 2.2 above the threshold, so `plan.md` §0 item 12
+— *"until its firing rate is known, no stability or accuracy number in this lineage is cleanly
+attributable to the model"* — **closes for the archived records, and for them only**. ⚠️ **It
+reopened on the new system**: `E[16,32]` parks near 0.010 there, below the reference's own minimum
+of 0.0243, and the gate fires on 0.4–1.8 % of steps at λ ≤ 1e-4 (§4b). So §3's archive subsection is
+clean model, and §3's rebaselined λ ≤ 1e-4 rows are model *plus* stabiliser. Also still open for
+Taylor-Green, whose training path drops rows at 0.5e-2 against deployment's 1e-2 — rows in between
+are trained on and then clamped.
 
 ---
 
@@ -994,15 +967,12 @@ driver's gate ships at a deliberately loose 1e-1 and the real bound should come 
 closure's online QoI trajectories against the regenerated reference across all six bands, with the
 marginal the KS statistic scores drawn beside each band.
 
-⚠️ **Band naming.** "The two top bands" elsewhere in this file means the two *highest-wavenumber*
-ones, `Z[16,32]` and `E[16,32]`. Below they are called **the `[16,32]` pair** and the other four
-**the larger-scale bands**, so nothing turns on which end of the spectrum "top" points at.
-
-⚠️ **How to read them.** Regime C is free-running — nothing is replayed, `q*` comes from the
-solver, and two runs launched from the same field decorrelate within an eddy turnover (~0.3 TU). So
-*pointwise* agreement past the opening is not expected and its absence is not a defect. The
-trajectory panel is read for the **envelope**: does the closure hold the right band of amplitudes,
-does it drift, does it collapse. The marginal beside it carries the claim.
+⚠️ **Naming and reading.** "The `[16,32]` pair" is the two highest-wavenumber bands, "the
+larger-scale bands" the other four, so nothing turns on which end "top" points at. Regime C is
+free-running, and two runs from the same field decorrelate within an eddy turnover (~0.3 TU), so
+*pointwise* agreement past the opening is neither expected nor a defect: read the trajectory panel
+for the **envelope** — right band of amplitudes, drift, collapse — and the marginal beside it for
+the claim.
 
 🔑 **The direction of each failure, which KS discards.** KS is a distance and has no sign, so the
 ratio of means is reported beside it:
@@ -1047,9 +1017,9 @@ minimum of **721**; `E[16,32]` reaches **6.2e-3** against **0.0243**.
 
 ![LinReg6 online](figures/fig8_online_LinReg6.png)
 
-🔴 **λ = 1e-4 does not remove them.** Same left tail, same envelope. Put beside the λ = 0 figure
-this is the clearest statement of the weak λ probe's negative result: a fit whose standalone
-recursion is 2.7× less explosive produces a visually indistinguishable trajectory.
+🔴 **λ = 1e-4 does not remove them** — same left tail, same envelope. The weak probe's negative
+result in one picture: a fit whose standalone recursion is 2.7× less explosive is visually
+indistinguishable.
 
 ![LinReg7 online](figures/fig8_online_LinReg7.png)
 
@@ -1140,25 +1110,22 @@ open-loop spectrum.
 | **DDN** | **3.45%** | 4.6e-4 | **no — `MVG_sampler` never receives `q*`** |
 
 🔑 **The DDN crosses the threshold nearly twice as often as the λ = 0 LRS and nothing stops it.**
-That is a sharper statement of the asymmetry than a firing count alone: it is not that the DDN
-stays clear of the condition, it is that the condition is never tested for it. The clamp lives only
-in the `LinReg` path (`time_series_methods.jl:162,165,190,193`). So a LRS-vs-DDN difference is
-model *plus* stabilizer, and **either clamp both or neither** before D6 runs.
+Sharper than a firing count alone: it is not that the DDN stays clear of the condition, it is that
+the condition is never tested for it — the clamp lives only in the `LinReg` path
+(`time_series_methods.jl:162,165,190,193`). So any LRS-vs-DDN difference is model *plus* stabilizer.
+✅ **Settled for D6 (Rik, 2026-09-16): neither is clamped and the DDN stays as published**; the
+counterfactual census is reported beside its deficit (§4c).
 
-🔑 **λ ≥ 1 gives a fourth option that the weak cells hid: don't need the clamp.** At λ = 1 the
-smallest `\|q*\|` reached anywhere in 5 × 40 000 steps is 1.4e-2 and at λ = 10 it is 2.1e-2 — 1.4×
-and 2.1× *above* the threshold — so the stabilizer is inert rather than merely quiet, and these
-trajectories are what the model produces with no intervention at all. That removes the confound from
-any comparison built on them: `LinReg7`-vs-DDN is model against model, where `LinReg1`-vs-DDN is
-model-plus-clamp against model. If the "clamp both or neither" fix does not land before D6,
-**`LinReg7` is the LRS cell to run it with** — best on KS and on dispersion, and for it the two
-options coincide.
+🔑 **λ ≥ 1 gives a fourth option the weak cells hid: don't need the clamp.** The smallest `\|q*\|`
+reached anywhere in 5 × 40 000 steps is 1.4e-2 at λ = 1 and 2.1e-2 at λ = 10 — *above* the
+threshold, so the stabilizer is inert rather than merely quiet and those trajectories are what the
+model produces with no intervention. `LinReg7`-vs-DDN is therefore model against model, where
+`LinReg1`-vs-DDN is model-plus-clamp against model.
 
-⚠️ **λ = 1's margin is 1.4×, not a comfortable one.** `LinReg8` clears the threshold by 2.1× and
-`LinReg9` by 4.2×, so if D6's initial conditions push further into the left tail than these 100 TU
-free runs did, λ = 1 is the first of the three that could start clamping and stop being a clean
-model-versus-model comparison. Worth re-checking the census on the D6 ensemble rather than assuming
-it carries over.
+⚠️ **λ = 1's margin is 1.4×, not comfortable, and the census was re-checked on D6 rather than
+assumed to carry over.** ✅ It does carry: over D6's forecast steps LinReg7 fires **0.000 %** and the
+DDN cannot fire at all, while LinReg1 fires on **0.392 %** (§4c). So the λ = 1-vs-DDN comparison is
+model against model there too, and only LinReg1's numbers are model-plus-stabiliser.
 
 ✅ **`E[16,32]` accounts for 100% of fired steps in all five λ = 0 replicas** — memory #59 checked
 only the worst — and no other band is ever under the threshold on a fired step. The events are
@@ -1177,6 +1144,27 @@ reference minimum of 0.0243.
 **Run 2026-09-16.** Three closures, each forecasting from the **same** initial conditions:
 `LinReg1` (h = 5, λ = 0), `LinReg7` (h = 5, λ = 1) and the `DDN`. K = 90 ICs × M = 10 members ×
 1200 lead steps, `nwarm = 100`, Float64, on `gpu_h100`.
+
+🆕 🔴 **Scored on ONE lead grid for every band since 2026-09-17 (Rik), not a per-QoI one.** Leads at
+**25, 50, 100, 200, 400, 1000 steps = 0.0625, 0.125, 0.25, 0.5, 1.0, 2.5 TU**, so 36 (band, lead)
+cells and a column label that means one forecast horizon.
+
+The per-QoI grid came from gotcha #30 — `T_int` spans a factor **36.8** across the QoIs — but that
+was measured on the **correction**, and D6 scores the **level**. On the level the six bands span
+2.18× on `T_int`, 1.40× on the `ρ = 0.1` crossing and only **1.22×** on the 1/e time (§1). So the
+old grid varied the leads about twice as much as the decorrelation it was tracking, and it did so
+through `T_int`, which is not well defined here because the level's ACF rings rather than decays.
+🔑 **It also made the columns incomparable**: the `0.25 × T_int` column pooled `Z[0,6]` at 25 steps
+(0.0625 TU) with `Z[16,32]` at 54 (0.135 TU) — a factor 2.2 in horizon averaged into one number —
+and the union needed **26** distinct leads to express five nominal ones, against **6** now.
+
+⚠️ **Every number in this section moved with the grid** and none of the conclusions did; where the
+old figures are quoted elsewhere they are marked. The new grid runs *shorter* at the short end
+(25 steps for every band, where only `Z[0,6]` reached before), which is why the mean skills are
+lower across the board — more of the grid now sits where forecasts are good. The 0.25 and 0.5 TU
+leads bracket the 1/e time (0.290–0.355) and the `ρ = 0.1` crossing (0.430–0.600) from both sides;
+2.5 TU is the single saturation anchor. ✅ **The saturation lead stays a per-band answer**, because
+it is found by scanning the grid rather than assumed.
 
 🔴 **Scored on 87 ICs, not 90, because THREE LinReg1 MEMBERS DIVERGED.** Confirmed from
 `slurm-26795092_67.out` (Rik, 2026-09-16), member 7 of `k` = 170:
@@ -1206,7 +1194,7 @@ members all completed:
 | 197 | 3 | 431 | 331 | **0.828 TU** |
 | 313 | 6 | 738 | 638 | **1.595 TU** |
 
-All three are **inside the scored grid** (longest lead 1086). None is near the end of the window, so
+All three are **inside the scored grid** (longest lead 1000). None is near the end of the window, so
 this is not a slow drift that runs out of room — it is a blow-up at 0.8–1.6 TU of free running.
 
 **Stability, metric #16 — measured, not bounded:**
@@ -1234,6 +1222,8 @@ flatters LinReg1.** All three closures are scored with the same three ICs exclud
 (`D6_EXCLUDE_ICS`), because a paired comparison must run over the intersection of what they
 produced — but for LinReg1 that intersection is not a random subset, it is "the ICs where the model
 did not break". Read the skill table with the stability table above it, never on its own.
+🆕 ✅ **And the size of that flattery is now measured, not asserted — see *What the exclusion is
+worth* below. It is +0.4%, and it does not reach the front.**
 
 ⚠️ The census is computed **before** the exclusion is applied, deliberately: `EXCLUDE_ICS` names
 what is kept out of the *scored* set, while the census describes **the run** — and an excluded IC is
@@ -1242,23 +1232,148 @@ one closure that had them.
 
 | | LinReg1 | LinReg7 | DDN |
 |---|---|---|---|
-| **mean skill**, all 30 (band, lead) cells | **0.5521** | 0.5666 | 0.9284 |
-| short leads (0.25, 0.5 × T_int) | **0.2908** | 0.3135 | 0.7655 |
-| long leads (2, 5 × T_int) | 0.7767 | **0.7735** | 1.0611 |
-| **spread–skill inside S7's [0.8, 1.25]** | **23 of 30** | 2 of 30 | 3 of 30 |
-| median spread–skill ratio | **0.974** | 0.600 | 0.405 |
+| **mean skill**, all 36 (band, lead) cells | **0.4957** | 0.5099 | 0.8457 |
+| short leads (≤ 0.3 TU) | **0.2558** | 0.2767 | 0.6574 |
+| long leads (≥ 0.6 TU) | 0.7740 | **0.7703** | 1.0500 |
+| **spread–skill inside S7's [0.8, 1.25]** | **27 of 36** | 5 of 36 | 4 of 36 |
+| median spread–skill ratio | **0.977** | 0.559 | 0.392 |
 | clamp firing rate | 0.392% | 0% | 0% |
 | bands saturating inside the grid | 0 of 6 | 0 of 6 | 2 of 6 |
 
 Skill is the RMSE of the ensemble mean as a fraction of the climatological level, so **1.0 is
 "no better than climatology"** and lower is better.
 
+### 🆕 RH-3 — the rank histograms, which say the same thing by shape
+
+`analysis/plot_d6_rh.jl`, from the saved score files, so these cannot disagree with the table above.
+Each histogram is one (band, lead) cell and its entries are the **87 initial conditions**: the rank
+of the truth among the 10 members. That axis is the whole reason D6 exists — an archived online run
+gives one trajectory from one IC, so each lead there has a single verification instance and a rank
+histogram over one sample is not a histogram.
+
+| | flat / 36 | U-shaped / 36 | median convexity | median slope |
+|---|---|---|---|---|
+| **LinReg1** (λ = 0) | **23** | **0** | **−0.07** | +1.51 |
+| **LinReg7** (λ = 1) | 1 | **31** | +4.97 | +2.08 |
+| **DDN** | 0 | **35** | +7.89 | +3.17 |
+
+*flat* = both Jolliffe–Primo intervals contain 0; *U-shaped* = the convexity interval lies strictly
+above 0, i.e. measurably under-dispersed. Intervals are block-bootstrapped along the IC axis.
+
+![RH-3, LinReg1](figures/fig10_d6_rank_histograms_LinReg1.png)
+![RH-3, LinReg7](figures/fig10_d6_rank_histograms_LinReg7.png)
+![RH-3, DDN](figures/fig10_d6_rank_histograms_DDN.png)
+![RH-3 contrasts against lead](figures/fig10b_d6_rh_summary.png)
+
+🔑 **This is an independent confirmation of the spread–skill ordering, and it is sharper.** The
+in-band counts (27 / 5 / 4) measure dispersion through a *variance ratio*; these measure it through
+the *shape* of the rank distribution, and they separate the closures further: LinReg1 is
+indistinguishable from flat in **23 of 36** cells and is never measurably U-shaped, while LinReg7 is
+U-shaped in 31 and the DDN in **35 of 36**. Two statistics, two mechanisms, same verdict — worth
+more than either alone, because a spread–skill ratio can be right for the wrong reason (a variance
+that matches on average while the shape of the distribution does not).
+
+🔑 **LinReg1's defect is at the other end, and only at long leads.** Its convexity is ≈ 0 out to
+0.5 TU and goes *negative* by 2.5 TU: cap-shaped, i.e. **over**-dispersed once the ensemble has
+saturated, which is what its spread–skill ratio says there too. So the λ = 0 cell is calibrated
+where forecasts carry information and slightly too wide past decorrelation — the benign direction.
+
+⚠️ **Every closure is mean-biased, and that is the slope column.** All three slopes are positive at
+almost every cell (medians +1.51 / +2.08 / +3.17): the truth lands high in the ranks, meaning the
+ensembles sit **below** it. That is §4b's low bias — every TO-LRS cell runs 6–9 % low in every band
+— reappearing in a statistic that was not built to measure it. A bias, not a dispersion defect, and
+an L0/L1 target rather than an L2 one.
+
+⚠️ **Do not read 36 cells as 36 tests.** The six bands move together (§1: their 1/e times span only
+1.22×) and the six leads within a band are nested windows of one trajectory. 87 ICs over 11 bins is
+**7.9 per bin** — comfortable for the contrasts, marginal for an omnibus χ², which is why no
+p-value is drawn and the contrasts carry the claim.
+
+### 🆕 ✅ What the exclusion is worth — measured, 2026-09-17 (Rik asked)
+
+**Question: the tables above exclude the unstable *initial conditions*; can the exclusion be
+narrowed to the unstable *replicas*?** It can, and it was, and the answer is that it changes
+nothing material. `analysis/d6_delta.jl` reports it; `analysis/score_d6.jl` now carries both
+policies and the control that separates them.
+
+🔑 **A divergence is a property of the member, not of the IC** (the stability table above: one
+member in ten, in three ICs, the other nine always completing). So dropping the IC discards nine
+sound forecasts to account for one that failed. The narrow policy instead drops the failing
+*member* from **every** closure — `member_seed(k, member) = hash((:d6, k, member))` does not depend
+on the model, so the same noise realisation leaves all three — and then thins each IC to a common
+`M`, which is what keeps the ensemble rectangular. `spread_skill`'s finite-`M` factor is one scalar
+per call and `rank_histogram`'s bins are `M+1`; neither statistic is defined instance by instance.
+
+🔴 **Two things change at once between the policies, so a third set is needed.** B scores 3 more
+ICs *and* one fewer member, and a spread–skill ratio is `M`-free only for a perfectly reliable
+ensemble — the thing under test. **C is the isolation control**: the published ICs at the new `M`.
+
+| | ICs | M | what it isolates |
+|---|---|---|---|
+| **A** | 87 | 10 | the published policy — whole ICs dropped |
+| **C** | 87 | 9 | **A → C is the `M` effect**, no ICs change |
+| **B** | 90 | 9 | **C → B is the initial conditions**, no `M` change |
+
+Mean skill over the 30 (band, lead) cells, all on a common `M` = 10 climatological denominator so
+that `climatological_skill`'s own `sqrt(1 + 1/M)` cannot masquerade as a change in the forecasts:
+
+| | A 87@10 | C 87@9 | B 90@9 | A→C (`M`) | **C→B (ICs)** |
+|---|---|---|---|---|---|
+| **LinReg1** | 0.4957 | 0.4965 | 0.4987 | +0.0008 | **+0.0022** |
+| **LinReg7** | 0.5099 | 0.5122 | 0.5154 | +0.0023 | **+0.0032** |
+| **DDN** | 0.8457 | 0.8437 | 0.8474 | −0.0020 | **+0.0037** |
+
+🔑 **The survivorship is real, worth +0.4% on LinReg1, and points the other way.** Every closure is
+slightly *worse* over the three restored ICs, and LinReg1's penalty is the **smallest** of the
+three. They are not selectively hard for the closure that broke on them — which is what the
+conditioning worry predicts and what this refutes. The `M` effect is separately ±0.2%.
+
+**The front, each policy on its own denominator:**
+
+| policy | LinReg1 | LinReg7 | gap | more skilful |
+|---|---|---|---|---|
+| **A** 87@10 | **0.4957** | 0.5099 | +2.9% | LinReg1 |
+| **C** 87@9 | **0.4940** | 0.5096 | +3.2% | LinReg1 |
+| **B** 90@9 | **0.4962** | 0.5128 | **+3.4%** | LinReg1 |
+
+✅ **LinReg1 holds the accuracy end of the front under all three, and the gap widens.** Stability is
+a property of the run and moves under none of them: 0.9967 / 1.0000 / 1.0000 and 0.9667 / 1.0000 /
+1.0000 throughout.
+
+⚠️ **Calibration is where the restored ICs show.** In-band cells go 27 → 28 (LinReg1) and hold at
+5 (LinReg7) and 4 (DDN), while the median spread–skill ratio falls for all three — 0.977 → 0.948,
+0.559 → 0.550, 0.392 → 0.393. The decomposition attributes that to the ICs (−0.029 / −0.025 /
+−0.005), not to `M` (+0.000 / +0.016 / +0.006): the three restored ICs are ones where **every**
+closure is more under-dispersed. The ordering is unchanged in kind.
+
+⚠️ **What the narrow policy does NOT remove.** A diverged member has no value past its blow-up under
+any policy, so member-level survivorship remains. What goes is the IC-level conditioning, which is
+the part that was selecting on the outcome.
+
+🔒 **The policy is deliberately left open (Rik, 2026-09-17), and the reason generalises past this
+run.** The two policies fail on different axes, and LinReg1 happens to sit where the published one
+is cheapest:
+
+- **A costs one IC per *affected* IC.** Here 3 of 90. A model whose divergences are spread one per
+  IC over thirty ICs would lose a third of `K` — the verification axis D6 exists to supply.
+- **B costs the *worst* IC's losses from *every* IC.** Here one member of ten. A model that loses
+  five members in a single IC would thin all 90 ICs to `M` = 5.
+
+🔑 So neither is right in general: **A is sensitive to how far the divergences are spread, B to how
+deep the worst one is.** Both stay implemented and every score file records which one produced it
+(`policy`, `member_ids`, `thinned_members`). ⚠️ A model with *clustered* divergences needs the third
+thing, which is not built: a genuinely ragged `M` with the finite-`M` correction applied per
+instance and a rank histogram that can pool unequal bin counts.
+
+⚠️ **§4c's published tables stay on policy A**, which is what every other number in this section and
+in `claude_memory.md` #68 refers to. The measurement above is the bound on what that choice costs.
+
 ### 🔴 D6 inverts the free-running ranking, which is the result this experiment was built to get
 
 On free-running 100 TU marginal KS, LinReg7 (λ = 1) was the best cell at 0.648 against LinReg1's
 0.836 (§3). **Paired, LinReg1 wins on skill at 9 of the 10 short- and mid-lead cells and is
-calibrated where LinReg7 is not** — 23 of 30 cells inside S7's band against 2, and a median ratio
-of 0.974 against 0.600. LinReg7 is systematically **under-dispersed**: its ensemble is too narrow
+calibrated where LinReg7 is not** — 27 of 36 cells inside S7's band against 5, and a median ratio
+of 0.977 against 0.559. LinReg7 is systematically **under-dispersed**: its ensemble is too narrow
 for the error it actually makes.
 
 🔑 That is exactly the failure mode #61 predicted. Free-running marginal KS compares *climatologies*
@@ -1304,9 +1419,9 @@ the stability–accuracy front, and the front is the claim (`claude_memory.md` #
 
 | | IC stability | mean skill | in-band (S7) | on the front? |
 |---|---|---|---|---|
-| **LinReg1** (λ = 0) | 0.9667 | **0.5521** | **23/30** | ✅ |
-| **LinReg7** (λ = 1) | **1.0000** | 0.5666 | 2/30 | ✅ |
-| **DDN** | **1.0000** | 0.9284 | 3/30 | ❌ **dominated** |
+| **LinReg1** (λ = 0) | 0.9667 | **0.4957** | **27/36** | ✅ |
+| **LinReg7** (λ = 1) | **1.0000** | 0.5099 | 5/36 | ✅ |
+| **DDN** | **1.0000** | 0.8457 | 4/36 | ❌ **dominated** |
 
 🔑 **The DDN is not on the front.** LinReg7 matches its perfect stability and beats it on skill by a
 factor 1.64 and on calibration 2 cells to 3 — so no trade-off buys the DDN anything, on this testbed.
@@ -1314,14 +1429,17 @@ That is the strongest form the negative-control result can take: not "worse on a
 *dominated*.
 
 🔑 **The front has exactly two points, and the trade is one-dimensional.** LinReg1 beats LinReg7 on
-**both** accuracy (0.5521 against 0.5666) and calibration (23 against 2 of 30); LinReg7 beats
+**both** accuracy (0.4957 against 0.5099) and calibration (27 against 5 of 36); LinReg7 beats
 LinReg1 on **stability alone** (1.0000 against 0.9667). So on this testbed **λ buys stability and
 pays for it in both accuracy and calibration** — and the calibration price is far the larger, a
-factor 11 in cells inside S7's band against a 2.6% difference in skill.
+factor 5 in cells inside S7's band against a 2.9% difference in skill.
 
 ⚠️ **The skill and calibration columns are measured on the 87 ICs LinReg1 survived**, so the front's
 accuracy axis is read in LinReg1's favour by construction. The stability column is measured on all
 90. Both are correct; they are not measured on the same set, and the table says so.
+🆕 ✅ **Measured 2026-09-17: that construction is worth +0.4%, and the front does not depend on it** —
+scored on all 90 ICs with only the diverged *members* excluded, LinReg1 still leads on accuracy and
+the gap widens to 3.4%. See *What the exclusion is worth* above.
 
 🔴 **The obvious extension is one more front point.** Both cells on the front have ρ(C̃) > 1
 (2.6888 and, at λ = 1, still above 1 — ρ crosses 1 between λ = 1 and 10, #63). `LinReg8` (λ = 10) is
@@ -1396,14 +1514,13 @@ whose oracle is R2's own LinReg1 replica 1, before these numbers are quoted anyw
     test rejects 87 % at nominal 5 % and the rescaled one 0 %. `chi2_eff` is a conservative guard,
     not a calibrated p-value; the contrasts are the primary statement.
 
-12. 🔴 **The "always score `dQ`, never `q`" rule is regime-B-scoped, and applying it to regime C
-    was an error in an earlier version of this report** (Rik). O7's measurement came from the
-    offline unrolled driver, where the replayed `q*` pins the level. Free-running, the level is
-    exactly what the claims are about, and it is what paper 2 scores. Two things followed from
-    fixing it: **G1's online acceptance became checkable and passes exactly** (§3), and the level
-    turned out to be a near-null diagnostic for temporal structure while remaining the right
-    target — so regime C now reports both. `plan.md` §9 spec 1 and `metrics.md` §1 already say
-    this correctly; the error was in reading them as unconditional.
+12. 🔴 **The "always score `dQ`, never `q`" rule is regime-B-scoped** (Rik). O7's measurement came
+    from the offline unrolled driver, where the replayed `q*` pins the level; free-running, the
+    level is what the claims are about and what paper 2 scores. Two things followed: **G1's online
+    acceptance became checkable and passes exactly** (§3), and the level proved a near-null
+    diagnostic for temporal structure while remaining the right target, so regime C reports both.
+    `plan.md` §9 spec 1 and `metrics.md` §1 already say this; reading them as unconditional was the
+    error.
 
 13. **Δρ₁ on the level is not a weak statistic but a null one** (§3): 0.000–0.003 across five
     configurations spanning a factor 5 on KS. `plan.md` §8b argues for the integral-timescale lag
@@ -1423,34 +1540,36 @@ whose oracle is R2's own LinReg1 replica 1, before these numbers are quoted anyw
     distinguishes the two records; both should, wherever a coefficient-level number is
     pre-registered.
 
-15. 🆕 **`_rand_initial_dQ` is a stale filename, not a warm-start treatment.** The two archive
-    roots hold the **same runs**: frozen `data_online_tsim100.0_replica<i>.jld2` is bit-identical
-    in `q` over all 40 001 columns to the working repository's `..._replica<i>_rand_initial_dQ.jld2`
-    (LinReg1 replicas 1–3, LinReg63/64 replicas 1–2), and `paper_runs/online_sgs.jl:62,84` seeds
-    `spinnup_data` from `data_track.dQ[:, 1:100]` exactly as `6_online_TO_LRS.jl:62,83` does. Three
-    consequences, all favourable: LinReg73/74 are on the **same** warm start as LinReg1/63/64 and
-    as D6, so regime C mixes nothing; `compute_ks.jl`'s split between `isfile` on one naming and
-    `load` on the other is harmless, so **G1's online acceptance stands unqualified**; and the
-    `replica_groups` guard is still required, but to stop replica 1 being **counted twice** in a
-    six-file glob rather than to separate treatments.
+15. 🆕 **`_rand_initial_dQ` is a stale filename, not a warm-start treatment.** The two archive roots
+    hold the **same runs** — bit-identical in `q` over all 40 001 columns — because
+    `paper_runs/online_sgs.jl:62,84` seeds `spinnup_data` exactly as `6_online_TO_LRS.jl:62,83`
+    does. Three favourable consequences: LinReg73/74 share a warm start with LinReg1/63/64 and with
+    D6, so regime C mixes nothing; `compute_ks.jl`'s `isfile`/`load` naming split is harmless, so
+    **G1's online acceptance stands unqualified**; and `replica_groups` is still needed, but to stop
+    replica 1 being **counted twice** rather than to separate treatments.
 
 ---
 
 16. 🆕 🔴 **D6 REVERSES THE FREE-RUNNING RANKING, and that is the point of the experiment** (§4c).
     On 100 TU marginal KS, LinReg7 (λ = 1) beat LinReg1 (λ = 0), 0.648 against 0.836. Paired over
     87 shared initial conditions, **LinReg1 is better on skill at 9 of 10 short- and mid-lead cells
-    and is calibrated where LinReg7 is not**: 23 of 30 (band, lead) cells inside S7's [0.8, 1.25]
-    against 2, median spread–skill ratio 0.974 against 0.600. LinReg7 is systematically
+    and is calibrated where LinReg7 is not**: 27 of 36 (band, lead) cells inside S7's [0.8, 1.25]
+    against 5, median spread–skill ratio 0.977 against 0.559. LinReg7 is systematically
     under-dispersed. ⇒ **#61's diagnosis is confirmed by a positive result, not just by a power
     argument**: the free-running statistic ranked the two cells backwards, and the λ ladder's "null"
-    (#63) was a null on the wrong statistic. Any cell selection made on marginal KS must be redone
-    on D6 before it enters the paper.
-    🔴 **RESOLVED 2026-09-16: they diverged** (`slurm-26795092_67.out`). So the finding is **S2′'s
-    stability–accuracy Pareto front, not a clean win — ✅ **and that is the intended result** (Rik,
-    2026-09-16), not a defect to engineer away.** LinReg1 is more skilful and better
-    fraction **0.9967 against 1.0000**, IC stability **0.9667 against 1.0000**, 3 of 90 ICs. Since the
-    excluded ICs are exactly the ones LinReg1 broke on, the skill table is conditioned in LinReg1's
-    favour and must never be quoted without the stability numbers beside it.
+    (#63) was a null on the wrong statistic. Any cell selected on marginal KS must be re-chosen on
+    D6 before it enters the paper.
+    ✅ **The shape of the finding is S2′'s stability–accuracy front, not a clean win — and that is
+    the intended result** (Rik, 2026-09-16), not a defect to engineer away. LinReg1 is more skilful
+    and better calibrated; LinReg7 is the stable one, member stability **1.0000 against 0.9967** and
+    IC stability **1.0000 against 0.9667** over 3 of 90 ICs. The excluded ICs are exactly the ones
+    LinReg1 broke on, so the skill table must never be quoted without the stability numbers.
+    🆕 ✅ **Bounded 2026-09-17: the conditioning is worth +0.4% and the front does not rest on it.**
+    Re-scored on all 90 ICs with only the diverged *members* excluded from every closure, LinReg1
+    still leads on accuracy and the gap widens from 2.9% to 3.4%; every closure is slightly worse
+    over the restored ICs and LinReg1's penalty is the smallest of the three, which is the opposite
+    of what the conditioning worry predicts. ⚠️ Which policy the paper uses is **open by decision**,
+    because the two scale differently outside this run — §4c and §7.
 
 17. 🆕 **The DDN is worse than climatology in both smallest-scale bands** (§4c): skill/climatology
     1.13–1.98 at every lead in `Z[16,32]` and `E[16,32]`, the only configuration for which that is
@@ -1467,44 +1586,42 @@ L2 demotes to confirmatory) or ∩-shaped (check the clamp census and tracking-n
 first).
 
 **It is U-shaped in four of six QoIs and biased in the other two — read against the correct null,
-
-🆕 **D6 corroborates this online, on the other regime.** §9's branch is an *offline* (regime A)
-question, and §4c answers the matching online one: `LinReg1`'s spread–skill sits inside S7's band in
-**23 of 30** (band, lead) cells with a median ratio of 0.974, so the λ = 0 cell is well calibrated
-under free running too. `LinReg7` (λ = 1) reads **2 of 30**, median 0.600 — strongly under-dispersed.
-So ridge does not repair the dispersion defect L2 was proposed for; it makes it worse while buying
-stability. That is a point *for* L2, on the axis L2 was proposed for, and it is now measured in both
-regimes rather than one.
-with the two ∩-candidates ruled out.**
+with both ∩-candidates ruled out. No stop: L2 stays as proposed**, with a sharper claim than the
+plan assumed, because the defect is band-selective and the paper can say which mechanism each band
+needs.
 
 - The four smaller-scale bands are under-dispersed: held-out residual 14–18 % wider than the fitted
   Σ, convexity +10 to +19 against the in-sample null, all intervals excluding zero. **L2's
   motivation is measured, on the axis it was proposed for.**
 - The two largest-scale bands are **biased, not mis-dispersed**: variance right to 1 %, slope +9.1
-  and +7.5. That is an L0/L1 target, not an L2 one.
-- §9's ∩ branch asked for two checks before believing over-dispersion. Both are now closed:
-  the **clamp never fires** (rate 0 on every record) and the archived configurations have
-  `tracking_noise = 0.0`. So the low-band ∩ is not an artefact of either.
+  and +7.5. An L0/L1 target, not an L2 one.
+- §9's ∩ branch asked for two checks before believing over-dispersion, and both hold *for the
+  records these histograms are computed on*: `tracking_noise = 0.0` in the archived configurations,
+  and the clamp never fires there (§4 #26). ⚠️ **"The clamp never fires" is no longer a statement
+  about this project** — it fires on 0.4–1.8 % of steps on the rebaselined λ ≤ 1e-4 runs (§4b). It
+  is still true of the archive, which is what the branch needed.
 
-**No stop.** L2 stays as proposed, with a sharper claim available than the plan assumed — the defect
-is band-selective, and the paper can say which mechanism each band needs.
+🆕 **D6 corroborates the verdict online, in the other regime.** §9's branch is offline (regime A);
+§4c answers the matching online question. `LinReg1`'s spread–skill is inside S7's band in **23 of
+36** (band, lead) cells, median 0.977 — the λ = 0 cell is well calibrated free-running too — against
+`LinReg7`'s **5 of 36**, median 0.559. So ridge does not repair the dispersion defect L2 was
+proposed for; it makes it worse while buying stability. A point *for* L2, on L2's own axis, now
+measured in both regimes.
 
 ---
 
 ## 7. What is still blocked
 
+*Open work only. Closed items are not parked here — they are in §4c and `claude_memory.md` #65, #68.*
+
 | | Blocker |
 |---|---|
 | **RH-2** | The archive has `n_replicas = 5` ⇒ 6 bins, 4-dof spread estimate. Computable, not quantitative. |
-| **#17 spread–skill vs lead, RH-3** | ✅ **CLOSED 2026-09-16.** D6 ran three closures at K = 90, M = 10; §4c reports spread–skill by lead and the rank histograms for all three. Scored on the 87 ICs common to all of them. |
-| **DDN in regime C** | ✅ **CLOSED.** R2 ran the DDN online, 5 × 100 TU, and §3 scores it. The archive never had these runs; these are new measurements, not a reproduction. |
 | **λ > 0 offline reproduction** | 🔴 **The parity check is no longer "not run" — it is RUN and it FAILED.** Measured on R1's record 2026-09-15: against the exact ridge minimiser the `RegularizedLeastSquares` ADMM iterate differs by a relative **0.970 at λ = 1e-5, 0.903 at 1e-4, 0.452 at 1e-2**, and its training RMSE is ~0.00714 at every one of those λ — it is iteration-limited, not λ-limited, so a sweep through it is not a sweep in λ. `5_train_LinReg.jl` now solves `:l2` exactly (`ridge_solver = :exact`) and keeps ADMM only for reproducing paper 2 and for `:nuclear`. G1's λ = 0.01 *coefficient* acceptance against the archive is still not run and now needs the `:admm` path explicitly. λ = 0 is reproduced for all three available configurations, and G1's **online** acceptance passes for all five (§3). |
 | **The h and λ sweep on the new system** | 🔴 Only h = 5 exists rebaselined (λ ∈ {0, 1e-5, 1e-4}). h ∈ {10, 40} and λ = 0.01 have never been run post-merge, so §3's archive subsection is the only place a sweep can be read — on the old system. |
 | **A third point on the front** | ⚠️ Both front cells have ρ(C̃) > 1. `LinReg8` (λ = 10, ρ = 0.9992, the first contractive cell) is fitted and on disk but has never been through D6. Running it would say whether contractivity buys anything past λ = 1 or only costs accuracy — i.e. whether the front continues or stops. One `sbatch`, same IC packages. |
-| **Which `T_int` estimator is right** | ⚠️ The Sokal-window estimator here gives 0.25–0.54 TU on the level; `report_marginals` gives 0.94–1.08 TU on the same record (#58). A factor ~2, and D6's grid is sized on the larger one. |
 | **D6's validation** | 🔴 **NOT RUN.** All three run directories hold 0 `d6_valid_*` files — the `--array=0` task was never submitted. `compare_validation` checks the whole D6 path against a trajectory produced by different code years earlier, and it costs one task. It belongs to LinReg1, whose oracle is R2's own LinReg1 replica 1. §4c's numbers are unvalidated until it runs. |
-| **LinReg1 diverges on 0.33% of members** | 🔴 **MEASURED 2026-09-16** after the patched driver and a rerun of ordinals 67, 81, 141: **3 of 900 members, in 3 of 90 ICs** — member stability 0.9967, IC stability 0.9667, against 1.0000/1.0000 for LinReg7 and the DDN. Blow-ups at leads 612, 331, 638 (0.83–1.60 TU past warm-up), all inside the scored grid, one member per affected IC. `Unreasonable large QoI` then NaNs, with `umax` *decreasing* — the correction over-drains and `tau = dQ/src_Q` explodes, not a CFL runaway. ⚠️ The gate does not prevent it (`k` = 170 has the 2nd-highest gate rate of 90). ✅ **CLOSED (Rik, 2026-09-16): report it as S2′'s Pareto front.** LinReg1 and LinReg7 are the two front points; do not stabilise LinReg1. |
-| **A gated DDN** | ✅ **CLOSED (Rik, 2026-09-16): keep the DDN as published.** `MVG_sampler` cannot apply `TURBULENCE_GATE` and will not be given one — that would be a different model. The 2.33% / 50% counterfactual census is reported beside the small-scale deficit so the bound stays visible. The DDN is dominated by LinReg7 regardless, so it is not on the front. |
+| **Which exclusion policy D6 uses** | ⚠️ **OPEN by decision (Rik, 2026-09-17), not by omission.** Dropping the unstable *ICs* (published) and dropping only the unstable *replicas* are both implemented in `score_d6.jl` and differ by +0.4% here, so nothing forces a choice on this run. Left open because the two scale differently and LinReg1 is the easy case: the IC policy costs one IC per *affected* IC, so divergences spread one per IC over many ICs would cost a large fraction of `K`; the member policy costs the *worst* IC's losses from every IC, so several members lost in one IC would thin all 90. ⚠️ Clustered divergences would need a ragged `M`, which is not built. See §4c. |
 | **#5, #6, #3** | Deferred by `metrics.md` §6. |
 | **Channel, Taylor-Green** | Only the channel tracked QoI cache is present; no channel or TG fits or online runs were scored. |
 
@@ -1512,24 +1629,20 @@ is band-selective, and the paper can say which mechanism each band needs.
 
 ## 8. Test coverage
 
-`julia --startup-file=no --project=test test/runtests.jl` — **1461 tests, all passing.** Run
-directly rather than through `Pkg.test`, because the suite deliberately has no RikFlow dependency:
-the `ts_*` layer is stdlib-only, so CI never loads IncompressibleNavierStokes, CUDA, Makie or Lux.
+`julia --startup-file=no --project=test test/runtests.jl` — **1548 pass, 1 broken.** Run directly
+rather than through `Pkg.test`, because the suite deliberately has no RikFlow dependency: the `ts_*`
+layer is stdlib-only, so CI never loads IncompressibleNavierStokes, CUDA, Makie or Lux.
 
-| Test | Status |
+| Test | What it pins |
 |---|---|
-| **V0** harness | ✅ |
-| **V1** `build_history` vs all five archived `create_history` copies | ✅ HIT / channel / `time_solvers` bit-identical; TG = builder + an exact column mask; the inline online copy row-by-row; plus the real tracked record at h ∈ {5, 10} |
-| **V1** archived coefficients | ✅ LinReg1, 64, 74 at λ = 0 — `rel_pred` 6.4e-7 to 8.3e-7 |
-| **V2** batch ≡ online buffer | ✅ |
-| **V16** ridge parity, unpenalized intercept | ✅ incl. QR vs normal equations on a collinear design |
-| **V17** NLL, CRPS vs Monte Carlo, Δρ on a known AR(1), erf to 4e-16 | ✅ |
-| **V18** companion blocks, total block sum, starred gain, Float64 invariance | ✅ |
-| **V23** Gram spectrum branches | ✅ |
-| **V25** rank deficit vs pinv gap | ✅ asserts the specified metric's failure |
-| **V26** level ≡ increment ranks | ✅ |
-| **V27** uniformity coverage, signed dispersion, χ² over-rejection | ✅ |
-| **V28** D6's lead-resolved scorer — planted-index truth alignment, the finite-`M` correction (1 corrected against √(M/(M+1)) uncorrected), signed dispersion, flatness as coverage over 30 replications, saturation reported not extrapolated, and `score_d6.jl`'s whole driver on synthetic members | ✅ `test_d6_score.jl`. ⚠️ `plan.md` §14 files V28 under `test_rollout.jl`, which does not exist |
-| **V29** D6's IC selection and packaging — both pool constraints per IC, `K = 180` at 0.4818 TU, `K = 400` fails loudly, the warm-up slice reducing to the archived driver's `dQ[:, 1:100]` at `k = 1`, and the step→column convention measured against the record | ✅ `test_d6_ics.jl` |
-| **V30** the OU replay — equality with the real `OU_forcing_step!`, the Markov property, `n = 0` a provable no-op, grid independence | ✅ `test_ou.jl`; the advance count itself is measured by `analysis/ou_replay.jl` on a CPU mini-solve (`nstep + 1`) |
-| **SC-48** index convention | ✅ |
+| **V0–V2** | harness · `build_history` against all five archived `create_history` copies (HIT / channel / `time_solvers` bit-identical, TG = builder + an exact column mask, the inline online copy row-by-row) · archived coefficients at λ = 0 for LinReg1/64/74, `rel_pred` 6.4e-7–8.3e-7 · batch ≡ online buffer |
+| **V16–V18, V23** | ridge parity with an unpenalized intercept, incl. QR against the normal equations on a collinear design · NLL, CRPS against Monte Carlo, Δρ on a known AR(1), erf to 4e-16 · companion blocks, total block sum, starred gain, Float64 invariance · Gram spectrum branches |
+| **V25–V27** | rank deficit against the pinv gap — **asserts the specified metric's failure** · level ≡ increment ranks · uniformity coverage, signed dispersion, χ² over-rejection |
+| **V28** D6's scorer | planted-index truth alignment, the finite-`M` correction (1 corrected against √(M/(M+1)) uncorrected), signed dispersion, flatness as coverage over 30 replications, saturation reported not extrapolated, and the whole driver on synthetic members. ⚠️ `plan.md` §14 files it under `test_rollout.jl`, which does not exist |
+| **V29, V30** | D6's IC selection and packaging, both pool constraints per IC, `K = 400` failing loudly, the warm-up slice reducing to `dQ[:, 1:100]` at `k = 1` · the OU replay: equality with the real `OU_forcing_step!`, the Markov property, `n = 0` a provable no-op, grid independence |
+| **V31–V38** source checks | 🔑 **The class no runtime test can reach**, because `test/Project.toml` excludes CUDA and INS on purpose so the drivers are never loaded locally. `@printf` formats are string literals (V31, with a positive control) · the validation gate and its saturation scale (V32) · the OU forcer is type-generic (V33) · the setup stays kernel-safe (V34) · every `using` resolves from `[deps]` or `@stdlib` (V35) · no top-level loop rebinds a top-level name (V36) · `unit_cartesian_indices` takes `Val`, never a bare integer (V37) · both samplers replay the warm-up before touching the rng (V38) |
+| **SC-48** | index convention |
+
+⚠️ **The one `@test_broken` is deliberate and is V35's**: six pre-existing unresolvable imports are
+carried as visible debt while the gate refuses *new* ones. It turns green only when those six are
+decided, so a green suite there would mean the debt was hidden, not paid.
