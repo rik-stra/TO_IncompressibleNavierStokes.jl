@@ -106,6 +106,39 @@ function RF.init_lstm_params(rng::AbstractRNG, spec::RF.LSTMSpec; T::Type = Floa
     )
 end
 
+"""
+    _timeslices(G, L)
+
+Split a `4H x L x B` gate-preactivation array into `L` matrices of `4H x B`, one per time step.
+
+🔴 **This exists only for its adjoint, and the slice it replaces was the single largest cost in
+the reverse pass.** Writing `G[:, t, :]` inside the recurrence looks free -- one small strided
+copy -- but Zygote's pullback for a slice allocates a *parent-sized* zero array and scatters the
+cotangent into it. Inside an `L`-step loop that is `L` allocations of `4H x L x B` and `L` full
+zero-fills, so the reverse pass is O(L^2) in a model whose forward pass is O(L). Profiling one
+`L = 200, B = 8, H = 16` gradient step put `fill!` and `setindex!` at the top of the self-time
+list, and the step allocated 172 MiB for a forward pass that allocates 3.8 MiB.
+
+Slicing once, through a rule that accumulates every step's cotangent into **one** buffer, makes
+the reverse pass O(L) again. Measured on that geometry: 246 ms -> 49 ms, 172 MiB -> 18 MiB, and
+the reverse/forward ratio from 26x down to 5.8x, which is what reverse mode should cost. Nothing
+about the model changes -- this is the same arithmetic with a cheaper pullback, and V50 is what
+says so.
+"""
+_timeslices(G::AbstractArray{<:Any,3}, L::Integer) = [G[:, t, :] for t in 1:L]
+
+Zygote.@adjoint function _timeslices(G::AbstractArray{<:Any,3}, L::Integer)
+    return _timeslices(G, L), function (Δ)
+        dG = zero(G)
+        for t in 1:L
+            Δt = Δ[t]
+            Δt === nothing && continue
+            @views dG[:, t, :] .+= Δt
+        end
+        return (dG, nothing)
+    end
+end
+
 # ---------------------------------------------------------------------------------------------
 # Architecture branches, in the type domain
 # ---------------------------------------------------------------------------------------------
@@ -186,17 +219,29 @@ function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3
     # `analysis/results_LSTMS.md` §4. Zygote's per-operation overhead dominates the actual flops
     # at this model size, so the win is close to the full factor of B.
     XZ2 = _cell_input(cellv, X2, Z2)
-    GX = reshape(ps.Wx * XZ2, 4H, L, B)
+    # The bias is folded in here rather than inside the loop: it is the same vector at every step,
+    # so adding it once to the whole batch is one broadcast instead of `L` of them.
+    GX = _timeslices(reshape(ps.Wx * XZ2 .+ ps.b, 4H, L, B), L)
+
+    # 🔑 `Wh` is pulled out of `ps` **before** the loop, and that is a performance fix, not tidying.
+    # Reading `ps.Wh` inside the loop makes every iteration's pullback a `getfield` on the whole
+    # parameter NamedTuple, so Zygote builds a full params-shaped tangent and `accum`s it `L`
+    # times; profiling showed that one line as the second-largest cost in the reverse pass, after
+    # the slice `_timeslices` replaces. Bound to a local, the per-step cotangent is just `H x H`.
+    Wh = ps.Wh
 
     Hb = Zygote.Buffer(zeros(T, H, L, B))
     h = zeros(T, H, B)
     c = zeros(T, H, B)
     for t in 1:L
-        g = GX[:, t, :] .+ ps.Wh * h .+ ps.b
-        i = _sig.(g[1:H, :])
-        f = _sig.(g[(H + 1):(2H), :])
-        gg = tanh.(g[(2H + 1):(3H), :])
-        o = _sig.(g[(3H + 1):(4H), :])
+        g = GX[t] .+ Wh * h
+        # Views, not slices: each of these used to copy an `H x B` block, and each copy is an
+        # operation Zygote traces and a cotangent it has to allocate; a view's pullback writes
+        # straight into the parent's.
+        i = _sig.(@view(g[1:H, :]))
+        f = _sig.(@view(g[(H + 1):(2H), :]))
+        gg = tanh.(@view(g[(2H + 1):(3H), :]))
+        o = _sig.(@view(g[(3H + 1):(4H), :]))
         c = f .* c .+ i .* gg
         h = o .* tanh.(c)
         Hb[:, t, :] = h
