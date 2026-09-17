@@ -308,6 +308,69 @@ const RF = RikFlow
                                                 arch = :lstm, emission = :none)
     end
 
+    # -----------------------------------------------------------------------------------------
+    # V52 -- the hand-written adjoint against finite differences
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔴 **V50 cannot catch a wrong `_timeslices` adjoint, and this is the gap it leaves.** V50
+    # compares the batched objective against the per-segment one, but since the time-slicing rule
+    # was introduced *both* sides go through it, so a bug in the custom pullback moves them
+    # together and V50 still passes. `_timeslices` is the only hand-written Zygote rule in the
+    # package; everything else composes from rules that are already tested upstream. So it gets an
+    # independent check, against the one reference that shares no code with it: the function
+    # itself, differenced numerically.
+    #
+    # Float64 throughout -- a central difference on Float32 parameters is dominated by round-off
+    # and would pass against almost anything.
+    @testset "V52 gradients match central differences ($em)" for em in (:state_dependent, :none)
+        T = Float64
+        spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = 4), n_hidden = 6,
+                           n_latent = 3, n_encoder = 5, arch = :vrnn, emission = em)
+        ps = RF.init_lstm_params(Xoshiro(61), spec; T)
+        # move off the zero initialisation, or Wd/Araw sit at a point where the check is vacuous
+        ps = merge(ps, (; Wd = randn(Xoshiro(62), T, RF.n_output(spec), spec.n_hidden) ./ 10,
+                        bd = randn(Xoshiro(63), T, RF.n_output(spec)) ./ 10,
+                        Araw = randn(Xoshiro(64), T, RF.n_output(spec), RF.n_output(spec)) ./ 10))
+
+        # L well past a couple of steps, so the recurrence -- and the slice rule -- is exercised
+        L, B, nin, nz, nout = 40, 3, RF.n_input(spec), spec.n_latent, RF.n_output(spec)
+        X = randn(Xoshiro(65), T, nin, L, B)
+        Y = randn(Xoshiro(66), T, nout, L, B)
+        E = randn(Xoshiro(67), T, nz, L, B)
+        sc = 11:L
+
+        f(p) = RF.elbo(spec, p, X, Y, sc, E; beta = 1e-3)
+        g = Zygote.gradient(f, ps)[1]
+
+        bump(p, k, i, d) = merge(p, NamedTuple{(k,)}((begin
+            a = copy(getproperty(p, k)); a[i] += d; a
+        end,)))
+
+        δ = 1e-6
+        keys_to_check = em === :none ? (:Wx, :Wh, :b, :V1, :V2, :cdec, :Bmu, :Bsig, :We, :be) :
+                        (:Wx, :Wh, :b, :V1, :V2, :cdec, :Bmu, :Bsig, :We, :be, :Wd, :bd, :Araw)
+        for k in keys_to_check
+            arr = getproperty(ps, k)
+            arr === nothing && continue
+            gk = getproperty(g, k)
+            @test gk !== nothing
+            # a handful of entries per array, deterministically chosen
+            for i in unique(round.(Int, range(1, length(arr); length = min(4, length(arr)))))
+                fd = (f(bump(ps, k, i, δ)) - f(bump(ps, k, i, -δ))) / (2δ)
+                @test isapprox(gk[i], fd; rtol = 1e-4, atol = 1e-7)
+            end
+        end
+
+        # and with emission = :none the three unused blocks get no gradient signal at all, which
+        # is what lets them stay at their zero initialisation without being frozen by hand
+        if em === :none
+            for k in (:Wd, :bd, :Araw)
+                gk = getproperty(g, k)
+                @test gk === nothing || all(iszero, gk)
+            end
+        end
+    end
+
     @testset "iwae_nll runs and tightens with K" begin
         spec = mkspec(:vrnn)
         T = Float32
