@@ -260,6 +260,14 @@ Fit an M4 model to a regressor/target pair.
 # Keywords
 - `L`, `burn`: segment length and burn-in. `L = 200`, `burn = 50` by default; both are sweep axes.
 - `epochs`, `batch`, `lr`, `beta`, `seed`.
+- `patience`, `lr_decay`, `min_lr`: decay the learning rate by `lr_decay` after `patience` epochs
+  without a validation improvement, down to `min_lr`.
+
+🔴 **Returns the best-validation iterate, not the last one**, and the validation epsilons are drawn
+once and held fixed so the curve is a function of the parameters alone. Both matter more than they
+look: on R1's record at a constant `lr`, the three latent architectures reached val ≈ −12 near
+epoch 91 and were at ≈ −4 by epoch 100, so a last-iterate fit **inverted the architecture ranking**.
+`history` carries `best_epoch` and `best_val` so a run that ends far from its best is visible.
 - `val_frac`: the trailing fraction of segments held out for the reported validation loss.
   ⚠️ This is an *inner* split for early stopping and diagnostics only. Model **selection** is on a
   window disjoint from both training and the online evaluation window -- that is the protocol's
@@ -271,7 +279,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             steps::AbstractVector{<:Integer};
                             L::Int = 200, burn::Int = 50, epochs::Int = 200, batch::Int = 8,
                             lr::Real = 1e-3, beta::Real = 1e-4, seed::Int = 1,
-                            val_frac::Real = 0.2, T::Type = Float32, verbose::Bool = true)
+                            val_frac::Real = 0.2, T::Type = Float32, verbose::Bool = true,
+                            patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-5)
     size(X, 2) == size(Y, 2) == length(steps) ||
         error("train_stochlstm: X, Y and steps disagree on the number of columns")
 
@@ -298,7 +307,19 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
         return RF.elbo(spec, p, Xt[:, rows], Yt[:, rows], local_score, e; beta)
     end
 
-    history = (; train = Float64[], val = Float64[])
+    # 🔴 **The validation epsilons are drawn ONCE and reused every epoch.** Re-drawing them makes
+    # the reported validation loss a fresh single-sample ELBO estimate, so an epoch-to-epoch
+    # comparison mixes "the model changed" with "the noise draw changed" -- and then "best
+    # validation" selects partly on a lucky draw. Measured on R1's record: with fresh draws the
+    # val loss moved by ~4 nats between consecutive checkpoints while the model was barely
+    # changing. A fixed set makes the curve a function of the parameters alone.
+    val_eps = [draw(s) for s in val_segs]
+
+    history = (; train = Float64[], val = Float64[], lr = Float64[])
+    best = (; val = Inf, ps = deepcopy(ps), epoch = 0)
+    since_improved = 0
+    cur_lr = T(lr)
+
     for epoch in 1:epochs
         order = shuffle(rng, eachindex(train_segs))
         tot, nb = 0.0, 0
@@ -316,13 +337,37 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
         end
         push!(history.train, tot / nb)
 
-        vl = mean(segloss(ps, s, draw(s)) for s in val_segs)
+        vl = mean(segloss(ps, s, val_eps[k]) for (k, s) in enumerate(val_segs))
         push!(history.val, vl)
+        push!(history.lr, cur_lr)
+
+        # 🔴 **Keep the best iterate, not the last one.** Without this the fit that gets saved is
+        # whatever the final epoch happened to land on. Measured on R1's record: all three latent
+        # architectures reached val ~= -12 around epoch 91 and were at ~= -4 by epoch 100, so the
+        # last-iterate fit inverted the architecture ranking and the conclusion drawn from it was
+        # an artefact of where the optimiser stopped.
+        if vl < best.val
+            best = (; val = vl, ps = deepcopy(ps), epoch)
+            since_improved = 0
+        else
+            since_improved += 1
+        end
+
+        # Decay on plateau. The end-of-training oscillation at a constant 1e-3 was several nats
+        # wide, which is the other half of why a last-iterate fit was meaningless.
+        if since_improved >= patience && cur_lr > min_lr
+            cur_lr = max(T(min_lr), cur_lr * T(lr_decay))
+            Optimisers.adjust!(opt, cur_lr)
+            since_improved = 0
+            verbose && @info "M4 lr decayed" epoch lr = cur_lr
+        end
+
         verbose && (epoch % 10 == 1 || epoch == epochs) &&
-            @info "M4 epoch $epoch" train = history.train[end] val = vl
+            @info "M4 epoch $epoch" train = history.train[end] val = vl best = best.val
     end
 
-    return ps, history
+    verbose && @info "M4 done" best_epoch = best.epoch best_val = best.val final_val = history.val[end]
+    return best.ps, (; history..., best_epoch = best.epoch, best_val = best.val)
 end
 
 # ---------------------------------------------------------------------------------------------

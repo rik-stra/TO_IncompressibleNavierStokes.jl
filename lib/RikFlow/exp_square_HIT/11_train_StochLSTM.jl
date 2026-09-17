@@ -108,15 +108,23 @@ for s in seeds
     RF.save_stochlstm(path, spec, w, scaling;
                       cfg, seed = s, train_range = cfg.train_range, track_file, qoi_cache,
                       losses = hist_loss, steps_span = (first(steps), last(steps)), ps)
-    push!(summaries, (; seed = s, final_train = hist_loss.train[end], final_val = hist_loss.val[end],
-                      path))
-    @printf("  seed %d: train %.4f  val %.4f  -> %s\n", s, hist_loss.train[end],
-            hist_loss.val[end], basename(path))
+    # 🔴 `best_val`, not `val[end]`. `train_stochlstm` returns the best-validation iterate, so the
+    # last epoch's loss is not the loss of the model that was saved -- and on R1's record the two
+    # differed by ~8 nats, enough to invert the architecture ranking. `final_val` is kept beside it
+    # precisely so a run that ended far from its best is visible rather than silently averaged in.
+    push!(summaries, (; seed = s, best_val = hist_loss.best_val, best_epoch = hist_loss.best_epoch,
+                      final_train = hist_loss.train[end], final_val = hist_loss.val[end], path))
+    @printf("  seed %d: best val %.4f (epoch %d)  final val %.4f  -> %s\n",
+            s, hist_loss.best_val, hist_loss.best_epoch, hist_loss.val[end], basename(path))
+    if hist_loss.best_epoch < 0.8 * epochs
+        @warn "seed $s peaked early and then got worse -- check the lr schedule" best_epoch =
+            hist_loss.best_epoch epochs
+    end
 end
 
 # The seed spread S6 asks to be reported, and the median seed the online driver deploys.
 if length(summaries) > 1
-    vals = [s.final_val for s in summaries]
+    vals = [s.best_val for s in summaries]
     med = summaries[sortperm(vals)[cld(length(vals), 2)]]
     jldsave("$(out_dir)/seed_summary.jld2"; summaries, median_seed = med.seed,
             val_mean = mean(vals), val_std = std(vals))

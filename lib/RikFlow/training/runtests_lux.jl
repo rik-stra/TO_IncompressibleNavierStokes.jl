@@ -172,6 +172,50 @@ const RF = RikFlow
         @test mean(hist.train[end-2:end]) < mean(hist.train[1:3])
     end
 
+    # -----------------------------------------------------------------------------------------
+    # V49 -- the fit that is RETURNED is the best iterate, on a reproducible curve
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔴 These three properties are not conveniences. Without them, on R1's record, all three
+    # latent architectures reached val ~= -12 near epoch 91 and were at ~= -4 by epoch 100, and
+    # the last-iterate fits that got saved INVERTED the architecture ranking. A conclusion was
+    # drawn from that and had to be retracted; this testset is what stops it recurring.
+    @testset "V49 train_stochlstm returns the best iterate, not the last" begin
+        T = Float32
+        nq, N = 3, 700
+        rng = Xoshiro(91)
+        q = zeros(Float64, nq, N)
+        for t in 2:N
+            q[:, t] = 0.8 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        spec = mkspec(:vrnn; n_qoi = nq, h = 1, n_hidden = 8, n_latent = 4, n_encoder = 8)
+        X, Yb, steps = RF.build_history(spec.hist, q[:, 1:(N - 1)], q)
+        Xc, Yc = permutedims(X), permutedims(Yb)
+
+        kw = (; L = 60, burn = 15, epochs = 20, batch = 4, lr = 5e-3, verbose = false, T)
+        ps, hist = RF.train_stochlstm(spec, Xc, Yc, steps; seed = 3, kw...)
+
+        # (1) the recorded best really is the minimum of the curve, and the returned fit is it
+        @test hist.best_val == minimum(hist.val)
+        @test hist.val[hist.best_epoch] == hist.best_val
+        @test 1 <= hist.best_epoch <= 20
+        @test hist.best_val <= hist.val[end]        # never worse than the last iterate
+
+        # (2) the validation curve is a function of the parameters alone. Two runs at the same
+        # seed must agree exactly -- if the val epsilons were redrawn each epoch they would not,
+        # and "best validation" would be selecting partly on a lucky noise draw.
+        _, hist2 = RF.train_stochlstm(spec, Xc, Yc, steps; seed = 3, kw...)
+        @test hist.val == hist2.val
+        @test hist.best_epoch == hist2.best_epoch
+
+        # (3) the learning rate decays on plateau rather than staying put
+        _, hplateau = RF.train_stochlstm(spec, Xc, Yc, steps; seed = 3, patience = 1,
+                                         lr_decay = 0.5, kw...)
+        @test length(hplateau.lr) == 20
+        @test hplateau.lr[end] < hplateau.lr[1]
+        @test all(hplateau.lr .>= 1e-5)
+    end
+
     @testset "iwae_nll runs and tightens with K" begin
         spec = mkspec(:vrnn)
         T = Float32
