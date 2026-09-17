@@ -147,7 +147,7 @@ function get_next_item_timeseries(m::StochLSTM{T}, q_star) where {T}
 
     lstm_step!(m.state, m.weights, m.spec, x; rng = m.rng, sample_latent = true)
     if m.stochastic
-        sample_emission!(m.scratch, m.state, m.weights, m.rng)
+        sample_emission!(m.scratch, m.state, m.weights, m.spec, m.rng)
     else
         copyto!(m.scratch, m.state.y)
     end

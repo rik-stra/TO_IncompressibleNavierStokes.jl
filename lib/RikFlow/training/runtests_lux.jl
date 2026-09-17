@@ -172,6 +172,205 @@ const RF = RikFlow
         @test mean(hist.train[end-2:end]) < mean(hist.train[1:3])
     end
 
+    # -----------------------------------------------------------------------------------------
+    # V49 -- the fit that is RETURNED is the best iterate, on a reproducible curve
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔴 These three properties are not conveniences. Without them, on R1's record, all three
+    # latent architectures reached val ~= -12 near epoch 91 and were at ~= -4 by epoch 100, and
+    # the last-iterate fits that got saved INVERTED the architecture ranking. A conclusion was
+    # drawn from that and had to be retracted; this testset is what stops it recurring.
+    @testset "V49 train_stochlstm returns the best iterate, not the last" begin
+        T = Float32
+        nq, N = 3, 700
+        rng = Xoshiro(91)
+        q = zeros(Float64, nq, N)
+        for t in 2:N
+            q[:, t] = 0.8 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        spec = mkspec(:vrnn; n_qoi = nq, h = 1, n_hidden = 8, n_latent = 4, n_encoder = 8)
+        X, Yb, steps = RF.build_history(spec.hist, q[:, 1:(N - 1)], q)
+        Xc, Yc = permutedims(X), permutedims(Yb)
+
+        kw = (; L = 60, burn = 15, epochs = 20, batch = 4, lr = 5e-3, verbose = false, T)
+        ps, hist = RF.train_stochlstm(spec, Xc, Yc, steps; seed = 3, kw...)
+
+        # (1) the recorded best really is the minimum of the curve, and the returned fit is it
+        @test hist.best_val == minimum(hist.val)
+        @test hist.val[hist.best_epoch] == hist.best_val
+        @test 1 <= hist.best_epoch <= 20
+        @test hist.best_val <= hist.val[end]        # never worse than the last iterate
+
+        # (2) the validation curve is a function of the parameters alone. Two runs at the same
+        # seed must agree exactly -- if the val epsilons were redrawn each epoch they would not,
+        # and "best validation" would be selecting partly on a lucky noise draw.
+        _, hist2 = RF.train_stochlstm(spec, Xc, Yc, steps; seed = 3, kw...)
+        @test hist.val == hist2.val
+        @test hist.best_epoch == hist2.best_epoch
+
+        # (3) the learning rate decays on plateau rather than staying put
+        _, hplateau = RF.train_stochlstm(spec, Xc, Yc, steps; seed = 3, patience = 1,
+                                         lr_decay = 0.5, kw...)
+        @test length(hplateau.lr) == 20
+        @test hplateau.lr[end] < hplateau.lr[1]
+        @test all(hplateau.lr .>= 1e-5)
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # V50 -- batching segments is a SPEED change and nothing else
+    # -----------------------------------------------------------------------------------------
+    #
+    # The recurrence runs over `H x B` matrices so a chunk of segments costs `L` traced steps
+    # instead of `B * L`. That is only legitimate if the numbers are unchanged, so: the batched
+    # forward must equal the per-segment forward on every segment, and the batched objective must
+    # equal the per-segment objective averaged with the right weights.
+    @testset "V50 batched == per-segment ($arch)" for arch in (:lstm, :vaernn, :storn, :vrnn)
+        spec = mkspec(arch)
+        T = Float32
+        ps = RF.init_lstm_params(Xoshiro(15), spec; T)
+        ps = merge(ps, (; Wd = randn(Xoshiro(16), T, RF.n_output(spec), spec.n_hidden) ./ 5,
+                        Araw = randn(Xoshiro(17), T, RF.n_output(spec), RF.n_output(spec)) ./ 5))
+
+        L, B, nin, nz, nout = 9, 4, RF.n_input(spec), spec.n_latent, RF.n_output(spec)
+        X = randn(Xoshiro(18), T, nin, L, B)
+        Y = randn(Xoshiro(19), T, nout, L, B)
+        E = randn(Xoshiro(20), T, nz, L, B)
+        sc = 4:L
+
+        ob = RF.lstm_forward(spec, ps, X, E)
+        for b in 1:B
+            os = RF.lstm_forward(spec, ps, X[:, :, b], E[:, :, b])
+            @test os.Y ≈ ob.Y[:, :, b] rtol = 1e-5
+            @test os.LOGD ≈ ob.LOGD[:, :, b] rtol = 1e-5
+            @test os.Hm ≈ ob.Hm[:, :, b] rtol = 1e-5
+        end
+
+        # the objective: per-scored-step normalisation makes the batch the plain mean here,
+        # because every segment contributes the same number of scored steps
+        lb = RF.elbo(spec, ps, X, Y, sc, E; beta = 1e-3)
+        ls = mean(RF.elbo(spec, ps, X[:, :, b], Y[:, :, b], sc, E[:, :, b]; beta = 1e-3)
+                  for b in 1:B)
+        @test lb ≈ ls rtol = 1e-4
+
+        # and the gradients agree, which is what actually trains the model
+        gb = Zygote.gradient(p -> RF.elbo(spec, p, X, Y, sc, E; beta = 1e-3), ps)[1]
+        gs = Zygote.gradient(ps) do p
+            mean(RF.elbo(spec, p, X[:, :, b], Y[:, :, b], sc, E[:, :, b]; beta = 1e-3)
+                 for b in 1:B)
+        end[1]
+        for k in (:Wx, :Wh, :b, :V1, :cdec, :Wd, :bd, :Araw)
+            @test getproperty(gb, k) ≈ getproperty(gs, k) rtol = 1e-3
+        end
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # V51 -- emission = :none is the source's design: the latent path is the ONLY noise
+    # -----------------------------------------------------------------------------------------
+    @testset "V51 emission = :none removes the second noise channel" begin
+        T = Float32
+        spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = 6), n_hidden = 16,
+                           n_latent = 4, n_encoder = 0, arch = :storn, emission = :none)
+        @test !RF.emission_noise(spec)
+        ps = RF.init_lstm_params(Xoshiro(31), spec; T)
+
+        L, B, nin, nz, nout = 12, 3, RF.n_input(spec), spec.n_latent, RF.n_output(spec)
+        X = randn(Xoshiro(32), T, nin, L, B)
+        Y = randn(Xoshiro(33), T, nout, L, B)
+        E = randn(Xoshiro(34), T, nz, L, B)
+        sc = 5:L
+
+        # the reconstruction term is a plain sum of squares, and beta still scales only the KL
+        out = RF.lstm_forward(spec, ps, X, E)
+        ns = length(sc) * B
+        expect = 0.5 * sum(abs2, Y[:, sc, :] .- out.Y[:, sc, :]) / ns
+        @test RF.elbo(spec, ps, X, Y, sc, E; beta = 0.0) ≈ expect rtol = 1e-4
+        @test RF.elbo(spec, ps, X, Y, sc, E; beta = 1.0) > expect      # the KL is positive
+
+        # 🔴 no predictive density means no likelihood, and it refuses rather than inventing one
+        @test_throws ErrorException RF.iwae_nll(spec, ps, X[:, :, 1], Y[:, :, 1], sc)
+
+        # the deployed step: log-scale is identically zero and the emission draw is the mean,
+        # so the ONLY source of ensemble spread is the latent draw
+        w = RF.LSTMWeights(ps, spec)
+        st = RF.LSTMState(spec, T)
+        rng = Xoshiro(35)
+        y, logd, _ = RF.lstm_step!(st, w, spec, view(X, :, 1, 1); rng, sample_latent = true)
+        @test all(iszero, logd)
+        outv = zeros(T, nout)
+        before = copy(rng)
+        RF.sample_emission!(outv, st, w, spec, rng)
+        @test outv == y                       # the prediction IS the mean
+        @test rand(rng) == rand(before)       # and nothing was drawn
+
+        # a deterministic backbone with no emission noise has no stochasticity at all, and is
+        # refused at construction rather than silently producing a zero-spread "ensemble"
+        @test_throws ErrorException RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = 6),
+                                                arch = :lstm, emission = :none)
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # V52 -- the hand-written adjoint against finite differences
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔴 **V50 cannot catch a wrong `_timeslices` adjoint, and this is the gap it leaves.** V50
+    # compares the batched objective against the per-segment one, but since the time-slicing rule
+    # was introduced *both* sides go through it, so a bug in the custom pullback moves them
+    # together and V50 still passes. `_timeslices` is the only hand-written Zygote rule in the
+    # package; everything else composes from rules that are already tested upstream. So it gets an
+    # independent check, against the one reference that shares no code with it: the function
+    # itself, differenced numerically.
+    #
+    # Float64 throughout -- a central difference on Float32 parameters is dominated by round-off
+    # and would pass against almost anything.
+    @testset "V52 gradients match central differences ($em)" for em in (:state_dependent, :none)
+        T = Float64
+        spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = 4), n_hidden = 6,
+                           n_latent = 3, n_encoder = 5, arch = :vrnn, emission = em)
+        ps = RF.init_lstm_params(Xoshiro(61), spec; T)
+        # move off the zero initialisation, or Wd/Araw sit at a point where the check is vacuous
+        ps = merge(ps, (; Wd = randn(Xoshiro(62), T, RF.n_output(spec), spec.n_hidden) ./ 10,
+                        bd = randn(Xoshiro(63), T, RF.n_output(spec)) ./ 10,
+                        Araw = randn(Xoshiro(64), T, RF.n_output(spec), RF.n_output(spec)) ./ 10))
+
+        # L well past a couple of steps, so the recurrence -- and the slice rule -- is exercised
+        L, B, nin, nz, nout = 40, 3, RF.n_input(spec), spec.n_latent, RF.n_output(spec)
+        X = randn(Xoshiro(65), T, nin, L, B)
+        Y = randn(Xoshiro(66), T, nout, L, B)
+        E = randn(Xoshiro(67), T, nz, L, B)
+        sc = 11:L
+
+        f(p) = RF.elbo(spec, p, X, Y, sc, E; beta = 1e-3)
+        g = Zygote.gradient(f, ps)[1]
+
+        bump(p, k, i, d) = merge(p, NamedTuple{(k,)}((begin
+            a = copy(getproperty(p, k)); a[i] += d; a
+        end,)))
+
+        δ = 1e-6
+        keys_to_check = em === :none ? (:Wx, :Wh, :b, :V1, :V2, :cdec, :Bmu, :Bsig, :We, :be) :
+                        (:Wx, :Wh, :b, :V1, :V2, :cdec, :Bmu, :Bsig, :We, :be, :Wd, :bd, :Araw)
+        for k in keys_to_check
+            arr = getproperty(ps, k)
+            arr === nothing && continue
+            gk = getproperty(g, k)
+            @test gk !== nothing
+            # a handful of entries per array, deterministically chosen
+            for i in unique(round.(Int, range(1, length(arr); length = min(4, length(arr)))))
+                fd = (f(bump(ps, k, i, δ)) - f(bump(ps, k, i, -δ))) / (2δ)
+                @test isapprox(gk[i], fd; rtol = 1e-4, atol = 1e-7)
+            end
+        end
+
+        # and with emission = :none the three unused blocks get no gradient signal at all, which
+        # is what lets them stay at their zero initialisation without being frozen by hand
+        if em === :none
+            for k in (:Wd, :bd, :Araw)
+                gk = getproperty(g, k)
+                @test gk === nothing || all(iszero, gk)
+            end
+        end
+    end
+
     @testset "iwae_nll runs and tightens with K" begin
         spec = mkspec(:vrnn)
         T = Float32

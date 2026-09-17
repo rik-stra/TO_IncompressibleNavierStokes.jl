@@ -106,6 +106,39 @@ function RF.init_lstm_params(rng::AbstractRNG, spec::RF.LSTMSpec; T::Type = Floa
     )
 end
 
+"""
+    _timeslices(G, L)
+
+Split a `4H x L x B` gate-preactivation array into `L` matrices of `4H x B`, one per time step.
+
+🔴 **This exists only for its adjoint, and the slice it replaces was the single largest cost in
+the reverse pass.** Writing `G[:, t, :]` inside the recurrence looks free -- one small strided
+copy -- but Zygote's pullback for a slice allocates a *parent-sized* zero array and scatters the
+cotangent into it. Inside an `L`-step loop that is `L` allocations of `4H x L x B` and `L` full
+zero-fills, so the reverse pass is O(L^2) in a model whose forward pass is O(L). Profiling one
+`L = 200, B = 8, H = 16` gradient step put `fill!` and `setindex!` at the top of the self-time
+list, and the step allocated 172 MiB for a forward pass that allocates 3.8 MiB.
+
+Slicing once, through a rule that accumulates every step's cotangent into **one** buffer, makes
+the reverse pass O(L) again. Measured on that geometry: 246 ms -> 49 ms, 172 MiB -> 18 MiB, and
+the reverse/forward ratio from 26x down to 5.8x, which is what reverse mode should cost. Nothing
+about the model changes -- this is the same arithmetic with a cheaper pullback, and V50 is what
+says so.
+"""
+_timeslices(G::AbstractArray{<:Any,3}, L::Integer) = [G[:, t, :] for t in 1:L]
+
+Zygote.@adjoint function _timeslices(G::AbstractArray{<:Any,3}, L::Integer)
+    return _timeslices(G, L), function (Δ)
+        dG = zero(G)
+        for t in 1:L
+            Δt = Δ[t]
+            Δt === nothing && continue
+            @views dG[:, t, :] .+= Δt
+        end
+        return (dG, nothing)
+    end
+end
+
 # ---------------------------------------------------------------------------------------------
 # Architecture branches, in the type domain
 # ---------------------------------------------------------------------------------------------
@@ -152,9 +185,11 @@ Returns `(; Y, LOGD, MU, SIG, Hm)`.
 are all applied to the whole segment as matrix products, which is both faster and far less for
 Zygote to get wrong.
 """
-function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T},
-                         epsz::AbstractMatrix) where {T}
-    H, L = spec.n_hidden, size(X, 2)
+function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3},
+                         epsz::AbstractArray) where {T}
+    H = spec.n_hidden
+    nin, L, B = size(X)
+    nz, nout = spec.n_latent, RF.n_output(spec)
 
     # 🔴 The architecture branches are DISPATCHED, not written as `?:` or `if`, and this is not
     # cosmetic. Two of them change the shape of what they return -- the encoder gives `n_encoder x
@@ -169,36 +204,74 @@ function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T}
     cellv = Val(RF.latent_to_cell(spec))
     decv = Val(RF.latent_to_decoder(spec))
 
-    # --- encoder and latent path, whole segment at once --------------------------------------
-    MU, SIG, Z = _latent(hasz, encv, ps, X, epsz, T, spec.n_latent, L)
+    # 🔑 **Everything that is pointwise in time is done on the flattened (L*B) axis**, so the
+    # encoder, the latent draw, the decoder and the log-scale head are four matrix products for
+    # the whole batch rather than 4*L*B small ones. Only the recurrence has to be a loop.
+    X2 = reshape(X, nin, L * B)
+    MU2, SIG2, Z2 = _latent(hasz, encv, ps, X2, reshape(epsz, nz, L * B), T, nz, L * B)
 
-    # --- recurrence ---------------------------------------------------------------------------
-    XZ = _cell_input(cellv, X, Z)
-    GX = ps.Wx * XZ                                  # every step's input contribution, precomputed
+    # --- recurrence, batched over segments ----------------------------------------------------
+    #
+    # 🔑 `h` and `c` are `H x B`, not `H`. This is the single biggest cost decision in the file.
+    # Running a chunk of `B` segments as `B` separate loops traces `B * L` recurrent steps through
+    # Zygote; running them as one loop over matrices traces `L`, for identical arithmetic, and
+    # turns every GEMV into a GEMM. Measured on R1's record at B = 8: 3.42 s/epoch -> see
+    # `analysis/results_LSTMS.md` §4. Zygote's per-operation overhead dominates the actual flops
+    # at this model size, so the win is close to the full factor of B.
+    XZ2 = _cell_input(cellv, X2, Z2)
+    # The bias is folded in here rather than inside the loop: it is the same vector at every step,
+    # so adding it once to the whole batch is one broadcast instead of `L` of them.
+    GX = _timeslices(reshape(ps.Wx * XZ2 .+ ps.b, 4H, L, B), L)
 
-    Hb = Zygote.Buffer(zeros(T, H, L))
-    h = zeros(T, H)
-    c = zeros(T, H)
+    # 🔑 `Wh` is pulled out of `ps` **before** the loop, and that is a performance fix, not tidying.
+    # Reading `ps.Wh` inside the loop makes every iteration's pullback a `getfield` on the whole
+    # parameter NamedTuple, so Zygote builds a full params-shaped tangent and `accum`s it `L`
+    # times; profiling showed that one line as the second-largest cost in the reverse pass, after
+    # the slice `_timeslices` replaces. Bound to a local, the per-step cotangent is just `H x H`.
+    Wh = ps.Wh
+
+    Hb = Zygote.Buffer(zeros(T, H, L, B))
+    h = zeros(T, H, B)
+    c = zeros(T, H, B)
     for t in 1:L
-        g = GX[:, t] .+ ps.Wh * h .+ ps.b
-        i = _sig.(g[1:H])
-        f = _sig.(g[(H + 1):(2H)])
-        gg = tanh.(g[(2H + 1):(3H)])
-        o = _sig.(g[(3H + 1):(4H)])
+        g = GX[t] .+ Wh * h
+        # Views, not slices: each of these used to copy an `H x B` block, and each copy is an
+        # operation Zygote traces and a cotangent it has to allocate; a view's pullback writes
+        # straight into the parent's.
+        i = _sig.(@view(g[1:H, :]))
+        f = _sig.(@view(g[(H + 1):(2H), :]))
+        gg = tanh.(@view(g[(2H + 1):(3H), :]))
+        o = _sig.(@view(g[(3H + 1):(4H), :]))
         c = f .* c .+ i .* gg
         h = o .* tanh.(c)
-        Hb[:, t] = h
+        Hb[:, t, :] = h
     end
     Hm = copy(Hb)
+    Hm2 = reshape(Hm, H, L * B)
 
     # --- decoder and log-scale head -----------------------------------------------------------
-    Y = _decoder_skip(decv, ps.V1 * Hm .+ ps.cdec, ps, Z)
-    LOGD = ps.Wd * Hm .+ ps.bd
+    Y2 = _decoder_skip(decv, ps.V1 * Hm2 .+ ps.cdec, ps, Z2)
+    LOGD2 = ps.Wd * Hm2 .+ ps.bd
     if spec.uclip !== nothing
-        LOGD = clamp.(LOGD, T(spec.uclip[1]), T(spec.uclip[2]))
+        LOGD2 = clamp.(LOGD2, T(spec.uclip[1]), T(spec.uclip[2]))
     end
 
-    return (; Y, LOGD, MU, SIG, Hm)
+    return (; Y = reshape(Y2, nout, L, B), LOGD = reshape(LOGD2, nout, L, B),
+            MU = reshape(MU2, nz, L, B), SIG = reshape(SIG2, nz, L, B), Hm)
+end
+
+"""
+    lstm_forward(spec, ps, X::AbstractMatrix, epsz)
+
+Single-segment form, kept so `iwae_nll` and V41 read the way they did. It is the batched method
+with `B = 1`, so there is only ever one implementation of the recurrence to get wrong.
+"""
+function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T},
+                         epsz::AbstractMatrix) where {T}
+    nin, L = size(X)
+    o = RF.lstm_forward(spec, ps, reshape(X, nin, L, 1), reshape(epsz, spec.n_latent, L, 1))
+    return (; Y = reshape(o.Y, :, L), LOGD = reshape(o.LOGD, :, L),
+            MU = reshape(o.MU, :, L), SIG = reshape(o.SIG, :, L), Hm = reshape(o.Hm, :, L))
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -216,28 +289,53 @@ recurrence and contribute nothing, which is the whole reason they exist.
 ⚠️ `beta` is the KL weight. The source calls it `lambda` and uses `1e-4`; **`lambda` is the ridge
 parameter in this project and the two must never be conflated.**
 """
-function RF.elbo(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T}, Ytrue::AbstractMatrix,
-                 score::AbstractUnitRange, epsz::AbstractMatrix; beta::Real = 1e-4) where {T}
+function RF.elbo(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3}, Ytrue::AbstractArray,
+                 score::AbstractUnitRange, epsz::AbstractArray; beta::Real = 1e-4) where {T}
     out = RF.lstm_forward(spec, ps, X, epsz)
     nout = RF.n_output(spec)
-    ns = length(score)
+    B = size(X, 3)
+    ns = length(score) * B            # scored steps summed over the batch
 
-    U = out.LOGD[:, score]
-    Rres = (Ytrue[:, score] .- out.Y[:, score]) ./ exp.(U)
-    A = _precision_factor(ps.Araw)
-    quad = sum(abs2, A * Rres)
-    logdet_term = 2 * sum(U) - 2 * ns * sum(log.(diag(A)))
-    nll = T(0.5) * (nout * ns * T(log(2 * pi)) + logdet_term + quad)
+    # 🔴 `:none` is a deterministic decoder, so there is no density to evaluate and the
+    # reconstruction term is a plain sum of squares -- the source's objective. `Wd`, `bd` and
+    # `Araw` never enter the loss, so their gradients are zero and they stay at their zero
+    # initialisation; nothing needs to be frozen by hand.
+    recon = if RF.emission_noise(spec)
+        U = out.LOGD[:, score, :]
+        Rres = (Ytrue[:, score, :] .- out.Y[:, score, :]) ./ exp.(U)
+        A = _precision_factor(ps.Araw)
+        quad = sum(abs2, A * reshape(Rres, nout, :))
+        logdet_term = 2 * sum(U) - 2 * ns * sum(log.(diag(A)))
+        T(0.5) * (nout * ns * T(log(2 * pi)) + logdet_term + quad)
+    else
+        T(0.5) * sum(abs2, Ytrue[:, score, :] .- out.Y[:, score, :])
+    end
+    nll = recon
 
     kl = if RF.latent_sampled(spec)
-        S = out.SIG[:, score]
-        M = out.MU[:, score]
+        S = out.SIG[:, score, :]
+        M = out.MU[:, score, :]
         sum(T(0.5) .* (S .^ 2 .+ M .^ 2 .- one(T)) .- log.(S))
     else
         zero(T)
     end
 
+    # 🔑 Normalised **per scored step**, so the value does not depend on how many segments were
+    # batched together. A chunk run as one batch of 8 and the same chunk run as 8 batches of 1 and
+    # averaged give the same number, which is what lets the batching be a pure speed change.
     return (nll + T(beta) * kl) / ns
+end
+
+"""
+    elbo(spec, ps, X::AbstractMatrix, Ytrue, score, epsz; beta)
+
+Single-segment form: the batched method at `B = 1`.
+"""
+function RF.elbo(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T}, Ytrue::AbstractMatrix,
+                 score::AbstractUnitRange, epsz::AbstractMatrix; beta::Real = 1e-4) where {T}
+    nin, L = size(X)
+    return RF.elbo(spec, ps, reshape(X, nin, L, 1), reshape(Ytrue, :, L, 1), score,
+                   reshape(epsz, spec.n_latent, L, 1); beta)
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -260,6 +358,14 @@ Fit an M4 model to a regressor/target pair.
 # Keywords
 - `L`, `burn`: segment length and burn-in. `L = 200`, `burn = 50` by default; both are sweep axes.
 - `epochs`, `batch`, `lr`, `beta`, `seed`.
+- `patience`, `lr_decay`, `min_lr`: decay the learning rate by `lr_decay` after `patience` epochs
+  without a validation improvement, down to `min_lr`.
+
+🔴 **Returns the best-validation iterate, not the last one**, and the validation epsilons are drawn
+once and held fixed so the curve is a function of the parameters alone. Both matter more than they
+look: on R1's record at a constant `lr`, the three latent architectures reached val ≈ −12 near
+epoch 91 and were at ≈ −4 by epoch 100, so a last-iterate fit **inverted the architecture ranking**.
+`history` carries `best_epoch` and `best_val` so a run that ends far from its best is visible.
 - `val_frac`: the trailing fraction of segments held out for the reported validation loss.
   ⚠️ This is an *inner* split for early stopping and diagnostics only. Model **selection** is on a
   window disjoint from both training and the online evaluation window -- that is the protocol's
@@ -271,7 +377,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             steps::AbstractVector{<:Integer};
                             L::Int = 200, burn::Int = 50, epochs::Int = 200, batch::Int = 8,
                             lr::Real = 1e-3, beta::Real = 1e-4, seed::Int = 1,
-                            val_frac::Real = 0.2, T::Type = Float32, verbose::Bool = true)
+                            val_frac::Real = 0.2, T::Type = Float32, verbose::Bool = true,
+                            patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-5)
     size(X, 2) == size(Y, 2) == length(steps) ||
         error("train_stochlstm: X, Y and steps disagree on the number of columns")
 
@@ -288,41 +395,110 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     ps = RF.init_lstm_params(rng, spec; T)
     opt = Optimisers.setup(Optimisers.Adam(T(lr)), ps)
 
-    # The randomness is drawn OUTSIDE the differentiated function -- the reparametrisation trick --
-    # so `elbo` is deterministic given `epsz` and Zygote never sees an RNG.
-    draw(seg) = randn(rng, T, spec.n_latent, length(seg.rows))
-
-    function segloss(p, seg, e)
-        rows = seg.rows
-        local_score = (first(seg.score) - first(rows) + 1):(last(seg.score) - first(rows) + 1)
-        return RF.elbo(spec, p, Xt[:, rows], Yt[:, rows], local_score, e; beta)
+    # 🔑 Segments of equal length share one recurrence, so they are grouped once here and batched
+    # below. Every segment is exactly `L` long except the last of each contiguous block, so in
+    # practice this is one large group plus a couple of singletons -- no padding, no dropped data,
+    # and no segment ever shares a batch with one of a different length.
+    function group_by_length(segs)
+        d = Dict{Int,Vector{Int}}()
+        for (i, s) in enumerate(segs)
+            push!(get!(d, length(s.rows), Int[]), i)
+        end
+        return d
     end
 
-    history = (; train = Float64[], val = Float64[])
+    # Stack a set of same-length segments into (n_in, L, B) / (N_Q, L, B) plus the shared scored
+    # range. `burn` is the same for every segment, so the local scored range is too.
+    function stack(segs, idx)
+        L = length(segs[first(idx)].rows)
+        Xb = Array{T,3}(undef, size(Xt, 1), L, length(idx))
+        Yb = Array{T,3}(undef, size(Yt, 1), L, length(idx))
+        for (k, i) in enumerate(idx)
+            Xb[:, :, k] = view(Xt, :, segs[i].rows)
+            Yb[:, :, k] = view(Yt, :, segs[i].rows)
+        end
+        s1 = segs[first(idx)]
+        sc = (first(s1.score) - first(s1.rows) + 1):(last(s1.score) - first(s1.rows) + 1)
+        return Xb, Yb, sc, length(sc) * length(idx)
+    end
+
+    # The randomness is drawn OUTSIDE the differentiated function -- the reparametrisation trick --
+    # so `elbo` is deterministic given `epsz` and Zygote never sees an RNG.
+    draw(L, B) = randn(rng, T, spec.n_latent, L, B)
+
+    train_groups = group_by_length(train_segs)
+    val_groups = group_by_length(val_segs)
+
+    # 🔴 **The validation epsilons are drawn ONCE and reused every epoch.** Re-drawing them makes
+    # the reported validation loss a fresh single-sample ELBO estimate, so an epoch-to-epoch
+    # comparison mixes "the model changed" with "the noise draw changed" -- and then "best
+    # validation" selects partly on a lucky draw. Measured on R1's record: with fresh draws the
+    # val loss moved by ~4 nats between consecutive checkpoints while the model was barely
+    # changing. A fixed set makes the curve a function of the parameters alone.
+    # One fixed batch per validation length-group: the arrays AND the noise draws, built once.
+    val_batches = [(stack(val_segs, idx)..., draw(length(val_segs[first(idx)].rows), length(idx)))
+                   for (_, idx) in sort(collect(val_groups); by = first)]
+
+    function validate(p)
+        num, den = 0.0, 0
+        for (Xb, Yb, sc, ns, eb) in val_batches
+            num += RF.elbo(spec, p, Xb, Yb, sc, eb; beta) * ns
+            den += ns
+        end
+        return num / den
+    end
+
+    history = (; train = Float64[], val = Float64[], lr = Float64[])
+    best = (; val = Inf, ps = deepcopy(ps), epoch = 0)
+    since_improved = 0
+    cur_lr = T(lr)
+
     for epoch in 1:epochs
-        order = shuffle(rng, eachindex(train_segs))
         tot, nb = 0.0, 0
-        for chunk in Iterators.partition(order, batch)
-            es = [draw(train_segs[i]) for i in chunk]
-            loss, gs = Zygote.withgradient(ps) do p
-                # an explicit comprehension rather than a generator: Zygote is reliable on the
-                # former and occasionally not on the latter, and the chunk is tiny
-                sum([segloss(p, train_segs[i], es[k]) for (k, i) in enumerate(chunk)]) /
-                    length(chunk)
+        for L in sort(collect(keys(train_groups)))
+            idxs = shuffle(rng, train_groups[L])
+            for chunk in Iterators.partition(idxs, batch)
+                Xb, Yb, sc, _ = stack(train_segs, chunk)
+                eb = draw(L, length(chunk))
+                loss, gs = Zygote.withgradient(p -> RF.elbo(spec, p, Xb, Yb, sc, eb; beta), ps)
+                opt, ps = Optimisers.update(opt, ps, gs[1])
+                tot += loss
+                nb += 1
             end
-            opt, ps = Optimisers.update(opt, ps, gs[1])
-            tot += loss
-            nb += 1
         end
         push!(history.train, tot / nb)
 
-        vl = mean(segloss(ps, s, draw(s)) for s in val_segs)
+        vl = validate(ps)
         push!(history.val, vl)
+        push!(history.lr, cur_lr)
+
+        # 🔴 **Keep the best iterate, not the last one.** Without this the fit that gets saved is
+        # whatever the final epoch happened to land on. Measured on R1's record: all three latent
+        # architectures reached val ~= -12 around epoch 91 and were at ~= -4 by epoch 100, so the
+        # last-iterate fit inverted the architecture ranking and the conclusion drawn from it was
+        # an artefact of where the optimiser stopped.
+        if vl < best.val
+            best = (; val = vl, ps = deepcopy(ps), epoch)
+            since_improved = 0
+        else
+            since_improved += 1
+        end
+
+        # Decay on plateau. The end-of-training oscillation at a constant 1e-3 was several nats
+        # wide, which is the other half of why a last-iterate fit was meaningless.
+        if since_improved >= patience && cur_lr > min_lr
+            cur_lr = max(T(min_lr), cur_lr * T(lr_decay))
+            Optimisers.adjust!(opt, cur_lr)
+            since_improved = 0
+            verbose && @info "M4 lr decayed" epoch lr = cur_lr
+        end
+
         verbose && (epoch % 10 == 1 || epoch == epochs) &&
-            @info "M4 epoch $epoch" train = history.train[end] val = vl
+            @info "M4 epoch $epoch" train = history.train[end] val = vl best = best.val
     end
 
-    return ps, history
+    verbose && @info "M4 done" best_epoch = best.epoch best_val = best.val final_val = history.val[end]
+    return best.ps, (; history..., best_epoch = best.epoch, best_val = best.val)
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -345,6 +521,13 @@ histogram beside it -- those two read the same on every cell of the ladder, whic
 function RF.iwae_nll(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T},
                      Y::AbstractMatrix, score::AbstractUnitRange;
                      K::Int = 64, rng::AbstractRNG = Xoshiro(0)) where {T}
+    # 🔴 `emission = :none` has a deterministic decoder, so there is no observation density and no
+    # likelihood to bound. Refusing is the honest behaviour: the alternative is a number that looks
+    # like an NLL and is not one. Score these cells with `crps_ensemble` and the rank histogram,
+    # which are defined for them and read the same on every cell of the ladder.
+    RF.emission_noise(spec) || error(
+        "iwae_nll: emission = :none has no predictive density, so no likelihood is defined. " *
+        "Use crps_ensemble and the rank histogram, or fit with emission = :constant.")
     nout = RF.n_output(spec)
     A = _precision_factor(ps.Araw)
     logdetA = sum(log.(diag(A)))

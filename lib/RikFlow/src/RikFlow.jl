@@ -296,7 +296,7 @@ export JointModel, pacf_to_ar, ar_roots, decorrelation_time
 # nothing here loads Lux. See the header of ts_lstm.jl for why the split runs this way round.
 include("ts_lstm.jl")
 export LSTMSpec, LSTMWeights, LSTMState, lstm_step!, sample_emission!
-export latent_sampled, latent_to_cell, latent_to_decoder
+export latent_sampled, latent_to_cell, latent_to_decoder, emission_noise
 export segment_indices, gauss_logpdf, kl_diag_gaussian, kl_to_standard_normal, iwae_bound
 
 # M4 as a deployed closure. Also stdlib-only, and included AFTER time_series_methods.jl so that
