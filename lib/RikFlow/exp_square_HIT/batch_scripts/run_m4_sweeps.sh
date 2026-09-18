@@ -118,7 +118,10 @@ echo "== M4_DEVICE=$M4_DEVICE"
 # it rather than the reader inferring it. The Julia driver prints them again from its own
 # side (`@info "M4 <which> scan" ... updates=/epochs=`), so the two together show the value
 # crossed the shell/Julia boundary too.
-echo "== budget: RIKFLOW_M4_UPDATES=${RIKFLOW_M4_UPDATES:-<default 3000>}"\n     " RIKFLOW_M4_LR_EPOCHS=${RIKFLOW_M4_LR_EPOCHS:-<default 1500>}"\n     " RIKFLOW_M4_EPOCHS=${RIKFLOW_M4_EPOCHS:-<unset>}"
+# 🔴 One echo, one line. The earlier `"..."\n     "..."` form put a literal `n` into the log
+# (`<default 3000>n`): outside quotes `\n` is an escaped 'n', not a newline and not a line
+# continuation. Same class as the `\r` that once broke the reproduce block in results_LSTMS.md.
+echo "== budget: RIKFLOW_M4_UPDATES=${RIKFLOW_M4_UPDATES:-<default 3000>} RIKFLOW_M4_LR_EPOCHS=${RIKFLOW_M4_LR_EPOCHS:-<default 1500>} RIKFLOW_M4_EPOCHS=${RIKFLOW_M4_EPOCHS:-<unset>} M4_DEVICE_RNG=${M4_DEVICE_RNG:-0}"
 
 # Find the drivers from whichever directory the job started in, and say so if it is neither.
 if [ -f 3_track_ref.jl ]; then

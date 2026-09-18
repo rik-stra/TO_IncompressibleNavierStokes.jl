@@ -469,6 +469,39 @@ point 1.01, 1.09, 0.79, 1.02, 1.02×), and an earlier claim of 1.19× did not re
 because it is free and removes launches and pullbacks, which is the axis the device is limited by.
 🔴 **The GPU benefit is predicted, not measured.**
 
+### 🔒 The verdict, with both optimisations measured on the GPU
+
+Run 2026-09-18 on `gpu_h100` with the gate fusion **and** zero per-update transfers
+(`M4_DEVICE=cuda M4_DEVICE_RNG=1`). `M4 SMOKE PASS`.
+
+| stride | batch | GPU before | GPU now | gain | CPU | GPU / CPU |
+|---|---|---|---|---|---|---|
+| 400 | 32 | 0.851 | **0.770** | 1.11x | 0.078 | 9.9x |
+| 400 | 2 | 1.481 | 1.493 | 0.99x | 0.126 | 11.8x |
+| 100 | 32 | 0.884 | **0.796** | 1.11x | 0.117 | 6.8x |
+| 50 | 32 | 1.251 | 1.166 | 1.07x | 0.200 | 5.8x |
+| 20 | 32 | 1.879 | 1.918 | 0.98x | 0.415 | 4.6x |
+| **scan** | | **102 min** | **96 min** | **1.06x** | **14 min** | **6.9x** |
+
+🔒 **Removing every per-update transfer and 4 of 9 forward kernels bought 6%.** That is the
+diagnosis confirmed by intervention rather than by argument: the loop is bound by the *length* of
+its dependent launch chain, which `L = 500` sets and neither change touches. The two well-sampled
+points (8 timed epochs each) both give 1.11x; the three at 2 samples are inside their own noise,
+and the old baseline was 2-sample throughout, so 1.06x overall is the honest figure and not a
+tight one.
+
+🔴 **The GPU remains ~6.9x slower than the same node's CPU, and this is now the end of the cheap
+options.** What is left is a fused multi-timestep kernel, and §5 establishes there is no
+differentiable one in Julia: Lux's `Recurrence` is the same per-timestep loop, neither Lux nor
+LuxLib calls cuDNN's RNN, and cuDNN.jl ships `cudnnRNNForward` with no backward wiring. Writing
+that is a project, against a CPU that finishes the whole scan in 14 minutes.
+
+✅ **Both changes are kept.** They are free, they help the CPU path not at all but cost it nothing,
+and they are bit-identical at the default (`device_rng = false`). ⚠️ `M4_DEVICE_RNG=1` is a
+measurement switch only — a different noise stream, so nothing fitted with it is comparable, and
+the stage-5 losses in that run (1.618 → 1.229 → 1.048 against the host stream's 1.611 → 1.207 →
+1.032) are exactly that difference showing up as designed.
+
 ### ✅ Host→device transfers per update: eliminated
 
 Rik asked for a device-resident dataloader, 2026-09-18. Done, and **counted rather than inspected**
