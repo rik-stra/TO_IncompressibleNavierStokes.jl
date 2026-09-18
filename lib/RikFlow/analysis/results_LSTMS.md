@@ -375,21 +375,30 @@ same node** gives the comparison that means something:
 
 | stride | batch | node CPU s/epoch | GPU s/epoch | GPU / CPU |
 |---|---|---|---|---|
-| 400 | 32 | 0.139 | 0.851 | 6.1x slower |
-| 400 | **2** | 0.124 | 1.481 | **11.9x slower** |
-| 100 | 32 | 0.089 | 0.884 | 9.9x slower |
-| 50 | 32 | 0.292 | 1.251 | 4.3x slower |
-| 20 | 32 | 0.574 | 1.879 | 3.3x slower |
-| **whole scan** | | **18 min** | **102 min** | **5.7x slower** |
+| 400 | 32 | 0.078 | 0.851 | 10.9x slower |
+| 400 | **2** | 0.126 | 1.481 | **11.8x slower** |
+| 100 | 32 | 0.117 | 0.884 | 7.6x slower |
+| 50 | 32 | 0.200 | 1.251 | 6.3x slower |
+| 20 | 32 | 0.415 | 1.879 | **4.5x slower** |
+| **whole scan** | | **14 min** | **102 min** | **7.3x slower** |
+
+⚠️ **The CPU column is the re-measured one** (2026-09-18, adaptive timing) and supersedes an
+earlier set that gave 18 min and a 5.7x ratio. Those per-point numbers were taken with a fixed
+two-epoch sample and were noise-dominated — they contained 7 segments timed *cheaper* than 25.
+The corrected column is monotonic in the segment count, as it must be: 0.078 / 0.117 / 0.200 /
+0.415 s per epoch for 7 / 25 / 49 / 120 segments, i.e. **17x the segments for 5.3x the time**.
+⚠️ **The GPU column has NOT been re-measured** and still rests on two-epoch samples, so `7.3x` is
+the best current estimate rather than a settled figure; its epochs are long enough that it is much
+less exposed, but the arm should be re-run before the ratio is quoted anywhere final.
 
 🔴 **This supersedes an earlier table here that read "1.38x slower, and the GPU wins at stride 20".
 That was wrong.** Its CPU column came from a workstation, not from the GPU node, and the node's CPU
 is **4.1x faster** than that workstation — enough to invert the conclusion. The caveat was stated
 at the time; it turned out to carry the entire result. 🔑 **A cross-machine ratio is not a ratio.**
 
-🔑 **What survives, and it is the part worth keeping:** the GPU's disadvantage shrinks monotonically
-as the stride shortens — 6.1x, 4.3x, 3.3x — which is §5's amortisation argument visible in the
-data. Wider batches give each launch more work. **It simply never crosses 1.** And the `batch = 2`
+🔑 **What survives, and it is the part worth keeping:** the GPU's disadvantage shrinks
+monotonically as the batch does more work per launch — 10.9x, 7.6x, 6.3x, 4.5x — which is §5's
+amortisation argument visible in the data. Wider batches give each launch more work. **It simply never crosses 1.** And the `batch = 2`
 control is the sharpest point: **11.9x** worse on the device, its worst by far, while being among
 the cheapest on the CPU. That is launch-boundedness measured rather than argued.
 
@@ -404,7 +413,8 @@ both already covered by the shared depot's `JULIA_CPU_TARGET`) would free the GP
 unmeasured — smoke it there before trusting a walltime. The cost accepted meanwhile is a GPU
 requested and left idle.
 
-🔒 **Walltimes follow**: `run_m4_sweeps.sh` **`-t 01:00:00`** (1.5 x 18 min + startup), raise to
+🔒 **Walltimes follow**: `run_m4_sweeps.sh` **`-t 01:00:00`** (1.5 x 14 min + startup, which is
+also exactly what the smoke suggests on this node), raise to
 3 h for `M4_DEVICE=cuda`; `run_train_lstm.sh` **`-t 02:00:00`**, which covers even the no-seed path
 that fits all five seeds in sequence (~35 min on this CPU, ~3.6 h on the GPU).
 
@@ -414,6 +424,87 @@ epoch, two timed epochs are dominated by the clock and by first-touch effects. T
 sound; the fast rows individually are not. `m4_smoke.jl` now grows the sample until each
 measurement spans at least `RIKFLOW_M4_TIMING_MIN_SECS` (default 2 s) and prints how many epochs
 each number rests on.
+
+### Why the GPU loses — measured, and it is not the transfers
+
+🔴 **Transfers are not the cause.** Counted by passing a counting function as `device`, the loop
+makes **exactly 3 host→device calls per optimiser update** (`stack` → `Xb`, `Yb`; `draw` → `eps`),
+plus 14 fixed calls staging parameters and validation batches once. At the production geometry that
+is **~0.2 MB per update — ~0.6 GB across a 3000-update point, under 0.1 MB/s**, against a PCIe bus
+doing tens of GB/s. The staging is genuinely redundant and worth removing, but it is two to three
+orders of magnitude away from explaining the gap.
+
+🔑 **It is launch latency over a sequential recurrence.** One update is `L = 500` strictly
+sequential timesteps, forward and backward, each issuing ~9 array operations; with Zygote's
+pullbacks that is **~17 000–20 000 dependent kernel launches per update**, i.e. **~25 µs each**
+against the measured 0.43 s/update — on 64×23 matrices representing nanoseconds of arithmetic. The
+CPU does the same step in ~78 µs because those are microsecond BLAS calls with no launch to pay.
+
+✅ **The confirming measurement:** on CPU a **32× wider batch costs only 5.07× more per update**
+(0.133 s at `B = 4` → 0.674 s at `B = 128`, stride 20). Most of an update is fixed cost set by the
+`L`-chain, not by arithmetic volume. That is exactly why the GPU/CPU ratio falls monotonically
+(10.9 → 7.6 → 6.3 → 4.5×) as the batch widens, and why it does not reach 1 in any geometry we can
+run.
+
+🔑 **We are not doing worse than the ecosystem.** Lux's `Recurrence`
+(`Lux/src/layers/recurrent.jl:135–169`) is the same per-timestep Julia loop, and **neither Lux nor
+LuxLib calls cuDNN's fused RNN** (`grep -rl cudnnRNNForward` over both `src` trees is empty).
+cuDNN.jl exposes `cudnnRNNForward` (`cuDNN/src/rnn.jl:2–5`) but ships **no `rrule` and no backward
+wiring** (`rnn.jl:167` notes backward would have to be called per-variable), so **there is no
+differentiable fused RNN in Julia today**. That absence is the whole gap between "GPUs are fast for
+deep learning" and this measurement. ⚠️ Flux is not installed in this depot and was not checked.
+
+🔑 **Our architecture would be compatible with a fused RNN.** `z_t` depends only on `x_t` — the
+encoder never sees `h_{t-1}` — so the entire `[x_t ; z_t]` sequence is computable before the
+recurrence, and `lstm_forward` already forms `Wx * XZ2 .+ b` as **one GEMM for the whole sequence**.
+The decoder skip and emission head sit outside the recurrence. The blocker is not the model, it is
+that training through cuDNN means writing the weight packing, workspace management and a backward
+rule ourselves, untestable without a GPU, to beat a CPU that finishes the scan in 14 minutes.
+
+✅ **Applied: the four gate activations are fused into the two state updates** — 6 broadcasts per
+timestep → 2, forward kernels per step 9 → 5. **Bit-identical**: the validation curves and summed
+weights of all four architectures are unchanged to the last digit, verified by a deterministic fit
+run immediately before and after. ⚠️ **No measurable CPU gain** (58 → 59 min over the scan; per
+point 1.01, 1.09, 0.79, 1.02, 1.02×), and an earlier claim of 1.19× did not reproduce. It is kept
+because it is free and removes launches and pullbacks, which is the axis the device is limited by.
+🔴 **The GPU benefit is predicted, not measured.**
+
+### ✅ Host→device transfers per update: eliminated
+
+Rik asked for a device-resident dataloader, 2026-09-18. Done, and **counted rather than inspected**
+— `device` is any `Array -> AbstractArray` function, so a counting one measures exactly what
+crosses the boundary, on a machine with no GPU and with no profiler.
+
+| | marginal calls per epoch | per update |
+|---|---|---|
+| before | 9 | 3 (`Xb`, `Yb`, `eps`) |
+| **now, default** | **3** | **1** (`eps` only) |
+| **now, `device_rng = true`** | **0** | **0** |
+
+**How.** The whole record is staged on the device once (`Xd`, `Yd` — 273 kB and 86 kB at the
+production geometry) and each batch is *gathered there*: `similar(Xd, …)` allocates wherever `Xd`
+lives, and `Xb[:, :, k] = view(Xd, :, rows)` is a device-to-device bulk copy, not scalar indexing.
+⚠️ **Batches cannot simply be built once and reused** — `train_groups` is reshuffled every epoch,
+so wherever segments outnumber `batch` the *membership* of a chunk changes, not just its order.
+Staging the record and gathering per update is what reaches zero without changing which segments
+meet in a batch.
+
+🔴 **The last transfer is the reparametrisation noise, and removing it costs reproducibility**, so
+it is opt-in. `device_rng = false` (default) draws on the host from `Xoshiro(seed)`, one copy per
+update, and a device fit still equals a host fit at the same seed to round-off (V54). `device_rng =
+true` draws on the device: zero transfers, **a different noise stream**, so no fit made with it is
+comparable to any made without it — and on the CPU it bypasses the seeded `rng` entirely. It is for
+measuring what the transfer costs, not for fitting.
+
+✅ **Bit-identical at the default**, re-verified against the same pre-change reference: four
+architectures, six validation values and summed weights each, every digit. Suites **1827/1** and
+**453/453** (V55 pins the marginal transfer counts so they cannot silently regress).
+
+⚠️ **Expect this to change the clock very little.** The traffic removed ran at **under 0.1 MB/s**
+against a bus doing tens of GB/s; the loop is launch-bound, not bandwidth-bound. It removes a
+confound, a per-update host allocation, and — with `device_rng = true` — the last synchronisation
+point per update, which is the part that could matter more than the bytes suggest. 🔴 **Unmeasured
+on a GPU.**
 
 ### How the GPU path is built
 

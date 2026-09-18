@@ -308,12 +308,35 @@ function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3
         # Views, not slices: each of these used to copy an `H x B` block, and each copy is an
         # operation Zygote traces and a cotangent it has to allocate; a view's pullback writes
         # straight into the parent's.
-        i = _sig.(@view(g[1:H, :]))
-        f = _sig.(@view(g[(H + 1):(2H), :]))
-        gg = tanh.(@view(g[(2H + 1):(3H), :]))
-        o = _sig.(@view(g[(3H + 1):(4H), :]))
-        c = f .* c .+ i .* gg
-        h = o .* tanh.(c)
+        gi = @view g[1:H, :]
+        gf = @view g[(H + 1):(2H), :]
+        gc = @view g[(2H + 1):(3H), :]
+        go = @view g[(3H + 1):(4H), :]
+        # 🔴 **The four gate activations are FUSED INTO THE TWO STATE UPDATES, and that is a
+        # kernel-count fix, not a style change.** Written out as `i = _sig.(gi); f = _sig.(gf);
+        # gg = tanh.(gc); o = _sig.(go); c = f .* c .+ i .* gg; h = o .* tanh.(c)` this is SIX
+        # broadcasts per timestep; as two `@.` expressions with the activations inside, it is TWO,
+        # for identical arithmetic on identical values in the same order.
+        # 🔑 Why it matters more than it looks: the recurrence is the one part of the model that
+        # cannot be batched over time, so its cost is `L` x (ops per step) and nothing amortises
+        # it. Each broadcast is a separate kernel launch on a device and a separate traced
+        # operation with its own pullback under Zygote, so removing four removes four launches AND
+        # four pullbacks per step -- 2000 of each over an `L = 500` segment. The GPU is
+        # launch-bound here (`results_LSTMS.md` §5: ~17 000-20 000 dependent launches per update
+        # at ~25 us each), which is the setting this was measured against.
+        # ✅ **Bit-identical, verified rather than assumed**: the validation curves and summed
+        # weights of all four architectures are unchanged to the last digit (2026-09-18), on a
+        # deterministic synthetic fit run before and immediately after the change.
+        # ⚠️ **It buys nothing measurable on the CPU, and the claim that it did was not
+        # reproduced.** Measured here at the real scan geometry, pre against post:
+        # 0.308/0.304, 0.498/0.458, 0.399/0.502, 0.842/0.829, 2.003/1.967 s/epoch -- scatter
+        # around 1.0 with one point worse, and 58 vs 59 min over the whole scan. It is kept
+        # because it is free and strictly fewer launches and pullbacks, which is the axis a
+        # LAUNCH-BOUND device is limited by (§5). 🔴 **That GPU benefit is predicted, not
+        # measured** -- forward kernels per step go 9 -> 5; whether that shows up needs a
+        # `M4_DEVICE=cuda` smoke on Snellius.
+        c = @. _sig(gf) * c + _sig(gi) * tanh(gc)
+        h = @. _sig(go) * tanh(c)
         Hb[:, t, :] = h
     end
     Hm = copy(Hb)
@@ -445,6 +468,10 @@ once and held fixed so the curve is a function of the parameters alone. Both mat
 look: on R1's record at a constant `lr`, the three latent architectures reached val ≈ −12 near
 epoch 91 and were at ≈ −4 by epoch 100, so a last-iterate fit **inverted the architecture ranking**.
 `history` carries `best_epoch` and `best_val` so a run that ends far from its best is visible.
+- `device_rng`: draw the reparametrisation noise on the device instead of on the host. `false` by
+  default. 🔴 **It removes the last host->device transfer per update and costs reproducibility**:
+  a different stream, so no fit made with it is comparable to any made without it, and on the CPU
+  it bypasses the seeded `rng` entirely. For measuring what the transfer costs, not for fitting.
 - `device`: any `Array -> AbstractArray` function placing the parameters and each batch.
   `identity` (the default) is the CPU path; `CuArray` runs the fit on a GPU. 🔑 **The randomness
   stays on the host**: parameters are initialised and `eps` drawn from `Xoshiro(seed)` and only
@@ -465,6 +492,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             lr::Real = 1e-2, beta::Real = 1e-4, seed::Int = 1,
                             val_frac::Real = 0.2, stride::Int = L - burn,
                             T::Type = Float32, verbose::Bool = true, device = identity,
+                            device_rng::Bool = false,
                             patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-5)
     size(X, 2) == size(Y, 2) == length(steps) ||
         error("train_stochlstm: X, Y and steps disagree on the number of columns")
@@ -472,7 +500,18 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
         error("train_stochlstm: need 1 <= stride <= L - burn = $(L - burn); got $stride. " *
               "A larger stride would leave rows no segment ever scores.")
 
+    # 🔴 **The whole record is staged on the device ONCE, and batches are gathered THERE.** Until
+    # 2026-09-18 every batch was assembled on the host and copied per optimiser update — 3 copies
+    # each, ~0.2 MB, ~0.6 GB over a 3000-update point. The record itself is far smaller than the
+    # batches cut from it (segments overlap, and each is re-copied every epoch), so uploading it
+    # once and gathering device-side removes the per-update host traffic entirely for `X` and `Y`.
+    # At the production geometry that is 273 kB for `Xd` and 86 kB for `Yd`, uploaded twice, total.
+    # ⚠️ **Do not expect this to be fast-er, only clean-er.** The measurement says the loop is
+    # launch-bound, not bandwidth-bound: the traffic it removes ran at under 0.1 MB/s on a bus
+    # doing tens of GB/s (`results_LSTMS.md` §5). It removes a confound and a per-update host
+    # allocation; it does not address the ~17 000-20 000 dependent kernel launches that dominate.
     Xt, Yt = T.(X), T.(Y)
+    Xd, Yd = device(Xt), device(Yt)
 
     # 🔴 **The record is split by ROW, then each side is segmented.** Splitting the segment LIST
     # instead -- `segs[1:end-nval]` / `segs[end-nval+1:end]`, which is what this did until
@@ -527,27 +566,43 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
 
     # Stack a set of same-length segments into (n_in, L, B) / (N_Q, L, B) plus the shared scored
     # range. `burn` is the same for every segment, so the local scored range is too.
-    # 🔑 The batch is assembled on the HOST out of `Xt`/`Yt` and moved once. Gathering `B`
-    # non-contiguous segments is exactly the scalar-indexing pattern a device array refuses, and
-    # there is nothing to gain from doing it there: the batch is ~1.2 MiB at the largest geometry
-    # against a gradient step of ~200 ms.
+    # 🔴 **Gathered from the DEVICE-resident record, so this transfers nothing.** `similar(Xd, ...)`
+    # allocates wherever `Xd` lives, and each `Xb[:, :, k] = view(Xd, :, rows)` is a device-to-device
+    # copy of a strided range — a bulk `copyto!`, not scalar indexing, so a device array accepts it.
+    # ⚠️ The batch CANNOT simply be built once and reused: `train_groups` is reshuffled every epoch,
+    # so at any stride where the segments outnumber `batch` the *membership* of each chunk changes,
+    # not merely its order. Staging the record and gathering per update is what gets the transfers
+    # to zero without changing which segments meet in a batch.
     function stack(segs, idx)
         L = length(segs[first(idx)].rows)
-        Xb = Array{T,3}(undef, size(Xt, 1), L, length(idx))
-        Yb = Array{T,3}(undef, size(Yt, 1), L, length(idx))
+        Xb = similar(Xd, T, size(Xd, 1), L, length(idx))
+        Yb = similar(Yd, T, size(Yd, 1), L, length(idx))
         for (k, i) in enumerate(idx)
-            Xb[:, :, k] = view(Xt, :, segs[i].rows)
-            Yb[:, :, k] = view(Yt, :, segs[i].rows)
+            Xb[:, :, k] = view(Xd, :, segs[i].rows)
+            Yb[:, :, k] = view(Yd, :, segs[i].rows)
         end
         s1 = segs[first(idx)]
         sc = (first(s1.score) - first(s1.rows) + 1):(last(s1.score) - first(s1.rows) + 1)
-        return device(Xb), device(Yb), sc, length(sc) * length(idx)
+        return Xb, Yb, sc, length(sc) * length(idx)
     end
 
     # The randomness is drawn OUTSIDE the differentiated function -- the reparametrisation trick --
-    # so `elbo` is deterministic given `epsz` and Zygote never sees an RNG. Drawn on the host from
-    # `rng`, then moved: see the note at `ps` above for why the stream must not become a device one.
-    draw(L, B) = device(randn(rng, T, spec.n_latent, L, B))
+    # so `elbo` is deterministic given `epsz` and Zygote never sees an RNG.
+    #
+    # 🔴 **This is the LAST host->device transfer per update, and removing it costs reproducibility,
+    # which is why it is opt-in.** Host-drawn (`device_rng = false`, the default): one copy per
+    # update, `n_latent x L x B` — 256 kB at the largest geometry — and a device fit equals a host
+    # fit at the same seed to round-off, which V54 asserts and every recorded number relies on.
+    # Device-drawn (`device_rng = true`): zero transfers, and **a different noise stream**, so the
+    # fit is no longer comparable with any existing one, on either device.
+    # ⚠️ `randn!` on a device array uses that device's generator; on a host array it uses the
+    # GLOBAL rng, **not** the seeded `rng` here — so `device_rng = true` makes even the CPU path
+    # non-reproducible. It exists to measure what the transfer costs, not to fit with.
+    draw = if device_rng
+        (L, B) -> randn!(similar(Xd, T, spec.n_latent, L, B))
+    else
+        (L, B) -> device(randn(rng, T, spec.n_latent, L, B))
+    end
 
     train_groups = group_by_length(train_segs)
     val_groups = group_by_length(val_segs)

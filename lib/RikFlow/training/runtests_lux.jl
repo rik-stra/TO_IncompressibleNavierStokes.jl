@@ -475,6 +475,69 @@ const RF = RikFlow
         end
     end
 
+    # -----------------------------------------------------------------------------------------
+    # V55 -- host->device transfers per optimiser update
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔑 **Counted, not inspected.** `device` is any `Array -> AbstractArray` function, so a
+    # counting one measures exactly how much crosses the boundary — on a machine with no GPU, and
+    # without profiling tools. The property under test is a MARGINAL: how many calls a further ten
+    # epochs add, which is what a 3000-update point pays over and over. One-time staging of the
+    # parameters and the record is not a per-update cost and is deliberately not counted.
+    #
+    # 🔴 The record is staged on the device once and batches are gathered THERE, so `X` and `Y`
+    # cost nothing per update. What remains by default is the reparametrisation noise, one draw
+    # per update, kept on the host because a device stream would break seed comparability (V54).
+    # `device_rng = true` removes that too, at that cost.
+    @testset "V55 the record is staged once, not copied per update" begin
+        calls = Ref(0)
+        counting(x) = (calls[] += 1; copy(x))
+
+        nq, N = 3, 900
+        rng = Xoshiro(91)
+        q = zeros(Float64, nq, N)
+        for t in 2:N
+            q[:, t] = 0.8 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = nq), n_hidden = 8,
+                           n_latent = 4, n_encoder = 0, arch = :storn, emission = :none)
+        X, Y, steps = RF.build_history(spec.hist, q[:, 1:(N - 1)], q)
+        Xc, Yc = permutedims(X), permutedims(Y)
+        kw = (; L = 120, burn = 30, batch = 4, lr = 5e-3, beta = 1e-4, seed = 3, verbose = false)
+
+        count_for(epochs; device_rng) = (calls[] = 0;
+            RF.train_stochlstm(spec, Xc, Yc, steps; kw..., epochs, device = counting, device_rng);
+            calls[])
+
+        # the marginal cost of ten further epochs, which is what a long fit actually pays
+        base = count_for(1; device_rng = false)
+        more = count_for(11; device_rng = false)
+        per_epoch = (more - base) / 10
+
+        # ⚠️ Updates per epoch is NOT `cld(nsegments, batch)`. Segments are grouped by LENGTH
+        # first and each group is batched separately, so the trailing short segment always costs
+        # an update of its own. Predicting the count the other way is what made the first version
+        # of this test fail against correct code -- the same arithmetic slip the scans' geometry
+        # helper exists to prevent.
+        segs = RF.segment_indices(view(steps, 1:floor(Int, 0.8 * length(steps)));
+                                  L = 120, burn = 30, stride = 90)
+        lens = Dict{Int,Int}()
+        for sg in segs
+            lens[length(sg.rows)] = get(lens, length(sg.rows), 0) + 1
+        end
+        n_upd = sum(cld(n, 4) for (_, n) in lens)
+
+        # exactly ONE transfer per update -- the noise draw -- and nothing else
+        @test per_epoch == n_upd
+        @test base > 0                       # staging did happen
+
+        # 🔴 `device_rng = true` makes the marginal ZERO: nothing crosses per update at all.
+        b2 = count_for(1; device_rng = true)
+        m2 = count_for(11; device_rng = true)
+        @test m2 == b2
+        @test b2 < base                      # and it stages no more than the default does
+    end
+
     @testset "train_stochlstm refuses a record it cannot segment" begin
         spec = mkspec(:vrnn)
         X = randn(Xoshiro(91), Float64, RF.n_input(spec), 20)
