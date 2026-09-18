@@ -631,7 +631,7 @@ is derived per point and is *not* the comparison axis):
 | **400** | **2** | 7 | 4 | 750 | 🔑 **control — more steps, no overlap** |
 | 100 | 32 | 25 | 2 | 1500 | overlap 4× |
 | 50 | 32 | 49 | 3 | 1000 | overlap 8× |
-| 20 | 32 | ~140 | ~6 | ~500 | overlap 20× |
+| 20 | 32 | 120 | 5 | 600 | overlap 17× |
 
 🔴 **Strides 100 / 50 / 20** (Rik, 2026-09-18). The first two rows are additions to that list and
 are said so here rather than left to look like part of it: row 1 is the current default, which is
