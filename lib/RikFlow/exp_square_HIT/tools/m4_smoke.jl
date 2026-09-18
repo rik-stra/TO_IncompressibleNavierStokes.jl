@@ -4,6 +4,7 @@
 #           lib/RikFlow/exp_square_HIT/tools/m4_smoke.jl
 #
 #     M4_DEVICE=cuda  julia ... m4_smoke.jl        # the same, on a GPU
+#     M4_DEVICE=cuda M4_DEVICE_RNG=1 julia ... m4_smoke.jl   # + zero transfers per update
 #
 # ---------------------------------------------------------------------------------------------
 # What this is for, and what it deliberately is NOT
@@ -47,11 +48,17 @@ include(joinpath(@__DIR__, "m4_data.jl"))
 
 const EPOCHS = parse(Int, get(ENV, "RIKFLOW_M4_SMOKE_EPOCHS", "3"))
 const DEV_NAME = get(ENV, "M4_DEVICE", "cpu")
+# 🔴 `M4_DEVICE_RNG=1` draws the reparametrisation noise ON the device, which removes the last
+# host->device transfer per update (the record and the batches are already device-resident). It is
+# off by default and must stay that way for real fits: the stream differs, so **no fit made with
+# it is comparable to any made without it**, and on the CPU it bypasses the seeded `rng` entirely
+# and is not even reproducible run to run. This switch exists to MEASURE what that transfer costs.
+const DEVICE_RNG = lowercase(get(ENV, "M4_DEVICE_RNG", "0")) in ("1", "true", "yes")
 
 failures = String[]
 check(ok, what) = ok ? m4_phase("  ok: $what") : (push!(failures, what); m4_phase("  🔴 FAIL: $what"))
 
-m4_phase("M4 smoke: device=$DEV_NAME epochs=$EPOCHS")
+m4_phase("M4 smoke: device=$DEV_NAME device_rng=$DEVICE_RNG epochs=$EPOCHS")
 
 # --- 1. the extension ---------------------------------------------------------------------------
 Base.get_extension(RikFlow, :RikFlowLuxExt) === nothing &&
@@ -100,7 +107,8 @@ m4_phase("5. fitting $EPOCHS epochs on $DEV_NAME (the first includes compilation
 t0 = time()
 ps, hist = RF.train_stochlstm(spec, permutedims(X), permutedims(Y), steps;
                               L = 200, burn = 50, epochs = EPOCHS, batch = 8, lr = 1e-2,
-                              beta = 1e-4, seed = 1, verbose = true, device)
+                              beta = 1e-4, seed = 1, verbose = true, device,
+                              device_rng = DEVICE_RNG)
 m4_phase(@sprintf("5. fit done in %.1f s; val %s", time() - t0,
                   join((@sprintf("%.4g", v) for v in hist.val), " -> ")))
 check(length(hist.val) == EPOCHS, "one validation value per epoch")
@@ -194,7 +202,8 @@ if get(ENV, "RIKFLOW_M4_TIMING", "1") == "1"
         # one compile epoch, then two timed -- the same shape as `m4_probe_step`, inline so the
         # per-point row can be printed as a table rather than as prose.
         RF.train_stochlstm(spec, pXc, pYc, psteps; L, burn, stride, epochs = 1, batch,
-                           lr = 1e-2, beta = 1e-4, val_frac, seed = 1, verbose = false, device)
+                           lr = 1e-2, beta = 1e-4, val_frac, seed = 1, verbose = false, device,
+                           device_rng = DEVICE_RNG)
         # 🔴 Time for at least `MIN_SECS`, not a fixed two epochs. On a fast node an epoch is
         # ~0.1 s and two of them are noise: the first run of this stage reported 25 segments as
         # CHEAPER than 7 (0.089 s against 0.139 s), which is more work in less time and therefore
@@ -204,7 +213,8 @@ if get(ENV, "RIKFLOW_M4_TIMING", "1") == "1"
         while true
             t0 = time()
             RF.train_stochlstm(spec, pXc, pYc, psteps; L, burn, stride, epochs = ntimed, batch,
-                               lr = 1e-2, beta = 1e-4, val_frac, seed = 1, verbose = false, device)
+                               lr = 1e-2, beta = 1e-4, val_frac, seed = 1, verbose = false, device,
+                               device_rng = DEVICE_RNG)
             el = time() - t0
             (el >= MIN_SECS || ntimed >= 64) && break
             ntimed *= 4
@@ -239,7 +249,7 @@ rm(dir; recursive = true, force = true)
 
 println()
 if isempty(failures)
-    m4_phase("M4 SMOKE PASS on device=$DEV_NAME")
+    m4_phase("M4 SMOKE PASS on device=$DEV_NAME device_rng=$DEVICE_RNG")
 else
     m4_phase("M4 SMOKE FAILED on device=$DEV_NAME: $(length(failures)) check(s)")
     foreach(f -> println("  - ", f), failures)
