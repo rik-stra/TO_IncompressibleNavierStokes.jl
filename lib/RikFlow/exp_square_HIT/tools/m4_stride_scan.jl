@@ -14,7 +14,7 @@
 # scored once per epoch, and at `L = 500` the 2879-row training block leaves **7 segments** --
 # far fewer than `batch`, so the batch is unreachable and an epoch is **2 updates** (the 7 fall
 # into two LENGTH groups, 6 x 500 and 1 x 479, and each group is batched separately). Shortening
-# the stride overlaps the segments and makes more of them: 13, 25, 49 at stride 200, 100, 50.
+# the stride overlaps the segments and makes more of them: 25, 49, ~140 at stride 100, 50, 20.
 #
 # 🔴 **This is augmentation, not data.** The same rows are re-scored at different offsets inside a
 # segment, so the extra gradients are correlated and `k x` the segments is not `k x` the
@@ -54,24 +54,14 @@ TO_folder = normpath(joinpath(@__DIR__, "..", "output", "TO_LSTM"))
 track_file = get(ENV, "RIKFLOW_TRACK_FILE",
                  joinpath(TO_folder, "..",
                           "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2"))
-qoi_cache = get(ENV, "RIKFLOW_QOI_CACHE", "")
-
 const UPDATES = parse(Int, get(ENV, "RIKFLOW_M4_UPDATES", "3000"))
 
-function load_qois()
-    if !isempty(qoi_cache)
-        isfile(qoi_cache) || error("RIKFLOW_QOI_CACHE=$qoi_cache does not exist")
-        d = load(qoi_cache)
-        return (; q = d["q"], q_star = d["q_star"])
-    end
-    isfile(track_file) || error("neither RIKFLOW_QOI_CACHE nor the tracking record is present")
-    d = load(track_file, "data_track")
-    return (; d.q, d.q_star)
-end
+# 🔑 One QoI resolver for all three M4 drivers -- each used to carry its own.
+include(joinpath(@__DIR__, "m4_data.jl"))
 
 inputs = load(joinpath(TO_folder, "inputs_lstm.jld2"), "inputs")
 cfg = inputs[cell_index]
-rec = load_qois()
+rec = load_m4_qois(; track_file)
 a, b = cfg.train_range
 
 # --- exactly the driver's data preparation ------------------------------------------------------

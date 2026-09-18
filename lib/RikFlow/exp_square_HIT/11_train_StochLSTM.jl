@@ -37,21 +37,8 @@ track_file = get(ENV, "RIKFLOW_TRACK_FILE",
                  @__DIR__() * "/output/data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2")
 # The extracted QoI cache is an equally good source and is 7 MB rather than 2.7 GB, so it is
 # preferred when present. `analysis/extract_qois.jl` writes it.
-qoi_cache = get(ENV, "RIKFLOW_QOI_CACHE", "")
-
-function load_qois()
-    if !isempty(qoi_cache)
-        isfile(qoi_cache) || error("RIKFLOW_QOI_CACHE=$qoi_cache does not exist")
-        d = load(qoi_cache)
-        @info "reading QoIs from the cache" qoi_cache
-        return (; q = d["q"], q_star = d["q_star"])
-    end
-    isfile(track_file) || error("neither RIKFLOW_QOI_CACHE nor the tracking record is present:\n" *
-                                "  track_file = $track_file")
-    @info "reading QoIs from the tracking record (slow -- consider the cache)" track_file
-    d = load(track_file, "data_track")
-    return (; d.q, d.q_star)
-end
+# 🔑 One QoI resolver for all three M4 drivers -- each used to carry its own.
+include(joinpath(@__DIR__, "tools", "m4_data.jl"))
 
 inputs = load(TO_folder * "/inputs_lstm.jld2", "inputs")
 1 <= model_index <= length(inputs) ||
@@ -59,7 +46,7 @@ inputs = load(TO_folder * "/inputs_lstm.jld2", "inputs")
 cfg = inputs[model_index]
 @info "fitting $(cfg.name)" arch=cfg.arch h=cfg.h beta=cfg.beta
 
-rec = load_qois()
+rec = load_m4_qois(; track_file)
 a, b = cfg.train_range
 size(rec.q, 2) >= b || error("the record has $(size(rec.q, 2)) columns but train_range needs $b")
 
@@ -123,7 +110,7 @@ for s in seeds
     # -- and the IWAE bound is defined on `ps`, so without it `analysis/postrun_lstm.jl` cannot
     # report a likelihood at all. The model is tiny; the duplication costs kilobytes.
     RF.save_stochlstm(path, spec, w, scaling;
-                      cfg, seed = s, train_range = cfg.train_range, track_file, qoi_cache,
+                      cfg, seed = s, train_range = cfg.train_range, track_file, qoi_source = rec.source,
                       losses = hist_loss, steps_span = (first(steps), last(steps)), ps)
     # 🔴 `best_val`, not `val[end]`. `train_stochlstm` returns the best-validation iterate, so the
     # last epoch's loss is not the loss of the model that was saved -- and on R1's record the two

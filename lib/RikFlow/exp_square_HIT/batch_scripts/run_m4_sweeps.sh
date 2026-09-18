@@ -97,18 +97,15 @@ else
     exit 1
 fi
 
-# 🔑 Prefer the extracted QoI cache: it is ~7 MB against the tracking record's 2.7 GB, and the
-# scans read nothing else from it. `analysis/data` is gitignored, so on a fresh checkout the cache
-# is absent and the scan falls back to the record -- correct either way, just slower to start.
-if [ -z "${RIKFLOW_QOI_CACHE:-}" ]; then
-    CACHE="$ROOT/analysis/data/data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2"
-    if [ -f "$CACHE" ]; then
-        export RIKFLOW_QOI_CACHE=$CACHE
-        echo "== using the QoI cache: $CACHE"
-    else
-        echo "== no QoI cache at $CACHE; the scan will read the 2.7 GB tracking record" >&2
-    fi
-fi
+# 🔑 **QoI resolution lives in Julia, in `tools/m4_data.jl`, not here.** All three M4 drivers
+# include it, so the cache pattern and the "which record is this?" rule have ONE definition --
+# and `_f64_lmwray3` in that pattern is load-bearing: `analysis/data/` also holds caches of paper
+# 2's archived records, which are a different dynamical system (`claude_memory.md` #45, #46).
+# `RIKFLOW_QOI_CACHE` still wins if it is set. If no cache is found the driver warns and reads the
+# 2.7 GB tracking record, which works but is slow and heavy when jobs overlap -- extract it once,
+# on the login node, before submitting the grid:
+#
+#   julia --project=analysis analysis/extract_qois.jl #       exp_square_HIT/output/data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2
 
 julia --project="$ROOT/training" -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' ||
     echo "precompile step failed — continuing; the run will compile in-process (slower start)" >&2

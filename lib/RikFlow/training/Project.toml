@@ -1,3 +1,19 @@
+# Training environment for M4: the only one with Lux, Optimisers and Zygote, which together
+# trigger `RikFlowLuxExt`. The deployed closure needs none of them.
+#
+# 🔴 **`[sources]` is what makes this work on a fresh checkout, and its absence was a real
+# failure on Snellius (2026-09-18):** `RikFlow` is a local package, and the path to it lived
+# ONLY in `training/Manifest.toml`, which is NOT tracked by git. With no manifest present
+# `Pkg.instantiate()` has nowhere to look and fails with
+#
+#     ERROR: expected package `RikFlow [07f19e49]` to be registered
+#
+# naming a registry the package will never be in. Declaring the path here puts it in the
+# TRACKED file, so any checkout resolves it. (`lib/RikFlow/test` does not need this: it
+# deliberately does not depend on RikFlow at all and `include`s the stdlib-only `ts_*` files.)
+# ⚠️ `[sources]` needs Julia >= 1.11; Snellius' juliaup default is 1.13 and this repo's
+# floor moved to 1.12 with the 2026-09-10 package update, so that is not a constraint.
+
 [deps]
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
 JLArrays = "27aeb0d3-9eb9-45fb-866b-73c2ecf80fcb"
@@ -11,3 +27,6 @@ Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 RikFlow = "07f19e49-00df-4880-aa48-bf317467130b"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
+
+[sources]
+RikFlow = {path = ".."}

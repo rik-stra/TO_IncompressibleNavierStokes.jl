@@ -47,26 +47,16 @@ TO_folder = normpath(joinpath(@__DIR__, "..", "output", "TO_LSTM"))
 track_file = get(ENV, "RIKFLOW_TRACK_FILE",
                  joinpath(TO_folder, "..",
                           "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2"))
-qoi_cache = get(ENV, "RIKFLOW_QOI_CACHE", "")
-
 const EPOCHS = parse(Int, get(ENV, "RIKFLOW_M4_LR_EPOCHS", "1500"))
-const LRS = [parse(Float64, s) for s in
+const LRS = [parse(Float64, x) for x in
              split(get(ENV, "RIKFLOW_M4_LRS", "1e-3,3e-3,1e-2,3e-2,1e-1,3e-1"), ",")]
 
-function load_qois()
-    if !isempty(qoi_cache)
-        isfile(qoi_cache) || error("RIKFLOW_QOI_CACHE=$qoi_cache does not exist")
-        d = load(qoi_cache)
-        return (; q = d["q"], q_star = d["q_star"])
-    end
-    isfile(track_file) || error("neither RIKFLOW_QOI_CACHE nor the tracking record is present")
-    d = load(track_file, "data_track")
-    return (; d.q, d.q_star)
-end
+# 🔑 One QoI resolver for all three M4 drivers -- each used to carry its own.
+include(joinpath(@__DIR__, "m4_data.jl"))
 
 inputs = load(joinpath(TO_folder, "inputs_lstm.jld2"), "inputs")
 cfg = inputs[cell_index]
-rec = load_qois()
+rec = load_m4_qois(; track_file)
 a, b = cfg.train_range
 
 # --- exactly the driver's data preparation, so the scan is about `lr` and nothing else ----------
