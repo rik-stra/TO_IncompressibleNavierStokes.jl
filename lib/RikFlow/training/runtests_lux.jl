@@ -13,6 +13,13 @@ using Test
 using RikFlow
 using Lux, Optimisers, Zygote
 using Random, LinearAlgebra, Statistics
+# V54 only. `JLArrays` is GPUArrays' host-backed reference array: it refuses scalar
+# indexing exactly as `CuArray` does, which is what makes it a real proxy for a device
+# on a machine that has none.
+# ⚠️ CUDA is deliberately NOT imported here: it is a dependency of `RikFlow`, not of this test
+# environment, and `using` it would be gotcha #53's class of defect in the test that exists to
+# catch that class. `m4_device`'s CUDA branch is tested through its behaviour instead.
+using JLArrays
 
 const RF = RikFlow
 
@@ -30,9 +37,12 @@ const RF = RikFlow
               NamedTuple
     end
 
-    mkspec(arch; n_qoi = 3, h = 2, n_hidden = 5, n_latent = 4, n_encoder = 5, uclip = nothing) =
+    # `emission` defaults to the Gaussian head here and to `:none` in `LSTMSpec`: the head is off
+    # in production (Rik, 2026-09-18) but still in the code and still has to be tested.
+    mkspec(arch; n_qoi = 3, h = 2, n_hidden = 5, n_latent = 4, n_encoder = 5, uclip = nothing,
+           emission = :state_dependent) =
         RF.LSTMSpec(; hist = RF.HistorySpec(; h, n_qoi), n_hidden, n_latent, n_encoder, arch,
-                    uclip)
+                    emission, uclip)
 
     # -----------------------------------------------------------------------------------------
     # V41 -- the training forward pass and the deployed one are the same model
@@ -386,6 +396,85 @@ const RF = RikFlow
         @test n64 <= n1
     end
 
+    # -----------------------------------------------------------------------------------------
+    # V54 -- the device path, without a device
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔴 **This workstation has no GPU (`claude_memory.md` #56), so the CUDA path cannot be run
+    # here -- and "it compiles" was never the question anyway.** `JLArray` is GPUArrays' reference
+    # array: host-backed, but it **refuses scalar indexing** exactly as `CuArray` does and its
+    # `similar` returns its own type. That makes it a real proxy for the two failure modes a GPU
+    # port actually has -- a host array silently mixed into a device graph, and a scalar `getindex`
+    # inside the recurrence -- both of which a plain CPU run cannot see.
+    #
+    # 🔑 **The positive control comes first.** A proxy that does not enforce the property proves
+    # nothing, which is V31's lesson in a new place: assert that `JLArray` really does refuse
+    # scalar indexing before believing anything the rest of this testset says.
+    #
+    # ⚠️ What this does NOT establish: that CUDA.jl compiles these kernels, that the performance is
+    # anything but worse, or that `m4_device("cuda")` finds a device. Those need a GPU node.
+    @testset "V54 the device path runs and agrees with the host ($arch)" for
+            arch in (:storn, :vrnn, :vaernn, :lstm)
+
+        # positive control: the proxy has the property the test relies on
+        probe = JLArray(randn(Float32, 2, 2))
+        @test_throws Exception probe[1, 1]
+        @test similar(probe, Float32, 3, 4) isa JLArray
+
+        em = arch === :lstm ? :constant : :none
+        nq, N = 3, 400
+        rng = Xoshiro(91)
+        q = zeros(Float64, nq, N)
+        for t in 2:N
+            q[:, t] = 0.8 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = nq), n_hidden = 8,
+                           n_latent = 4, n_encoder = 0, arch, emission = em)
+        X, Y, steps = RF.build_history(spec.hist, q[:, 1:(N - 1)], q)
+        Xc, Yc = permutedims(X), permutedims(Y)
+        kw = (; L = 60, burn = 15, epochs = 5, batch = 4, lr = 5e-3, seed = 3, verbose = false)
+
+        pc, hc = RF.train_stochlstm(spec, Xc, Yc, steps; kw...)
+        pd, hd = RF.train_stochlstm(spec, Xc, Yc, steps; kw..., device = JLArray)
+
+        # (1) the device fit is the SAME fit. The host draws every random number and only then
+        # moves it, so the two differ by reduction order alone -- Float32 round-off, not a
+        # different trajectory. A device RNG would show up here as a completely different curve.
+        @test length(hd.val) == length(hc.val)
+        @test isapprox(hd.val, hc.val; rtol = 1e-4)
+        @test isapprox(hd.train, hc.train; rtol = 1e-4)
+        @test hd.best_epoch == hc.best_epoch
+
+        # (2) parameters come back on the HOST whatever the device was: `LSTMWeights`,
+        # `save_stochlstm` and JLD2 all want plain arrays, and a fit only readable on a GPU node
+        # is not a fit.
+        @test all(v -> v === nothing || v isa Array, values(pd))
+        @test all(isapprox(pd[k], pc[k]; rtol = 1e-3, atol = 1e-5)
+                  for k in keys(pc) if pc[k] isa Array)
+    end
+
+    @testset "V54 m4_device resolves names and refuses a missing device" begin
+        @test RF.m4_device("cpu") === identity
+        @test RF.m4_device("CPU ") === identity
+        @test_throws ErrorException RF.m4_device("tpu")
+        # 🔴 `cuda` must THROW when no device is functional, never fall back to the host: a
+        # silent fallback reports a GPU run that took CPU time and puts that in a table. Written
+        # without importing CUDA (see the header): accept either outcome, but pin WHICH -- on a
+        # machine with no device it must be the refusal, with a message naming the reason, and
+        # never `identity`.
+        res = try
+            RF.m4_device("cuda")
+        catch e
+            e
+        end
+        @test !(res === identity)
+        if res isa ErrorException
+            @test occursin("CUDA.functional() is false", res.msg)
+        else
+            @test res isa Type || res isa Function      # a device array constructor
+        end
+    end
+
     @testset "train_stochlstm refuses a record it cannot segment" begin
         spec = mkspec(:vrnn)
         X = randn(Xoshiro(91), Float64, RF.n_input(spec), 20)
@@ -393,5 +482,56 @@ const RF = RikFlow
         @test_throws ErrorException RF.train_stochlstm(spec, X, Y, collect(1:20);
                                                        L = 200, burn = 150, verbose = false)
         @test_throws ErrorException RF.train_stochlstm(spec, X, Y, collect(1:19); verbose = false)
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # V53 -- overlapping training segments, and the split that makes them safe
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔴 The train/val split is by ROW, not by position in the segment list. Splitting the list is
+    # safe ONLY at `stride == L - burn`, where the scored windows exactly tile the record; at any
+    # shorter stride they overlap, and scored validation rows land inside scored training rows --
+    # a validation loss that is quietly a training loss. This testset reproduces the geometry of
+    # the split directly, because it is the property that has to hold, not the code that produces
+    # it.
+    @testset "V53 scored train and val rows stay disjoint at every stride" begin
+        ncol, L, burn, val_frac = 1000, 200, 50, 0.2
+        ntrain = floor(Int, (1 - val_frac) * ncol)
+        steps = collect(1:ncol)
+
+        for stride in (L - burn, 75, 50, 25, 1)
+            tr = RF.segment_indices(view(steps, 1:ntrain); L, burn, stride)
+            va = [(; rows = s.rows .+ ntrain, score = s.score .+ ntrain)
+                  for s in RF.segment_indices(view(steps, (ntrain + 1):ncol); L, burn)]
+            @test !isempty(tr) && !isempty(va)
+
+            scored_tr = reduce(union, (collect(s.score) for s in tr))
+            scored_va = reduce(union, (collect(s.score) for s in va))
+            @test isempty(intersect(scored_tr, scored_va))
+            # and no segment of EITHER side reaches a row belonging to the other
+            @test maximum(maximum(s.rows) for s in tr) <= ntrain
+            @test minimum(minimum(s.rows) for s in va) > ntrain
+            # the embargo: the first scored val row is `burn` steps past the last training row
+            @test minimum(scored_va) == ntrain + burn + 1
+        end
+
+        # a shorter stride really does make more segments, and they cover the same rows
+        n_tile = length(RF.segment_indices(view(steps, 1:ntrain); L, burn, stride = L - burn))
+        n_over = length(RF.segment_indices(view(steps, 1:ntrain); L, burn, stride = 25))
+        @test n_over > 4 * n_tile
+
+        # a stride past `L - burn` would leave rows nothing ever scores, and is refused
+        spec = mkspec(:vrnn; h = 1, n_qoi = 2)
+        X = randn(Xoshiro(93), Float64, RF.n_input(spec), ncol)
+        Y = randn(Xoshiro(94), Float64, RF.n_output(spec), ncol)
+        @test_throws ErrorException RF.train_stochlstm(spec, X, Y, steps;
+                                                       L, burn, stride = L - burn + 1,
+                                                       epochs = 1, verbose = false)
+
+        # and a strided fit runs and improves, which the geometry above does not by itself prove
+        _, h = RF.train_stochlstm(spec, X, Y, steps; L, burn, stride = 50, epochs = 8, batch = 4,
+                                  lr = 5e-3, seed = 2, verbose = false)
+        @test length(h.train) == 8
+        @test all(isfinite, h.train)
     end
 end

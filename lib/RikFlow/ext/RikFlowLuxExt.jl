@@ -37,6 +37,10 @@ using Zygote
 using Random
 using LinearAlgebra
 using Statistics
+# ⚠️ Only for `m4_device`'s `CuArray` and its `functional()` check -- no other line in this file
+# mentions a device, by design (see "Device placement"). `CUDA` is a hard dependency of `RikFlow`,
+# so this costs nothing that was not already loaded, and it loads on a machine with no GPU.
+using CUDA
 
 const RF = RikFlow
 
@@ -106,6 +110,55 @@ function RF.init_lstm_params(rng::AbstractRNG, spec::RF.LSTMSpec; T::Type = Floa
     )
 end
 
+# ---------------------------------------------------------------------------------------------
+# Device placement
+# ---------------------------------------------------------------------------------------------
+#
+# 🔑 **There is no CUDA in this file, and that is the design.** `lstm_forward` allocates its
+# recurrent state and its hidden-state buffer with `similar(X, ...)`, so every array it makes
+# follows the array type it was *given*. Device choice therefore lives entirely at the call site:
+# `train_stochlstm(...; device = CuArray)` moves the parameters and each batch across and the
+# arithmetic follows, with no device-specific branch anywhere in the model.
+#
+# `device` is any `Array -> AbstractArray` function. `identity` is the CPU path and the default.
+#
+# ⚠️ **What this does NOT do is make a GPU worth using.** `results_LSTMS.md` §5 measures the fit at
+# ~75 MFLOP and ~0.34 GFLOP/s per gradient step over a recurrence whose `L` steps are strictly
+# sequential, i.e. overhead-bound on the host side, where a device cannot help. This plumbing
+# exists so the question can be *measured* rather than argued.
+
+_to_device(device, x::AbstractArray) = device(x)
+_to_device(device, ::Nothing) = nothing
+_to_device(device, nt::NamedTuple) = map(v -> _to_device(device, v), nt)
+
+"Bring a parameter set back to the host. `Array` on a host array is a no-op."
+_to_host(x) = _to_device(Array, x)
+
+"""
+    m4_device(name) -> f
+
+Resolve `"cpu"` / `"cuda"` into the function `train_stochlstm`'s `device` keyword wants.
+
+🔴 **`"cuda"` throws when no device is functional rather than falling back to the host.** A silent
+fallback is the worst outcome available here: the job would report a GPU run, take CPU time, and
+put a number in a table that says something it does not mean.
+
+⚠️ `CUDA` is a hard dependency of `RikFlow`, so `using CUDA` costs nothing extra here and works on
+a machine with no GPU — loading it without a device is supported; only *using* one is not.
+"""
+function RF.m4_device(name::AbstractString)
+    d = lowercase(strip(name))
+    d in ("cpu", "host") && return identity
+    if d in ("cuda", "gpu")
+        CUDA.functional() || error(
+            "m4_device: M4_DEVICE=$name was requested but CUDA.functional() is false -- no " *
+            "usable device. Refusing to fall back to the CPU silently; either run on a node " *
+            "with a GPU or set M4_DEVICE=cpu.")
+        return CUDA.CuArray
+    end
+    return error("m4_device: expected \"cpu\" or \"cuda\"; got \"$name\"")
+end
+
 """
     _timeslices(G, L)
 
@@ -165,8 +218,20 @@ function _latent(::Val{true}, encv, ps, X, epsz, ::Type{T}, nz, L) where {T}
     SIG = _sp.(ps.Bsig * E)
     return MU, SIG, MU .+ SIG .* epsz
 end
-_latent(::Val{false}, encv, ps, X, epsz, ::Type{T}, nz, L) where {T} =
-    (zeros(T, nz, L), ones(T, nz, L), zeros(T, nz, L))
+# 🔴 Allocated with `zero(similar(X, ...))`, NOT `zeros(T, ...)`, so the constants follow the
+# INPUT'S array type instead of being pinned to the host. That is what lets the same code run on a
+# device (see `train_stochlstm`'s `device` keyword); `zeros` here would silently mix a host array
+# into a device graph. ⚠️ `zero(similar(...))` and not `fill!(similar(...), 0)`: the latter is a
+# `setindex!` on an array Zygote can see and is refused with *"Mutating arrays is not supported"* --
+# measured 2026-09-18, not assumed.
+# 🔑 For `:lstm` these three are dead downstream -- `_cell_input`/`_decoder_skip` on `Val{false}`
+# ignore `Z`, and `elbo` reads `MU`/`SIG` only when `latent_sampled` -- so this is about not
+# leaving a host array inside a device NamedTuple, not about the arithmetic.
+function _latent(::Val{false}, encv, ps, X, epsz, ::Type{T}, nz, L) where {T}
+    mu = zero(similar(X, T, nz, L))
+    z = zero(similar(X, T, nz, L))
+    return (mu, zero(similar(X, T, nz, L)) .+ one(T), z)
+end
 
 # ---------------------------------------------------------------------------------------------
 # Forward
@@ -230,9 +295,14 @@ function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3
     # the slice `_timeslices` replaces. Bound to a local, the per-step cotangent is just `H x H`.
     Wh = ps.Wh
 
-    Hb = Zygote.Buffer(zeros(T, H, L, B))
-    h = zeros(T, H, B)
-    c = zeros(T, H, B)
+    # 🔴 `similar(X, ...)` / `zero(similar(X, ...))`, not `zeros(T, ...)`: the recurrent state and
+    # the hidden-state buffer follow the INPUT'S array type, which is the whole mechanism by which
+    # this function runs on a device without a single device-specific line in it. The `Buffer`'s
+    # backing array is left uninitialised on purpose -- every one of its `L` slices is written in
+    # the loop below -- and `Zygote.Buffer` is what makes that mutation legal at all.
+    Hb = Zygote.Buffer(similar(X, T, H, L, B))
+    h = zero(similar(X, T, H, B))
+    c = zero(similar(X, T, H, B))
     for t in 1:L
         g = GX[t] .+ Wh * h
         # Views, not slices: each of these used to copy an `H x B` block, and each copy is an
@@ -356,7 +426,16 @@ Fit an M4 model to a regressor/target pair.
   in it become segment boundaries.
 
 # Keywords
-- `L`, `burn`: segment length and burn-in. `L = 200`, `burn = 50` by default; both are sweep axes.
+- `L`, `burn`: segment length and burn-in. `L = 500`, `burn = 100` by default -- the configuration
+  table's values, kept in step with it so a bare call and a driver call mean the same thing.
+- `stride`: distance between the starts of consecutive TRAINING segments. The default `L - burn`
+  makes the scored windows exactly tile the record, so every row is scored once per epoch. A
+  shorter stride overlaps them, which is **augmentation, not data**: the same rows are re-scored at
+  different offsets within a segment. 🔑 It buys two real things -- more optimiser steps per epoch
+  (at `L = 500` the default leaves 7 training segments, i.e. one full-batch update per epoch) and
+  variation in how long the hidden state has been charged when a given row is scored. ⚠️ The
+  gradients from overlapping segments are correlated, so `k x` the segments is not `k x` the
+  information; compare runs on optimiser steps, not epochs.
 - `epochs`, `batch`, `lr`, `beta`, `seed`.
 - `patience`, `lr_decay`, `min_lr`: decay the learning rate by `lr_decay` after `patience` epochs
   without a validation improvement, down to `min_lr`.
@@ -366,6 +445,13 @@ once and held fixed so the curve is a function of the parameters alone. Both mat
 look: on R1's record at a constant `lr`, the three latent architectures reached val ≈ −12 near
 epoch 91 and were at ≈ −4 by epoch 100, so a last-iterate fit **inverted the architecture ranking**.
 `history` carries `best_epoch` and `best_val` so a run that ends far from its best is visible.
+- `device`: any `Array -> AbstractArray` function placing the parameters and each batch.
+  `identity` (the default) is the CPU path; `CuArray` runs the fit on a GPU. 🔑 **The randomness
+  stays on the host**: parameters are initialised and `eps` drawn from `Xoshiro(seed)` and only
+  then moved, so a device fit and a host fit at the same seed are the same fit to round-off. A
+  device RNG would be faster and would void V49's reproducibility property and every number
+  already recorded. The returned parameters are always on the host.
+  ⚠️ **Never run on a GPU as of 2026-09-18** — see `results_LSTMS.md` §5.
 - `val_frac`: the trailing fraction of segments held out for the reported validation loss.
   ⚠️ This is an *inner* split for early stopping and diagnostics only. Model **selection** is on a
   window disjoint from both training and the online evaluation window -- that is the protocol's
@@ -375,24 +461,56 @@ Returns `(ps, history)`.
 """
 function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMatrix,
                             steps::AbstractVector{<:Integer};
-                            L::Int = 200, burn::Int = 50, epochs::Int = 200, batch::Int = 8,
-                            lr::Real = 1e-3, beta::Real = 1e-4, seed::Int = 1,
-                            val_frac::Real = 0.2, T::Type = Float32, verbose::Bool = true,
+                            L::Int = 500, burn::Int = 100, epochs::Int = 200, batch::Int = 8,
+                            lr::Real = 1e-2, beta::Real = 1e-4, seed::Int = 1,
+                            val_frac::Real = 0.2, stride::Int = L - burn,
+                            T::Type = Float32, verbose::Bool = true, device = identity,
                             patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-5)
     size(X, 2) == size(Y, 2) == length(steps) ||
         error("train_stochlstm: X, Y and steps disagree on the number of columns")
+    1 <= stride <= L - burn ||
+        error("train_stochlstm: need 1 <= stride <= L - burn = $(L - burn); got $stride. " *
+              "A larger stride would leave rows no segment ever scores.")
 
     Xt, Yt = T.(X), T.(Y)
-    segs = RF.segment_indices(steps; L, burn)
-    isempty(segs) && error("train_stochlstm: no segment survived L = $L, burn = $burn on a " *
-                           "record of $(length(steps)) columns")
 
-    nval = max(1, round(Int, val_frac * length(segs)))
-    train_segs, val_segs = segs[1:(end - nval)], segs[(end - nval + 1):end]
-    isempty(train_segs) && error("train_stochlstm: val_frac = $val_frac leaves no training segments")
+    # 🔴 **The record is split by ROW, then each side is segmented.** Splitting the segment LIST
+    # instead -- `segs[1:end-nval]` / `segs[end-nval+1:end]`, which is what this did until
+    # 2026-09-18 -- is safe only at `stride == L - burn`, where the scored windows exactly tile the
+    # record and consecutive segments overlap purely in their (unscored) burn-in. At any shorter
+    # stride the scored windows overlap, so scored validation rows land inside scored training
+    # rows and the validation loss quietly becomes a training loss. Splitting by row cannot do
+    # that at any stride.
+    # 🔑 The embargo comes free: the validation block's first `burn` rows charge the hidden state
+    # and are not scored, so the first scored validation row sits `burn` steps after the last
+    # training row -- at `burn = 100` that is about one 1/e time of the level's ACF.
+    ncol = length(steps)
+    ntrain = floor(Int, (1 - val_frac) * ncol)
+    0 < ntrain < ncol || error("train_stochlstm: val_frac = $val_frac leaves no split of a " *
+                               "$(ncol)-column record")
 
+    train_segs = RF.segment_indices(view(steps, 1:ntrain); L, burn, stride)
+    # ⚠️ Validation is NEVER strided. Overlapping validation segments would re-weight some rows
+    # more than others for no gain; augmentation is a training-set device.
+    val_raw = RF.segment_indices(view(steps, (ntrain + 1):ncol); L, burn)
+    val_segs = [(; rows = s.rows .+ ntrain, score = s.score .+ ntrain) for s in val_raw]
+
+    isempty(train_segs) && error("train_stochlstm: no training segment survived L = $L, " *
+                                 "burn = $burn, stride = $stride on $(ntrain) columns")
+    isempty(val_segs) && error("train_stochlstm: no validation segment survived L = $L, " *
+                               "burn = $burn on $(ncol - ntrain) columns. Lower `L` or raise " *
+                               "`val_frac`.")
+
+    # 🔑 **Everything random is drawn on the HOST with `Xoshiro(seed)` and only then moved.** That
+    # is what makes a device fit and a host fit at the same seed the *same* fit, agreeing to
+    # floating-point round-off -- which is the only strong test the device path can be given, and
+    # is also why `device` is a plain `Array -> Array` function rather than a device RNG. A CURAND
+    # stream would be faster and would break V49's reproducibility property and every comparison
+    # against a number already in `results_LSTMS.md`. The copies are tiny: one parameter set of
+    # ~3 000 values, and `n_latent x L x B` noise, 256 KiB at the largest geometry, against a
+    # gradient step measured at ~200 ms.
     rng = Xoshiro(seed)
-    ps = RF.init_lstm_params(rng, spec; T)
+    ps = _to_device(device, RF.init_lstm_params(rng, spec; T))
     opt = Optimisers.setup(Optimisers.Adam(T(lr)), ps)
 
     # 🔑 Segments of equal length share one recurrence, so they are grouped once here and batched
@@ -409,6 +527,10 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
 
     # Stack a set of same-length segments into (n_in, L, B) / (N_Q, L, B) plus the shared scored
     # range. `burn` is the same for every segment, so the local scored range is too.
+    # 🔑 The batch is assembled on the HOST out of `Xt`/`Yt` and moved once. Gathering `B`
+    # non-contiguous segments is exactly the scalar-indexing pattern a device array refuses, and
+    # there is nothing to gain from doing it there: the batch is ~1.2 MiB at the largest geometry
+    # against a gradient step of ~200 ms.
     function stack(segs, idx)
         L = length(segs[first(idx)].rows)
         Xb = Array{T,3}(undef, size(Xt, 1), L, length(idx))
@@ -419,12 +541,13 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
         end
         s1 = segs[first(idx)]
         sc = (first(s1.score) - first(s1.rows) + 1):(last(s1.score) - first(s1.rows) + 1)
-        return Xb, Yb, sc, length(sc) * length(idx)
+        return device(Xb), device(Yb), sc, length(sc) * length(idx)
     end
 
     # The randomness is drawn OUTSIDE the differentiated function -- the reparametrisation trick --
-    # so `elbo` is deterministic given `epsz` and Zygote never sees an RNG.
-    draw(L, B) = randn(rng, T, spec.n_latent, L, B)
+    # so `elbo` is deterministic given `epsz` and Zygote never sees an RNG. Drawn on the host from
+    # `rng`, then moved: see the note at `ps` above for why the stream must not become a device one.
+    draw(L, B) = device(randn(rng, T, spec.n_latent, L, B))
 
     train_groups = group_by_length(train_segs)
     val_groups = group_by_length(val_segs)
@@ -498,7 +621,10 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     end
 
     verbose && @info "M4 done" best_epoch = best.epoch best_val = best.val final_val = history.val[end]
-    return best.ps, (; history..., best_epoch = best.epoch, best_val = best.val)
+    # 🔴 Returned on the HOST whatever `device` was. `LSTMWeights`, `save_stochlstm` and JLD2 all
+    # expect plain arrays, and a fit that can only be read back on a machine with a GPU is not a
+    # fit. `Array` on a host array is a no-op, so the CPU path is untouched.
+    return _to_host(best.ps), (; history..., best_epoch = best.epoch, best_val = best.val)
 end
 
 # ---------------------------------------------------------------------------------------------

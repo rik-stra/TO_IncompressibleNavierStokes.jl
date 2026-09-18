@@ -27,9 +27,13 @@ const N_QOI = 6
 const BUDGET_MS = 1.85          # the surrogate's measured share of a HIT step
 const S4_HEADROOM = 0.15        # <=1.15x TO-LRS
 
-function build(; arch, h, n_hidden, n_latent, n_encoder, T = Float32)
+# `emission` follows the deployed configuration: `:none` everywhere except the `:lstm` control,
+# which `LSTMSpec` refuses without an emission head because it would have no stochasticity at all.
+# The cost table therefore measures the model that runs, not a variant of it.
+function build(; arch, h, n_hidden, n_latent, n_encoder, T = Float32,
+               emission = arch === :lstm ? :constant : :none)
     spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h, n_qoi = N_QOI), n_hidden, n_latent,
-                       n_encoder, arch)
+                       n_encoder, arch, emission)
     H = spec.n_hidden
     nin, nout, nz = RF.n_input(spec), RF.n_output(spec), spec.n_latent
     ncin, nenc = RF.n_cell_input(spec), RF.n_encoder_out(spec)

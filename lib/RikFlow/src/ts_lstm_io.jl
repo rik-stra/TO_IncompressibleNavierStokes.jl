@@ -22,6 +22,12 @@ function save_stochlstm(path::AbstractString, spec::LSTMSpec, weights::LSTMWeigh
     specnt = (; h = spec.hist.h, n_qoi = spec.hist.n_qoi, hist_var = spec.hist.hist_var,
               include_predictor = spec.hist.include_predictor,
               n_hidden = spec.n_hidden, n_latent = spec.n_latent, n_encoder = spec.n_encoder,
+              # 🔴 `emission` was missing from this tuple until 2026-09-18, so a fit made with one
+              # emission mode came back deployed under whichever mode `LSTMSpec` defaulted to --
+              # silently, and with `check_shapes` passing, because the head's weights exist in
+              # every mode and only the *use* of them differs. It decides whether the deployed
+              # closure adds observation noise at all, so it is part of the model.
+              emission = spec.emission,
               arch = spec.arch, uclip = spec.uclip)
     wnt = (; weights.Wx, weights.Wh, weights.b, weights.We, weights.be,
            weights.Bmu, weights.Bsig, weights.V1, weights.V2, weights.cdec,
@@ -29,6 +35,16 @@ function save_stochlstm(path::AbstractString, spec::LSTMSpec, weights::LSTMWeigh
     mkpath(dirname(path))
     jldsave(path; spec = specnt, weights = wnt, scaling, version = 1, extras = (; extras...))
     return path
+end
+
+# A file written before `emission` was stored carries whatever mode was the `LSTMSpec` default
+# when it was made, which was `:state_dependent`. Assume that and say so, rather than silently
+# adopting today's `:none` and deploying a different model from the one that was fitted.
+function _stored_emission(s)
+    hasproperty(s, :emission) && return s.emission
+    @warn "this fit predates the stored `emission` field; assuming :state_dependent, the default " *
+          "in force when it was written. Refit if that is not what it was."
+    return :state_dependent
 end
 
 """
@@ -48,7 +64,7 @@ function load_stochlstm(path::AbstractString)
         hist = HistorySpec(; h = s.h, n_qoi = s.n_qoi, hist_var = s.hist_var,
                            include_predictor = s.include_predictor),
         n_hidden = s.n_hidden, n_latent = s.n_latent, n_encoder = s.n_encoder,
-        arch = s.arch, uclip = s.uclip)
+        arch = s.arch, uclip = s.uclip, emission = _stored_emission(s))
     w = d["weights"]
     T = eltype(w.Wx)
     weights = LSTMWeights{T}(w.Wx, w.Wh, w.b, w.We, w.be, w.Bmu, w.Bsig,

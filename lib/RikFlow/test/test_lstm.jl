@@ -65,9 +65,13 @@ end
     arithmetic, not the capacity.
     """
     function build(arch; n_encoder = 6, T = Float64, seed = 42, n_qoi = 3, h = 2,
-                   n_hidden = 7, n_latent = 4, uclip = nothing)
+                   n_hidden = 7, n_latent = 4, uclip = nothing,
+                   emission = :state_dependent)
+        # `emission` defaults to the Gaussian head HERE and to `:none` in `LSTMSpec`: the head is
+        # off in production (Rik, 2026-09-18) but is still in the code, so the arithmetic tests
+        # that exercise it have to name it rather than inherit it.
         spec = LSTMSpec(; hist = HistorySpec(; h, n_qoi), n_hidden, n_latent, n_encoder, arch,
-                        uclip)
+                        emission, uclip)
         H = spec.n_hidden
         nin, nout, nz = n_input(spec), n_output(spec), spec.n_latent
         ncin, nenc = n_cell_input(spec), n_encoder_out(spec)
@@ -325,7 +329,8 @@ end
     using Test
 
     mk(arch) = TSLayer.LSTMSpec(; hist = TSLayer.HistorySpec(; h = 2, n_qoi = 6),
-                                n_hidden = 60, n_latent = 6, n_encoder = 6, arch)
+                                n_hidden = 60, n_latent = 6, n_encoder = 6, arch,
+                                emission = :state_dependent)
 
     @test !TSLayer.latent_sampled(mk(:lstm))
     @test all(TSLayer.latent_sampled, (mk(:vaernn), mk(:storn), mk(:vrnn)))

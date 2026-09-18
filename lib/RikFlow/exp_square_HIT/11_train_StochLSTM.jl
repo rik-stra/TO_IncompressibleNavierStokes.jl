@@ -78,10 +78,12 @@ qss = RF.scale_input(rec.q_star[:, a:(b - 1)], in_scaling)
 X, Y, steps = RF.build_history(hist, qss, qs)
 @info "regressor built" rows=size(X, 1) features=size(X, 2) span=(first(steps), last(steps))
 
-# `emission` is read with a fallback so a table written before it existed still loads and keeps the
-# behaviour it had.
+# `emission` is read with a fallback so a table written before the field existed still loads.
+# 🔴 The fallback is `:none`, not `:state_dependent` (Rik, 2026-09-18): the Gaussian emission head
+# is off, so a table that does not name an emission gets the source's deterministic decoder rather
+# than a second noise channel nobody asked for.
 spec = RF.LSTMSpec(; hist, cfg.n_hidden, cfg.n_latent, cfg.n_encoder, cfg.arch, cfg.uclip,
-                   emission = get(cfg, :emission, :state_dependent))
+                   emission = get(cfg, :emission, :none))
 
 # `build_history` is row-major (one row per step) because the linear cells solve a least-squares
 # system with it; the recurrence wants time last.
@@ -92,6 +94,15 @@ Xc, Yc = permutedims(X), permutedims(Y)
 epochs = parse(Int, get(ENV, "RIKFLOW_M4_EPOCHS", string(cfg.epochs)))
 epochs == cfg.epochs || @warn "epochs overridden by RIKFLOW_M4_EPOCHS" epochs config=cfg.epochs
 
+
+# 🔴 Device placement. `M4_DEVICE=cpu` (the default) or `cuda`. `m4_device` refuses `cuda` when no
+# device is functional rather than falling back to the host, because a silent fallback would report
+# a GPU run that took CPU time. ⚠️ **The GPU path has never been run on a GPU** -- it is verified
+# only against `JLArrays`, which enforces the same no-scalar-indexing semantics on the host (V54).
+# And expect it to be SLOWER at the current geometry: `results_LSTMS.md` §5.
+const DEVICE = RF.m4_device(get(ENV, "M4_DEVICE", "cpu"))
+@info "device" M4_DEVICE=get(ENV, "M4_DEVICE", "cpu")
+
 seeds = seed_arg === nothing ? (1:cfg.n_seeds) : (seed_arg:seed_arg)
 out_dir = TO_folder * "/$(cfg.name)"
 mkpath(out_dir)
@@ -99,9 +110,12 @@ mkpath(out_dir)
 summaries = NamedTuple[]
 for s in seeds
     @info "seed $s of $(cfg.n_seeds)"
+    # `stride` is read with a fallback so a table written before it existed still loads and keeps
+    # the behaviour it had: `L - burn`, at which the scored windows exactly tile the record.
     ps, hist_loss = RF.train_stochlstm(spec, Xc, Yc, steps;
                                        cfg.L, cfg.burn, epochs, cfg.batch, cfg.lr,
-                                       cfg.beta, cfg.val_frac, seed = s)
+                                       cfg.beta, cfg.val_frac, seed = s, device = DEVICE,
+                                       stride = get(cfg, :stride, cfg.L - cfg.burn))
     w = RF.LSTMWeights(ps, spec)
     path = "$(out_dir)/StochLSTM_seed$(s).jld2"
     # 🔑 `ps` is stored alongside `w`. They are the same model in two parametrisations -- `w`

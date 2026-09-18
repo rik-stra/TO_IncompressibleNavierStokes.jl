@@ -38,13 +38,15 @@
 #
 # Three deliberate deviations from the source, each with a reason:
 #
-#   (a) **A Gaussian emission head, where the source is deterministic.** Their decoder emits a
-#       point and the objective is a plain MSE, so their model has no predictive density at all.
-#       This project selects on held-out likelihood and has a calibrated-spread criterion (S7), and
-#       `plan.md` §3 specifies a *"Gaussian emission head"* for M4. So the decoder here carries the
-#       L2 head of `methods_overview.tex` §"State dependent covariance", `Sigma = D R D` with
-#       `log d_i` linear in `h_t`. 🔴 This is a deviation, not a reproduction, and the paper must
-#       say so where it reports M4.
+#   (a) **A Gaussian emission head is IMPLEMENTED BUT OFF.** 🔴 `emission` defaults to `:none`
+#       (Rik, 2026-09-18): the source's decoder is deterministic, `z` is its only stochasticity,
+#       and a second noise channel would let "the noise is in the latent state" stop being true of
+#       the fitted model. The head -- `plan.md` §3's *"Gaussian emission head"*, the L2 head of
+#       `methods_overview.tex` §"State dependent covariance", `Sigma = D R D` with `log d_i`
+#       linear in `h_t` -- stays reachable as `emission = :state_dependent` for when S7 wants a
+#       likelihood back, and is still covered by the test suite. Nothing in the M4 experiment
+#       uses it; only the `:lstm` control uses `:constant`, and only because a deterministic
+#       backbone with no emission noise cannot produce an ensemble at all.
 #   (b) **The mass-conservation penalty is not imported.** It is L4, explicitly out of scope
 #       (`plan.md` §24). M4 takes the architecture, not the penalty.
 #   (c) **Their KL weight is called `lambda` and is `1e-4`. Here it is `beta`, always** -- `lambda`
@@ -61,7 +63,8 @@
 # from.
 
 """
-    LSTMSpec(; hist, n_hidden = 60, n_latent = 60, n_encoder = 60, arch = :vrnn, uclip = nothing)
+    LSTMSpec(; hist, n_hidden = 60, n_latent = 60, n_encoder = 60, arch = :vrnn,
+             emission = :none, uclip = nothing)
 
 Shape and architecture of an M4 model.
 
@@ -75,6 +78,9 @@ Shape and architecture of an M4 model.
 - `n_encoder`: width of the encoder's dense `tanh` layer. `0` drops it, giving the purely linear
   encoder the tex's equations describe. 60 in the source.
 - `arch`: one of `:lstm`, `:vaernn`, `:storn`, `:vrnn` -- see the table below.
+- `emission`: one of `:none`, `:constant`, `:state_dependent` -- see [`emission_noise`](@ref).
+  🔴 **`:none` by default**: the source's decoder is deterministic and `z` is its only
+  stochasticity. The Gaussian head is implemented and tested but is not used by the M4 experiment.
 - `uclip`: `(u_min, u_max)` bounds on the emission log-scale pre-activation, or `nothing`.
   Same device, and the same reason, as [`JointModel`](@ref)'s `uclip`: `d_i = exp(u_i)` grows
   exponentially once the input leaves the training range, and the fraction of steps on which the
@@ -101,7 +107,9 @@ Base.@kwdef struct LSTMSpec
     n_latent::Int = 60
     n_encoder::Int = 60
     arch::Symbol = :vrnn
-    emission::Symbol = :state_dependent
+    # 🔴 OFF by default (Rik, 2026-09-18). The source's decoder is deterministic; the head is kept
+    # reachable as `:state_dependent` but nothing in the experiment asks for it. See the header.
+    emission::Symbol = :none
     uclip::Union{Nothing,Tuple{Float64,Float64}} = nothing
 
     function LSTMSpec(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip)
@@ -665,6 +673,18 @@ elbo(args...; kwargs...) = error(_LUX_EXT_HINT)
 Fit an M4 model. Implemented in the Lux extension.
 """
 train_stochlstm(args...; kwargs...) = error(_LUX_EXT_HINT)
+
+"""
+    m4_device(name) -> f
+
+Resolve a device name into the `Array -> AbstractArray` function `train_stochlstm`'s `device`
+keyword wants. `"cpu"` gives `identity`; `"cuda"`/`"gpu"` gives `CuArray`, and **throws if no
+device is actually present** rather than falling back to the host silently.
+
+One resolver for all three drivers, so `M4_DEVICE` cannot come to mean three different things.
+Implemented in the Lux extension.
+"""
+m4_device(args...; kwargs...) = error(_LUX_EXT_HINT)
 
 """
     iwae_nll(spec, ps, X, Y, score; K, rng)

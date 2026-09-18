@@ -9,40 +9,34 @@ M4 is `plan.md` §3's off-grid exploratory cell — the stochastic LSTM of Barth
 cut list. Design and build notes live in `meta_files/handoff_m4_stochastic_lstm.md`; this file is
 only the measurements.
 
-**Status, 2026-09-17.** The architecture, the training code and both deployment drivers are built
-and tested; the experiment in §8 is approved, encoded in the config table and verified by
-construction. 🔴 **Nothing has been fitted since the training loop was repaired, so there are no
-architecture results at all.** The one run that was made had its conclusions **retracted** (§5.1),
-and §5.2 is deliberately empty rather than filled with numbers from a superseded loop.
+**Status, 2026-09-18.** Architecture, training code and both deployment drivers are built and
+tested (1827 pass / 1 broken in `test/`, **412/412** in `training/`). The experiment is settled and
+encoded in the configuration table. §6 is the first measurement made under it: **the loss curves,
+which is all this round is for** — the held-out architecture comparison waits until the training
+length and the learning rate are read off them.
 
-**To produce §5.2** (~7 minutes, see §4):
-
-```bash
-for i in 1 2 3 4 5 6 7; do
-  RIKFLOW_QOI_CACHE=... julia --project=lib/RikFlow/training \
-    lib/RikFlow/exp_square_HIT/11_train_StochLSTM.jl $i 1
-done
-```
-
-then `analysis/postrun_lstm.jl <i>` for each, and re-run the winning β at all five seeds.
+Settled by this round: **`epochs` 300 → 3000**, because 300 was ~6× short of the plateau (§6), and
+**`lr` stays at `1e-2`**, because the usable range above it is ~1.2× in steps and everything two
+decades up diverges (§6.1). 🔴 **Still open and now a cluster job: §6.2**, whether overlapping
+training segments help — the mechanism is implemented and tested, and unmeasured.
 
 ---
 
-## 1. The architecture
+## 1. The architecture and its size
 
 Four variants, one flag apart, because the source's claim is a *ranking* across them rather than a
 statement about one model. With `x_t` the regressor row and `y_t` the prediction:
 
 ```
 z_t  ~  q(z_t | x_t) = N( mu_z , sigma_z )     mu_z = B_mu e_t ,  sigma_z = softplus(B_sig e_t)
-e_t  =  tanh( W_e x_t + b_e )                  single dense encoder layer
-h_t  =  LSTM( [x_t ; z_t] , h_{t-1} )          hidden 60
+e_t  =  tanh( W_e x_t + b_e )                  dense encoder layer; n_encoder = 0 drops it
+h_t  =  LSTM( [x_t ; z_t] , h_{t-1} )
 y_t  =  V1 h_t  +  V2 z_t  +  c                linear output
 ```
 
 | `arch` | `z` drawn | `z` → cell | `z` → decoder | is |
 |---|---|---|---|---|
-| `:lstm` | no | no | no | deterministic LSTM + Gaussian head |
+| `:lstm` | no | no | no | deterministic LSTM |
 | `:vaernn` | yes | no | yes | stochasticity at the **output** only |
 | `:storn` | yes | yes | no | **STORN** |
 | `:vrnn` | yes | yes | yes | **VRNN** |
@@ -52,37 +46,75 @@ exactly the `z → cell` column.** STORN and VRNN have it; the deterministic and
 do not.
 
 🔴 **The first line is the ENCODER, the approximate posterior `q(z|x_t)` — not the prior.** The
-prior is a fixed `N(0, I)`. This was settled against the reference implementation
+prior is a fixed `N(0, I)`. Settled against the reference implementation
 (`ben-barthel/learning_dynamics`, `ML_Code/networks_qg.py`), which is unambiguous: the encoder sees
 **only `x_t`** — not the target, not `h_{t-1}` — and there is no separate recognition RNN. Reading
 `methods_overview.tex`'s equation as the prior is the one way to get this structurally wrong.
 Because `x_t` is observed at deployment, the same encoder serves training and inference, which is
 what makes the architecture deployable at all.
 
-### Dimensions, and what the input is
+### Every dimension, ours against the source's
 
-Hidden 60, latent 60, encoder 60 — the source's. ⚠️ The latent dimension is **not** `N_Q`; an early
-reading assumed it matched the output width and it does not.
+| | source | here | why |
+|---|---|---|---|
+| what is predicted | a QG **field**, 2 channels on an `Ny x Nx` grid | **6 scalars**, the TO QoIs | different problem |
+| input `x_t` | the field | **19 features** — `q*^n`, `q^{n-1}`, `q*^{n-1}`, bias, at `h = 1`, `N_Q = 6` | the shared `build_history` regressor |
+| output | the field | **6** | `N_Q` |
+| LSTM hidden | 60 | **16** | §sizing below |
+| latent `z` | 60 | **4** | ⚠️ the latent dim is **not** `N_Q`; an early reading assumed it matched the output width and it does not |
+| encoder | 60 (dense `tanh`) | **0** — the linear encoder `methods_overview.tex` writes | the tex and the repository disagree; `n_encoder = 0` is the tex's form |
+| parameters | 43 128 at `h = 1` | **~2 950** (`:storn`) / **~2 980** (`:vrnn`) | |
 
-🔴 **These are the source's dimensions and we do not propose to use them.** At `h = 1` they give
-43 128 parameters against 21 594 training target values — twice as many parameters as data. Their
-60 units predict a QG *field*; we predict six scalars. **§8 is the sizing argument and the
-architecture actually proposed for testing.**
+**Sizing, and why it is not a taste question.** Carrying the source's 60/60/60 across gives
+**43 128 parameters against 21 594 training target values** (3599 rows × 6 QoIs on the
+`t ∈ [1,10]` TU window) — twice as many parameters as data. Their 60 units predict a field; we
+predict six scalars. Copying the width across is copying a number, not the architecture.
 
-The input `x_t` is **the same regressor every other cell on the ladder uses** — `build_history`
-with a `HistorySpec`, so `q^{n*}` plus `h` lags of `(q, q*)` plus a bias. M4 introduces no new
-input layout, which is what lets V1/V2 cover it and keeps the data budget comparable. At `h = 1`,
-`N_Q = 6` that is 19 features.
+| configuration | parameters |
+|---|---|
+| source dims, `h = 1` | 43 128 |
+| source dims, `h = 5` | 57 528 |
+| hidden 60, latent 6, no encoder | 21 672 |
+| hidden 32, latent 8, no encoder | 8 464 |
+| **hidden 16, latent 4, no encoder** | **~2 950** ← ours |
+
+⚠️ **Consequence for the write-up:** shrinking means we are **not reproducing their model**. We are
+testing their *architectural claim* — that stochasticity injected upstream beats the alternatives —
+at `N_Q = 6`. That is the more meaningful test, but the paper must say which of the two it did.
+
+🔑 **`h = 1`, and the recurrence carries the memory.** `h` is the explicit lag window in the
+regressor; M0/TO-LRS uses `h = 5`. The level's 1/e time is **116–142 steps** (§3), so an `h = 5`
+window is about 4% of one decay time — negligible either way. The recurrence has to do the memory
+work regardless, and `h = 5` would buy nothing but 48 extra input features.
 
 ### Two deliberate deviations from the source
 
-1. 🔴 **A Gaussian emission head, where the source is deterministic.** Their decoder emits a point
-   and the objective is a plain MSE, so their model has **no predictive density at all**. This
-   project selects on held-out likelihood and has a calibrated-spread criterion (S7), and
-   `plan.md` §3 specifies a *"Gaussian emission head"* for M4 in as many words. So the decoder here
-   carries the L2 head, `Sigma^n = D^n R D^n` with `log d_i` linear in `h_t` and `R` a constant
-   correlation matrix. **This is a deviation, not a reproduction, and it must be stated wherever
-   M4 is reported.**
+1. **The Gaussian emission head is implemented but OFF** (Rik, 2026-09-18). `plan.md` §3 specifies
+   a *"Gaussian emission head"* for M4 and the code carries it — `Sigma^n = D^n R D^n` with
+   `log d_i` linear in `h_t`, the L2 head of `methods_overview.tex`. 🔴 **`emission` now defaults
+   to `:none` in `LSTMSpec`, in the configuration table and in `11_train_StochLSTM.jl`'s fallback**,
+   so nothing gets the head without asking for it. The reason is the source's design: their decoder
+   is deterministic and `z` is their *only* stochasticity, and a second noise channel with nothing
+   in the objective allocating between them lets *"the noise is in the latent state"* stop being
+   true of the fitted model even with the architecture flag set.
+   - The reconstruction term becomes a plain sum of squares, which **is** the source's objective.
+   - 🔴 **No predictive density, so no likelihood.** `iwae_nll` refuses for these cells rather than
+     returning a number that looks like an NLL and is not one. Ensemble scoring is unaffected:
+     drawing `z` still gives an ensemble, so `crps_ensemble`, the rank histogram with
+     Jolliffe–Primo contrasts and spread–skill all read normally — and those are the metrics
+     `plan.md` §9 makes ladder-wide precisely because they survive this kind of model.
+   - ⚠️ **One exception, forced by construction: the `:lstm` control uses `emission = :constant`.**
+     A deterministic backbone with no emission noise is a point predictor, cannot produce an
+     ensemble, and `LSTMSpec` refuses the combination. Its spread is a constant `Sigma`, which is
+     also the sharper contrast — noise upstream against noise at the output, state-independent,
+     which is the DDN's design one level down. 🔴 **Its loss is therefore on a different scale**
+     (Gaussian log-density, not sum of squares) and never shares an axis with the latent cells.
+   - `:state_dependent` stays one keyword away for when S7 wants a likelihood back, and stays
+     covered by the test suite.
+   - 🔴 **Fixed while turning it off: `emission` was neither saved nor loaded.** A fit made with
+     one mode came back deployed under whichever mode was the default, silently and with
+     `check_shapes` passing, because the head's weights exist in every mode and only their *use*
+     differs. `save_stochlstm`/`load_stochlstm` now carry it.
 2. **The conservation-of-mass penalty is not imported.** It is L4, out of scope (`plan.md` §24).
    M4 takes the architecture, not the penalty.
 
@@ -97,38 +129,30 @@ scale (this project's, for the convexity and collapsing log-determinant that
 Per-step negative ELBO, summed over the scored part of a segment:
 
 ```
-L  =  sum_t [  -log N( q^n ; mu_y(h_t, z_t), Sigma^n )  +  beta * KL( q(z_t|x_t) || N(0, I) )  ]
+L  =  sum_t [  -log p( q^n | mu_y(h_t, z_t), Sigma^n )  +  beta * KL( q(z_t|x_t) || N(0, I) )  ]
 ```
 
-- The reconstruction term is a **genuine Gaussian log-density**, not an MSE — that is deviation (1)
-  above, and it is what makes a held-out likelihood definable at all.
+- With `emission = :none` the first term is a **plain sum of squares** — the source's objective.
+  With `:constant` or `:state_dependent` it is a genuine Gaussian log-density.
 - The KL is to a **fixed standard normal**, confirmed from `ML_Code/loss_funs_qg.py`.
 - ⚠️ **`beta`, never `lambda`.** The source calls this weight `lambda` and uses `1e-4`; `lambda` is
   the ridge parameter throughout this project and a collision would corrupt the §8a analysis and
   the S2′ axis.
 
-### The covariance is parametrised differently in training and deployment
+🔴 **The ELBO is an upper bound on the NLL, not the NLL.** The reconstruction term uses a single
+`z` draw, so the training objective is a one-sample ELBO. For `:lstm` there is no latent path and
+the objective *is* the exact NLL. **The two are not on the same scale, and a training or validation
+loss must never be used to rank `:lstm` against the latent architectures.** Held-out comparison
+uses ensemble CRPS and the rank histogram; the IWAE bound only where a likelihood exists at all.
 
-Training carries a free lower-triangular **precision** factor `A`:
-
-```
-Sigma^{-1} = D^{-1} A' A D^{-1}      quad = || A (r ./ d) ||^2
-log det Sigma = 2 sum(log d) - 2 sum(log diag(A))
-```
-
-which is unconstrained, needs no triangular solve and differentiates cleanly. Deployment carries
-the specified `Sigma = D R D` with `R` a correlation matrix. These are the same family: `A` leaves
-`R`'s scale confounded with `d` by a per-coordinate constant only, and the conversion normalises
-`R` to unit diagonal and folds the scale into `bd`. **V41 is the test that the two give the same
-density**, not merely the same mean.
-
-### What the loss is NOT
-
-🔴 **It is an upper bound on the NLL, not the NLL.** The reconstruction term uses a single `z`
-draw, so the training objective is a one-sample ELBO. For `:lstm` there is no latent path and the
-objective *is* the exact NLL. **The two are therefore not on the same scale, and a training or
-validation loss must never be used to rank `:lstm` against the latent architectures.** Held-out
-comparison uses the IWAE bound (§3) and ensemble CRPS.
+**The covariance is parametrised differently in training and deployment** (and only matters when
+an emission head is on). Training carries a free lower-triangular **precision** factor `A` —
+`Sigma^{-1} = D^{-1} A' A D^{-1}`, `quad = ||A (r ./ d)||²`,
+`log det Sigma = 2 sum(log d) − 2 sum(log diag(A))` — which is unconstrained, needs no triangular
+solve and differentiates cleanly. Deployment carries the specified `Sigma = D R D` with `R` a
+correlation matrix. Same family: `A` leaves `R`'s scale confounded with `d` by a per-coordinate
+constant only, and the conversion normalises `R` to unit diagonal and folds the scale into `bd`.
+**V41 is the test that the two give the same density**, not merely the same mean.
 
 ---
 
@@ -136,12 +160,12 @@ comparison uses the IWAE bound (§3) and ensemble CRPS.
 
 | | |
 |---|---|
-| optimiser | Adam, `lr = 1e-3`, decayed by `0.3` after `patience = 20` epochs without validation improvement, floor `1e-5` |
-| batching | segments, not rows — `batch = 8` segments per step |
-| segments | length `L = 200`, burn-in `burn = 50`, stride `L - burn` — ⚠️ **both under review, see §8.5**: `burn = 50` is shorter than the level's 1/e time on every band |
-| epochs | 300 |
+| optimiser | Adam, **`lr = 1e-2`**, decayed by `0.3` after `patience = 20` epochs without validation improvement, floor `1e-5` |
+| batching | segments, not rows — **`batch = 32`** segments per step, ⚠️ unreachable at the current stride (see §6.2) |
+| segments | length **`L = 500`**, burn-in **`burn = 100`**, stride `L - burn` |
+| epochs | **3000** — raised from 300, which §6 measured to be ~6x too few |
 | seeds | 5 per cell (S6: neural cells are fitted with five seeds, spread reported, **median seed deployed**) |
-| precision | Float32 weights; the record is Float64 |
+| precision | Float32 weights; the record and the solver are Float64 — see below |
 | reparametrisation | `z = mu + sigma * eps` with `eps` drawn **outside** the differentiated function |
 
 **Segments and burn-in.** `build_history` returns rows in increasing step order with their step
@@ -151,9 +175,62 @@ hidden state and are **excluded from the loss**. Without the burn-in every segme
 cold-start term from `h = 0`, which the model can only fit by learning to predict well from no
 history — exactly the behaviour the recurrence exists to avoid.
 
-### 🔴 Three things the training loop must do, learned the hard way
+### 🔑 `L` and `burn` come from the measured ACF, not from `T_int`
 
-All three were absent in the first implementation and all three invalidated its results (§5.1):
+⚠️ **Do not size these with `T_int`.** `results.md` §1 is explicit about why: **the level's ACF is
+not a decaying exponential.** It falls to ~0.1 within half a TU and then *rings* between roughly
+−0.2 and +0.2 with a period near 1 TU, out to the end of the 10 TU window. Any integral-based
+timescale is integrating that ringing, so "the" decorrelation time is not a well-defined property
+of this series, and `T_exp` is meaningless on the level (`ρ₁(q) ≈ 0.9999` gives 3–34 TU).
+
+**The robust statistics are the crossings** (level `q`, all six bands, from `results.md` §1):
+
+| statistic | range over bands | in steps at `dt = 2.5e-3` |
+|---|---|---|
+| lag at ρ = 1/e | **0.290–0.355 TU** | **116–142** |
+| lag at ρ = 0.1 | 0.430–0.600 TU | 172–240 |
+| ringing period | ≈ 1 TU | ≈ 400 |
+| ±2 Bartlett se | 0.114–0.132 | — |
+
+The 1/e times span only **1.22×** across bands (against 2.18× for `T_int`), so a single `burn`
+serves every QoI.
+
+- **`L = 500`** covers more than one full ringing period. A recurrence is one of the few model
+  classes that *can* represent an oscillating memory kernel — it is why `methods_overview.tex`
+  reaches for a Hankel basis over a bank of real-pole exponentials, citing Gouasmi's
+  decaying-sinusoid MZ kernel. At `L = 200` the model never sees a full period and cannot
+  distinguish a ring from a decay, so it is denied the one thing the architecture is good for.
+- **`burn = 100`** is D6's own warm-up length (`claude_memory.md` #67), just under the 1/e crossing
+  at 116–142. The earlier `burn = 50` was under it on every band, so the hidden state was scored
+  before it had seen one decay time of history.
+- ⚠️ **The same argument applies to the online warm-up.** `nwarm = 100` was inherited from the
+  linear cells, where the lag window is the only state; M4 also has to charge `(h, c)`.
+  `tools/m4_warmup_probe.jl` is prerequisite P1 in `meta_files/handoff_m4_stochastic_lstm.md`
+  §12.1, and it is not optional.
+- ⚠️ **`analysis/postrun_lstm.jl` used its own fixed `burn = h + 50 = 51`** and now takes at least
+  the fit's own `burn`. A scorer that charges the recurrence for less than training did is
+  measuring cold starts.
+
+### 🔴 Precision: Float32 model, Float64 solver, conversion at two named boundaries
+
+The record is Float64 and **the solver stays Float64** — `12_online_StochLSTM.jl` sets `T = Float64`
+and `params_track`'s Float32 `Re` is overridden, because a splat that carries it wins
+(`claude_memory.md` #57). The model's weights and recurrent state are Float32. The conversions are
+in `get_next_item_timeseries` and nowhere else:
+
+- **in** — `q*` arrives at the solver's precision, is scaled, then cast **down** to the model's `T`;
+  the lag window is stored in `T`, which is model state and not an output.
+- **out** — the predicted level is cast **up** to `eltype(q*)` *before* `dQ = qhat − q*` is formed,
+  so `dQ` leaves at the solver's precision whatever the weights and the `Scaling` happen to be.
+- **the replayed warm-up is returned unconverted**, bit-identically, as `LinReg` and `MVG_sampler`
+  do. D6's validation gate is `dQ` bit-identity over that window (`claude_memory.md` #48), and a
+  conversion there would break it while passing every `≈` test in the suite (V44).
+
+⚠️ **Promotion is not a policy.** It gave the right answer while every `Scaling` was Float64 and
+would have stopped doing so the first time one fitted on a Float32 record was loaded. Training
+converts the same way, once: `Xt, Yt = T.(X), T.(Y)`.
+
+### 🔴 Three things the training loop must do, learned the hard way
 
 1. **Return the best-validation iterate, not the last.** Without checkpointing, the fit that gets
    saved is whatever the final epoch happened to land on.
@@ -163,7 +240,11 @@ All three were absent in the first implementation and all three invalidated its 
    a fresh one-sample estimate, so epoch-to-epoch comparison mixes "the model changed" with "the
    draw changed", and any best-validation rule selects partly on a lucky draw.
 
-`V49` in `training/runtests_lux.jl` pins all three.
+All three were absent in the first implementation and all three invalidated its results, which were
+withdrawn in full. `V49` in `training/runtests_lux.jl` pins all three. 🔑 **The lesson generalises:
+a fit is not a result until the curve is shown to have converged, and a training loop that returns
+its last iterate will manufacture rankings out of optimiser noise.** That is why §6 exists and why
+it comes before any architecture comparison.
 
 ### Scoring — what M4 breaks
 
@@ -172,12 +253,10 @@ closed-form CRPS and `companion`/ρ(C̃) are **undefined** for M4.
 
 | metric | on M4 |
 |---|---|
-| exact one-step NLL | ❌ undefined |
-| closed-form CRPS | ❌ undefined |
-| ρ(C̃), starred gain, total block sum | ❌ undefined — no linear mean |
+| exact one-step NLL · closed-form CRPS · ρ(C̃), starred gain, total block sum | ❌ undefined |
 | `crps_ensemble` | ✅ unchanged |
 | rank histogram + Jolliffe–Primo | ✅ unchanged — **the one axis the whole ladder reads on** |
-| IWAE-K bound (`nll_iwae`) | ✅ but see below |
+| IWAE-K bound (`nll_iwae`) | ❌ undefined at `emission = :none`; ✅ but an upper bound on the NLL otherwise |
 
 🔴 **`nll_iwae` is a lower bound on `log p`, hence an upper bound on the NLL. It is not comparable
 to M0's exact NLL and must never share a column with one.** This is why `plan.md` §9 makes the
@@ -191,26 +270,54 @@ paired dynamics statistic (lag-1 autocorrelation of the predicted mean `dQ`) bes
 
 ---
 
-## 4. Can this be done locally? — yes for offline, no for online
+## 4. The experiment
 
-**Short answer: the entire offline programme runs on this laptop in hours. The online programme
-cannot run here at all.**
+🔑 **Sørensen et al.'s conclusion is that the noise belongs in the latent state** — the variants
+that beat the others are the ones that feed `z` *into the recurrence*. So the first experiment is
+those two, plus a control:
 
-### Offline — feasible
+| cell | `arch` | `emission` | `z` into cell | `z` into decoder | role |
+|---|---|---|---|---|---|
+| 1–3 | `:storn` | `:none` | ✅ | — | upstream stochasticity, no output skip |
+| 4–6 | `:vrnn` | `:none` | ✅ | ✅ | upstream stochasticity + skip |
+| **7** | `:lstm` | `:constant` | — | — | **control** |
+| 8–9 | `:vrnn` | `:none` | ✅ | ✅ | latent dimension 6, 8 |
+| 10 | `:vaernn` | `:constant` | — | ✅ | output-only; the variant their result argues against |
 
-The model is tiny: ~10⁴ parameters on 6 QoIs. Training is CPU-bound Julia; no GPU is involved, and
+Cells 1–6 are the **`beta` scan**, `{0, 1e-4, 1e-2}` × the two architectures, at **one seed**; the
+winning `beta` is then re-run at all 5. Spending five seeds per point before knowing which `beta`
+is sensible is an hour bought for nothing.
+
+⚠️ **Keep the control even though it is not one of the two.** Without it there is no statement to
+make: *"the latent path helped"* is only meaningful against a model that has none, and it costs
+minutes. `:vaernn` is deliberately last — it is the variant their result argues against.
+
+| | value | note |
+|---|---|---|
+| train window | `t ∈ [1, 10]` TU, `train_range = (400, 4000)` | the window the M0 cells use |
+| selection window | `t ∈ [10, 19]` TU | disjoint from training **and** from the online reference |
+| record | R1's tracking record, the `(q*, q)` pairing M0 is fitted to | the literal Sørensen setup — a free-running LF trajectory mapped to HF — is a different dataset and a different question; **our application is the closure** |
+| inner validation | trailing `val_frac = 0.2` of segments | ⚠️ early stopping and diagnostics **only**; selection is the protocol's job, not this split's |
+
+---
+
+## 5. Cost
+
+**The entire offline programme runs on this laptop in minutes. The online programme cannot run here
+at all.** The model is ~10³ parameters on 6 QoIs; training is CPU-bound Julia and
 `11_train_StochLSTM.jl` never touches CUDA.
 
-**Measured on this laptop**, on R1's tracked QoIs over `train_range = (400, 4000)` — 3599 rows,
-19 features. The number moved a long way during the build, and the steps are worth recording
-because three of them are lessons rather than tuning:
+### Offline, measured on this laptop
+
+Over R1's tracked QoIs on `train_range = (400, 4000)` — 3599 rows, 19 features. Three of the four
+steps below are lessons rather than tuning:
 
 | state | s/epoch | note |
 |---|---|---|
 | as first written, 60/60/60, `L = 200` | 3.42 | one `L`-step loop per segment |
 | + segments batched through one recurrence | 2.05 | `B` GEMVs become one GEMM (V50) |
-| + right-sized net, 16/4/no encoder | 0.58 | 43 128 → 2 976 parameters (§8.1) |
-| **+ O(L) reverse pass, at `L = 400`** | **0.178** | the per-step slice was O(L²) — see below |
+| + right-sized net, 16/4/no encoder | 0.58 | 43 128 → ~2 950 parameters (§1) |
+| **+ O(L) reverse pass, at `L = 400`** | **0.178** | the per-step slice was O(L²) |
 
 🔴 **The last step was the big one and it was a bug, not a tuning knob.** `GX[:, t, :]` inside the
 recurrence looks free, but Zygote's pullback for a slice allocates a *parent-sized* zero array and
@@ -219,118 +326,129 @@ quadratic in `L` while the forward pass was linear. One gradient step allocated 
 forward pass allocating 3.8 MiB. Slicing once behind an adjoint that accumulates into a single
 buffer restored O(L): 246 ms → 51 ms, and reverse/forward from 26× down to 5.8×.
 
-Note the last row is at **`L = 400`**, double the sequence length of the rows above it — so per
-unit of sequence the improvement is about **13×**.
+⚠️ Sizing the network down bought 3.5×, not the 14× the parameter count suggests — the cost was
+dominated by Zygote's per-timestep overhead, not arithmetic. The remaining 3.3× came from the
+O(L²) fix, which is why long segments are affordable at all.
 
-### The approved configuration, timed
-
-| run | `arch` | `emission` | params | s/epoch | 300 epochs |
-|---|---|---|---|---|---|
-| A | `:storn` | `:none` | 2 952 | 0.178 | **0.9 min** |
-| B | `:vrnn` | `:none` | 2 976 | 0.185 | **0.9 min** |
-| C | `:lstm` | `:constant` | 2 696 | 0.245 | **1.2 min** |
-
-| unit of work | cost |
-|---|---|
-| the six-point β scan at one seed, plus the control | **~7 min** |
-| one cell at all 5 seeds (S6) | ~5 min |
-| the full 10-row table × 5 seeds | **~50 min** |
+⚠️ If several fits are run in parallel, set `OPENBLAS_NUM_THREADS=1`: Julia processes each spawning
+a full BLAS pool contend badly enough to be slower than running sequentially.
 
 🔑 **The offline programme is an experimentation loop, not a batch job.** There is no reason to run
-it on a cluster and no reason to economise on seeds or epochs — §5.1 is what economising cost.
+it on a cluster and no reason to economise on seeds or epochs — §3's retracted first run is what
+economising cost.
 
-⚠️ If several fits are ever run in parallel, set `OPENBLAS_NUM_THREADS=1`: Julia processes each
-spawning a full BLAS pool contend badly enough to be slower than running sequentially. At these
-speeds parallelism is not needed.
+### 🔑 Why not a GPU — the parallelism is across fits, not inside one
 
-### Online — not feasible locally
+Rik asked, 2026-09-18, and it is the right question to ask of anything that takes 45 minutes.
+**Training M4 is not compute-bound and a GPU does not address what it is bound by.** Three
+measurements say so, none of them about the device:
+
+- **The arithmetic is negligible.** The largest matrix in the model is `Wx`, `64 x 23`. One
+  gradient step is 500 timesteps forward and backward over ~2 950 parameters at `B = 7` —
+  about **75 MFLOP**. Measured at ~0.2 s per gradient step, that is **~0.34 GFLOP/s**, one to two
+  percent of a single CPU core. The whole five-point stride scan is **~1.1 TFLOP**, which an H100
+  would finish in ~20 ms of arithmetic. The 45 minutes is not arithmetic.
+- **The time is overhead, and §5 already located it**: ~400 µs per timestep for a matrix product
+  that takes nanoseconds, i.e. Zygote's per-timestep tracing. Moving the FLOPs to a device does
+  not touch that.
+- **The long axis cannot be parallelised.** `h_t` depends on `h_{t-1}`, so the 500 timesteps are
+  strictly sequential: ~1000+ *dependent* kernel launches per gradient step. At 5–10 µs of launch
+  latency each that is 5–10 ms of pure latency per step, on work the device would do in
+  nanoseconds. This is a throughput machine's worst case, and it is the same reason
+  `ts_lstm_online.jl` keeps the **deployed** closure on the CPU: *"at H = 60 / N_Q = 6 the cell is
+  far too small to amortise a kernel launch."*
+
+🔑 **Where the speedup actually is, and it is large.** (i) **Across fits**: 6 `lr` points, 5
+`stride` points, 5 seeds and 10 cells are all independent, so a SLURM array over CPU cores is
+near-linear and needs no port. That is what makes the scans minutes on Snellius. (ii) **Batch is
+the only parallel axis inside a fit and it is currently 7.** V50 already made segments share one
+recurrence so `B` GEMVs become one GEMM — but there is nothing to amortise at `B = 7`. 🔴 **This is
+a second, independent reason to care about §6.2**: at `stride = 50` there are 56 training segments,
+so `B` could be 56 — eight times the work per launch at nearly the same overhead. That helps the
+CPU directly, and it is the only thing that would make a GPU worth re-examining.
+
+### 🔴 The GPU path is implemented and unverified on a GPU
+
+Built 2026-09-18 on Rik's instruction, *after* the argument above rather than against it: the point
+is to let the question be **measured** instead of argued.
+
+**How it works, and why there is no CUDA in the model code.** `lstm_forward` allocates its
+recurrent state and hidden-state buffer with `similar(X, ...)` rather than `zeros(T, ...)`, so
+every array it makes follows the array type it was *given*. Device choice then lives entirely at
+the call site — `train_stochlstm(...; device = CuArray)` — and not one line of the recurrence,
+the encoder, the decoder or the loss mentions a device.
+
+⚠️ **`zero(similar(...))`, never `fill!(similar(...), 0)`.** The second is a `setindex!` Zygote can
+see and is refused outright with *"Mutating arrays is not supported"*. Measured, not assumed.
+
+🔑 **Every random number is drawn on the HOST and only then moved.** Parameters come from
+`init_lstm_params(Xoshiro(seed))` and `eps` from the same stream; both are then placed. So **a
+device fit and a host fit at the same seed are the same fit**, differing only by reduction order.
+A CURAND stream would be faster and would void V49's reproducibility property and every number
+already in this file. The copies are trivial — ~3 000 parameters, and 256 KiB of noise at the
+largest geometry, against a gradient step of ~200 ms. Parameters are returned **on the host**,
+because `LSTMWeights`, `save_stochlstm` and JLD2 all want plain arrays and a fit readable only on a
+GPU node is not a fit.
+
+**Selecting it.** `M4_DEVICE=cpu` or `cuda`, honoured by `11_train_StochLSTM.jl` and both scans
+through one resolver, `RikFlow.m4_device`. 🔴 **The Snellius batch scripts default it to `cuda`**
+(Rik, 2026-09-18) — `run_train_lstm.sh` and `run_m4_sweeps.sh` both do
+`export M4_DEVICE=${M4_DEVICE:-cuda}`, so the cluster trains on the device and
+`M4_DEVICE=cpu sbatch ...` is the per-submission override (SLURM's default `--export=ALL` carries
+it through). The library default stays `cpu`, so nothing that calls `train_stochlstm` directly
+changes behaviour. 🔴 **`cuda` throws when no device is functional
+rather than falling back to the host** — a silent fallback would report a GPU run that took CPU
+time and put that number in a table. Verified: on this GPU-less workstation the drivers fail at
+load with *"CUDA.functional() is false … Refusing to fall back to the CPU silently"*.
+
+✅ **V54 tests the device path without a device, and it is not a compile check.** `JLArray`
+(GPUArrays' host-backed reference array) **refuses scalar indexing exactly as `CuArray` does** and
+its `similar` returns its own type, so it is a real proxy for the two failure modes a port actually
+has: a host array silently mixed into a device graph, and a scalar `getindex` inside the
+recurrence — neither of which a plain CPU run can see. The testset opens with a **positive
+control** asserting `JLArray` really does refuse scalar indexing, because a proxy that does not
+enforce the property proves nothing (V31's lesson, one level up). Measured, all four
+architectures including the `:constant` emission head:
+
+| arch | device run | max rel. difference on the validation curve vs host |
+|---|---|---|
+| `:storn` | ✅ | 1.6e-7 |
+| `:vrnn` | ✅ | 2.1e-7 |
+| `:lstm` / `:constant` | ✅ | 6.6e-8 |
+
+i.e. Float32 round-off from a different reduction order, which is what "the same fit" looks like.
+
+🔴 **What V54 does NOT establish, and it is the expensive half.** That CUDA.jl compiles these
+kernels; that `m4_device("cuda")` finds a device; that the performance is anything but worse. Those
+need a GPU node, and this repository has been bitten twice by exactly the class of defect a CPU
+test cannot see — defeated constant propagation (#56) and non-isbits kernel arguments (#57), both
+found only on the cluster. **Treat the first GPU run as a test, not as a measurement**, and run it
+at a small budget (`RIKFLOW_M4_UPDATES=5`) before anything long.
+
+⚠️ **The expectation is still that it will be slower at the current geometry**, for the reasons
+measured above. The configuration in which it could pay is §6.2's short `stride` with `batch = 32`,
+which widens each launch from 7 segments to 32.
+
+⚠️ **Not measured: no GPU training run exists**, and this workstation has no GPU (`claude_memory.md`
+#56). The above is an arithmetic-intensity and launch-latency argument from numbers that *were*
+measured, not a benchmark. 🔑 **The cheap way to settle it is a `B` sweep on the CPU**: if wall time
+per gradient step is flat from `B = 7` to `B = 56`, the fit is overhead-bound, which confirms the
+diagnosis and answers the GPU question at the same time. A port would additionally have to survive
+the two GPU-only failure classes this repository has already been bitten by — non-isbits kernel
+arguments and defeated constant propagation (#56, #57).
+
+### Online, not feasible locally
 
 `12_online_StochLSTM.jl` couples the closure into a 64³ LES for 40 001 steps per replica, five
-replicas per cell. That needs a GPU and R1's 2.7 GB tracking record. On Snellius this is the same
-cost as an LRS online run (~50 min for five replicas, per `run_online.sh`'s estimate). **It has
-never been executed** — it is the one part of the M4 build that has not been run end to end.
+replicas per cell — a GPU and R1's 2.7 GB tracking record. On Snellius that is the same cost as an
+LRS online run (~50 min for five replicas). **It has never been executed**; it is the one part of
+the M4 build that has not been run end to end. D6 — the multi-IC ensemble S7-online needs — is
+`K = 90 × M = 10` coupled runs and is a cluster job by any measure.
 
-D6 — the multi-IC ensemble S7-online needs — is `K = 90 × M = 10` coupled runs, and is a cluster
-job by any measure.
+### S4, measured
 
-🔑 **So the split of work is clear: everything up to and including offline calibration can be done
-here and now; S7-online and the calibration gate need the cluster.** That is a comfortable position
-— the offline phase is where the architecture question is decided, and `plan.md` §7's whole
-concern is that offline results may *not* transfer, which is a question you can only ask once the
-offline numbers exist.
-
----
-
-## 5. Offline results
-
-### 5.1 🔴 The first run, and why it was retracted
-
-Four architectures, one seed, 100 epochs, fitted on R1's tracked QoIs over `train_range = (400,
-4000)` and scored post-run on the disjoint window `(4000, 7600)`.
-
-**Its conclusions were withdrawn in full.** The check that broke them was simply asking whether
-anything had converged:
-
-| config | val @ epoch 91 | val @ epoch 100 (what was scored) |
-|---|---|---|
-| `:lstm` | −10.79 | −10.87 |
-| `:vaernn` | **−12.14** | −4.21 |
-| `:storn` | **−11.81** | −4.94 |
-| `:vrnn` | **−12.57** | −3.54 |
-
-At epoch 91 all three latent architectures were **better** than the deterministic backbone; nine
-epochs later they were ~8 nats worse, and those were the iterates that got saved and scored. The
-run therefore inverted the architecture ranking, and a calibration diagnosis built on that ranking
-("the latent path injects spread not matched to the error") was wrong and is retracted.
-
-🔑 **The lesson is recorded rather than buried, because it is a general one:** a fit is not a
-result until the curve is shown to have converged, and a training loop that returns its last
-iterate will manufacture rankings out of optimiser noise. The three fixes are §3's list.
-
-**What survived:** the pipeline works end to end on real tracked data, and there is no posterior
-collapse — KL 2.1–3.9 per latent dimension in all three latent architectures, so the latent path is
-genuinely active.
-
-### 5.2 The corrected run
-
-*(pending — this section is filled by the run described in §4. The protocol is 4 architectures ×
-`n` seeds × 300 epochs with best-iterate selection, scored by `analysis/postrun_lstm.jl` on the
-window disjoint from training.)*
-
----
-
-## 6. How to reproduce
-
-```bash
-# once, per checkout: the training environment (the only one with Lux)
-julia --project=lib/RikFlow/training -e 'using Pkg; Pkg.instantiate()'
-
-# the configuration table (gitignored output, so it must be regenerated per checkout)
-julia --project=lib/RikFlow/training lib/RikFlow/exp_square_HIT/10_setup_lstm.jl
-
-# fit one cell, all seeds.  RIKFLOW_QOI_CACHE points at an extracted QoI cache;
-# without it the driver reads the 2.7 GB tracking record instead.
-RIKFLOW_QOI_CACHE=analysis/data/data_track_dns512_..._qois.jld2 \
-  julia --project=lib/RikFlow/training lib/RikFlow/exp_square_HIT/11_train_StochLSTM.jl 4
-
-# score it post-run (the faithful Sørensen setting: teacher-forced, no solver)
-RIKFLOW_QOI_CACHE=... \
-  julia --project=lib/RikFlow/training lib/RikFlow/analysis/postrun_lstm.jl 4
-
-# per-step cost against the S4 budget (no Lux needed — the deployed path is stdlib)
-julia --project=lib/RikFlow lib/RikFlow/exp_square_HIT/tools/m4_cost_probe.jl
-```
-
-⚠️ `RIKFLOW_M4_EPOCHS` overrides the configured epoch count. It warns when it fires. It is a
-smoke-test switch, **not** a way to run the experiment — §5.1 is what happens when a short run is
-treated as a result.
-
----
-
-## 7. Cost — S4, measured
-
-The deployed closure is hand-written on plain arrays in `src/ts_lstm.jl`; Lux is never called from
-the solver loop. Measured by `tools/m4_cost_probe.jl` (CPU, Float32):
+`tools/m4_cost_probe.jl`, CPU, Float32, deployed closure only (`src/ts_lstm.jl` is hand-written on
+plain arrays; Lux is never called from the solver loop):
 
 | arch | h | hidden | latent | encoder | median / step | % of the S4 allowance |
 |---|---|---|---|---|---|---|
@@ -342,199 +460,422 @@ the solver loop. Measured by `tools/m4_cost_probe.jl` (CPU, Float32):
 | `:vrnn` | 1 | 60 | 6 | 0 | 14.8 µs | 5.3% |
 
 The allowance is 15% of the 1.85 ms/step surrogate share on HIT, i.e. **278 µs**. 🔑 **M4 is
-admissible at the source's full dimensions with roughly six times the margin it needs.** S4 is a
-kill criterion, not a target, and it is not the binding constraint here.
-
-⚠️ This measures the closure only — not the FFTs, the QoI computation or the host/device round
-trip, all of which are already inside the 1.85 ms.
+admissible at the source's full dimensions with roughly six times the margin it needs** — and ours
+is far smaller again. S4 is a kill criterion, not a target, and it is not the binding constraint
+here. ⚠️ This measures the closure only, not the FFTs, the QoI computation or the host/device round
+trip, all of which are already inside the 1.85 ms. ⚠️ The table predates `emission = :none`; the
+probe now follows the deployed configuration, so it will read slightly cheaper on re-run.
 
 ---
 
-## 8. Proposed experiment — ⚠️ FOR REVIEW, nothing has been run
+## 6. The loss curves — what this round was for
 
-Written 2026-09-17 for comment **before** any fitting. Every number below is either measured or a
-choice; the choices are collected in §8.6 so they can be argued with individually.
+Three cells, seed 1, at the settings of §3 and §4, run to **3000 epochs** via `RIKFLOW_M4_EPOCHS`
+rather than the configured 300. `analysis/plot_lstm_losses.jl` draws them from the saved fits, so
+the figure cannot disagree with what the driver printed.
 
-### 8.1 Why the network shrinks
+⚠️ **These three fits were made under the pre-2026-09-18 train/validation split** — by position in
+the segment list rather than by row (§6.2). At the tiling stride the two splits differ only in
+which two segments form the validation set, so the shape of the curves and the epoch at which they
+flatten are unaffected; the *values* will move in the third digit. The re-run under the new split
+belongs on the cluster with everything else in §6.2 and has not been made here.
 
-The source's dimensions are hidden 60, latent 60, encoder 60. Carried across unchanged, that is:
+![M4 training curves](figures/fig11_lstm_losses.png)
 
-| configuration | parameters |
-|---|---|
-| source dims, `h = 1` | **43 128** |
-| source dims, `h = 5` | 57 528 |
-| hidden 60, latent 6, no encoder | 21 672 |
-| **hidden 32, latent 8, no encoder** | **8 464** |
-| **hidden 16, latent 4, no encoder** | **2 976** |
+| cell | arch | emission | params | val @300 | @1000 | @1500 | @2000 | @3000 | best | best ep |
+|---|---|---|---|---|---|---|---|---|---|---|
+| StochLSTM2 | `:storn` | `:none` | 2 952 | 5.28e-3 | 1.51e-3 | 9.65e-4 | 8.14e-4 | 8.14e-4 | **8.13e-4** | 2949 |
+| StochLSTM5 | `:vrnn` | `:none` | 2 976 | 9.05e-3 | 1.84e-3 | 1.37e-3 | 1.19e-3 | 1.19e-3 | **1.19e-3** | 2896 |
+| StochLSTM7 | `:lstm` | `:constant` | 2 696 | −13.8 | −16.9 | −18.0 | −18.0 | −18.1 | **−18.07** | 3000 |
 
-against **21 594 training target values** (3599 rows x 6 QoIs) on the `t in [1,10]` TU window.
+🔴 **The configured 300 epochs is roughly 6× too short, and that is the finding of this round.**
+At 300 epochs every curve is in the middle of a clean power-law descent with the learning rate
+still at its starting value — nothing had converged, and the retracted first run is what reading a
+fit at that stage costs. The two latent cells reach their floor at **~2000 epochs** and do not move
+between 2000 and 3000 (8.14e-4 and 1.19e-3 to three digits at both). **`epochs` is now 3000** —
+2000 is where it flattens, and the extra 1000 is insurance that costs only time, because
+best-iterate selection means over-running cannot make the fit worse. 300 would have been read as a
+ranking.
 
-🔴 **At the source's dimensions there are twice as many parameters as target values.** Their 60
-units predict a quasi-geostrophic *field* — two channels over an `Ny x Nx` grid. We predict **six
-scalars**. Copying the width across is copying a number, not the architecture.
+⚠️ **An epoch here is ≈ one optimiser step.** At `L = 500` on 3599 rows there are 9 segments, 7 of
+them training — far fewer than `batch`, so the batch is never filled. 🔴 **Under the current
+(row-based) split it is 2 updates, not 1**: the 2879-row training block gives 7 segments in two
+*length* groups (6 × 500 and 1 × 479), and `group_by_length` batches each group separately. The
+three fits in the table above predate that split, had 7 segments of one length, and so ran at 1
+update per epoch — their x axis is **updates**, and the current configuration reaches the same
+update count in half the epochs. A comparison against any other project's epoch count is
+meaningless; compare updates, and quote the segment geometry beside them.
 
-⚠️ **Consequence for the write-up:** shrinking means we are **not reproducing their model**. We are
-testing their *architectural claim* — that stochasticity injected upstream beats the alternatives —
-at `N_Q = 6`. That is the more meaningful test, but the paper must say which of the two it did.
+🔑 **The plateau is produced by the decay, not by the data running out.** The schedule first fires
+at epoch **1655** (`:storn`) / **1691** (`:vrnn`) and reaches the `1e-5` floor within ~300 epochs of
+that; the curve is flat only after. Before it fires the descent is still steep. So the run is
+*learning-rate limited at the end and step limited in the middle* — which is exactly the regime in
+which "train longer" and "start higher" are the two things worth testing, and §6.1 tests the second.
 
-### 8.2 The proposed architecture
+⚠️ **The control's curve is on a different scale and is not comparable to the other two** —
+Gaussian log-density against sum of squares (§2). Read it only against itself. It is also visibly
+the noisiest of the three between epochs 30 and 150, with spikes of several nats, and its schedule
+fires far earlier (epochs **131** and **387**) because those spikes look like plateaus to a
+patience rule. That is a property of the `:constant` head's objective, not of the backbone.
 
-| | |
-|---|---|
-| input | the shared `build_history` regressor, `h = 1` → **19 features** (`q*^n`, `q^{n-1}`, `q*^{n-1}`, bias) |
-| encoder | **none** (`n_encoder = 0`) — the linear encoder `methods_overview.tex` writes, not the repository's dense `tanh` layer |
-| LSTM hidden | **16** (fallback 32) |
-| latent | **4** (fallback 8) |
-| decoder | linear, `V1 h_t + V2 z_t + c` |
-| emission | **`:none`** — deterministic decoder, ✅ resolved in §8.6 Q1. `z` is the only stochasticity, as in the source |
-| parameters | **~2 976** at 16/4, ~8 464 at 32/8 |
+🔴 **Do NOT read `:storn` 8.13e-4 against `:vrnn` 1.19e-3 as the architecture result.** This is the
+*inner* validation split — the trailing 20% of segments, used for early stopping and for drawing
+these curves — at **one seed**, on the loss the model was trained on. The architecture comparison is
+held-out, on the disjoint selection window, by ensemble CRPS and the rank histogram at five seeds
+(§4, §8). Reporting an inner-split loss as a ranking is the same mistake as the retracted run in a
+different costume.
 
-🔴 **With `emission = :none` there is no predictive density**, so these cells have no likelihood and
-`iwae_nll` refuses. They are scored by **ensemble CRPS and the rank histogram**, which are defined
-for them and are what `plan.md` §9 makes ladder-wide anyway.
+⚠️ **No overfitting is visible yet** on the latent cells: at 3000 epochs train/val is
+6.48e-4 / 8.13e-4 (`:storn`) and 1.20e-3 / 1.19e-3 (`:vrnn`) — a gap of 1.25× and none at all. With
+~2 950 parameters against 21 594 target values that is what should happen, and it is the sizing
+argument of §1 coming out right rather than a new result.
 
-### 8.3 Which variants, and why
+### 6.1 Does a higher starting learning rate converge in fewer steps? — ❌ no. 🔒 CLOSED
 
-🔑 **Sørensen et al.'s conclusion is that the noise belongs in the latent state** — the variants
-that beat the others are the ones that feed `z` *into the recurrence*. So the first experiment is
-those two:
+🔒 **`lr` is fixed at `1e-2` and is no longer swept** (Rik, 2026-09-18). The scan below is why;
+`tools/m4_lr_scan.jl` stays for the record and for a future architecture, but nothing in the
+current programme re-runs it.
 
-| run | `arch` | `emission` | `z` into cell | `z` into decoder | role |
+`tools/m4_lr_scan.jl`, cell 2, seed 1, 1000 epochs per point. **Every point runs inside one
+process on one prepared dataset**: same segments, same initialisation, same validation split, same
+fixed validation noise draws, so the only thing that differs is `lr`. The thresholds are read off
+the scan itself — the best validation loss any point reached, and 100× / 10× / 2× above it.
+
+| lr | best val | best ep | epochs to 0.148 | to 0.0148 | to 0.00295 | schedule |
+|---|---|---|---|---|---|---|
+| 1e-3 | 1.077e-2 | 1000 | 164 | 821 | never | never fired |
+| 3e-3 | 2.950e-3 | 995 | 61 | 312 | 995 | never fired |
+| **1e-2** | **1.476e-3** | 999 | 31 | 146 | 477 | never fired |
+| 3e-2 | 1.599e-3 | 1000 | 21 | 91 | 393 | 0.03 → 0.009 |
+| 1e-1 | 0.127 | **37** | 34 | never | never | 🔴 **NaN** |
+| 3e-1 | 1.953 | **3** | never | never | never | 🔴 **NaN** |
+
+🔴 **The usable range is narrow and `1e-2` sits at the good end of it.** Above it the return is
+~1.2× in steps and it is paid for in the minimum reached (3e-2 lands at 1.60e-3 against 1e-2's
+1.48e-3), and it is the only surviving rate whose decay-on-plateau fired — i.e. it stalled and had
+to be rescued. Two decades up the fit diverges to NaN.
+
+🔑 **`1e-1` is the entry in the table worth remembering.** For the first ~34 epochs it is the
+*fastest* point in the scan — it reaches the loosest threshold before any other rate — and it is
+destroyed by epoch 37. **Early descent is not evidence of anything.** This is §3's retracted-run
+lesson in the `lr` axis: read the best validation reached, never the first fifty epochs.
+
+⚠️ Below `1e-2` the cost is steep and asymmetric: `3e-3` needs ~3× the steps for the same loss and
+`1e-3` — the value this project used until 2026-09-18 — never reaches it at all inside 1000 epochs.
+So the move from `1e-3` to `1e-2` was worth about **3× in steps**; there is no second such move
+available above it.
+
+✅ **Cross-check that the scan is a measurement and not a fixture:** its `lr = 1e-2` point ends at
+1.5075e-3 after 1000 epochs, and the independent 3000-epoch fit of the same cell reads 1.51e-3 at
+its own epoch 1000. Two processes, same number.
+
+### 6.2 Do overlapping (shorter-stride) training segments help?
+
+⏳ **PENDING — the scan is written and runs on the cluster, not here** (Rik, 2026-09-18: *"we can
+do that on snellius in a matter of minutes"*). `tools/m4_stride_scan.jl` was started on this
+workstation and stopped; five points at 3000 updates each is ~45 minutes here and minutes there.
+The mechanism below is implemented, tested (V53) and unmeasured.
+
+**The question, because it is not the obvious one.** Until 2026-09-18 the training segments were
+computed **once** before the epoch loop and reused unchanged; only their order and the latent
+noise draws varied per epoch. With `stride = L - burn` the scored windows exactly **tile** the
+record — every row is scored once per epoch — which at `L = 500` leaves **7 training segments**,
+fewer than `batch = 8`. So an epoch was **one full-batch update**, the shuffle was inert, and
+"3000 epochs" in §6 means 3000 optimiser steps.
+
+`stride` is now a keyword on `train_stochlstm` and a configuration field (defaulting to
+`L - burn`, so nothing moved without being asked to). A shorter stride overlaps the segments and
+makes more of them — 4× as many at `stride = 25`.
+
+🔴 **It is augmentation, not data.** The same 3599 rows are re-scored at different offsets inside a
+segment, so the extra gradients are correlated and `k ×` the segments is not `k ×` the information.
+Two things it can genuinely buy, and they are different:
+
+- **more optimiser steps per epoch** — a pure budget effect, nothing to do with the overlap;
+  lowering `batch` at the tiling stride buys exactly the same thing;
+- **variation in how long the hidden state has been charged** when a given row is scored — a real
+  regulariser for a recurrence, and the only part the overlap alone can supply.
+
+🔑 **So the scan matches every point on optimiser STEPS, and carries `(stride = 400, batch = 2)` as
+the control that separates the two.** Comparing at equal epochs would confound them completely.
+
+🔑 **`batch = 32` (Rik, 2026-09-18) is the other half of the same lever.** It does nothing at the
+current stride — 7 segments cannot fill a batch of 8, let alone 32 — and takes effect only once the
+stride shortens. Its purpose is the amortisation §5 identifies: V50 already made a chunk of
+segments share one recurrence, so the per-timestep Zygote overhead is paid once for `B` segments
+instead of `B` times. At `B = 7` there is nothing to amortise; at `B = 32` there is. **So `stride`
+and `batch` are one lever, not two** — the stride creates the segments and the batch is what makes
+them cheap — and it is also the only route by which a GPU could ever become relevant here (§5).
+
+🔴 **The train/validation split had to change with it, and the old one was a latent trap.** It was
+`segs[1:end-nval]` / `segs[end-nval+1:end]` — by position in the *segment list*. At the tiling
+stride that is safe: consecutive segments overlap by exactly `burn` rows, and those rows are the
+next segment's **burn-in**, which is not scored, so the scored ranges stay disjoint. At any shorter
+stride the scored windows overlap and scored validation rows land inside scored training rows —
+**the validation loss quietly becomes a training loss, with nothing looking wrong.** The split is
+now by **row**, each side segmented independently, which cannot do that at any stride; and the
+embargo comes free, because the validation block's first `burn = 100` rows are burn-in, putting the
+first scored validation row about one 1/e time past the last training row. **V53** pins the whole
+geometry at strides 400 / 75 / 50 / 25 / 1, and refuses a stride past `L - burn`, which would leave
+rows nothing ever scores.
+
+⚠️ **§6's table predates this change** and was measured on the old split. It is re-run under the
+new one before it stands.
+
+**The scan, as it will run** (5 points, each to the same 3000 optimiser steps, so the epoch count
+is derived per point and is *not* the comparison axis):
+
+| stride | batch | train segs | updates/epoch | epochs | isolates |
 |---|---|---|---|---|---|
-| **A** | `:storn` | `:none` | ✅ | — | upstream stochasticity, no output skip |
-| **B** | `:vrnn` | `:none` | ✅ | ✅ | upstream stochasticity + skip |
-| **C** | `:lstm` | `:constant` | — | — | **control** |
+| 400 (tiling) | 32 | 7 | 2 | 1500 | the baseline |
+| **400** | **2** | 7 | 4 | 750 | 🔑 **control — more steps, no overlap** |
+| 100 | 32 | 25 | 2 | 1500 | overlap 4× |
+| 50 | 32 | 49 | 3 | 1000 | overlap 8× |
+| 20 | 32 | ~140 | ~6 | ~500 | overlap 20× |
 
-⚠️ **I would keep C even though it is not one of the two.** Without a control there is no statement
-to make: *"the latent path helped"* is only meaningful against a model that has none, and C costs
-three minutes.
+🔴 **Strides 100 / 50 / 20** (Rik, 2026-09-18). The first two rows are additions to that list and
+are said so here rather than left to look like part of it: row 1 is the current default, which is
+what the other rows have to be *read against*, and row 2 is the control without which "overlap
+helped" cannot be separated from "more optimiser steps". Together they cost two points of five.
 
-🔴 **C must use `emission = :constant`, not `:none`.** A deterministic backbone with no emission
-noise has no stochasticity at all — it is a point predictor, cannot produce an ensemble, and
-`LSTMSpec` refuses the combination at construction. So the control's spread comes from a constant
-`Sigma`, which is also the honest comparison: *"noise upstream"* against *"noise at the output,
-state-independent"* — the latter being the DDN's design one level down.
+⚠️ **Segment counts are on the 2879-row TRAINING block, not the whole record**, and `updates/epoch`
+accounts for the two length groups — both are things I got wrong before the smoke run printed them.
+⚠️ **At `batch = 32` matched updates is no longer matched compute**: one update covers up to 32
+segments, so at `stride = 50` an update sees ~9× the row-steps the tiling stride can offer. That is
+the intended asymmetry — a bigger update is the point of a bigger batch — but the wall times the
+scan prints are then not a cost ranking and must not be read as one.
 
-`:vaernn` (output-only, state-dependent noise) is the one I would **drop** from the first pass. It
-is the variant their result argues against, and it can be added later if A/B look promising.
+🔑 **How to read it when it comes back.** If the short strides beat the baseline by no more than
+the `(400, batch = 2)` row does, the gain was budget — more optimiser steps — and the overlap
+itself bought nothing, in which case lower `batch` and leave `stride` alone, because it is
+cheaper per step. Only a margin *over* that control is evidence for the context-position
+augmentation, and that is the part worth carrying into the paper.
 
-### 8.4 Training setup
+⚠️ **`epochs` and updates decouple the moment `stride` moves.** `epochs = 3000` at the tiling
+stride is 3000 updates; at `stride = 50` it would be 21 000. Any change to `stride` requires the
+epoch count to be re-derived from the intended update budget, which is what the scan does and what
+the configuration table does **not** do automatically.
 
-| | value | note |
+---
+
+### 6.3 The capacity x regularisation grid — cells 11-28
+
+🔴 **The programme after §6.2** (Rik, 2026-09-18). `lr` and `epochs` are now FIXED at `1e-2` and
+3000 (§6, §6.1), so the remaining axes are the model's, not the optimiser's:
+
+| axis | values | why |
 |---|---|---|
-| objective | negative ELBO, Gaussian reconstruction + `beta * KL(q || N(0,I))` | §2 |
-| `beta` | **sweep {0, 1e-4, 1e-2}** | 1e-4 is theirs; at that weight the KL is nearly inactive — Q2 |
-| optimiser | Adam, `lr = 1e-3` | decayed x0.3 after 20 epochs without improvement, floor 1e-5 |
-| epochs | 300 | **best-validation iterate returned, not the last** (§3) |
-| seeds | **3 for exploration, 5 for the record** | S6: spread reported, median seed deployed |
-| batch | 8 segments | batched through one recurrence; V50 says this is a pure speed change |
-| precision | Float32 weights | the record is Float64 |
-| train window | `t in [1, 10]` TU, `train_range = (400, 4000)` | the window the M0 cells use |
-| selection window | `t in [10, 19]` TU | disjoint from training **and** from the online reference |
+| `beta` | **0, 1e-4, 1e-2** | the KL weight, and the latent path is now the *only* noise channel, so this is the whole regularisation of the stochasticity (§9 Q2) |
+| `n_latent` | **4, 6** | 6 is `N_Q`, the matched case; 4 is under-complete and forces compression (§9 Q3) |
+| `n_hidden` | **6, 10, 16** | how much the recurrence can do *without* the latent path |
 
-### 8.5 🔑 Segment length and burn-in should come from the measured ACF, and currently do not
+**3 x 2 x 3 = 18 cells, appended to the configuration table as StochLSTM11-28**, generated by a
+loop rather than written out so the table cannot drift from its own description.
 
-Current defaults are `L = 200`, `burn = 50`. At `dt = 2.5e-3` those are **0.5 TU** and **0.125 TU**.
+🔑 **A grid, not three sweeps.** `beta` regularises the latent path and `n_latent` is how much
+latent there is to regularise — they are not separable — and neither is independent of `n_hidden`,
+which sets how much the model can do if the latent path contributes nothing. Sweeping them one at a
+time answers a question nobody asked.
 
-⚠️ **Do not size these with `T_int`.** `results.md` §1 is explicit about why, and an earlier draft
-of this section got it wrong: **the level's ACF is not a decaying exponential.** It falls to ~0.1
-within half a TU and then *rings* between roughly −0.2 and +0.2 with a period near 1 TU, out to the
-end of the 10 TU window. Any integral-based timescale is integrating that ringing, so "the"
-decorrelation time is not a well-defined property of this series. `results.md` also settles a
-factor-2 convention between the two integral estimators (#58) and notes that `T_exp` is meaningless
-on the level, `ρ₁(q) ≈ 0.9999` giving 3–34 TU.
+🔴 **Three of the eighteen are exact re-runs of cells 1-3.** The `n_hidden = 16, n_latent = 4`
+column at the three betas *is* cells 1, 2, 3 — same configuration, same seeds, same fit. The table
+is append-only so they stay. `10_setup_lstm.jl` now **detects and prints** duplicates with the
+array range that skips them, rather than leaving them to be found as wasted cluster time:
 
-**The robust statistics are the crossings**, and they are what to size with (level `q`, all six
-bands, from `results.md` §1):
+```
+3 duplicate configuration(s) — the same fit under two names:
+  StochLSTM13 == StochLSTM1
+  StochLSTM19 == StochLSTM2
+  StochLSTM25 == StochLSTM3
+  distinct rows: 25 of 28
+```
 
-| statistic | range over bands | in steps |
-|---|---|---|
-| lag at ρ = 1/e | **0.290–0.355 TU** | **116–142** |
-| lag at ρ = 0.1 | 0.430–0.600 TU | 172–240 |
-| ringing period | ≈ 1 TU | ≈ 400 |
-| ±2 Bartlett se | 0.114–0.132 | — |
+⚠️ **The grid is `:storn` only, and that was not specified.** Upstream stochasticity with **no**
+decoder skip, so the latent can act only *through* the recurrence — the cleanest test of the
+source's claim, and the reason to prefer it when only one architecture can be afforded. 18 cells on
+both is 36. `GRID_ARCH` in `10_setup_lstm.jl` switches it, or a second block appends `:vrnn`.
+⚠️ `n_hidden = 6` with `n_latent = 6` is the corner where the cell is *smaller* than the latent.
+Deliberate, and also the corner most likely to be simply bad — do not read a poor result there as
+evidence about the latent dimension.
 
-Note how tight the 1/e times are — they span only **1.22×** across bands, against 2.18× for `T_int`
-— so a single `burn` serves every QoI.
+⚠️ **Run this after §6.2, not beside it.** The grid inherits whatever `stride` the stride scan
+settles, and `stride` changes `updates/epoch`, so fitting the grid first would fix 18 cells at a
+segmentation that is about to change.
 
-🔴 **`burn = 50` is shorter than the 1/e crossing on every band**, so the hidden state is scored
-before it has seen even one decay time of history — precisely the cold-start contamination the
-burn-in exists to remove.
+---
 
-🔑 **And `L = 200` is half a ringing period, which is the more interesting problem.** A recurrence
-is one of the few model classes that *can* represent an oscillating memory kernel — it is why
-`methods_overview.tex` reaches for a Hankel basis over a bank of real-pole exponentials, citing
-Gouasmi's decaying-sinusoid MZ kernel. At `L = 200` the model never sees a full period and cannot
-distinguish a ring from a decay, so it is denied the one thing the architecture is good for.
+## 7. Running the sweeps on Snellius
 
-**Proposed instead: `L = 400`, `burn = 150`** — one full ringing period, with the burn-in past the
-1/e crossing on every band, leaving 250 scored steps. Cost is roughly unchanged: with
-`stride = L - burn` the total scored steps per epoch is nearly the same, the same data cut into
-fewer, longer pieces.
+🔴 **The M4 batch scripts train on the GPU by default since 2026-09-18** (Rik):
+`run_m4_sweeps.sh` (the scans) and `run_train_lstm.sh` (one cell) both set
+`M4_DEVICE=${M4_DEVICE:-cuda}` on `gpu_h100 --gpus=1`. Both are single sequential Julia processes;
+the batches are still assembled on the host, which is why `OPENBLAS_NUM_THREADS=1` is still set.
 
-⚠️ **The same argument applies to the online warm-up.** `nwarm = 100` (0.25 TU) is about half the
-level's `T_int`. It was inherited from the linear cells, where the lag window is the only state;
-M4 also has to charge `(h, c)`. That is prerequisite P1 in
-`meta_files/handoff_m4_stochastic_lstm.md` §12.1, and it is not optional.
+```bash
+# on the login node, from lib/RikFlow (or from exp_square_HIT -- the script finds the drivers)
+julia --project exp_square_HIT/10_setup_lstm.jl          # only if the table changed; no GPU
 
-### 8.6 Open questions — ✅ four resolved 2026-09-17, two still open
+# 🔴 FIRST SUBMISSION IS A TEST, NOT A MEASUREMENT. The GPU path has never run on a GPU (§5);
+# this exercises every point and the write in about a minute, on the device.
+RIKFLOW_M4_UPDATES=5 sbatch batch_scripts/run_m4_sweeps.sh stride
 
-**Q1 — the emission head. ✅ RESOLVED: removed.** It was a second noise channel competing with the
-latent path, so *"the noise is in the latent state"* could stop being true of the fitted model even
-with the architecture flag set. `LSTMSpec` now takes `emission ∈ (:none, :constant,
-:state_dependent)` and **the experiment uses `:none`** — the source's design, where `z` is the only
-stochasticity and the decoder is deterministic.
+# then the real thing
+sbatch batch_scripts/run_m4_sweeps.sh stride             # the stride scan (§6.2), on the GPU
 
-Consequences, all stated rather than discovered later:
+# then the capacity x regularisation grid (§6.3), one cell per job, 1 seed to explore.
+# 🔴 The list SKIPS 13, 19 and 25 -- they are exact re-runs of cells 1-3 (10_setup_lstm.jl prints
+# this list). ⚠️ A LOOP of sbatch, not `--array`: run_train_lstm.sh takes the cell as $1 and does
+# NOT read SLURM_ARRAY_TASK_ID, so an array would fit cell 11 fifteen times.
+for i in 11 12 14 15 16 17 18 20 21 22 23 24 26 27 28; do
+  sbatch batch_scripts/run_train_lstm.sh $i 1
+done
 
-- The reconstruction term becomes a plain sum of squares, which is the source's objective.
-- 🔴 **There is no predictive density, so there is no likelihood.** `iwae_nll` refuses for these
-  cells rather than returning a number that looks like an NLL and is not one.
-- **Ensemble scoring is unaffected**: drawing `z` still gives an ensemble, so `crps_ensemble`, the
-  rank histogram with Jolliffe–Primo contrasts and spread–skill all read normally — and those are
-  the metrics `plan.md` §9 makes ladder-wide precisely because they survive this kind of model.
-- `:constant` remains one keyword away if a likelihood is wanted back for a particular comparison.
-- ⚠️ `arch = :lstm` with `emission = :none` is refused at construction: it has no stochasticity at
-  all and cannot produce an ensemble. So **the control C is `:lstm` with `emission = :constant`** —
-  see §8.3's note below.
+# the CPU is one env var away, for the device comparison or if the GPU turns out not to pay
+M4_DEVICE=cpu sbatch batch_scripts/run_m4_sweeps.sh stride
 
-**Q2 — `beta`. ⏳ STILL OPEN.** At the source's `1e-4` the KL contributes ~0.01 to a loss of order
-10, so the latent is almost unregularised and can carry arbitrary spread. Now that it is the *only*
-noise channel this matters more, not less. Proposed sweep `{0, 1e-4, 1e-2}`.
+# budgets, from the submitting shell; the defaults are the scans' own
+RIKFLOW_M4_UPDATES=3000 sbatch batch_scripts/run_m4_sweeps.sh stride
+RIKFLOW_M4_EPOCHS=5     sbatch batch_scripts/run_train_lstm.sh 19 1    # smoke one grid cell
 
-**Q3 — latent dimension relative to `N_Q = 6`. ⏳ STILL OPEN.** 4 (under-complete, forces
-compression), 6 (matched), or 8?
+# the lr scan is CLOSED (§6.1) -- kept runnable, not part of the programme
+# sbatch batch_scripts/run_m4_sweeps.sh lr
+```
 
-**Q4 — what it was, and the answer. ✅ RESOLVED: `h = 1`.** `h` is the length of the **explicit lag
-window in the regressor** — how many past `(q, q*)` pairs are stacked into `x_t` alongside the
-current `q*`. M0/TO-LRS uses `h = 5`. The question was whether to let the recurrence carry the
-memory (`h = 1`) or hand the model the same explicit window M0 gets (`h = 5`) so the inputs match.
+Each writes one file into `exp_square_HIT/output/TO_LSTM/` — `lr_scan_<cell>_seed<n>.jld2` or
+`stride_scan_<cell>_seed<n>.jld2` — holding every point's full curve, so the summary table can be
+recomputed without refitting.
 
-§8.5's measurement answers it: the level's 1/e time is **116–142 steps**. An `h = 5` lag window is
-**five** steps — 0.0125 TU, about 4% of one decay time. It is negligible either way, so the
-recurrence has to do the memory work regardless and `h = 5` buys nothing but 48 extra input
-features. **`h = 1`.**
+**What to expect.** Measured on a workstation CPU core, so a cluster core is the right order.
+🔴 **There is no GPU timing yet** — that is what the first submission produces:
 
-**Q5 — `L` and `burn`. ✅ RESOLVED: `L = 400`, `burn = 150`**, on §8.5's corrected reasoning — one
-full ringing period, burn past the 1/e crossing on every band. ⚠️ The same argument says the online
-warm-up `nwarm = 100` (0.25 TU) is under the 1/e crossing too; P1 measures it properly.
+| job | points | per point (CPU) | total (CPU) |
+|---|---|---|---|
+| `stride`, 3000 updates | 5 | ~10 min | **~50 min** |
+| one grid cell, 3000 epochs | 1 | ~10 min | ~10 min |
+| the 15 distinct grid cells, 1 seed | 15 | ~10 min | ~2.5 h **wall, if serial** — they are separate jobs, so in practice the queue decides |
 
-**Q6 — which record. ✅ RESOLVED: out of scope.** Stay with the tracking record's `(q*, q)`, the
-same pairing M0 is fitted to. The literal Sørensen setup — a free-running LF trajectory mapped to
-HF — is a different dataset and a different question; **our application is the closure**, and the
-tracking record is what a closure is fitted to.
-### 8.7 Cost, measured
+The scripts ask for **2 h**. ⚠️ The **first** point of any scan includes Julia compilation — the
+smoke run measured **100.3 s** against **0.7–1.9 s** for the four after it. Gotcha #44 in
+miniature: never read the first point's wall time as a cost. That applies twice over on the GPU,
+where the first kernel launch also pays CUDA compilation.
 
-See §4 for the full table and how it got there. At the approved settings —
-hidden 16 / latent 4 / no encoder, `L = 400`, `burn = 150` — a 300-epoch fit is **0.9 min**
-(`:storn`, `:vrnn`) or **1.2 min** (the `:constant` control), so:
+### 🔴 The GPU is the default, and the first run is a test
 
-| unit of work | cost |
-|---|---|
-| the β scan, 6 points at one seed + the control | **~7 min** |
-| the winner re-run at all 5 seeds | ~5 min |
+`run_m4_sweeps.sh` and `run_train_lstm.sh` both set `M4_DEVICE=${M4_DEVICE:-cuda}` on
+`gpu_h100 --gpus=1`. Before 2026-09-18 both asked for a GPU and ran on the node's CPU — nothing in
+the training path moved an array to a device — and `run_train_lstm.sh`'s header said so. §5 has the
+mechanism; what matters operationally:
 
-⚠️ Sizing the network down bought 3.5×, not the 14× the parameter count suggests — the cost was
-dominated by Zygote's per-timestep overhead, not arithmetic. The remaining 3.3× came from fixing an
-**O(L²) reverse pass**, which is a different kind of problem entirely and is the reason `L = 400`
-is now affordable at all. Both are in §4.
+- 🔴 **The device path has never run on a GPU.** V54 verifies it against `JLArrays`, which enforces
+  the same no-scalar-indexing semantics on the host, and all four architectures agree with the CPU
+  fit to ~1e-7 — but that cannot see a CUDA **compilation** failure, which is the class this
+  repository has been bitten by twice and both times only on the cluster (#56, #57).
+  **So: `RIKFLOW_M4_UPDATES=5` first.** A minute, every code path, including the write.
+- ✅ **A mis-scheduled job fails loudly.** `m4_device` refuses `cuda` when `CUDA.functional()` is
+  false rather than falling back to the host, so a job that lands without a device dies at load
+  instead of reporting CPU time as GPU time. Verified on this workstation.
+- ⚠️ **Expect it to be slower at the current geometry.** §5's measurement, not a guess about the
+  hardware: ~75 MFLOP per gradient step at ~0.34 GFLOP/s over a strictly sequential 500-step
+  recurrence. 🔑 **The case where it could pay is exactly what §6.2 sweeps** — a short `stride`
+  with `batch = 32` widens each launch from 7 segments to 32. Read the device comparison off the
+  stride scan rather than off the baseline row.
+- **`M4_DEVICE=cpu sbatch ...`** is the per-submission override, and is how the device comparison
+  is taken. SLURM's default `--export=ALL` carries it through.
+
+⚠️ **A CPU partition remains available and is no longer an untested risk.** `m4_lr_scan.jl` —
+`using RikFlow` **plus** the Lux extension, strictly more imports than the training driver — ran six
+fits to completion on a machine with **no GPU at all**, so `run_train_lrs.sh`'s worry about *"CUDA.jl
+initialising with no device"* does not bite. `--partition=rome` (Zen2) or `genoa` (Zen4) are both
+covered by the shared depot's `JULIA_CPU_TARGET`, so neither needs a new depot; pair either with
+`M4_DEVICE=cpu`. 🔴 Confirm the partition name with `sinfo` — it is the one thing here that could
+not be checked from inside the repository.
+
+⚠️ **`OPENBLAS_NUM_THREADS=1` is set on both scripts and still matters on the GPU path**: the
+batches are assembled on the host, and on `64 x 23` matrices a full BLAS pool contends rather than
+helps (§5).
+
+### What is *not* a single job
+
+🔑 **The grid and the production fits are many jobs, and that is where the parallelism is.**
+`run_train_lstm.sh <cell> [seed]` fits one cell. §6.3's grid is 15 distinct cells at one seed to
+explore; S6 then wants 5 seeds on whichever survive. These are independent fits, which is the
+"parallelism is across fits, not inside them" point of §5 actually paying — and the reason a GPU
+per job is a weaker lever than more jobs.
+
+🔴 **Submit them as a LOOP of `sbatch`, not as `--array`.** `run_train_lstm.sh` takes the cell as
+`$1` and does **not** read `SLURM_ARRAY_TASK_ID`, so `--array=11,12,...` would run cell 11 fifteen
+times, with nothing in the output saying so.
+⚠️ Its own header records a second trap: if the *seeds* are ever split across jobs, **one final
+`11_train_StochLSTM.jl` pass without a seed argument is still needed** to write
+`seed_summary.jld2`, or `12_online_StochLSTM.jl` silently deploys seed 1 instead of the median.
+
+⚠️ **The scans could be split across jobs too and deliberately are not.** It would work — the data
+preparation is deterministic given the cache and `train_range`, and the seed is passed explicitly —
+but it costs the property that makes a scan a comparison (one process, one prepared dataset, one
+initialisation) and needs an aggregation step for the thresholds, which are read off the best point
+in the scan. At ~50 minutes that trade is not worth making.
+
+---
+
+## 8. How to reproduce
+
+```bash
+# once, per checkout: the training environment (the only one with Lux)
+julia --project=lib/RikFlow/training -e 'using Pkg; Pkg.instantiate()'
+
+# the configuration table (gitignored output, so it must be regenerated per checkout)
+julia --project=lib/RikFlow/training lib/RikFlow/exp_square_HIT/10_setup_lstm.jl
+
+# fit one cell.  A trailing seed fits that seed only; without it, all n_seeds in sequence.
+# RIKFLOW_QOI_CACHE points at an extracted QoI cache; without it the driver reads the 2.7 GB
+# tracking record instead.
+RIKFLOW_QOI_CACHE=analysis/data/data_track_dns512_..._f64_lmwray3_qois.jld2 \
+  julia --project=lib/RikFlow/training lib/RikFlow/exp_square_HIT/11_train_StochLSTM.jl 2 1
+
+# the loss curves (§6)
+julia --project=lib/RikFlow/analysis lib/RikFlow/analysis/plot_lstm_losses.jl 2 5 7
+
+# the two scans (§6.1, §6.2). Runnable here -- ~18 min and ~50 min -- but §7 is how they are
+# meant to be run, and NOT as a GPU job (§5, "Why not a GPU").
+RIKFLOW_M4_LR_EPOCHS=1000 \
+  julia --project=lib/RikFlow/training lib/RikFlow/exp_square_HIT/tools/m4_lr_scan.jl 2 1
+RIKFLOW_M4_UPDATES=3000 \
+  julia --project=lib/RikFlow/training lib/RikFlow/exp_square_HIT/tools/m4_stride_scan.jl 2 1
+
+# score it post-run (the faithful Sørensen setting: teacher-forced, no solver)
+RIKFLOW_QOI_CACHE=... \
+  julia --project=lib/RikFlow/training lib/RikFlow/analysis/postrun_lstm.jl 2
+
+# per-step cost against the S4 budget (no Lux needed — the deployed path is stdlib)
+julia --project=lib/RikFlow lib/RikFlow/exp_square_HIT/tools/m4_cost_probe.jl
+```
+
+⚠️ `RIKFLOW_M4_EPOCHS` overrides the configured epoch count and warns when it fires. It is a
+smoke-test switch and the knob §6's long runs were made with — **not** a way to run the experiment
+without changing the table.
+
+---
+
+## 9. Open questions
+
+**Q2 — `beta`, and Q3 — the latent dimension. ⏳ OPEN, and now asked together.** At the source's
+`1e-4` the KL contributes ~0.01 to a loss of order 10, so the latent is almost unregularised and
+can carry arbitrary spread — which matters more, not less, now that it is the only noise channel.
+And `n_latent` is *how much latent there is to regularise*, so the two are not separable; `n_hidden`
+is the third, because it sets how much the model can do if the latent contributes nothing.
+🔴 **§6.3's 18-cell grid is the answer to both**, cells 11–28.
+
+**Q7 — which architecture carries the grid. ⏳ OPEN, decided provisionally as `:storn`.** Not
+specified; 18 cells on `:storn` and `:vrnn` is 36. `:storn` has no decoder skip, so the latent can
+act only through the recurrence, which is the sharper test of the source's claim. `GRID_ARCH`
+switches it (§6.3).
+
+**Q8 — does a GPU help. ⏳ OPEN, and now answerable.** The device path is implemented and verified
+against `JLArrays` (§5); it has never run on a GPU, and the measured arithmetic intensity says it
+should be slower except possibly at §6.2's shortest strides.
+
+**Resolved, kept because re-deriving them wastes a session:** the emission head is off (§1,
+deviation 1) · `h = 1`, because an `h = 5` window is 4% of one decay time (§1) · `L = 500`,
+`burn = 100` from the crossings rather than `T_int` (§3) · the record stays R1's tracking record,
+the pairing M0 is fitted to (§4) · **`lr = 1e-2`, fixed and no longer swept** (§6.1) ·
+**`epochs = 3000`**, from the measured plateau at ~2000 (§6).

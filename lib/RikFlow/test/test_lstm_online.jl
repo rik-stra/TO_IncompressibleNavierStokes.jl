@@ -38,8 +38,12 @@
             Matrix{T}(I, nout, nout))
     end
 
-    spec(arch = :vrnn; n_qoi = NQ, h = H, n_hidden = 4, n_latent = 3, n_encoder = 4) =
-        LSTMSpec(; hist = HistorySpec(; h, n_qoi), n_hidden, n_latent, n_encoder, arch)
+    # `emission` defaults to the Gaussian head here and to `:none` in `LSTMSpec`: the head is off
+    # in production (Rik, 2026-09-18) but still in the code, so the deployed-path tests that
+    # exercise an emission draw have to name it rather than inherit it.
+    spec(arch = :vrnn; n_qoi = NQ, h = H, n_hidden = 4, n_latent = 3, n_encoder = 4,
+         emission = :state_dependent) =
+        LSTMSpec(; hist = HistorySpec(; h, n_qoi), n_hidden, n_latent, n_encoder, arch, emission)
 
     "A synthetic predictor stream and a warm-up record, both Float64 as a real record is."
     function stream(; n = 12, nwarm = 5, nq = NQ, seed = 21)

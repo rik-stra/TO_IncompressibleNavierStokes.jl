@@ -108,7 +108,12 @@ X, Y, steps = RF.build_history(spec.hist, qss, qs)
 Xc, Yc = permutedims(Float32.(X)), permutedims(Float32.(Y))
 N = size(Xc, 2)
 nq = RF.n_output(spec)
-burn = min(spec.hist.h + 50, N - 10)     # let the recurrence charge before anything is scored
+# 🔴 The scorer charges the recurrence for AT LEAST as long as training did. It used to use a
+# fixed `h + 50 = 51`, which is under the level's 1/e crossing on every band (116-142 steps), so
+# the first scored steps carried exactly the cold-start contamination the training burn-in exists
+# to remove -- and the number was smaller than the burn-in the fit had been trained with, which is
+# the part that makes it a defect rather than a choice.
+burn = min(max(spec.hist.h + 50, get(cfg, :burn, 0)), N - 10)
 score = (burn + 1):N
 
 # --- the ensemble, teacher-forced ---------------------------------------------------------------

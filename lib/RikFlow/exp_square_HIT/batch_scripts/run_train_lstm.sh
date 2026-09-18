@@ -19,10 +19,24 @@
 # ⚠️ **Runs under `--project=training`, not `--project`.** Training needs the Lux extension, which
 # is triggered by Lux + Optimisers + Zygote together. The deployed closure needs none of them.
 #
-# ⚠️ It asks for a GPU and does not currently use one: the model is ~10^4 parameters on 6 QoIs and
-# trains on CPU in minutes. The request is here for the same reason `run_train_lrs.sh` has one --
-# `using RikFlow` pulls CUDA in as a hard dependency and a CPU partition is an untested failure
-# mode. Move it once someone has checked that import works there.
+# 🔴 **It now TRAINS ON THE GPU: `M4_DEVICE=cuda` by default since 2026-09-18.** Until then it
+# asked for a GPU and ran on the node's CPU, because nothing in the training path moved an array to
+# a device. `train_stochlstm` gained a `device` keyword and `RikFlow.m4_device` resolves
+# `M4_DEVICE`; override per submission with
+#
+#     M4_DEVICE=cpu sbatch batch_scripts/run_train_lstm.sh 19
+#
+# 🔴 **The GPU path has never actually run on a GPU.** It is verified against `JLArrays`, which
+# refuses scalar indexing exactly as `CuArray` does (V54: all four architectures agree with the CPU
+# fit to ~1e-7), but that cannot see a CUDA compilation failure -- the class this repository has
+# been bitten by twice (`claude_memory.md` #56, #57), both times only on the cluster.
+# 🔑 **Make the first submission a test:** `RIKFLOW_M4_EPOCHS=5 sbatch ... 19` runs in about a
+# minute and exercises the whole path including the write. `m4_device` refuses `cuda` when no
+# device is functional rather than falling back to the host, so a mis-scheduled job fails at load
+# instead of reporting CPU time as GPU time.
+# ⚠️ Expect it to be slower than the CPU at the current geometry -- `results_LSTMS.md` §5 measures
+# the fit as overhead-bound, running at ~1% of one CPU core's arithmetic over a strictly sequential
+# recurrence. The case where it could pay is a short `stride` with `batch = 32` (§6.2).
 #
 # 🔴 Run `10_setup_lstm.jl` first if the table has changed. It needs no GPU:
 #     julia --project exp_square_HIT/10_setup_lstm.jl
@@ -39,6 +53,13 @@ fi
 export JULIA_DEPOT_PATH=$HOME/julia/julia_h100:
 export JULIA_CPU_TARGET="generic;znver2,clone_all;znver4,clone_all;icelake-server,clone_all"
 
+# Train on the device unless the submitting shell says otherwise. SLURM's default `--export=ALL`
+# carries `M4_DEVICE=cpu sbatch ...` through, so this is a default, not an override.
+export M4_DEVICE=${M4_DEVICE:-cuda}
+# The batches are assembled on the host whichever device trains, and on 64 x 23 matrices a full
+# BLAS pool contends rather than helps.
+export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}
+
 if [ -f 3_track_ref.jl ]; then
     EXP=.
     ROOT=..
@@ -53,5 +74,5 @@ fi
 julia --project="$ROOT/training" -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' ||
     echo "precompile step failed — continuing; the run will compile in-process (slower start)" >&2
 
-echo "== training StochLSTM$INDEX ${SEED:+(seed $SEED)}"
+echo "== training StochLSTM$INDEX ${SEED:+(seed $SEED)} on device $M4_DEVICE"
 julia --project="$ROOT/training" "$EXP/11_train_StochLSTM.jl" "$INDEX" $SEED
