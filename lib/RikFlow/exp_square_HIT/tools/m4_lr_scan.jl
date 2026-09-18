@@ -91,17 +91,24 @@ m4_probe_step(spec, Xc, Yc, steps; device = DEVICE, stride = cfg.L - cfg.burn,
               batch = cfg.batch, cfg, epochs_planned = EPOCHS,
               label = "device probe ($(get(ENV, "M4_DEVICE", "cpu")))")
 
+# 🔴 Fixed before the loop: every point writes to it, so a killed scan keeps what finished.
+out = joinpath(TO_folder, "lr_scan_$(cfg.name)_seed$(seed).jld2")
+
 results = NamedTuple[]
 for lr in LRS
     m4_phase("point: lr = $lr")
     t0 = time()
-    _, h = RF.train_stochlstm(spec, Xc, Yc, steps;
+    # 🔑 `ps` kept, not discarded -- 12 kB against a point that costs minutes.
+    ps, h = RF.train_stochlstm(spec, Xc, Yc, steps;
                               cfg.L, cfg.burn, epochs = EPOCHS, cfg.batch, lr,
                               cfg.beta, cfg.val_frac, seed, verbose = true, device = DEVICE)
     push!(results, (; lr, wall = time() - t0, train = h.train, val = h.val, lrhist = h.lr,
-                    best_val = h.best_val, best_epoch = h.best_epoch))
+                    best_val = h.best_val, best_epoch = h.best_epoch, ps))
     @printf("    best val %.5g at epoch %d; final %.5g; lr %g -> %g; %.1f s\n",
             h.best_val, h.best_epoch, h.val[end], h.lr[1], h.lr[end], time() - t0)
+    m4_save_progress(out; complete = false, results, cell = cfg.name, cfg, seed, epochs = EPOCHS,
+                     spec, points_done = length(results), points_total = length(LRS))
+    m4_phase("point saved ($(length(results))/$(length(LRS))) -> $(basename(out))")
 end
 
 # 🔑 The thresholds are read off the SCAN, not chosen in advance: the best validation loss any
@@ -121,6 +128,9 @@ for r in results
 end
 println("\n(0 in a reach column = that threshold was never reached inside $EPOCHS epochs)")
 
-out = joinpath(TO_folder, "lr_scan_$(cfg.name)_seed$(seed).jld2")
-jldsave(out; results, cell = cfg.name, cfg, seed, epochs = EPOCHS, thresholds = THRESHOLDS)
-println("\nwrote $out")
+# Final write: adds the thresholds and marks the file complete. ⚠️ `thresholds` come from the best
+# point in the scan, so they mean nothing on a partial file -- which is what `complete` records.
+m4_save_progress(out; complete = true, results, cell = cfg.name, cfg, seed, epochs = EPOCHS,
+                 spec, points_done = length(results), points_total = length(LRS),
+                 thresholds = THRESHOLDS)
+println("\nwrote $out (complete)")

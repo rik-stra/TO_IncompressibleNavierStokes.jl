@@ -118,21 +118,34 @@ let (s1, b1) = POINTS[1]
                   label = "device probe ($(get(ENV, "M4_DEVICE", "cpu")), stride $s1)")
 end
 
+# 🔴 The output path is fixed BEFORE the loop, because every point writes to it. A scan killed at
+# its walltime then keeps everything that finished -- see `m4_save_progress`.
+out = joinpath(TO_folder, "stride_scan_$(cfg.name)_seed$(seed).jld2")
+
 results = NamedTuple[]
 for (stride, batch) in POINTS
     nseg, upd_per_epoch, scored = geometry(stride, batch)
     epochs = max(1, cld(UPDATES, upd_per_epoch))
     m4_phase("point: stride $stride batch $batch -- $nseg segments, $upd_per_epoch updates/epoch, $epochs epochs")
     t0 = time()
-    _, h = RF.train_stochlstm(spec, Xc, Yc, steps;
+    # 🔑 `ps` is KEPT, not discarded. It is ~2 950 Float32 -- 12 kB -- and without it a point that
+    # took twenty minutes leaves only a loss curve, so the winning configuration would have to be
+    # refitted before it could be deployed or inspected. `train_stochlstm` returns it on the host.
+    ps, h = RF.train_stochlstm(spec, Xc, Yc, steps;
                               cfg.L, cfg.burn, stride, epochs, batch, cfg.lr,
                               cfg.beta, cfg.val_frac, seed, verbose = true, device = DEVICE)
     push!(results, (; stride, batch, nseg, upd_per_epoch, epochs, scored,
                     updates = epochs * upd_per_epoch, wall = time() - t0,
                     train = h.train, val = h.val, lrhist = h.lr,
-                    best_val = h.best_val, best_epoch = h.best_epoch))
+                    best_val = h.best_val, best_epoch = h.best_epoch, ps))
     @printf("    best val %.5g at epoch %d (update %d); final %.5g; %.1f s\n",
             h.best_val, h.best_epoch, h.best_epoch * upd_per_epoch, h.val[end], time() - t0)
+    # Saved after EVERY point, atomically. `spec` travels with it, so `LSTMWeights(r.ps, spec)`
+    # reconstructs any point's model without re-reading the configuration table.
+    m4_save_progress(out; complete = false, results, cell = cfg.name, cfg, seed,
+                     updates = UPDATES, spec, points_done = length(results),
+                     points_total = length(POINTS))
+    m4_phase("point saved ($(length(results))/$(length(POINTS))) -> $(basename(out))")
 end
 
 best_overall = minimum(r.best_val for r in results if isfinite(r.best_val))
@@ -153,6 +166,10 @@ end
 println("\n(0 in a reach column = never reached inside the budget; `best upd` is the update the " *
         "returned iterate came from)")
 
-out = joinpath(TO_folder, "stride_scan_$(cfg.name)_seed$(seed).jld2")
-jldsave(out; results, cell = cfg.name, cfg, seed, updates = UPDATES, thresholds = THRESHOLDS)
-println("\nwrote $out")
+# The final write adds the thresholds and marks the file complete. ⚠️ `thresholds` are derived from
+# the best point in the scan, so they only mean anything once every point has run -- which is
+# exactly what `complete` records, and why a partial file must not be read as a ranking.
+m4_save_progress(out; complete = true, results, cell = cfg.name, cfg, seed, updates = UPDATES,
+                 spec, points_done = length(results), points_total = length(POINTS),
+                 thresholds = THRESHOLDS)
+println("\nwrote $out (complete)")

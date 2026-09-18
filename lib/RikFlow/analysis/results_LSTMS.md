@@ -367,7 +367,55 @@ a second, independent reason to care about §6.2**: at `stride = 50` there are 5
 so `B` could be 56 — eight times the work per launch at nearly the same overhead. That helps the
 CPU directly, and it is the only thing that would make a GPU worth re-examining.
 
-### 🔴 The GPU path is implemented and unverified on a GPU
+### ✅ The GPU path RUNS, and it is 5.7x SLOWER than the same node's CPU — measured
+
+🔒 **First GPU run, Snellius `gpu_h100`, 2026-09-18: `M4 SMOKE PASS on device=cuda`.** Every stage
+passed. Stage 9 then timed the whole scan geometry, and a second smoke at `M4_DEVICE=cpu` **on the
+same node** gives the comparison that means something:
+
+| stride | batch | node CPU s/epoch | GPU s/epoch | GPU / CPU |
+|---|---|---|---|---|
+| 400 | 32 | 0.139 | 0.851 | 6.1x slower |
+| 400 | **2** | 0.124 | 1.481 | **11.9x slower** |
+| 100 | 32 | 0.089 | 0.884 | 9.9x slower |
+| 50 | 32 | 0.292 | 1.251 | 4.3x slower |
+| 20 | 32 | 0.574 | 1.879 | 3.3x slower |
+| **whole scan** | | **18 min** | **102 min** | **5.7x slower** |
+
+🔴 **This supersedes an earlier table here that read "1.38x slower, and the GPU wins at stride 20".
+That was wrong.** Its CPU column came from a workstation, not from the GPU node, and the node's CPU
+is **4.1x faster** than that workstation — enough to invert the conclusion. The caveat was stated
+at the time; it turned out to carry the entire result. 🔑 **A cross-machine ratio is not a ratio.**
+
+🔑 **What survives, and it is the part worth keeping:** the GPU's disadvantage shrinks monotonically
+as the stride shortens — 6.1x, 4.3x, 3.3x — which is §5's amortisation argument visible in the
+data. Wider batches give each launch more work. **It simply never crosses 1.** And the `batch = 2`
+control is the sharpest point: **11.9x** worse on the device, its worst by far, while being among
+the cheapest on the CPU. That is launch-boundedness measured rather than argued.
+
+🔒 **Conclusion: train M4 on the CPU. `M4_DEVICE` defaults to `cpu` in both batch scripts**
+(Rik, 2026-09-18). The GPU works and stays fully supported — `M4_DEVICE=cuda sbatch -t 03:00:00 …`
+— it simply costs 5.7x the wall time.
+
+⚠️ **The partition stays `gpu_h100`; only the device moved.** That is the better-evidenced choice,
+not an oversight: the 18 min was measured on *that node's* CPU, so running there with
+`M4_DEVICE=cpu` is the configuration that was actually timed. A CPU partition (`rome`, `genoa`,
+both already covered by the shared depot's `JULIA_CPU_TARGET`) would free the GPU but is
+unmeasured — smoke it there before trusting a walltime. The cost accepted meanwhile is a GPU
+requested and left idle.
+
+🔒 **Walltimes follow**: `run_m4_sweeps.sh` **`-t 01:00:00`** (1.5 x 18 min + startup), raise to
+3 h for `M4_DEVICE=cuda`; `run_train_lstm.sh` **`-t 02:00:00`**, which covers even the no-seed path
+that fits all five seeds in sequence (~35 min on this CPU, ~3.6 h on the GPU).
+
+⚠️ **The per-point CPU numbers above are noisy and the ordering among the fast ones is not real** —
+7 segments timed at 0.139 s against 25 segments at 0.089 s is more work in less time. At ~0.1 s an
+epoch, two timed epochs are dominated by the clock and by first-touch effects. The **totals** are
+sound; the fast rows individually are not. `m4_smoke.jl` now grows the sample until each
+measurement spans at least `RIKFLOW_M4_TIMING_MIN_SECS` (default 2 s) and prints how many epochs
+each number rests on.
+
+### How the GPU path is built
 
 Built 2026-09-18 on Rik's instruction, *after* the argument above rather than against it: the point
 is to let the question be **measured** instead of argued.
@@ -390,8 +438,8 @@ largest geometry, against a gradient step of ~200 ms. Parameters are returned **
 because `LSTMWeights`, `save_stochlstm` and JLD2 all want plain arrays and a fit readable only on a
 GPU node is not a fit.
 
-**Selecting it.** `M4_DEVICE=cpu` or `cuda`, honoured by `11_train_StochLSTM.jl` and both scans
-through one resolver, `RikFlow.m4_device`. 🔴 **The Snellius batch scripts default it to `cuda`**
+**Selecting it.** `M4_DEVICE=cpu` or `cuda`, honoured by `11_train_StochLSTM.jl`, both scans and
+the smoke through one resolver, `RikFlow.m4_device`. 🔴 **The Snellius batch scripts default it to `cuda`**
 (Rik, 2026-09-18) — `run_train_lstm.sh` and `run_m4_sweeps.sh` both do
 `export M4_DEVICE=${M4_DEVICE:-cuda}`, so the cluster trains on the device and
 `M4_DEVICE=cpu sbatch ...` is the per-submission override (SLURM's default `--export=ALL` carries
@@ -429,9 +477,8 @@ at a small budget (`RIKFLOW_M4_UPDATES=5`) before anything long.
 measured above. The configuration in which it could pay is §6.2's short `stride` with `batch = 32`,
 which widens each launch from 7 segments to 32.
 
-⚠️ **Not measured: no GPU training run exists**, and this workstation has no GPU (`claude_memory.md`
-#56). The above is an arithmetic-intensity and launch-latency argument from numbers that *were*
-measured, not a benchmark. 🔑 **The cheap way to settle it is a `B` sweep on the CPU**: if wall time
+✅ **Now measured — see the table above.** What follows was written before the GPU run and is
+kept because the prediction it makes is the one the measurement confirmed. 🔑 **The cheap way to settle it is a `B` sweep on the CPU**: if wall time
 per gradient step is flat from `B = 7` to `B = 56`, the fit is overhead-bound, which confirms the
 diagnosis and answers the GPU question at the same time. A port would additionally have to survive
 the two GPU-only failure classes this repository has already been bitten by — non-isbits kernel

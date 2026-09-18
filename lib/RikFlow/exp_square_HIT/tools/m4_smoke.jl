@@ -174,14 +174,17 @@ if get(ENV, "RIKFLOW_M4_TIMING", "1") == "1"
     ntrain = floor(Int, (1 - val_frac) * length(psteps))
     updates = parse(Int, get(ENV, "RIKFLOW_M4_UPDATES", "3000"))
     budget = parse(Float64, get(ENV, "RIKFLOW_M4_TIMING_BUDGET", "600"))
+    # Minimum wall time per timed sample. Below a second or so the clock, the scheduler and the
+    # first-touch of a fresh allocation are all comparable to the thing being measured.
+    MIN_SECS = parse(Float64, get(ENV, "RIKFLOW_M4_TIMING_MIN_SECS", "2.0"))
 
     points = [(500 - 100, 32), (500 - 100, 2), (100, 32), (50, 32), (20, 32)]
     t_stage = time()
     total = 0.0
     unmeasured = Tuple{Int,Int}[]
-    @printf("%-8s %-6s %6s %6s %8s %12s %12s
+    @printf("%-8s %-6s %6s %6s %8s %12s %12s %7s
 ",
-            "stride", "batch", "segs", "u/ep", "epochs", "s/epoch", "point (min)")
+            "stride", "batch", "segs", "u/ep", "epochs", "s/epoch", "point (min)", "timed")
     for (stride, batch) in points
         if time() - t_stage > budget
             push!(unmeasured, (stride, batch)); continue
@@ -192,15 +195,26 @@ if get(ENV, "RIKFLOW_M4_TIMING", "1") == "1"
         # per-point row can be printed as a table rather than as prose.
         RF.train_stochlstm(spec, pXc, pYc, psteps; L, burn, stride, epochs = 1, batch,
                            lr = 1e-2, beta = 1e-4, val_frac, seed = 1, verbose = false, device)
-        t0 = time()
-        RF.train_stochlstm(spec, pXc, pYc, psteps; L, burn, stride, epochs = 2, batch,
-                           lr = 1e-2, beta = 1e-4, val_frac, seed = 1, verbose = false, device)
-        sec = (time() - t0) / 2
+        # 🔴 Time for at least `MIN_SECS`, not a fixed two epochs. On a fast node an epoch is
+        # ~0.1 s and two of them are noise: the first run of this stage reported 25 segments as
+        # CHEAPER than 7 (0.089 s against 0.139 s), which is more work in less time and therefore
+        # impossible. Growing the sample until the measurement is seconds long fixes it, and the
+        # count is printed so a reader can see how much it rests on.
+        ntimed, el = 2, 0.0
+        while true
+            t0 = time()
+            RF.train_stochlstm(spec, pXc, pYc, psteps; L, burn, stride, epochs = ntimed, batch,
+                               lr = 1e-2, beta = 1e-4, val_frac, seed = 1, verbose = false, device)
+            el = time() - t0
+            (el >= MIN_SECS || ntimed >= 64) && break
+            ntimed *= 4
+        end
+        sec = el / ntimed
         proj = sec * epochs / 60
         total += proj
-        @printf("%-8d %-6d %6d %6d %8d %10.3f s %10.1f
+        @printf("%-8d %-6d %6d %6d %8d %10.3f s %10.1f %7d
 ",
-                stride, batch, g.nseg, g.upd, epochs, sec, proj)
+                stride, batch, g.nseg, g.upd, epochs, sec, proj, ntimed)
         flush(stdout)
     end
     println()

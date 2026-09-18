@@ -1,6 +1,12 @@
 #!/bin/bash
 #SBATCH -J m4_train
+# 🔒 2 h on the CPU. One cell at `epochs = 3000`, stride 400, is ~7 min at the 0.139 s/epoch the
+# smoke measured, so even the **no-seed-argument path, which fits all `n_seeds` = 5 in sequence**,
+# is ~35 min. (On the GPU the same five seeds were ~3.6 h -- 5.7x slower, §5.)
 #SBATCH -t 02:00:00
+# 🔒 Stays on gpu_h100 (Rik, 2026-09-18): only the DEVICE default moved to the CPU. The 0.139
+# s/epoch below is this node's CPU, so this is the measured configuration; `M4_DEVICE=cuda` still
+# works here unchanged.
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 # 🔑 Explicit, though it is also SLURM's default: the job inherits the SUBMITTING environment.
@@ -27,12 +33,12 @@
 # ⚠️ **Runs under `--project=training`, not `--project`.** Training needs the Lux extension, which
 # is triggered by Lux + Optimisers + Zygote together. The deployed closure needs none of them.
 #
-# 🔴 **It now TRAINS ON THE GPU: `M4_DEVICE=cuda` by default since 2026-09-18.** Until then it
-# asked for a GPU and ran on the node's CPU, because nothing in the training path moved an array to
-# a device. `train_stochlstm` gained a `device` keyword and `RikFlow.m4_device` resolves
-# `M4_DEVICE`; override per submission with
+# 🔒 **It trains on the CPU (`M4_DEVICE=cpu`), and that is a measurement, not a habit.** The GPU
+# path exists and works -- `train_stochlstm` takes a `device` and `RikFlow.m4_device` resolves
+# `M4_DEVICE` -- but the smoke timed it at **5.7x SLOWER** than this node's CPU (§5), because the
+# model is overhead-bound over a strictly sequential recurrence. To use it anyway:
 #
-#     M4_DEVICE=cpu sbatch batch_scripts/run_train_lstm.sh 19
+#     M4_DEVICE=cuda sbatch -t 04:00:00 batch_scripts/run_train_lstm.sh 19
 #
 # 🔴 **The GPU path has never actually run on a GPU.** It is verified against `JLArrays`, which
 # refuses scalar indexing exactly as `CuArray` does (V54: all four architectures agree with the CPU
@@ -63,7 +69,7 @@ export JULIA_CPU_TARGET="generic;znver2,clone_all;znver4,clone_all;icelake-serve
 
 # Train on the device unless the submitting shell says otherwise. SLURM's default `--export=ALL`
 # carries `M4_DEVICE=cpu sbatch ...` through, so this is a default, not an override.
-export M4_DEVICE=${M4_DEVICE:-cuda}
+export M4_DEVICE=${M4_DEVICE:-cpu}
 # The batches are assembled on the host whichever device trains, and on 64 x 23 matrices a full
 # BLAS pool contends rather than helps.
 export OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-1}

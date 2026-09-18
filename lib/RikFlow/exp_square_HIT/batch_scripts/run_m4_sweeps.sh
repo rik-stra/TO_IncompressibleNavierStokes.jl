@@ -1,6 +1,17 @@
 #!/bin/bash
 #SBATCH -J m4_sweep
-#SBATCH -t 02:00:00
+# 🔒 1 h, from a measurement on THIS partition: the smoke's stage 9 timed the whole scan at
+# **18 min on this node's CPU** against **102 min on its GPU** (`results_LSTMS.md` §5), and
+# 1.5 x 18 + 15 min of package load and compilation is well under an hour.
+# ⚠️ `M4_DEVICE=cuda` needs **3 h** instead -- raise it at submission with `sbatch -t 03:00:00`.
+# ⚠️ The `smoke` mode itself takes ~3 minutes; this is the cap for the scans.
+#SBATCH -t 01:00:00
+# 🔒 Stays on gpu_h100 (Rik, 2026-09-18). Only the DEVICE moved to the CPU, not the partition --
+# and that is the better-evidenced choice: the 18 min came from this node's CPU, so running here
+# with `M4_DEVICE=cpu` is the configuration that was actually measured. A CPU partition (`rome`,
+# `genoa`, both covered by the shared depot) would free the GPU but is unmeasured; smoke it there
+# first if the allocation matters.
+# ⚠️ The GPU is requested and, at `M4_DEVICE=cpu`, sits idle. That is a known cost, accepted.
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 # 🔑 Explicit, though it is also SLURM's default: the job inherits the SUBMITTING environment.
@@ -32,12 +43,12 @@
 #     RIKFLOW_M4_UPDATES     optimiser steps per stride point (default 3000)
 #
 # ---------------------------------------------------------------------------------------------
-# 🔴 IT TRAINS ON THE GPU (`M4_DEVICE=cuda` by default since 2026-09-18)
+# 🔒 IT TRAINS ON THE CPU (`M4_DEVICE=cpu`), because the GPU was measured 5.7x SLOWER
 # ---------------------------------------------------------------------------------------------
 #
-# `M4_DEVICE` decides where the fit runs and **defaults to `cuda` here**. Override per submission:
+# `M4_DEVICE` decides where the fit runs and **defaults to `cpu`**. Override per submission:
 #
-#     M4_DEVICE=cpu sbatch batch_scripts/run_m4_sweeps.sh stride     # the node's CPU instead
+#     M4_DEVICE=cuda sbatch -t 03:00:00 batch_scripts/run_m4_sweeps.sh stride    # 5.7x slower
 #
 # 🔴 **THE GPU PATH HAS NEVER RUN ON A GPU.** It is verified only against `JLArrays`, which
 # enforces the same no-scalar-indexing semantics on the host (V54), and all four architectures
@@ -96,9 +107,11 @@ export JULIA_DEPOT_PATH=$HOME/julia/julia_h100:
 export JULIA_CPU_TARGET="generic;znver2,clone_all;znver4,clone_all;icelake-server,clone_all"
 export OPENBLAS_NUM_THREADS=1
 
-# Train on the device unless the submitting shell says otherwise. SLURM's default `--export=ALL`
-# carries `M4_DEVICE=cpu sbatch ...` through, so this is a default and not an override.
-export M4_DEVICE=${M4_DEVICE:-cuda}
+# Train on the CPU unless the submitting shell says otherwise. SLURM's default `--export=ALL`
+# carries `M4_DEVICE=cuda sbatch ...` through, so this is a default and not an override.
+# 🔑 `M4_DEVICE=cuda` works here as-is -- the partition still provides the GPU; it is only the
+# default that changed. Give it `-t 03:00:00`, because it is 5.7x slower.
+export M4_DEVICE=${M4_DEVICE:-cpu}
 echo "== M4_DEVICE=$M4_DEVICE"
 # 🔑 Echo the budgets that actually arrived. Whether an env var survives submission is the
 # kind of thing that is easy to assume and expensive to assume wrongly, so the log answers

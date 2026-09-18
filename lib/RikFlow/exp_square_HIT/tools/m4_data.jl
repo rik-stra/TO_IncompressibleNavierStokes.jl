@@ -110,6 +110,32 @@ function m4_geometry(steps, ntrain; L, burn, stride, batch)
 end
 
 """
+    m4_save_progress(path; complete, payload...)
+
+Write a scan's results so far, **atomically**, after every point.
+
+🔴 **Because a scan that is killed must not lose everything.** `jldsave` used to run once, after
+the last point, so a walltime kill — or a cancelled job, which is how the first Snellius run
+ended — threw away every completed point. A scan point costs minutes; there is no reason to make
+the last one a single point of failure for the first four.
+
+🔑 **Atomic: written to a `.tmp` and renamed.** `jldsave` is not atomic, so a kill *during* the
+write leaves a truncated file that is worse than no file — it looks like a result and fails, or
+worse loads, later. `mv` within one filesystem is atomic, so a reader sees either the previous
+complete file or the new one, never a half-written one.
+
+`complete` is stored so a consumer can tell a finished scan from a partial one without counting
+rows. ⚠️ **A partial file is not a result**: its `thresholds` are computed from the points that
+happen to have finished, so a ranking read off one is a ranking over a subset.
+"""
+function m4_save_progress(path::AbstractString; complete::Bool, payload...)
+    tmp = path * ".tmp"
+    jldsave(tmp; complete, payload...)
+    mv(tmp, path; force = true)
+    return path
+end
+
+"""
     QOI_PATTERN
 
 Which extracted caches count as *this* project's tracking record.
