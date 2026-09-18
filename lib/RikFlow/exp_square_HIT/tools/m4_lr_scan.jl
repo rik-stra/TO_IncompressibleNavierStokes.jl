@@ -86,13 +86,18 @@ first_below(val, thr) = (i = findfirst(<=(thr), val); i === nothing ? 0 : i)
 const DEVICE = RF.m4_device(get(ENV, "M4_DEVICE", "cpu"))
 @info "device" M4_DEVICE=get(ENV, "M4_DEVICE", "cpu")
 
+# 🔴 Probe before committing -- see the stride scan's note.
+m4_probe_step(spec, Xc, Yc, steps; device = DEVICE, stride = cfg.L - cfg.burn,
+              batch = cfg.batch, cfg, epochs_planned = EPOCHS,
+              label = "device probe ($(get(ENV, "M4_DEVICE", "cpu")))")
+
 results = NamedTuple[]
 for lr in LRS
-    @info "lr = $lr"
+    m4_phase("point: lr = $lr")
     t0 = time()
     _, h = RF.train_stochlstm(spec, Xc, Yc, steps;
                               cfg.L, cfg.burn, epochs = EPOCHS, cfg.batch, lr,
-                              cfg.beta, cfg.val_frac, seed, verbose = false, device = DEVICE)
+                              cfg.beta, cfg.val_frac, seed, verbose = true, device = DEVICE)
     push!(results, (; lr, wall = time() - t0, train = h.train, val = h.val, lrhist = h.lr,
                     best_val = h.best_val, best_epoch = h.best_epoch))
     @printf("    best val %.5g at epoch %d; final %.5g; lr %g -> %g; %.1f s\n",

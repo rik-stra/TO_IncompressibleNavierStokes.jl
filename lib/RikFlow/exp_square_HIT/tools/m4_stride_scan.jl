@@ -79,18 +79,9 @@ Xc, Yc = permutedims(X), permutedims(Y)
 ncol = length(steps)
 ntrain = floor(Int, (1 - cfg.val_frac) * ncol)
 
-"Training segments and optimiser steps per epoch, for one (stride, batch)."
-function geometry(stride, batch)
-    segs = RF.segment_indices(view(steps, 1:ntrain); cfg.L, cfg.burn, stride)
-    nseg = length(segs)
-    # one group per distinct segment length, each partitioned into chunks of `batch`
-    lens = Dict{Int,Int}()
-    for s in segs
-        lens[length(s.rows)] = get(lens, length(s.rows), 0) + 1
-    end
-    upd = sum(cld(n, batch) for (_, n) in lens)
-    return nseg, upd, sum(length(s.score) for s in segs)
-end
+# 🔑 `m4_geometry` is shared with the smoke's walltime estimate, so the two cannot disagree.
+geometry(stride, batch) = ((g = m4_geometry(steps, ntrain; cfg.L, cfg.burn, stride, batch));
+                           (g.nseg, g.upd, g.scored))
 
 # (stride, batch). 🔑 The second row is the CONTROL: the tiling stride with a batch small enough to
 # give a comparable number of updates. If the shorter strides beat the tiling stride only as much
@@ -118,15 +109,24 @@ POINTS = [(cfg.L - cfg.burn, cfg.batch),     # 400: the current default, the bas
 const DEVICE = RF.m4_device(get(ENV, "M4_DEVICE", "cpu"))
 @info "device" M4_DEVICE=get(ENV, "M4_DEVICE", "cpu")
 
+# 🔴 Probe before committing. A point is 3000 updates with no output until it finishes;
+# on an untried device that is an unbounded silence. This prints the per-epoch cost first.
+let (s1, b1) = POINTS[1]
+    _, upd1, _ = geometry(s1, b1)
+    m4_probe_step(spec, Xc, Yc, steps; device = DEVICE, stride = s1, batch = b1, cfg,
+                  epochs_planned = max(1, cld(UPDATES, upd1)),
+                  label = "device probe ($(get(ENV, "M4_DEVICE", "cpu")), stride $s1)")
+end
+
 results = NamedTuple[]
 for (stride, batch) in POINTS
     nseg, upd_per_epoch, scored = geometry(stride, batch)
     epochs = max(1, cld(UPDATES, upd_per_epoch))
-    @info "stride $stride, batch $batch" segments=nseg updates_per_epoch=upd_per_epoch epochs scored_rows_per_epoch=scored
+    m4_phase("point: stride $stride batch $batch -- $nseg segments, $upd_per_epoch updates/epoch, $epochs epochs")
     t0 = time()
     _, h = RF.train_stochlstm(spec, Xc, Yc, steps;
                               cfg.L, cfg.burn, stride, epochs, batch, cfg.lr,
-                              cfg.beta, cfg.val_frac, seed, verbose = false, device = DEVICE)
+                              cfg.beta, cfg.val_frac, seed, verbose = true, device = DEVICE)
     push!(results, (; stride, batch, nseg, upd_per_epoch, epochs, scored,
                     updates = epochs * upd_per_epoch, wall = time() - t0,
                     train = h.train, val = h.val, lrhist = h.lr,

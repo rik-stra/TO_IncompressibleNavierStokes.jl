@@ -3,6 +3,14 @@
 #SBATCH -t 02:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
+# 🔑 Explicit, though it is also SLURM's default: the job inherits the SUBMITTING environment.
+# That is what makes `RIKFLOW_M4_UPDATES=5 sbatch ...` and `M4_DEVICE=cpu sbatch ...` work, and it
+# is what the other scripts here have always relied on -- none of them sets `--export`, and they
+# all need an inherited `PATH` just to find `julia`. Stating it protects against a site default of
+# `NONE`, which would strip both the budget AND the PATH.
+# 🔴 **Do NOT write `--export=VAR=value` on the command line: that REPLACES `ALL`**, so the job
+# would lose `PATH` and die before Julia starts. The additive form is `--export=ALL,VAR=value`.
+#SBATCH --export=ALL
 
 # Fit ONE M4 configuration -- all of its seeds, or one seed if given.
 #

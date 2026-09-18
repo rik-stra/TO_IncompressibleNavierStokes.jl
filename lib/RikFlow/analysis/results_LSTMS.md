@@ -715,9 +715,9 @@ the batches are still assembled on the host, which is why `OPENBLAS_NUM_THREADS=
 # on the login node, from lib/RikFlow (or from exp_square_HIT -- the script finds the drivers)
 julia --project exp_square_HIT/10_setup_lstm.jl          # only if the table changed; no GPU
 
-# 🔴 FIRST SUBMISSION IS A TEST, NOT A MEASUREMENT. The GPU path has never run on a GPU (§5);
-# this exercises every point and the write in about a minute, on the device.
-RIKFLOW_M4_UPDATES=5 sbatch batch_scripts/run_m4_sweeps.sh stride
+# 🔴 FIRST SUBMISSION, ALWAYS. ~3 min, finishes, exits 0 with `M4 SMOKE PASS` or names the phase
+# that failed. Needs no inputs_lstm.jld2 and writes only to a temp dir.
+sbatch batch_scripts/run_m4_sweeps.sh smoke
 
 # then the real thing
 sbatch batch_scripts/run_m4_sweeps.sh stride             # the stride scan (§6.2), on the GPU
@@ -770,7 +770,44 @@ mechanism; what matters operationally:
   the same no-scalar-indexing semantics on the host, and all four architectures agree with the CPU
   fit to ~1e-7 — but that cannot see a CUDA **compilation** failure, which is the class this
   repository has been bitten by twice and both times only on the cluster (#56, #57).
-  **So: `RIKFLOW_M4_UPDATES=5` first.** A minute, every code path, including the write.
+  🔴 **So the first job on a device is `run_m4_sweeps.sh smoke`, never a scan.**
+  `tools/m4_smoke.jl` runs a few seconds of arithmetic through all eight stages — extension,
+  device, QoIs, regressor, fit, host return, save/load round-trip, one deployed step — printing a
+  timestamped line at each, and exits 0 with `M4 SMOKE PASS` or non-zero naming the phase.
+  ⚠️ **A scan is a bad first job**, which is how a 20-minute run came to be cancelled blind on
+  2026-09-18: one point is thousands of updates and printed nothing until it finished, so a slow
+  device and a hung one looked identical. Measured afterwards on CPU, that job was not hung —
+  point 1 alone is ~12 min and the whole 5-point scan ~3.4 h, against a 2 h walltime (below).
+  ✅ **`M4_DEVICE=jl` runs the same smoke through `JLArray`**, i.e. GPU *semantics* with no GPU.
+  Verified 2026-09-18: PASS on `cpu` and on `jl`, with **identical** validation losses
+  (1.609 → 1.209 → 1.034), which is the host-side RNG design doing what §5 claims.
+
+### The stride scan's cost, measured
+
+🔴 **Measured by the smoke's stage 9, which is what a walltime should be set from.** An earlier
+paragraph here projected ~3.4 h by assuming per-epoch cost scales with the segment count; **that
+was wrong by a factor of three and the error was extrapolating instead of measuring.** On CPU:
+
+| stride | batch | segs | u/ep | epochs | s/epoch | point |
+|---|---|---|---|---|---|---|
+| 400 | 32 | 7 | 2 | 1500 | 0.597 | 14.9 min |
+| 400 | 2 | 7 | 4 | 750 | 0.433 | 5.4 min |
+| 100 | 32 | 25 | 2 | 1500 | 0.703 | 17.6 min |
+| 50 | 32 | 49 | 3 | 1000 | 0.987 | 16.5 min |
+| 20 | 32 | 120 | 5 | 600 | 1.986 | 19.9 min |
+| | | | | | | **74 min total** |
+
+🔑 **17× the segments costs only 3.3× the time, and that is `batch = 32` earning its keep.** More
+segments per update means wider GEMMs, so the per-timestep Zygote overhead §5 identifies is
+amortised over more work — the same amortisation argument that makes a short stride the only
+geometry where a GPU could help. A naive "cost ∝ segments" projection misses it entirely.
+
+⚠️ So the scan **does** fit a 2 h walltime on CPU, though not with much margin: the smoke suggests
+`-t 03:00:00` (1.5× the measured total, plus 15 min of package load and compilation). Run the
+smoke on the GPU and take its number rather than this one.
+
+⚠️ **`jldsave` still runs only after all five points**, so a walltime kill produces no output at
+all. Writing results incrementally is not done and is worth doing before a long run.
 - ✅ **A mis-scheduled job fails loudly.** `m4_device` refuses `cuda` when `CUDA.functional()` is
   false rather than falling back to the host, so a job that lands without a device dies at load
   instead of reporting CPU time as GPU time. Verified on this workstation.
@@ -780,7 +817,24 @@ mechanism; what matters operationally:
   with `batch = 32` widens each launch from 7 segments to 32. Read the device comparison off the
   stride scan rather than off the baseline row.
 - **`M4_DEVICE=cpu sbatch ...`** is the per-submission override, and is how the device comparison
-  is taken. SLURM's default `--export=ALL` carries it through.
+  is taken.
+
+**Do the `VAR=value sbatch ...` prefixes actually reach the compute node?** Yes. `sbatch` defaults
+to `--export=ALL`, so the job inherits the submitting environment — and the evidence is already in
+this directory: **no script here sets `--export`, and every one of them needs an inherited `PATH`
+just to find `julia`.** If the default were anything else, no job in this repository would ever
+have run. Both M4 scripts now state it (`#SBATCH --export=ALL`) rather than rely on it, which also
+protects against a site default of `NONE`.
+
+🔴 **The trap is the explicit form.** `sbatch --export=RIKFLOW_M4_UPDATES=5 ...` **replaces** `ALL`
+rather than adding to it, so the job loses `PATH` and dies before Julia starts. The additive form
+is `--export=ALL,RIKFLOW_M4_UPDATES=5`. The prefix form, `RIKFLOW_M4_UPDATES=5 sbatch ...`, has no
+such hazard and is what §7's examples use.
+
+🔑 **And the log answers it rather than the reader inferring it.** `run_m4_sweeps.sh` echoes the
+budgets it received before Julia starts, and the driver prints them again from its own side
+(`@info "M4 stride scan" … updates=5`). Two lines, one on each side of the shell/Julia boundary, so
+a value that failed to cross is visible instead of silently becoming the default.
 
 ⚠️ **A CPU partition remains available and is no longer an untested risk.** `m4_lr_scan.jl` —
 `using RikFlow` **plus** the Lux extension, strictly more imports than the training driver — ran six

@@ -616,8 +616,13 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
             verbose && @info "M4 lr decayed" epoch lr = cur_lr
         end
 
-        verbose && (epoch % 10 == 1 || epoch == epochs) &&
+        # 🔴 FLUSHED. A SLURM log is a redirected stream, and an unflushed heartbeat is
+        # indistinguishable from a hang -- which is exactly how a 20-minute job came to be
+        # cancelled blind on 2026-09-18.
+        if verbose && (epoch % 10 == 1 || epoch == epochs)
             @info "M4 epoch $epoch" train = history.train[end] val = vl best = best.val
+            flush(stderr)
+        end
     end
 
     verbose && @info "M4 done" best_epoch = best.epoch best_val = best.val final_val = history.val[end]

@@ -22,6 +22,92 @@
 # output. A warning that says what to run is the right behaviour; a helpful auto-write is not.
 
 using JLD2
+using Printf
+
+"""
+    m4_phase(msg)
+
+Print a timestamped, **flushed** progress line.
+
+🔴 **This exists because a 20-minute Snellius job produced no output at all and was cancelled
+blind** (2026-09-18). Julia's streams are block-buffered when redirected to a file, which a SLURM
+job always is, so a long phase looks identical to a hang: the log is empty either way and there is
+nothing to tell you whether to wait or to kill it. Every phase that can take minutes prints one of
+these before it starts and one after, with the elapsed time, so the log localises a stall to a
+phase even if the job is killed.
+
+🔑 It flushes BOTH streams. `@info` goes to stderr and the driver's own `println`s go to stdout;
+flushing one and not the other reorders the log in exactly the way that makes it untrustworthy.
+"""
+function m4_phase(msg)
+    println("[", Libc.strftime("%H:%M:%S", time()), "] ", msg)
+    flush(stdout)
+    flush(stderr)
+end
+
+"""
+    m4_probe_step(spec, X, Y, steps; cfg, device, stride, batch, label)
+
+Time a handful of optimiser steps on `device` and print the per-update cost, **before** committing
+to a full scan.
+
+🔴 **This is the answer to a 20-minute job that printed nothing and was cancelled blind.** The
+scans pass `verbose = false`, so a single point — 3000 updates — produces no output at all from
+start to finish; on the CPU that is ~10 minutes of silence and on an untried device it is
+unbounded. A probe costs a few updates and turns "is it hung or is it slow?" into a number in the
+log before the first point starts.
+
+🔑 **The first call is compilation, not cost** — gotcha #44, and doubly so on a GPU, where the
+first launch also pays PTX compilation. So one epoch is run and discarded before the timed ones,
+and both numbers are printed: a large gap between them IS the compilation, and a large *steady*
+number is the thing worth stopping for.
+"""
+function m4_probe_step(spec, X, Y, steps; cfg, device, stride, batch, epochs_planned = nothing,
+                       label = "probe")
+    m4_phase("$label: compiling one update on the selected device ...")
+    t0 = time()
+    RikFlow.train_stochlstm(spec, X, Y, steps; cfg.L, cfg.burn, stride, epochs = 1, batch,
+                            cfg.lr, cfg.beta, cfg.val_frac, seed = 1, verbose = false, device)
+    tc = time() - t0
+    m4_phase(@sprintf("%s: first epoch (compilation included) %.2f s", label, tc))
+
+    n = 3
+    t0 = time()
+    RikFlow.train_stochlstm(spec, X, Y, steps; cfg.L, cfg.burn, stride, epochs = n, batch,
+                            cfg.lr, cfg.beta, cfg.val_frac, seed = 1, verbose = false, device)
+    ts = (time() - t0) / n
+    # 🔴 Project from the epochs the CALLER actually plans, not from the update budget. An epoch is
+    # `updates_per_epoch` optimiser steps and that factor is 2-5 here, so projecting a 3000-UPDATE
+    # budget as 3000 epochs overstates the cost by exactly that factor -- which this message did on
+    # its first outing.
+    if epochs_planned === nothing
+        m4_phase(@sprintf("%s: steady %.3f s/epoch", label, ts))
+    else
+        m4_phase(@sprintf("%s: steady %.3f s/epoch -> %d epochs is about %.1f min",
+                          label, ts, epochs_planned, ts * epochs_planned / 60))
+    end
+    return (; compile = tc, steady = ts)
+end
+
+"""
+    m4_geometry(steps, ntrain; L, burn, stride, batch)
+
+Training segments, optimiser steps per epoch, and scored rows per epoch for one `(stride, batch)`.
+
+🔑 **Shared so the scan and the walltime estimate cannot disagree.** `updates/epoch` is not
+`ceil(nseg/batch)`: segments are grouped by LENGTH first and each group is batched separately, so
+the trailing short segment always costs an update of its own. Getting that wrong understates the
+step count, which is exactly the quantity a walltime is set from.
+"""
+function m4_geometry(steps, ntrain; L, burn, stride, batch)
+    segs = RikFlow.segment_indices(view(steps, 1:ntrain); L, burn, stride)
+    lens = Dict{Int,Int}()
+    for sg in segs
+        lens[length(sg.rows)] = get(lens, length(sg.rows), 0) + 1
+    end
+    upd = sum(cld(n, batch) for (_, n) in lens)
+    return (; nseg = length(segs), upd, scored = sum(length(sg.score) for sg in segs))
+end
 
 """
     QOI_PATTERN
@@ -70,15 +156,19 @@ function load_m4_qois(; track_file::AbstractString,
     explicit = get(ENV, "RIKFLOW_QOI_CACHE", "")
     if !isempty(explicit)
         isfile(explicit) || error("RIKFLOW_QOI_CACHE=$explicit does not exist")
+        m4_phase("reading QoIs from RIKFLOW_QOI_CACHE: $explicit")
+        t0 = time()
         d = load(explicit)
-        @info "QoIs from RIKFLOW_QOI_CACHE" path = explicit
+        m4_phase(@sprintf("QoIs read in %.1f s", time() - t0))
         return (; q = d["q"], q_star = d["q_star"], source = explicit)
     end
 
     cache = find_qoi_cache(data_dir)
     if cache !== nothing
+        m4_phase("reading QoIs from the extracted cache: $cache")
+        t0 = time()
         d = load(cache)
-        @info "QoIs from the extracted cache" path = cache
+        m4_phase(@sprintf("QoIs read in %.1f s", time() - t0))
         return (; q = d["q"], q_star = d["q_star"], source = cache)
     end
 
