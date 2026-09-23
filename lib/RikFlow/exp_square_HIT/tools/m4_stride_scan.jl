@@ -5,7 +5,9 @@
 #
 # Environment: `RIKFLOW_QOI_CACHE` (as the training driver), `RIKFLOW_M4_EPOCHS` (the epoch CAP
 # per point, default 3000), `RIKFLOW_M4_STOP_PATIENCE` (VALIDATIONS past the best before stopping,
-# default 100) and `RIKFLOW_M4_VAL_EVERY` (updates between validations, default 2).
+# default 100), `RIKFLOW_M4_VAL_EVERY` (updates between validations, default 2),
+# `RIKFLOW_M4_STOP_WINDOW` / `RIKFLOW_M4_STOP_REL` (stop once the best gained < REL over the last
+# WINDOW updates, default 500 / 0.005) and `RIKFLOW_M4_POINTS` (a subset of rows, own output file).
 #
 # ---------------------------------------------------------------------------------------------
 # The question, and why it needs a matched budget
@@ -75,6 +77,11 @@ const STOP_PATIENCE = parse(Int, get(ENV, "RIKFLOW_M4_STOP_PATIENCE", "100"))
 # as it was until 2026-09-18, they run at 1 update per validation at the tiling stride and 3 at
 # `stride = 20`, which is the confound the whole scan exists to avoid.
 const VAL_EVERY = parse(Int, get(ENV, "RIKFLOW_M4_VAL_EVERY", "2"))
+# 🔑 The windowed stop: end a point once its best has improved by < STOP_REL over the last
+# STOP_WINDOW updates (`train_stochlstm`'s `stop_window`/`stop_rel`). `RIKFLOW_M4_STOP_WINDOW=0`
+# turns it off.
+const STOP_WINDOW = parse(Int, get(ENV, "RIKFLOW_M4_STOP_WINDOW", "500"))
+const STOP_REL = parse(Float64, get(ENV, "RIKFLOW_M4_STOP_REL", "0.005"))
 
 # 🔑 One QoI resolver for all three M4 drivers -- each used to carry its own.
 include(joinpath(@__DIR__, "m4_data.jl"))
@@ -134,7 +141,7 @@ if POINT_SEL !== nothing
     POINTS = POINTS[POINT_SEL]
 end
 
-@info "M4 stride scan" cell=cfg.name arch=cfg.arch beta=cfg.beta seed epoch_cap=EPOCHS stop_patience=STOP_PATIENCE val_every=VAL_EVERY L=cfg.L burn=cfg.burn
+@info "M4 stride scan" cell=cfg.name arch=cfg.arch beta=cfg.beta seed epoch_cap=EPOCHS stop_patience=STOP_PATIENCE val_every=VAL_EVERY stop_window=STOP_WINDOW stop_rel=STOP_REL L=cfg.L burn=cfg.burn
 @info "data" rows=ncol train_rows=ntrain
 
 
@@ -172,24 +179,28 @@ for (stride, batch) in POINTS
     ps, h = RF.train_stochlstm(spec, Xc, Yc, steps;
                               cfg.L, cfg.burn, stride, epochs = EPOCHS, batch, cfg.lr,
                               cfg.beta, cfg.val_frac, seed, verbose = true, device = DEVICE,
-                              stop_patience = STOP_PATIENCE, val_every = VAL_EVERY)
+                              stop_patience = STOP_PATIENCE, val_every = VAL_EVERY,
+                              stop_window = STOP_WINDOW, stop_rel = STOP_REL)
     # 🔑 The geometry is taken from the HISTORY, not from `geometry(...)`. The helper predicts
     # it for the walltime estimate; the fit reports what it actually did, and a disagreement
     # between the two is a bug rather than something to average over.
     push!(results, (; stride, batch, nseg = h.nseg, batch_eff = h.batch_eff,
                     upd_per_epoch = h.upd_per_epoch, epochs = h.epochs_run, scored,
                     updates = h.updates, val_every = h.val_every,
-                    stopped_early = h.stopped_early, wall = time() - t0,
+                    stopped_early = h.stopped_early, stop_reason = h.stop_reason,
+                    wall = time() - t0,
                     upd_axis = h.update, train = h.train, val = h.val, lrhist = h.lr,
                     best_val = h.best_val, best_update = h.best_update,
                     best_index = h.best_index, ps))
     @printf("    best val %.5g at update %d; final %.5g; %d updates / %d epochs%s; %.1f s\n",
             h.best_val, h.best_update, h.val[end], h.updates, h.epochs_run,
-            h.stopped_early ? " (converged, stopped early)" : " (hit the cap)", time() - t0)
+            h.stopped_early ? " (converged, stopped early: $(h.stop_reason))" : " (hit the cap)",
+            time() - t0)
     # Saved after EVERY point, atomically. `spec` travels with it, so `LSTMWeights(r.ps, spec)`
     # reconstructs any point's model without re-reading the configuration table.
     m4_save_progress(out; complete = false, results, cell = cfg.name, cfg, seed,
-                     epoch_cap = EPOCHS, stop_patience = STOP_PATIENCE, spec,
+                     epoch_cap = EPOCHS, stop_patience = STOP_PATIENCE, stop_window = STOP_WINDOW,
+                     stop_rel = STOP_REL, spec,
                      points_done = length(results),
                      points_total = length(POINTS), point_selection = POINT_SEL)
     m4_phase("point saved ($(length(results))/$(length(POINTS))) -> $(basename(out))")
@@ -204,15 +215,15 @@ THRESHOLDS = (10 * best_overall, 3 * best_overall, 1.5 * best_overall)
 first_below(r, thr) = (i = findfirst(<=(thr), r.val); i === nothing ? 0 : r.upd_axis[i])
 
 println()
-@printf("%-7s %-6s %5s %5s %5s %7s %7s %5s %11s %9s | %s\n", "stride", "batch", "segs", "beff",
+@printf("%-7s %-6s %5s %5s %5s %7s %7s %6s %11s %9s | %s\n", "stride", "batch", "segs", "beff",
         "u/ep", "epochs", "updates", "conv", "best val", "best upd",
         "updates to reach " * join((@sprintf("%.3g", t) for t in THRESHOLDS), " / "))
 println("-"^140)
 for r in results
     reach = join((@sprintf("%8d", first_below(r, t)) for t in THRESHOLDS), " ")
-    @printf("%-7d %-6d %5d %5d %5d %7d %7d %5s %11.5g %9d | %s\n",
+    @printf("%-7d %-6d %5d %5d %5d %7d %7d %6s %11.5g %9d | %s\n",
             r.stride, r.batch, r.nseg, r.batch_eff, r.upd_per_epoch, r.epochs, r.updates,
-            r.stopped_early ? "yes" : "NO", r.best_val, r.best_update, reach)
+            r.stopped_early ? string(r.stop_reason) : "NO", r.best_val, r.best_update, reach)
 end
 println("\n(0 in a reach column = never reached; `best upd` is the update the returned iterate " *
         "came from)")
@@ -233,7 +244,7 @@ end
 # the best point in the scan, so they only mean anything once every point has run -- which is
 # exactly what `complete` records, and why a partial file must not be read as a ranking.
 m4_save_progress(out; complete = true, results, cell = cfg.name, cfg, seed, epoch_cap = EPOCHS,
-                 stop_patience = STOP_PATIENCE,
+                 stop_patience = STOP_PATIENCE, stop_window = STOP_WINDOW, stop_rel = STOP_REL,
                  spec, points_done = length(results), points_total = length(POINTS),
                  point_selection = POINT_SEL, thresholds = THRESHOLDS)
 println("\nwrote $out (complete)")

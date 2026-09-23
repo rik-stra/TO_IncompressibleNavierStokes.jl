@@ -650,4 +650,50 @@ const RF = RikFlow
         @test first_decay(decays_new, vals) == first_decay(decays_old, vals)
         @test first_decay(decays_new, flat) == first_decay(decays_old, flat)
     end
+
+    # -----------------------------------------------------------------------------------------
+    # V57 -- the windowed stop: < stop_rel gain over the last stop_window updates
+    # -----------------------------------------------------------------------------------------
+    @testset "V57 the windowed stop reads a RATE, and survives a negative loss" begin
+        ext = Base.get_extension(RikFlow, :RikFlowLuxExt)
+        ws = ext._window_stalled
+        u = collect(2:2:1000)                        # validations every 2 updates
+        # geometric best-so-far: a fixed fractional gain per validation
+        bsf_rate(g) = [1.0 * (1 - g)^k for k in 0:(length(u) - 1)]
+        # 250 validations span 500 updates: 1e-4/validation is ~2.5% per window -> not stalled;
+        # 1e-5/validation is ~0.25% -> stalled
+        @test !ws(u, bsf_rate(1e-4), 500, 0.005)
+        @test ws(u, bsf_rate(1e-5), 500, 0.005)
+        # not before the history spans the window, and never when disabled
+        @test !ws(u[1:100], bsf_rate(1e-5)[1:100], 500, 0.005)
+        @test !ws(u, bsf_rate(1e-5), 0, 0.005)
+        @test !ws(u, bsf_rate(1e-5), 500, 0.0)
+        # 🔴 a NEGATIVE loss (the `:lstm` control's log-density, ~ -18): a steady improvement must
+        # not be read as a loss. Without `abs` in the denominator the first line would be true.
+        neg_fast = [-18.0 - 0.01k for k in 0:(length(u) - 1)]     # 2.5 nats per window: 14%
+        neg_slow = [-18.0 - 1e-5k for k in 0:(length(u) - 1)]     # 0.0025 nats: 0.014%
+        @test !ws(u, neg_fast, 500, 0.005)
+        @test ws(u, neg_slow, 500, 0.005)
+
+        # and inside a real fit: a window the fit can span, with a threshold no gain can meet,
+        # stops it before the cap and says why
+        T = Float32
+        nq, N = 3, 700
+        rng = Xoshiro(97)
+        q = zeros(Float64, nq, N)
+        for t in 2:N
+            q[:, t] = 0.8 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        spec = mkspec(:storn; n_qoi = nq, h = 1, n_hidden = 8, n_latent = 4, n_encoder = 8)
+        X, Yb, steps = RF.build_history(spec.hist, q[:, 1:(N - 1)], q)
+        kw = (; L = 60, burn = 15, epochs = 40, batch = 4, lr = 5e-3, seed = 3, verbose = false, T)
+        _, h = RF.train_stochlstm(spec, permutedims(X), permutedims(Yb), steps; kw...,
+                                  stop_window = 4, stop_rel = 10.0)
+        @test h.stopped_early && h.stop_reason === :window
+        @test h.updates < 40 * h.upd_per_epoch
+        # the default window cannot be spanned by a fit this short, so it runs to the cap
+        _, h0 = RF.train_stochlstm(spec, permutedims(X), permutedims(Yb), steps; kw...)
+        @test !h0.stopped_early && h0.stop_reason === :cap
+        @test h0.updates == 40 * h0.upd_per_epoch
+    end
 end

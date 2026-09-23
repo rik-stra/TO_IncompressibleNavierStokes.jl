@@ -847,6 +847,19 @@ validation loss and cost is reported in its own columns rather than forced equal
   388/428/468/508/548 — `min_lr` in 160 updates, stopped at 586 at ~15x its neighbours' loss;
   `stride = 20` cascaded the same way at 3276–3396. Best-iterate selection and the early stop still
   read the all-time best. `_plateau_step`, **V56** (with the old rule as positive control).
+- 🔴 **`min_lr` raised 1e-5 → 1e-4, and a second, windowed stop** (Rik, 2026-09-23). The
+  `(400, b2)` control rerun to a 10 000-epoch cap (30 000 updates, fig14) reached 1e-5 at update
+  2912 — batch-2 minibatch noise reads as a plateau — and then kept improving at that rate:
+  2.05e-3 → 1.90e-3 (10k) → 1.54e-3 (20k) → 1.32e-3 (30k), best at update 29 960, never
+  stopping. The floor was too low to be a floor. The new rule ends a fit once its best has
+  improved by **< 0.5% over the last 500 updates**, at any rate (`stop_window`, `stop_rel`;
+  `history.stop_reason` says which rule fired). ⚠️ Replayed on the recorded curves, that rule
+  would have stopped the old b2 run at update 3094 at 2.05e-3 — 56% above where it went — which
+  is why it ships together with the higher floor rather than alone; it never fires on the three
+  capped full-batch points, which are still steep at 3000 updates. **V57**.
+
+  ![b2 control, 10 000-epoch rerun](figures/fig14_lstm_b2_long_run.png)
+
 - 🔴 **Early stopping fires only once the schedule has bottomed out** — at `min_lr` *and*
   `stop_patience` validations past the best. Both halves are needed: a fit still above `min_lr` has
   a decay left that may restart the descent, and one still improving has not converged.

@@ -464,6 +464,31 @@ end
 const _PLATEAU_FRESH = (; ref = Inf, since = 0)
 
 """
+    _window_stalled(upd_axis, bsf, window, rel) -> Bool
+
+Whether the best-so-far validation loss `bsf` (one entry per validation, at the updates in
+`upd_axis`) has improved by less than a fraction `rel` over the last `window` updates. `false`
+until the history spans `window` updates, and always `false` when `window <= 0` or `rel <= 0`.
+
+🔴 **The gain is relative to `abs` of the earlier value**, because the `:lstm` control's validation
+loss is a Gaussian log-density and is NEGATIVE (~ -18): `(old - new) / old` flips sign there, reads
+every improvement as a loss, and would stop that fit at its first check.
+
+🔑 Why a window at all (Rik, 2026-09-23, `(400, b2)` rerun, fig14): at `min_lr` the stop keyed on
+"no new best for `stop_patience` validations" never fires on a curve that keeps setting tiny new
+bests -- that run did 30 000 updates. A windowed gain is a statement about the RATE, which is what
+convergence means. Default 0.5% over 500 updates; on the recorded full-batch curves it never fires,
+because they are still steep.
+"""
+function _window_stalled(upd_axis::AbstractVector, bsf::AbstractVector, window::Integer,
+                         rel::Real)
+    (window <= 0 || rel <= 0 || isempty(bsf)) && return false
+    j = searchsortedlast(upd_axis, upd_axis[end] - window)
+    j >= 1 || return false
+    return (bsf[j] - bsf[end]) / abs(bsf[j]) < rel
+end
+
+"""
     train_stochlstm(spec, X, Y, steps; kwargs...)
 
 Fit an M4 model to a regressor/target pair.
@@ -507,13 +532,19 @@ Fit an M4 model to a regressor/target pair.
   `min_lr`. 🔴 Not the all-time best: after a loss spike that reference is out of reach at the
   reduced rate, and the rule then fires every `patience` validations until `min_lr` -- the
   cascade that ended the 2026-09-23 `(400, b2)` control at update 586 (see `_plateau_step`).
-- `stop_patience`: 🔴 **early stopping, and only once the schedule has bottomed out.** The fit
-  ends when the learning rate is at `min_lr` *and* `stop_patience` VALIDATIONS (i.e.
-  `stop_patience * val_every` updates) have passed with no new best. Both halves are needed: a fit still above `min_lr` has a decay left that may restart the
-  descent, and one still improving has not converged. 🔑 This is what lets points run to
-  CONVERGENCE on their own schedules rather than to a shared budget -- the only comparison that is
-  not confounded by whichever budget axis was matched. `history.stopped_early` records whether it
-  fired.
+  🔴 **`min_lr` is 1e-4, raised from 1e-5 (Rik, 2026-09-23).** The `(400, b2)` rerun reached
+  1e-5 at update 2912 -- minibatch noise at batch 2 reads as a plateau -- and then improved 36%
+  over the next 27 000 updates at that rate: the floor was too low to be a floor.
+- `stop_patience`: 🔴 **early stopping, first rule: once the schedule has bottomed out.** The
+  fit ends when the learning rate is at `min_lr` *and* `stop_patience` VALIDATIONS (i.e.
+  `stop_patience * val_every` updates) have passed with no new best. 🔑 This is what lets points
+  run to CONVERGENCE on their own schedules rather than to a shared budget -- the only comparison
+  that is not confounded by whichever budget axis was matched.
+- `stop_window`, `stop_rel`: 🔴 **early stopping, second rule: the best has improved by less than
+  `stop_rel` (relative) over the last `stop_window` updates**, at any learning rate. Default 0.5%
+  over 500 updates (Rik, 2026-09-23); `stop_window = 0` disables it. See `_window_stalled`.
+  `history.stopped_early` records whether either rule fired and `history.stop_reason` which --
+  `:floor`, `:window`, or `:cap` for a fit that ran to `epochs`.
 
 🔴 **Returns the best-validation iterate, not the last one**, and the validation epsilons are drawn
 once and held fixed so the curve is a function of the parameters alone. Both matter more than they
@@ -548,8 +579,9 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             val_frac::Real = 0.2, stride::Int = L - burn,
                             T::Type = Float32, verbose::Bool = true, device = identity,
                             device_rng::Bool = false,
-                            patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-5,
-                            stop_patience::Int = 100, val_every::Int = 2)
+                            patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-4,
+                            stop_patience::Int = 100, val_every::Int = 2,
+                            stop_window::Int = 500, stop_rel::Real = 0.005)
     size(X, 2) == size(Y, 2) == length(steps) ||
         error("train_stochlstm: X, Y and steps disagree on the number of columns")
     1 <= stride <= L - burn ||
@@ -718,6 +750,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     plateau = _PLATEAU_FRESH
     since_best = 0
     stopped_early = false
+    stop_reason = :cap              # :floor (min_lr + stop_patience), :window, or :cap
+    bsf = Float64[]                 # best-so-far validation loss, one entry per validation
     cur_lr = T(lr)
     upd = 0
     tot, nb = 0.0, 0
@@ -781,9 +815,18 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
             # final epoch and ended two decades above `min_lr` -- their numbers were where the
             # budget stopped, not where the fit went, and they were not comparable with the two
             # that had converged.
+            push!(bsf, best.val)
             if cur_lr <= min_lr && since_best >= stop_patience
                 stopped_early = true
-                verbose && @info "M4 early stop" update = upd best_update = best.update best_val = best.val
+                stop_reason = :floor
+            # 🔴 **Or: the best improved by < `stop_rel` over the last `stop_window` updates**, at
+            # any rate -- see `_window_stalled`. Not gated on `min_lr`, by design (Rik, 2026-09-23).
+            elseif _window_stalled(history.update, bsf, stop_window, stop_rel)
+                stopped_early = true
+                stop_reason = :window
+            end
+            if stopped_early
+                verbose && @info "M4 early stop" reason = stop_reason update = upd best_update = best.update best_val = best.val lr = cur_lr
                 break
             end
 
@@ -809,7 +852,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # and using one where the other belongs is how a curve gets annotated in the wrong place.
     return _to_host(best.ps),
            (; history..., best_update = best.update, best_index = best.index,
-            best_val = best.val, stopped_early, updates = upd,
+            best_val = best.val, stopped_early, stop_reason, updates = upd,
             epochs_run = cld(upd, nbatch), nseg, batch_eff, upd_per_epoch = nbatch, val_every)
 end
 

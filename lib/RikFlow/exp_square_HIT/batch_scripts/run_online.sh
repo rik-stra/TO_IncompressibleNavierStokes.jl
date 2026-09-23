@@ -43,6 +43,7 @@ set -u
 
 CASE=${1:-}
 INDEX=${2:-1}
+REPLICA=${3:-}      # lstm only: one replica instead of all n_replicas
 
 case "$CASE" in
     lrs|ddn|smag|nomodel|lstm) ;;
@@ -114,7 +115,15 @@ case "$CASE" in
             echo "run_online.sh: no M4 config table; run 10_setup_lstm.jl first" >&2
             exit 1
         fi
-        echo "== running StochLSTM$INDEX online, 5 replicas x 100 TU"
-        julia --project "$EXP/12_online_StochLSTM.jl" "$INDEX"
+        # 🔑 `RIKFLOW_M4_MODEL_DIR=<dir>` deploys an exported stride-scan point
+        # (`tools/m4_export_point.jl`) instead of the table's own fit; the replicas are written
+        # into that directory. An optional third argument runs ONE replica -- enough for a
+        # stability probe:
+        #     RIKFLOW_M4_MODEL_DIR=... sbatch batch_scripts/run_online.sh lstm 2 1
+        # `RIKFLOW_ONLINE_TSIM=1` makes it a 1 TU smoke -- do that first.
+        echo "== tsim: ${RIKFLOW_ONLINE_TSIM:-<default 100>} TU"
+        echo "== model dir: ${RIKFLOW_M4_MODEL_DIR:-<table default>}"
+        echo "== running StochLSTM$INDEX online, replica(s) ${REPLICA:-all} x 100 TU"
+        julia --project "$EXP/12_online_StochLSTM.jl" "$INDEX" $REPLICA
         ;;
 esac

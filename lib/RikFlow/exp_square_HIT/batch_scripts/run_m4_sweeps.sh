@@ -53,6 +53,8 @@
 #                            paced by it -- the plateau rule and the early stop -- is then paced
 #                            in UPDATES, identically at every point, rather than by an epoch that
 #                            is 1 update at the tiling stride and 3 at stride 20.
+#     RIKFLOW_M4_STOP_WINDOW / RIKFLOW_M4_STOP_REL  stop once the best improved by < REL over
+#                            the last WINDOW updates (default 500 / 0.005; WINDOW=0 disables)
 #     RIKFLOW_M4_POINTS      stride scan only: comma-separated 1-based rows to run (default
 #                            all five). A subset writes its OWN file, never the canonical one:
 #     RIKFLOW_M4_POINTS=2,5 RIKFLOW_M4_EPOCHS=10000 sbatch batch_scripts/run_m4_sweeps.sh stride
@@ -115,7 +117,7 @@ echo "== M4_DEVICE=$M4_DEVICE"
 # 🔴 One echo, one line. The earlier `"..."\n     "..."` form put a literal `n` into the log
 # (`<default 3000>n`): outside quotes `\n` is an escaped 'n', not a newline and not a line
 # continuation. Same class as the `\r` that once broke the reproduce block in results_LSTMS.md.
-echo "== budget: RIKFLOW_M4_EPOCHS=${RIKFLOW_M4_EPOCHS:-<default 3000>} RIKFLOW_M4_STOP_PATIENCE=${RIKFLOW_M4_STOP_PATIENCE:-<default 100>} RIKFLOW_M4_VAL_EVERY=${RIKFLOW_M4_VAL_EVERY:-<default 2>} RIKFLOW_M4_LR_EPOCHS=${RIKFLOW_M4_LR_EPOCHS:-<default 1500>} M4_DEVICE_RNG=${M4_DEVICE_RNG:-0} RIKFLOW_M4_POINTS=${RIKFLOW_M4_POINTS:-<all>}"
+echo "== budget: RIKFLOW_M4_EPOCHS=${RIKFLOW_M4_EPOCHS:-<default 3000>} RIKFLOW_M4_STOP_PATIENCE=${RIKFLOW_M4_STOP_PATIENCE:-<default 100>} RIKFLOW_M4_VAL_EVERY=${RIKFLOW_M4_VAL_EVERY:-<default 2>} RIKFLOW_M4_LR_EPOCHS=${RIKFLOW_M4_LR_EPOCHS:-<default 1500>} M4_DEVICE_RNG=${M4_DEVICE_RNG:-0} RIKFLOW_M4_POINTS=${RIKFLOW_M4_POINTS:-<all>} RIKFLOW_M4_STOP_WINDOW=${RIKFLOW_M4_STOP_WINDOW:-<default 500>} RIKFLOW_M4_STOP_REL=${RIKFLOW_M4_STOP_REL:-<default 0.005>}"
 
 # Find the drivers from whichever directory the job started in, and say so if it is neither.
 if [ -f 3_track_ref.jl ]; then

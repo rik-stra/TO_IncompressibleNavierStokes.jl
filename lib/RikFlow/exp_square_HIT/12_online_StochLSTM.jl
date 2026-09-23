@@ -39,7 +39,10 @@ track_file = get(ENV, "RIKFLOW_TRACK_FILE",
 T = Float64
 Re = T(2_000)
 Δt = T(2.5e-3)
-tsim = T(100)
+# 🔑 `RIKFLOW_ONLINE_TSIM` shortens the run for a smoke (e.g. 1 TU) -- the first time a model goes
+# into the solver, a short run catches a bad path or an immediate blow-up before 100 TU does. The
+# output name carries `tsim`, so a smoke never overwrites a full run.
+tsim = T(parse(Float64, get(ENV, "RIKFLOW_ONLINE_TSIM", "100")))
 
 ArrayType = CuArray
 backend = CUDABackend()
@@ -50,7 +53,15 @@ inputs = load(TO_folder * "/inputs_lstm.jld2", "inputs")
 1 <= model_index <= length(inputs) ||
     error("model_index $model_index is out of range 1:$(length(inputs))")
 cfg = inputs[model_index]
-out_dir = TO_folder * "/$(cfg.name)/"
+# 🔑 `RIKFLOW_M4_MODEL_DIR` deploys a fit from somewhere other than the table's own directory --
+# in practice one stride-scan point exported by `tools/m4_export_point.jl`, which cannot be written
+# into `<cfg.name>/` without overwriting the fit that lives there. The online replicas are written
+# beside the model, so the two directories never mix. `model_index` still supplies `n_replicas`,
+# and the fit must be of that cell (checked below).
+model_dir_env = strip(get(ENV, "RIKFLOW_M4_MODEL_DIR", ""))
+out_dir = isempty(model_dir_env) ? TO_folder * "/$(cfg.name)/" : rstrip(model_dir_env, '/') * "/"
+isempty(model_dir_env) || isdir(out_dir) ||
+    error("RIKFLOW_M4_MODEL_DIR = $out_dir is not a directory")
 
 if replica_arg !== nothing
     1 <= replica_arg <= cfg.n_replicas ||
@@ -67,6 +78,14 @@ isfile(model_file) || error("no fitted model at $model_file -- run 11_train_Stoc
 @info "Deploying $(cfg.name)" arch=cfg.arch deploy_seed replicas=collect(replicas)
 
 fit = RF.load_stochlstm(model_file)
+# 🔴 An exported fit must belong to the cell the index names: `n_replicas` and the seeds come from
+# `cfg`, and deploying cell 2's weights under cell 5's row would label the replicas wrongly.
+fit_cell = hasproperty(fit.extras, :cfg) ? fit.extras.cfg.name : cfg.name
+fit_cell == cfg.name || error("the model in $out_dir was fitted for $fit_cell, but model_index " *
+                              "$model_index is $(cfg.name) -- pass the matching index")
+isempty(model_dir_env) || @info "deploying an exported fit" out_dir source_scan =
+    get(fit.extras, :source_scan, "?") stride = get(fit.extras, :stride, "?") batch =
+    get(fit.extras, :batch, "?")
 
 # --- the reference run this one inherits from --------------------------------------------------
 params_track = load(track_file, "params_track")
@@ -113,5 +132,5 @@ for i in replicas
     @info "Running sim $i out of $(cfg.n_replicas)"
     data_online = online_sgs(; params..., ustart = ustart, time_series_method = sampler)
     jldsave(out_dir * "data_online_tsim$(tsim)_replica$(i).jld2";
-            data_online, params, model_index, deploy_seed, nwarm)
+            data_online, params, model_index, deploy_seed, nwarm, model_file)
 end
