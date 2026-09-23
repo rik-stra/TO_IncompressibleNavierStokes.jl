@@ -4,18 +4,19 @@
 #           lib/RikFlow/exp_square_HIT/tools/m4_stride_scan.jl [cell] [seed]
 #
 # Environment: `RIKFLOW_QOI_CACHE` (as the training driver), `RIKFLOW_M4_EPOCHS` (the epoch CAP
-# per point, default 3000) and `RIKFLOW_M4_STOP_PATIENCE` (epochs past the best before stopping,
-# default 100).
+# per point, default 3000), `RIKFLOW_M4_STOP_PATIENCE` (VALIDATIONS past the best before stopping,
+# default 100) and `RIKFLOW_M4_VAL_EVERY` (updates between validations, default 2).
 #
 # ---------------------------------------------------------------------------------------------
 # The question, and why it needs a matched budget
 # ---------------------------------------------------------------------------------------------
 #
-# At the default `stride = L - burn` the scored windows exactly TILE the record: every row is
-# scored once per epoch, and at `L = 500` the 2879-row training block leaves **7 segments** --
-# far fewer than `batch`, so the batch is unreachable and an epoch is **2 updates** (the 7 fall
-# into two LENGTH groups, 6 x 500 and 1 x 479, and each group is batched separately). Shortening
-# the stride overlaps the segments and makes more of them: 25, 49, ~140 at stride 100, 50, 20.
+# At the default `stride = L - burn` the scored windows exactly TILE the record, and at `L = 500`
+# the 2879-row training block leaves **6 full-length segments** -- far fewer than `batch`, so the
+# batch is capped at 6 and an epoch is **1 full-batch update**. Training tiles from the END of the
+# block and drops the one short segment left at its start (`train_stochlstm`). Shortening the
+# stride overlaps the segments and makes more of them: 24, 48, 119 at stride 100, 50, 20, at
+# 1, 1, 3 updates per epoch; the fit prints the geometry it actually used.
 #
 # 🔴 **This is augmentation, not data.** The same rows are re-scored at different offsets inside a
 # segment, so the extra gradients are correlated and `k x` the segments is not `k x` the
@@ -122,9 +123,8 @@ POINTS = [(cfg.L - cfg.burn, cfg.batch),     # 400: the current default, the bas
 
 # 🔴 Device placement. `M4_DEVICE=cpu` (the default) or `cuda`. `m4_device` refuses `cuda` when no
 # device is functional rather than falling back to the host, because a silent fallback would report
-# a GPU run that took CPU time. ⚠️ **The GPU path has never been run on a GPU** -- it is verified
-# only against `JLArrays`, which enforces the same no-scalar-indexing semantics on the host (V54).
-# And expect it to be SLOWER at the current geometry: `results_LSTMS.md` §5.
+# a GPU run that took CPU time. 🔒 **Train on the CPU**: the GPU path works (smoke PASS on
+# `gpu_h100`, 2026-09-18) and is ~7x SLOWER than the same node's CPU (`results_LSTMS.md` §5).
 const DEVICE = RF.m4_device(get(ENV, "M4_DEVICE", "cpu"))
 @info "device" M4_DEVICE=get(ENV, "M4_DEVICE", "cpu")
 

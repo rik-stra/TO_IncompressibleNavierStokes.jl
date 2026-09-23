@@ -11,14 +11,12 @@
 # which suggested `-t 04:00:00` THERE. That machine has run ~4x slower than this node before, but
 # a cross-machine ratio is not a measurement -- that mistake already inverted the GPU verdict once
 # (`claude_memory.md`). So: 2 h here as a bounded guess, and the node's own smoke settles it.
-# ⚠️ `M4_DEVICE=cuda` was 5.7x slower under the old policy -- raise to `-t 08:00:00` if used.
+# ⚠️ `M4_DEVICE=cuda` was ~7x slower than this node's CPU -- raise to `-t 08:00:00` if used.
 # ⚠️ The `smoke` mode itself takes ~3 minutes; this is the cap for the scans.
 #SBATCH -t 02:00:00
-# 🔒 Stays on gpu_h100 (Rik, 2026-09-18). Only the DEVICE moved to the CPU, not the partition --
-# and that is the better-evidenced choice: the 18 min came from this node's CPU, so running here
-# with `M4_DEVICE=cpu` is the configuration that was actually measured. A CPU partition (`rome`,
-# `genoa`, both covered by the shared depot) would free the GPU but is unmeasured; smoke it there
-# first if the allocation matters.
+# 🔒 Stays on gpu_h100: the allocation has access to GPU nodes only (Rik, 2026-09-23), so a CPU
+# partition is not an option. Only the DEVICE is the CPU (`M4_DEVICE=cpu`), and that is also the
+# configuration that was measured -- every CPU timing in `results_LSTMS.md` §5 is this node's.
 # ⚠️ The GPU is requested and, at `M4_DEVICE=cpu`, sits idle. That is a known cost, accepted.
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
@@ -57,43 +55,22 @@
 #                            is 1 update at the tiling stride and 3 at stride 20.
 #
 # ---------------------------------------------------------------------------------------------
-# 🔒 IT TRAINS ON THE CPU (`M4_DEVICE=cpu`), because the GPU was measured 5.7x SLOWER
+# 🔒 IT TRAINS ON THE CPU (`M4_DEVICE=cpu`), because the GPU was measured ~7x SLOWER
 # ---------------------------------------------------------------------------------------------
 #
 # `M4_DEVICE` decides where the fit runs and **defaults to `cpu`**. Override per submission:
 #
-#     M4_DEVICE=cuda sbatch -t 03:00:00 batch_scripts/run_m4_sweeps.sh stride    # 5.7x slower
+#     M4_DEVICE=cuda sbatch -t 08:00:00 batch_scripts/run_m4_sweeps.sh stride    # ~7x slower
 #
-# 🔴 **THE GPU PATH HAS NEVER RUN ON A GPU.** It is verified only against `JLArrays`, which
-# enforces the same no-scalar-indexing semantics on the host (V54), and all four architectures
-# agree with the CPU fit to 6.6e-8-2.1e-7 there. What that does NOT establish is that CUDA.jl
-# compiles these kernels -- and this repository has been bitten twice by exactly the class of
-# defect a CPU test cannot see (`claude_memory.md` #56 defeated constant propagation, #57
-# non-isbits kernel arguments), both found only on the cluster.
-# 🔑 **So make the FIRST submission a test, not a measurement:**
+# ✅ **The GPU path WORKS** -- `M4 SMOKE PASS on device=cuda` on `gpu_h100`, 2026-09-18, every
+# stage including the save/load round-trip -- and it LOSES: 96 min against 14 min for the whole
+# old stride scan on the same node, after both cheap optimisations (fused gate activations, zero
+# per-update transfers). The loop is bound by the length of its dependent kernel-launch chain,
+# set by `L = 500` sequential timesteps, and no differentiable fused RNN exists in Julia
+# (`results_LSTMS.md` §5). Do not spend more on the GPU for M4.
 #
-#     RIKFLOW_M4_EPOCHS=5 sbatch batch_scripts/run_m4_sweeps.sh stride
-#
-# It runs every point at a trivial budget in about a minute and exercises the whole path including
-# the write. `m4_device` refuses `cuda` when no device is functional rather than falling back to
-# the host, so a mis-scheduled job fails at load instead of quietly reporting CPU time as GPU time.
-#
-# ⚠️ **Expect it to be SLOWER at the current geometry, and that is a measurement rather than a
-# guess about the hardware.** One gradient step is ~75 MFLOP at ~0.34 GFLOP/s -- about 1% of one
-# CPU core -- over a recurrence whose 500 timesteps are strictly SEQUENTIAL, i.e. ~1000+ dependent
-# kernel launches per step on matrices of 64 x 23. Launch latency alone is then several ms per
-# step, against ~200 ms currently spent almost entirely in Zygote's HOST-side tracing, which a
-# device does not remove. **The configuration where it could pay is exactly what §6.2 sweeps:** a
-# short `stride` with `batch = 32` makes each launch 32 segments wide instead of 7.
-#
-# ✅ A CPU partition also works if the GPU turns out not to pay: `m4_lr_scan.jl` -- `using RikFlow`
-# plus the Lux extension -- ran six fits to completion on a machine with no GPU at all
-# (2026-09-18), so CUDA.jl loading without a device is not the failure mode `run_train_lrs.sh`
-# feared. `--partition=rome` or `genoa` are covered by the depot's `JULIA_CPU_TARGET` and need no
-# new depot; pair either with `M4_DEVICE=cpu`.
-#
-# ⚠️ `OPENBLAS_NUM_THREADS=1` is set below. It still matters on the GPU path: the batches are
-# assembled on the host, and on `64 x 23` matrices a full BLAS pool contends rather than helps.
+# ⚠️ `OPENBLAS_NUM_THREADS=1` is set below: on `64 x 23` matrices a full BLAS pool contends rather
+# than helps.
 #
 # 🔴 Run `10_setup_lstm.jl` first if the configuration table has changed. It needs no GPU:
 #     julia --project exp_square_HIT/10_setup_lstm.jl
@@ -124,7 +101,7 @@ export OPENBLAS_NUM_THREADS=1
 # Train on the CPU unless the submitting shell says otherwise. SLURM's default `--export=ALL`
 # carries `M4_DEVICE=cuda sbatch ...` through, so this is a default and not an override.
 # 🔑 `M4_DEVICE=cuda` works here as-is -- the partition still provides the GPU; it is only the
-# default that changed. Give it `-t 03:00:00`, because it is 5.7x slower.
+# default that changed. Give it `-t 08:00:00`, because it is ~7x slower.
 export M4_DEVICE=${M4_DEVICE:-cpu}
 echo "== M4_DEVICE=$M4_DEVICE"
 # 🔑 Echo the budgets that actually arrived. Whether an env var survives submission is the

@@ -43,6 +43,47 @@
     # and the arguments are policed
     @test_throws ErrorException TSLayer.segment_indices(collect(1:20); L = 5, burn = 5)
     @test_throws ErrorException TSLayer.segment_indices(collect(1:20); L = 10, burn = 2, stride = 0)
+    @test_throws ErrorException TSLayer.segment_indices(collect(1:20); L = 10, burn = 2,
+                                                        anchor = :middle)
+
+    # 🔴 `anchor = :end` -- what training uses. The last segment is flush with the block's end, the
+    # short remainder moves to the START, and the tiling property is unchanged.
+    # 2879 rows at L = 500, burn = 100 is the HIT training block: under `:start` the full segments
+    # stop at row 2500 at the tiling stride; under `:end` they reach 2879 at every stride.
+    for (n, L, burn, stride) in ((100, 20, 5, 15), (2879, 500, 100, 400), (2879, 500, 100, 20))
+        se = TSLayer.segment_indices(collect(1:n); L, burn, stride, anchor = :end)
+        ss = TSLayer.segment_indices(collect(1:n); L, burn, stride)
+        @test last(se[end].rows) == n                      # flush with the end
+        @test first(se[1].rows) == 1                       # the stub reaches the start
+        @test all(length(s.rows) == L for s in se[2:end])  # only the FIRST may be short
+        @test issorted([first(s.rows) for s in se])        # increasing time, like `:start`
+        for s in se
+            @test first(s.score) == first(s.rows) + burn && last(s.score) == last(s.rows)
+        end
+        # same number of full segments either way; only WHICH rows they cover moves
+        @test count(s -> length(s.rows) == L, se) == count(s -> length(s.rows) == L, ss)
+        if stride == L - burn
+            sc = reduce(vcat, [collect(s.score) for s in se])
+            @test sc == collect((burn + 1):n)              # still an exact tiling
+        end
+    end
+    let full = filter(s -> length(s.rows) == 500,
+                      TSLayer.segment_indices(collect(1:2879); L = 500, burn = 100, anchor = :end))
+        @test length(full) == 6
+        @test first(full[1].score) == 480                  # rows 101:479 are the ones dropped
+    end
+
+    # a block no longer than L is one segment under either anchor
+    @test TSLayer.segment_indices(collect(1:15); L = 20, burn = 5, anchor = :end) ==
+          TSLayer.segment_indices(collect(1:15); L = 20, burn = 5)
+
+    # and the end anchor respects blocks too: each block ends flush
+    steps2 = vcat(1:30, 101:130)
+    se2 = TSLayer.segment_indices(steps2; L = 12, burn = 3, stride = 9, anchor = :end)
+    for s in se2
+        @test all(diff(steps2[collect(s.rows)]) .== 1)
+    end
+    @test any(s -> last(s.rows) == 30, se2) && last(se2[end].rows) == 60
 end
 
 # ---------------------------------------------------------------------------------------------

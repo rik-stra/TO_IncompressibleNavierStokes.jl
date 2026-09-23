@@ -496,7 +496,7 @@ end
 # ---------------------------------------------------------------------------------------------
 
 """
-    segment_indices(steps; L, burn, stride = L - burn)
+    segment_indices(steps; L, burn, stride = L - burn, anchor = :start)
 
 Cut a run of regressor rows into contiguous BPTT segments.
 
@@ -512,14 +512,27 @@ slices. What this function adds is the two things that are easy to get silently 
   the model can only fit by learning to predict well from no history -- exactly the behaviour the
   recurrence exists to avoid.
 
+- **Anchor.** `anchor = :start` (the default) lays the first segment at the start of each block
+  and walks forward, so any short remainder is the block's LAST segment. `anchor = :end` lays the
+  last segment flush with the block's end and walks backward, so the short remainder is the FIRST
+  segment. 🔑 **Training uses `:end`**: a fit keeps only full-length segments, and under `:start`
+  the dropped remainder is the most recent stretch of the training block -- the rows right before
+  validation -- and its size depends on the stride (13.6% of the scored rows at the tiling stride,
+  0.7% at `stride = 20`, on the 2879-row HIT block). Under `:end` the full segments always reach
+  the last training row, and what is dropped is the oldest stretch. ⚠️ The COUNT dropped is the
+  same under both anchors; only which rows it is changes. Validation keeps `:start`, and keeps its
+  short segment, because an evaluation must not drop data.
+
 Returns a vector of `(; rows, score)` where `rows` is the full segment (what the forward pass
-consumes) and `score` is the sub-range that the loss is summed over. Segments with no scored rows
-are dropped.
+consumes) and `score` is the sub-range that the loss is summed over, in increasing time order
+under either anchor. Segments with no scored rows are dropped.
 """
 function segment_indices(steps::AbstractVector{<:Integer}; L::Int, burn::Int,
-                         stride::Int = L - burn)
+                         stride::Int = L - burn, anchor::Symbol = :start)
     L > burn >= 0 || error("segment_indices: need L > burn >= 0; got L = $L, burn = $burn")
     stride >= 1 || error("segment_indices: stride must be >= 1; got $stride")
+    anchor in (:start, :end) ||
+        error("segment_indices: anchor must be :start or :end; got $(repr(anchor))")
     n = length(steps)
     segs = NamedTuple{(:rows, :score),Tuple{UnitRange{Int},UnitRange{Int}}}[]
     n == 0 && return segs
@@ -530,7 +543,19 @@ function segment_indices(steps::AbstractVector{<:Integer}; L::Int, burn::Int,
         isend = i == n || steps[i + 1] != steps[i] + 1
         isend || continue
         blk = bstart:i
-        if length(blk) > burn
+        if length(blk) > burn && anchor === :end
+            # Mirror of the forward walk below: the last segment ends at the block's last row and
+            # each earlier one ends `stride` before it; a leading stub keeps what is left.
+            nseg0 = length(segs)
+            e = last(blk)
+            while e - first(blk) + 1 > burn
+                s = max(e - L + 1, first(blk))
+                push!(segs, (; rows = s:e, score = (s + burn):e))
+                s == first(blk) && break
+                e -= stride
+            end
+            reverse!(view(segs, (nseg0 + 1):length(segs)))
+        elseif length(blk) > burn
             s = first(blk)
             while s <= last(blk) - burn
                 e = min(s + L - 1, last(blk))

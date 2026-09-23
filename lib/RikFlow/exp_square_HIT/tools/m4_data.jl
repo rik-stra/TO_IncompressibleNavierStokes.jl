@@ -97,9 +97,10 @@ Training segments, optimiser steps per epoch, and scored rows per epoch for one 
 🔑 **Shared so the scan and the walltime estimate cannot disagree.** `updates/epoch` is neither
 `ceil(nseg/batch)` nor `cld` over length groups, and both have been wrong here before:
 
-  - `segment_indices` leaves ONE short segment at the end of the block. `train_stochlstm` drops it,
-    because a segment of a different length cannot share a recurrence and so would be batched
-    alone -- one whole update spent on one segment.
+  - training tiles from the END (`anchor = :end`), leaving ONE short segment at the START of the
+    block. `train_stochlstm` drops it, because a segment of a different length cannot share a
+    recurrence and so would be batched alone -- one whole update spent on one segment. 🔴 The
+    anchor here MUST match `train_stochlstm`'s, or this predicts a geometry the fit does not use.
   - the final PARTIAL batch is dropped too, so every update covers exactly `batch_eff` segments.
   - `batch_eff = min(batch, nseg)`, because at the tiling stride there are 6 segments and a batch
     of 32 can never be filled; without the cap that point would take no updates at all.
@@ -107,7 +108,7 @@ Training segments, optimiser steps per epoch, and scored rows per epoch for one 
 ⚠️ `scored` counts the KEPT segments only -- the dropped tail's rows are scored by nothing.
 """
 function m4_geometry(steps, ntrain; L, burn, stride, batch)
-    segs = RikFlow.segment_indices(view(steps, 1:ntrain); L, burn, stride)
+    segs = RikFlow.segment_indices(view(steps, 1:ntrain); L, burn, stride, anchor = :end)
     full = [sg for sg in segs if length(sg.rows) == L]
     nseg = length(full)
     batch_eff = min(batch, max(nseg, 1))

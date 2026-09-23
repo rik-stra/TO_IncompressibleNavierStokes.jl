@@ -30,9 +30,13 @@
 # segmentation rather than on the model.
 #
 # 🔑 **Scored rows 2980:3599 are disjoint from BOTH training blocks.** The pre-split fits trained
-# on scored rows 101:2900 and the post-split ones on 101:2879, so this set leaks into neither and
-# is a fair held-out set for every model in the table. That is the property that makes one common
-# set possible at all, and it is checked below rather than asserted here.
+# on scored rows 101:2900 and the post-split ones on 101:2879, so this set leaks into neither
+# TRAINING block. That is the property that makes one common set possible at all, and it is
+# checked below rather than asserted here.
+# ⚠️ **It is not independent of SELECTION.** For the post-split fits these rows are their own
+# early-stopping set, and the pre-split fits' (2901:3599) contains them, so every number here is
+# mildly optimistic. It ranks models on equal footing; it is not a test score. The test is the
+# held-out window in `m4_traj_heldout.jl`.
 #
 # ⚠️ **The reported number is the RECONSTRUCTION term, `beta = 0`.** The models differ in `beta`,
 # and the KL is weighted by it, so a full ELBO would compare fits partly on how hard each one was

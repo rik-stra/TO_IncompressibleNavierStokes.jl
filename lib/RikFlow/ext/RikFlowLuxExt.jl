@@ -456,7 +456,8 @@ Fit an M4 model to a regressor/target pair.
   shorter stride overlaps them, which is **augmentation, not data**: the same rows are re-scored at
   different offsets within a segment. 🔑 It buys two real things -- more optimiser steps per epoch
   (at `L = 500` the default leaves 6 full-length training segments, i.e. one full-batch update per
-  epoch, a seventh short one being dropped) and
+  epoch, a seventh short one -- the OLDEST rows, since training tiles from the end -- being
+  dropped) and
   variation in how long the hidden state has been charged when a given row is scored. ⚠️ The
   gradients from overlapping segments are correlated, so `k x` the segments is not `k x` the
   information; compare runs on optimiser steps, not epochs.
@@ -472,12 +473,12 @@ Fit an M4 model to a regressor/target pair.
   training at every stride -- 1 update at the tiling stride, 3 at `stride = 20` -- so the plateau
   rule and the early stop were paced differently at every point, which is exactly the confound
   the matched-update budget was supposed to remove. On a fixed update cadence they are not.
-  Default 2, at which `patience = 20` is 40 updates, matching the pre-2026-09-18 baseline.
+  Default 2, at which `patience = 20` is 40 updates.
 - `patience`, `lr_decay`, `min_lr`: decay the learning rate by `lr_decay` after `patience`
   VALIDATIONS without an improvement, down to `min_lr`.
 - `stop_patience`: 🔴 **early stopping, and only once the schedule has bottomed out.** The fit
-  ends when the learning rate is at `min_lr` *and* `stop_patience` epochs have passed with no new
-  best. Both halves are needed: a fit still above `min_lr` has a decay left that may restart the
+  ends when the learning rate is at `min_lr` *and* `stop_patience` VALIDATIONS (i.e.
+  `stop_patience * val_every` updates) have passed with no new best. Both halves are needed: a fit still above `min_lr` has a decay left that may restart the
   descent, and one still improving has not converged. 🔑 This is what lets points run to
   CONVERGENCE on their own schedules rather than to a shared budget -- the only comparison that is
   not confounded by whichever budget axis was matched. `history.stopped_early` records whether it
@@ -500,7 +501,7 @@ plotted against updates rather than against an epoch that means something differ
   then moved, so a device fit and a host fit at the same seed are the same fit to round-off. A
   device RNG would be faster and would void V49's reproducibility property and every number
   already recorded. The returned parameters are always on the host.
-  ⚠️ **Never run on a GPU as of 2026-09-18** — see `results_LSTMS.md` §5.
+  ⚠️ **Works on a GPU and is ~7x slower than the same node's CPU** (2026-09-18) — see `results_LSTMS.md` §5.
 - `val_frac`: the trailing fraction of ROWS held out for the reported validation loss -- rows, not
   segments, which is what keeps the scored windows disjoint at any stride (V53).
   ⚠️ This is an *inner* split for early stopping and diagnostics only. Model **selection** is on a
@@ -546,20 +547,28 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # that at any stride.
     # 🔑 The embargo comes free: the validation block's first `burn` rows charge the hidden state
     # and are not scored, so the first scored validation row sits `burn` steps after the last
-    # training row -- at `burn = 100` that is about one 1/e time of the level's ACF.
+    # training row -- at `burn = 100` that is about one 1/e time of the level's ACF. With training
+    # tiled from the end (below) that last training row is scored at every stride, so the gap is
+    # exactly `burn`, not `burn` plus whatever the tiling left over.
     ncol = length(steps)
     ntrain = floor(Int, (1 - val_frac) * ncol)
     0 < ntrain < ncol || error("train_stochlstm: val_frac = $val_frac leaves no split of a " *
                                "$(ncol)-column record")
 
     # 🔴 **Training keeps only FULL-LENGTH segments, and that is what makes a minibatch a
-    # random sample of one population.** `segment_indices` leaves one short segment at the end of
-    # the block, and segments of different lengths cannot share a recurrence, so it used to be
-    # batched alone: at the tiling stride that is ONE of the two updates per epoch spent on 13.6%
-    # of the scored rows, measured on the 2026-09-18 stride scan. Dropping it costs those rows
-    # once and buys a single length group, so every batch has the same shape and every update the
-    # same weight.
-    train_all = RF.segment_indices(view(steps, 1:ntrain); L, burn, stride)
+    # random sample of one population.** Segments of different lengths cannot share a recurrence,
+    # so the one short segment used to be batched alone: at the tiling stride that is ONE of the
+    # two updates per epoch spent on 13.6% of the scored rows, measured on the 2026-09-18 stride
+    # scan. Dropping it buys a single length group, so every batch has the same shape and every
+    # update the same weight.
+    # 🔴 **Tiled from the END (`anchor = :end`), so the dropped short segment is the OLDEST
+    # stretch, not the newest.** Tiled from the start, the full segments stop short of the block's
+    # end by a stride-dependent amount -- 379 scored rows at the tiling stride, 19 at `stride =
+    # 20`, on the 2879-row HIT block -- and those are exactly the rows adjacent to validation, so
+    # the stride scan would have compared points trained on different recent data. Anchored at
+    # the end, every stride's last scored training row is `ntrain`. ⚠️ The NUMBER of rows lost
+    # still depends on the stride (same 379 vs 19); only where they sit has changed.
+    train_all = RF.segment_indices(view(steps, 1:ntrain); L, burn, stride, anchor = :end)
     train_segs = [sg for sg in train_all if length(sg.rows) == L]
     # ⚠️ Validation is NEVER strided. Overlapping validation segments would re-weight some rows
     # more than others for no gain; augmentation is a training-set device.
@@ -672,9 +681,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # scan uncomparable, and validating once per epoch would have kept it so even with the
     # batching fixed: the plateau rule and the early stop would still have counted epochs.
     # 🔑 `val_every` is in UPDATES, so `patience` and `stop_patience` are too, identically for
-    # every point. At the default `val_every = 2`, `patience = 20` is 40 updates -- what the
-    # pre-2026-09-18 tiling-stride baseline actually ran with, so the new fits stay comparable
-    # with the numbers already recorded.
+    # every point. At the default `val_every = 2`, `patience = 20` is 40 updates.
     history = (; update = Int[], train = Float64[], val = Float64[], lr = Float64[])
     best = (; val = Inf, ps = deepcopy(ps), update = 0, index = 0)
     since_improved = 0

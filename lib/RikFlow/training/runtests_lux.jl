@@ -519,7 +519,7 @@ const RF = RikFlow
         # one segment -- and so is the final partial batch, leaving every update exactly
         # `batch_eff` segments wide. `m4_geometry` is the same arithmetic, shared.
         segs = RF.segment_indices(view(steps, 1:floor(Int, 0.8 * length(steps)));
-                                  L = 120, burn = 30, stride = 90)
+                                  L = 120, burn = 30, stride = 90, anchor = :end)
         nfull = count(sg -> length(sg.rows) == 120, segs)
         n_upd = fld(nfull, min(4, nfull))
 
@@ -559,7 +559,9 @@ const RF = RikFlow
         steps = collect(1:ncol)
 
         for stride in (L - burn, 75, 50, 25, 1)
-            tr = RF.segment_indices(view(steps, 1:ntrain); L, burn, stride)
+            # training's geometry exactly: tiled from the end, short stub dropped
+            tr = filter(s -> length(s.rows) == L,
+                        RF.segment_indices(view(steps, 1:ntrain); L, burn, stride, anchor = :end))
             va = [(; rows = s.rows .+ ntrain, score = s.score .+ ntrain)
                   for s in RF.segment_indices(view(steps, (ntrain + 1):ncol); L, burn)]
             @test !isempty(tr) && !isempty(va)
@@ -572,6 +574,9 @@ const RF = RikFlow
             @test minimum(minimum(s.rows) for s in va) > ntrain
             # the embargo: the first scored val row is `burn` steps past the last training row
             @test minimum(scored_va) == ntrain + burn + 1
+            # 🔴 and the last training row IS scored, at every stride: the dropped short segment
+            # is the oldest stretch, not the rows adjacent to validation
+            @test maximum(scored_tr) == ntrain
         end
 
         # a shorter stride really does make more segments, and they cover the same rows

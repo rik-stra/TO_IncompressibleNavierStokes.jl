@@ -831,8 +831,16 @@ validation loss and cost is reported in its own columns rather than forced equal
   point with no updates at all.
 - 🔴 **Validation, the plateau rule and the early stop are paced in UPDATES**, via
   `val_every = 2` (Rik). `patience = 20` is then 40 updates and `stop_patience = 100` is 200
-  updates, identically at every point. 40 updates is what the pre-2026-09-18 tiling-stride baseline
-  actually ran with, so the new fits stay on the old scale.
+  updates, identically at every point. ⚠️ This is **not** the pre-split cells' schedule: they
+  ran at 1 update per epoch and validated every update, so their `patience = 20` was 20 updates.
+  Nothing here is meant to reproduce them (§6.4).
+- 🔴 **Training segments are tiled from the END of the block** (`segment_indices(...; anchor =
+  :end)`, Rik, 2026-09-23). Tiled from the start, the full segments stopped short of the block's
+  end by a stride-dependent amount and the dropped short segment was the **newest** stretch — the
+  rows adjacent to validation: scored training ended at row 2500 at the tiling stride but at 2860
+  at `stride = 20`, so the points were trained on different recent data. Anchored at the end,
+  every stride's last scored training row is 2879 and the gap to the first scored validation row
+  is exactly `burn`. The rows dropped are now the **oldest** (101:479 at the tiling stride).
 - 🔴 **Early stopping fires only once the schedule has bottomed out** — at `min_lr` *and*
   `stop_patience` validations past the best. Both halves are needed: a fit still above `min_lr` has
   a decay left that may restart the descent, and one still improving has not converged.
@@ -854,8 +862,11 @@ The new geometry, printed by the fit rather than derived:
 | 20 | 32 | 119 | 32 | 3 | 23 |
 
 ⚠️ The `dropped/epoch` segments are a **different few each epoch** — the set is reshuffled — so
-they are dropped from an epoch, never from the fit. One short segment is dropped outright at every
-stride, costing 379 scored rows of 2779 at the tiling stride and 399 of 47999 at `stride = 20`.
+they are dropped from an epoch, never from the fit. One short segment — the first, since training
+tiles from the end — is dropped outright at every stride. ⚠️ **What it costs still depends on the
+stride**: 379 of the 2779 scorable rows (13.6%) are never scored at the tiling stride, against 79
+(2.8%) at `stride = 100`, 29 (1.0%) at 50 and 19 (0.7%) at 20. Tiling from the end moved those rows
+away from validation; it did not equalise how many there are.
 
 ⚠️ **One test was removed rather than repaired:** V49's decay-on-plateau check asserted that the
 schedule fires within 20 epochs. With one length group the descent is now monotone for ~50 epochs
@@ -932,9 +943,13 @@ removes that by scoring every saved model on one set.
 At `stride = L - burn` the scored windows exactly tile the block, so every row is scored once and
 none is weighted twice; a shorter stride would make the number a function of the segmentation
 rather than of the model. 🔑 **Those rows are disjoint from BOTH training blocks** — the pre-split
-fits trained on scored rows 101:2900 and the post-split ones on 101:2879 — so the set is genuinely
-held out for every model in the table. The driver checks both properties rather than asserting
-them.
+fits trained on scored rows 101:2900 and the post-split ones on 101:2879 — and the driver checks
+both properties rather than asserting them.
+⚠️ **Disjoint from training is not disjoint from selection.** For every post-split fit these rows
+*are* its early-stopping set — the best iterate was chosen on them — and the pre-split fits'
+early-stopping set (2901:3599) contains them. So this set ranks models on equal footing, but it is
+not a test score and is mildly optimistic for all of them. The held-out window below, steps
+4000–7600, is the test.
 
 ⚠️ **The comparable column is the reconstruction term at `beta = 0`.** The models differ in `beta`
 and the KL is weighted by it, so a full ELBO would rank fits partly on how hard each was penalised.
@@ -951,17 +966,21 @@ The ELBO at each model's own `beta` is printed beside it and is *not* comparable
 | stride 50, b32 | 1.350e-3 | 1.841e-3 | 1.820e-3 | 2.17 |
 | stride 400, b2 | 1.452e-3 | 2.005e-3 | 1.981e-3 | 2.33 |
 
-🔴 **The post-split re-fits are ~2x worse than the pre-split fit of the identical
-configuration, and it is not the yardstick.** `stride 400, b32` *is* `StochLSTM2`'s configuration
-refitted at the same 3000 updates, and on these rows it is 2.06x worse. The yardstick accounts for
+🔴 **The old scan's re-fits are ~2x worse than the pre-split fit of the same cell, and it is not
+the yardstick.** `stride 400, b32` is `StochLSTM2`'s cell refitted at 3000 updates under the flawed
+batching of §6.2, and on these rows it is 2.06x worse. The yardstick accounts for
 0.3% of that (above). 🔑 **Every stride point is also beaten by the deterministic `:lstm`
 control on held-out data**, which is not a thing that should happen to a `:storn` cell and is the
 clearest sign that the re-fits are damaged rather than the architecture being wrong.
 
-⚠️ **Which of §6.2's three defects causes it is NOT established.** The lone 479-row tail batch is
-the leading candidate — it is the one change that alters *what the gradient is* rather than how long
-the fit runs — but the re-run is what will say. Until then this is a measured regression with a
-suspected cause, and §6's table should not be quoted against any post-split number without it.
+⚠️ **Which of §6.2's defects caused it is not established, and the re-run is not designed to
+establish it** (Rik, 2026-09-23). The old scan had serious flaws and is superseded, not something to
+reproduce, and the rebuilt training differs from the pre-split fits in several ways at once
+(segmentation anchor, update-paced schedule, early stopping, 6 rather than 7 full segments). 🔑
+**What the re-run has to show is that it lands in the same ball park as the pre-split fits on this
+set — recon ~6e-4 — and preferably below them**; a like-for-like match is not the criterion. A
+re-run still ~2x worse would say the cause is outside the three defects fixed, and would need
+looking into before any M4 number is quoted.
 
 #### Held-out trajectories — `fig12`, `fig12b`
 
