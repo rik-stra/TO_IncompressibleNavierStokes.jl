@@ -455,19 +455,41 @@ Fit an M4 model to a regressor/target pair.
   makes the scored windows exactly tile the record, so every row is scored once per epoch. A
   shorter stride overlaps them, which is **augmentation, not data**: the same rows are re-scored at
   different offsets within a segment. 🔑 It buys two real things -- more optimiser steps per epoch
-  (at `L = 500` the default leaves 7 training segments, i.e. one full-batch update per epoch) and
+  (at `L = 500` the default leaves 6 full-length training segments, i.e. one full-batch update per
+  epoch, a seventh short one being dropped) and
   variation in how long the hidden state has been charged when a given row is scored. ⚠️ The
   gradients from overlapping segments are correlated, so `k x` the segments is not `k x` the
   information; compare runs on optimiser steps, not epochs.
-- `epochs`, `batch`, `lr`, `beta`, `seed`.
-- `patience`, `lr_decay`, `min_lr`: decay the learning rate by `lr_decay` after `patience` epochs
-  without a validation improvement, down to `min_lr`.
+- `epochs`, `batch`, `lr`, `beta`, `seed`. ⚠️ `epochs` is a CAP, not a budget: `stop_patience`
+  ends the fit once it has converged, so a point that converges early does not burn the rest.
+- `batch`: 🔴 **minibatches are a uniform random sample of the training segments and the final
+  partial batch is DROPPED**, so every update covers exactly the same number of segments and an
+  update count is comparable across strides. ⚠️ The effective size is `min(batch, nseg)`: at the
+  tiling stride there are 6 segments and a batch of 32 can never be filled, and dropping every
+  partial batch literally would leave that point with no updates at all.
+- `val_every`: 🔴 **optimiser updates between validations, and the unit everything else is
+  paced in.** Validation used to run once per epoch, and an epoch is a different amount of
+  training at every stride -- 1 update at the tiling stride, 3 at `stride = 20` -- so the plateau
+  rule and the early stop were paced differently at every point, which is exactly the confound
+  the matched-update budget was supposed to remove. On a fixed update cadence they are not.
+  Default 2, at which `patience = 20` is 40 updates, matching the pre-2026-09-18 baseline.
+- `patience`, `lr_decay`, `min_lr`: decay the learning rate by `lr_decay` after `patience`
+  VALIDATIONS without an improvement, down to `min_lr`.
+- `stop_patience`: 🔴 **early stopping, and only once the schedule has bottomed out.** The fit
+  ends when the learning rate is at `min_lr` *and* `stop_patience` epochs have passed with no new
+  best. Both halves are needed: a fit still above `min_lr` has a decay left that may restart the
+  descent, and one still improving has not converged. 🔑 This is what lets points run to
+  CONVERGENCE on their own schedules rather than to a shared budget -- the only comparison that is
+  not confounded by whichever budget axis was matched. `history.stopped_early` records whether it
+  fired.
 
 🔴 **Returns the best-validation iterate, not the last one**, and the validation epsilons are drawn
 once and held fixed so the curve is a function of the parameters alone. Both matter more than they
 look: on R1's record at a constant `lr`, the three latent architectures reached val ≈ −12 near
 epoch 91 and were at ≈ −4 by epoch 100, so a last-iterate fit **inverted the architecture ranking**.
-`history` carries `best_epoch` and `best_val` so a run that ends far from its best is visible.
+`history` carries `update` (the optimiser step each row was recorded at), `best_update`,
+`best_index` and `best_val`, so a run that ends far from its best is visible and the curve can be
+plotted against updates rather than against an epoch that means something different per point.
 - `device_rng`: draw the reparametrisation noise on the device instead of on the host. `false` by
   default. 🔴 **It removes the last host->device transfer per update and costs reproducibility**:
   a different stream, so no fit made with it is comparable to any made without it, and on the CPU
@@ -479,7 +501,8 @@ epoch 91 and were at ≈ −4 by epoch 100, so a last-iterate fit **inverted the
   device RNG would be faster and would void V49's reproducibility property and every number
   already recorded. The returned parameters are always on the host.
   ⚠️ **Never run on a GPU as of 2026-09-18** — see `results_LSTMS.md` §5.
-- `val_frac`: the trailing fraction of segments held out for the reported validation loss.
+- `val_frac`: the trailing fraction of ROWS held out for the reported validation loss -- rows, not
+  segments, which is what keeps the scored windows disjoint at any stride (V53).
   ⚠️ This is an *inner* split for early stopping and diagnostics only. Model **selection** is on a
   window disjoint from both training and the online evaluation window -- that is the protocol's
   job, not this function's, and this keyword is not it.
@@ -493,7 +516,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             val_frac::Real = 0.2, stride::Int = L - burn,
                             T::Type = Float32, verbose::Bool = true, device = identity,
                             device_rng::Bool = false,
-                            patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-5)
+                            patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-5,
+                            stop_patience::Int = 100, val_every::Int = 2)
     size(X, 2) == size(Y, 2) == length(steps) ||
         error("train_stochlstm: X, Y and steps disagree on the number of columns")
     1 <= stride <= L - burn ||
@@ -528,14 +552,23 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     0 < ntrain < ncol || error("train_stochlstm: val_frac = $val_frac leaves no split of a " *
                                "$(ncol)-column record")
 
-    train_segs = RF.segment_indices(view(steps, 1:ntrain); L, burn, stride)
+    # 🔴 **Training keeps only FULL-LENGTH segments, and that is what makes a minibatch a
+    # random sample of one population.** `segment_indices` leaves one short segment at the end of
+    # the block, and segments of different lengths cannot share a recurrence, so it used to be
+    # batched alone: at the tiling stride that is ONE of the two updates per epoch spent on 13.6%
+    # of the scored rows, measured on the 2026-09-18 stride scan. Dropping it costs those rows
+    # once and buys a single length group, so every batch has the same shape and every update the
+    # same weight.
+    train_all = RF.segment_indices(view(steps, 1:ntrain); L, burn, stride)
+    train_segs = [sg for sg in train_all if length(sg.rows) == L]
     # ⚠️ Validation is NEVER strided. Overlapping validation segments would re-weight some rows
     # more than others for no gain; augmentation is a training-set device.
     val_raw = RF.segment_indices(view(steps, (ntrain + 1):ncol); L, burn)
     val_segs = [(; rows = s.rows .+ ntrain, score = s.score .+ ntrain) for s in val_raw]
 
-    isempty(train_segs) && error("train_stochlstm: no training segment survived L = $L, " *
-                                 "burn = $burn, stride = $stride on $(ntrain) columns")
+    isempty(train_segs) && error("train_stochlstm: no FULL-LENGTH training segment survived " *
+                                 "L = $L, burn = $burn, stride = $stride on $(ntrain) columns " *
+                                 "($(length(train_all)) shorter ones were dropped)")
     isempty(val_segs) && error("train_stochlstm: no validation segment survived L = $L, " *
                                "burn = $burn on $(ncol - ntrain) columns. Lower `L` or raise " *
                                "`val_frac`.")
@@ -604,7 +637,13 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
         (L, B) -> device(randn(rng, T, spec.n_latent, L, B))
     end
 
-    train_groups = group_by_length(train_segs)
+    # 🔑 The training side is now ONE length group by construction, so its geometry is three
+    # numbers rather than a dictionary. `group_by_length` survives for validation, which keeps
+    # every segment including the short one -- an evaluation must not drop data.
+    nseg = length(train_segs)
+    batch_eff = min(batch, nseg)
+    nbatch = fld(nseg, batch_eff)
+    verbose && @info "M4 geometry" nseg batch_eff updates_per_epoch = nbatch dropped_short = (length(train_all) - nseg) dropped_per_epoch = (nseg - nbatch * batch_eff)
     val_groups = group_by_length(val_segs)
 
     # 🔴 **The validation epsilons are drawn ONCE and reused every epoch.** Re-drawing them makes
@@ -626,65 +665,113 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
         return num / den
     end
 
-    history = (; train = Float64[], val = Float64[], lr = Float64[])
-    best = (; val = Inf, ps = deepcopy(ps), epoch = 0)
+    # 🔴 **The history is indexed by OPTIMISER UPDATE, not by epoch, and `update` is stored
+    # beside the curves.** An epoch is a different amount of training at every stride -- 1 update
+    # at the tiling stride and 3 at `stride = 20` under the current geometry -- so anything paced
+    # by the epoch is paced differently at every point. That is what made the 2026-09-18 stride
+    # scan uncomparable, and validating once per epoch would have kept it so even with the
+    # batching fixed: the plateau rule and the early stop would still have counted epochs.
+    # 🔑 `val_every` is in UPDATES, so `patience` and `stop_patience` are too, identically for
+    # every point. At the default `val_every = 2`, `patience = 20` is 40 updates -- what the
+    # pre-2026-09-18 tiling-stride baseline actually ran with, so the new fits stay comparable
+    # with the numbers already recorded.
+    history = (; update = Int[], train = Float64[], val = Float64[], lr = Float64[])
+    best = (; val = Inf, ps = deepcopy(ps), update = 0, index = 0)
     since_improved = 0
+    since_best = 0
+    stopped_early = false
     cur_lr = T(lr)
+    upd = 0
+    tot, nb = 0.0, 0
 
     for epoch in 1:epochs
-        tot, nb = 0.0, 0
-        for L in sort(collect(keys(train_groups)))
-            idxs = shuffle(rng, train_groups[L])
-            for chunk in Iterators.partition(idxs, batch)
-                Xb, Yb, sc, _ = stack(train_segs, chunk)
-                eb = draw(L, length(chunk))
-                loss, gs = Zygote.withgradient(p -> RF.elbo(spec, p, Xb, Yb, sc, eb; beta), ps)
-                opt, ps = Optimisers.update(opt, ps, gs[1])
-                tot += loss
-                nb += 1
+        # 🔑 Reshuffled every epoch, so which segments meet in a batch changes AND the
+        # `nseg - nbatch * batch_eff` that fall outside the last full batch are a different few
+        # each time -- dropped from an epoch, never from the fit.
+        idxs = shuffle(rng, 1:nseg)
+        for k in 1:nbatch
+            chunk = view(idxs, ((k - 1) * batch_eff + 1):(k * batch_eff))
+            Xb, Yb, sc, _ = stack(train_segs, chunk)
+            eb = draw(L, batch_eff)
+            loss, gs = Zygote.withgradient(p -> RF.elbo(spec, p, Xb, Yb, sc, eb; beta), ps)
+            opt, ps = Optimisers.update(opt, ps, gs[1])
+            tot += loss
+            nb += 1
+            upd += 1
+
+            # ⚠️ The final update of the final epoch is always validated, whatever `val_every`
+            # divides into. Without it a fit whose update count is not a multiple of `val_every`
+            # -- `epochs = 1` in the probe and in several tests -- would return an empty history.
+            upd % val_every == 0 || (epoch == epochs && k == nbatch) || continue
+
+            vl = validate(ps)
+            push!(history.update, upd)
+            push!(history.train, tot / nb)          # the mean since the previous validation
+            push!(history.val, vl)
+            push!(history.lr, cur_lr)
+            tot, nb = 0.0, 0
+
+            # 🔴 **Keep the best iterate, not the last one.** Without this the fit that gets
+            # saved is whatever the final update happened to land on. Measured on R1's record: all
+            # three latent architectures reached val ~= -12 around epoch 91 and were at ~= -4 by
+            # epoch 100, so the last-iterate fit inverted the architecture ranking and the
+            # conclusion drawn from it was an artefact of where the optimiser stopped.
+            if vl < best.val
+                best = (; val = vl, ps = deepcopy(ps), update = upd,
+                        index = length(history.val))
+                since_improved = 0
+                since_best = 0
+            else
+                since_improved += 1
+                # ⚠️ A SECOND counter, because `since_improved` is reset by every decay and so
+                # can never reach a stopping threshold. This counts validations since the best.
+                since_best += 1
+            end
+
+            # Decay on plateau. The end-of-training oscillation at a constant 1e-3 was several
+            # nats wide, which is the other half of why a last-iterate fit was meaningless.
+            if since_improved >= patience && cur_lr > min_lr
+                cur_lr = max(T(min_lr), cur_lr * T(lr_decay))
+                Optimisers.adjust!(opt, cur_lr)
+                since_improved = 0
+                verbose && @info "M4 lr decayed" update = upd lr = cur_lr
+            end
+
+            # 🔴 **Early stop: at `min_lr` AND `stop_patience` validations past the best.**
+            # Three of the five points of the 2026-09-18 stride scan had their best iterate at the
+            # final epoch and ended two decades above `min_lr` -- their numbers were where the
+            # budget stopped, not where the fit went, and they were not comparable with the two
+            # that had converged.
+            if cur_lr <= min_lr && since_best >= stop_patience
+                stopped_early = true
+                verbose && @info "M4 early stop" update = upd best_update = best.update best_val = best.val
+                break
+            end
+
+            # 🔴 FLUSHED. A SLURM log is a redirected stream, and an unflushed heartbeat is
+            # indistinguishable from a hang -- which is exactly how a 20-minute job came to be
+            # cancelled blind on 2026-09-18.
+            if verbose && length(history.val) % 10 == 1
+                @info "M4 update $upd (epoch $epoch)" train = history.train[end] val = vl best = best.val
+                flush(stderr)
             end
         end
-        push!(history.train, tot / nb)
-
-        vl = validate(ps)
-        push!(history.val, vl)
-        push!(history.lr, cur_lr)
-
-        # 🔴 **Keep the best iterate, not the last one.** Without this the fit that gets saved is
-        # whatever the final epoch happened to land on. Measured on R1's record: all three latent
-        # architectures reached val ~= -12 around epoch 91 and were at ~= -4 by epoch 100, so the
-        # last-iterate fit inverted the architecture ranking and the conclusion drawn from it was
-        # an artefact of where the optimiser stopped.
-        if vl < best.val
-            best = (; val = vl, ps = deepcopy(ps), epoch)
-            since_improved = 0
-        else
-            since_improved += 1
-        end
-
-        # Decay on plateau. The end-of-training oscillation at a constant 1e-3 was several nats
-        # wide, which is the other half of why a last-iterate fit was meaningless.
-        if since_improved >= patience && cur_lr > min_lr
-            cur_lr = max(T(min_lr), cur_lr * T(lr_decay))
-            Optimisers.adjust!(opt, cur_lr)
-            since_improved = 0
-            verbose && @info "M4 lr decayed" epoch lr = cur_lr
-        end
-
-        # 🔴 FLUSHED. A SLURM log is a redirected stream, and an unflushed heartbeat is
-        # indistinguishable from a hang -- which is exactly how a 20-minute job came to be
-        # cancelled blind on 2026-09-18.
-        if verbose && (epoch % 10 == 1 || epoch == epochs)
-            @info "M4 epoch $epoch" train = history.train[end] val = vl best = best.val
-            flush(stderr)
-        end
+        stopped_early && break
     end
 
-    verbose && @info "M4 done" best_epoch = best.epoch best_val = best.val final_val = history.val[end]
+    verbose && @info "M4 done" best_update = best.update best_val = best.val final_val = history.val[end] updates = upd
     # 🔴 Returned on the HOST whatever `device` was. `LSTMWeights`, `save_stochlstm` and JLD2 all
     # expect plain arrays, and a fit that can only be read back on a machine with a GPU is not a
     # fit. `Array` on a host array is a no-op, so the CPU path is untouched.
-    return _to_host(best.ps), (; history..., best_epoch = best.epoch, best_val = best.val)
+    # 🔑 The geometry travels with the history. An epoch count is meaningless without it,
+    # and deriving it afterwards from `(stride, batch)` is how it came to be wrong twice.
+    # ⚠️ `best_update` is the optimiser step the returned iterate came from; `best_index` is
+    # its position in the history arrays. They are different numbers whenever `val_every > 1`,
+    # and using one where the other belongs is how a curve gets annotated in the wrong place.
+    return _to_host(best.ps),
+           (; history..., best_update = best.update, best_index = best.index,
+            best_val = best.val, stopped_early, updates = upd,
+            epochs_run = cld(upd, nbatch), nseg, batch_eff, upd_per_epoch = nbatch, val_every)
 end
 
 # ---------------------------------------------------------------------------------------------

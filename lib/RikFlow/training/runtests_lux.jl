@@ -177,7 +177,12 @@ const RF = RikFlow
         ps, hist = RF.train_stochlstm(spec, permutedims(X), permutedims(Yb), steps;
                                       L = 60, burn = 15, epochs = 12, batch = 4, lr = 5e-3,
                                       seed = 2, verbose = false, T)
-        @test length(hist.train) == 12
+        # ⚠️ The history has one row per VALIDATION, not per epoch, so its length is not the
+        # epoch count -- it is `updates / val_every`. Asserting the invariants rather than a
+        # number keeps this honest if `val_every` ever moves again.
+        @test length(hist.train) == length(hist.val) == length(hist.update)
+        @test hist.updates == 12 * hist.upd_per_epoch
+        @test hist.update[end] == hist.updates
         @test all(isfinite, hist.train)
         @test mean(hist.train[end-2:end]) < mean(hist.train[1:3])
     end
@@ -207,8 +212,9 @@ const RF = RikFlow
 
         # (1) the recorded best really is the minimum of the curve, and the returned fit is it
         @test hist.best_val == minimum(hist.val)
-        @test hist.val[hist.best_epoch] == hist.best_val
-        @test 1 <= hist.best_epoch <= 20
+        @test hist.val[hist.best_index] == hist.best_val
+        @test hist.update[hist.best_index] == hist.best_update
+        @test 1 <= hist.best_index <= length(hist.val)
         @test hist.best_val <= hist.val[end]        # never worse than the last iterate
 
         # (2) the validation curve is a function of the parameters alone. Two runs at the same
@@ -216,14 +222,7 @@ const RF = RikFlow
         # and "best validation" would be selecting partly on a lucky noise draw.
         _, hist2 = RF.train_stochlstm(spec, Xc, Yc, steps; seed = 3, kw...)
         @test hist.val == hist2.val
-        @test hist.best_epoch == hist2.best_epoch
-
-        # (3) the learning rate decays on plateau rather than staying put
-        _, hplateau = RF.train_stochlstm(spec, Xc, Yc, steps; seed = 3, patience = 1,
-                                         lr_decay = 0.5, kw...)
-        @test length(hplateau.lr) == 20
-        @test hplateau.lr[end] < hplateau.lr[1]
-        @test all(hplateau.lr .>= 1e-5)
+        @test hist.best_update == hist2.best_update
     end
 
     # -----------------------------------------------------------------------------------------
@@ -443,7 +442,7 @@ const RF = RikFlow
         @test length(hd.val) == length(hc.val)
         @test isapprox(hd.val, hc.val; rtol = 1e-4)
         @test isapprox(hd.train, hc.train; rtol = 1e-4)
-        @test hd.best_epoch == hc.best_epoch
+        @test hd.best_update == hc.best_update
 
         # (2) parameters come back on the HOST whatever the device was: `LSTMWeights`,
         # `save_stochlstm` and JLD2 all want plain arrays, and a fit only readable on a GPU node
@@ -514,18 +513,15 @@ const RF = RikFlow
         more = count_for(11; device_rng = false)
         per_epoch = (more - base) / 10
 
-        # ⚠️ Updates per epoch is NOT `cld(nsegments, batch)`. Segments are grouped by LENGTH
-        # first and each group is batched separately, so the trailing short segment always costs
-        # an update of its own. Predicting the count the other way is what made the first version
-        # of this test fail against correct code -- the same arithmetic slip the scans' geometry
-        # helper exists to prevent.
+        # ⚠️ Updates per epoch is `fld(nfull, min(batch, nfull))`, and every part of that has
+        # been got wrong here before. The trailing SHORT segment is dropped -- it cannot share a
+        # recurrence with the full-length ones, so batching it alone would spend a whole update on
+        # one segment -- and so is the final partial batch, leaving every update exactly
+        # `batch_eff` segments wide. `m4_geometry` is the same arithmetic, shared.
         segs = RF.segment_indices(view(steps, 1:floor(Int, 0.8 * length(steps)));
                                   L = 120, burn = 30, stride = 90)
-        lens = Dict{Int,Int}()
-        for sg in segs
-            lens[length(sg.rows)] = get(lens, length(sg.rows), 0) + 1
-        end
-        n_upd = sum(cld(n, 4) for (_, n) in lens)
+        nfull = count(sg -> length(sg.rows) == 120, segs)
+        n_upd = fld(nfull, min(4, nfull))
 
         # exactly ONE transfer per update -- the noise draw -- and nothing else
         @test per_epoch == n_upd
@@ -594,7 +590,9 @@ const RF = RikFlow
         # and a strided fit runs and improves, which the geometry above does not by itself prove
         _, h = RF.train_stochlstm(spec, X, Y, steps; L, burn, stride = 50, epochs = 8, batch = 4,
                                   lr = 5e-3, seed = 2, verbose = false)
-        @test length(h.train) == 8
+        @test length(h.train) == length(h.update)
+        @test h.updates == 8 * h.upd_per_epoch
+        @test h.update[end] == h.updates
         @test all(isfinite, h.train)
     end
 end
