@@ -111,7 +111,14 @@ ps, hist = RF.train_stochlstm(spec, permutedims(X), permutedims(Y), steps;
                               device_rng = DEVICE_RNG)
 m4_phase(@sprintf("5. fit done in %.1f s; val %s", time() - t0,
                   join((@sprintf("%.4g", v) for v in hist.val), " -> ")))
-check(length(hist.val) == EPOCHS, "one validation value per epoch")
+# ⚠️ One row per VALIDATION, not per epoch: validation runs every `val_every` optimiser updates
+# (default 2), so the history length is `updates / val_every` and the epoch count does not appear
+# in it at all. The invariants are that the three curves agree and that the axis ends where the
+# fit did.
+check(length(hist.val) == length(hist.train) == length(hist.update),
+      "the loss curves and the update axis are the same length")
+check(hist.update[end] == hist.updates && hist.updates == EPOCHS * hist.upd_per_epoch,
+      "the update axis ends at the last update the fit took")
 check(all(isfinite, hist.val) && all(isfinite, hist.train), "losses are finite")
 
 # --- 6. parameters come back on the host --------------------------------------------------------
@@ -180,7 +187,11 @@ if get(ENV, "RIKFLOW_M4_TIMING", "1") == "1"
     pXc, pYc = permutedims(pX), permutedims(pY)
     L, burn, val_frac = 500, 100, 0.2
     ntrain = floor(Int, (1 - val_frac) * length(psteps))
-    updates = parse(Int, get(ENV, "RIKFLOW_M4_UPDATES", "3000"))
+    # 🔴 The scan runs every point to the SAME EPOCH CAP and stops early when it converges
+    # (2026-09-18), so the projection is `cap x s/epoch` -- and it is an UPPER bound, because
+    # early stopping can only make a point cheaper. It used to derive the epochs from an update
+    # budget, which no longer exists.
+    epoch_cap = parse(Int, get(ENV, "RIKFLOW_M4_EPOCHS", "3000"))
     budget = parse(Float64, get(ENV, "RIKFLOW_M4_TIMING_BUDGET", "600"))
     # Minimum wall time per timed sample. Below a second or so the clock, the scheduler and the
     # first-touch of a fresh allocation are all comparable to the thing being measured.
@@ -190,15 +201,16 @@ if get(ENV, "RIKFLOW_M4_TIMING", "1") == "1"
     t_stage = time()
     total = 0.0
     unmeasured = Tuple{Int,Int}[]
-    @printf("%-8s %-6s %6s %6s %8s %12s %12s %7s
+    @printf("%-8s %-6s %6s %6s %6s %8s %9s %12s %12s %7s
 ",
-            "stride", "batch", "segs", "u/ep", "epochs", "s/epoch", "point (min)", "timed")
+            "stride", "batch", "segs", "beff", "u/ep", "epochs", "updates", "s/epoch",
+            "point (min)", "timed")
     for (stride, batch) in points
         if time() - t_stage > budget
             push!(unmeasured, (stride, batch)); continue
         end
         g = m4_geometry(psteps, ntrain; L, burn, stride, batch)
-        epochs = max(1, cld(updates, g.upd))
+        epochs = epoch_cap
         # one compile epoch, then two timed -- the same shape as `m4_probe_step`, inline so the
         # per-point row can be printed as a table rather than as prose.
         RF.train_stochlstm(spec, pXc, pYc, psteps; L, burn, stride, epochs = 1, batch,
@@ -222,15 +234,18 @@ if get(ENV, "RIKFLOW_M4_TIMING", "1") == "1"
         sec = el / ntimed
         proj = sec * epochs / 60
         total += proj
-        @printf("%-8d %-6d %6d %6d %8d %10.3f s %10.1f %7d
+        @printf("%-8d %-6d %6d %6d %6d %8d %9d %10.3f s %10.1f %7d
 ",
-                stride, batch, g.nseg, g.upd, epochs, sec, proj, ntimed)
+                stride, batch, g.nseg, g.batch_eff, g.upd, epochs, epochs * g.upd, sec, proj,
+                ntimed)
         flush(stdout)
     end
     println()
     if isempty(unmeasured)
-        m4_phase(@sprintf("9. scan projection on %s: %.0f min total at %d updates/point",
-                          DEV_NAME, total, updates))
+        # 🔴 ONE string literal. A `"..." * "..."` format parses fine and fails at
+        # MACROEXPANSION -- gotcha #47, written down in this repo, and walked into anyway.
+        m4_phase(@sprintf("9. scan projection on %s: %.0f min total at the %d-epoch cap (an UPPER bound -- early stopping can only make it cheaper)",
+                          DEV_NAME, total, epoch_cap))
         # 🔑 A walltime, with the margin a projection from two timed epochs deserves, plus the
         # fixed cost every job pays before the first point (package load + compilation).
         m4_phase(@sprintf("9. suggested walltime: -t %02d:00:00  (1.5x the %.0f min, +15 min startup)",

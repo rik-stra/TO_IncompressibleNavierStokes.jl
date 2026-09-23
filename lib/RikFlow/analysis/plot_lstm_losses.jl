@@ -49,7 +49,9 @@ const COLOURS = Dict(:storn => RGBf(0.20, 0.40, 0.75),
 """
     load_cell(i; seed)
 
-The saved fit for cell `i`, as `(; name, arch, emission, beta, losses, best_epoch, best_val)`.
+The saved fit for cell `i`, as `(; name, arch, emission, beta, losses, upd, best_index,
+`best_update`, `best_val)`, where `upd` is the optimiser-update axis the curves are drawn
+against -- reconstructed as `1:n` for fits that predate it.
 
 The configuration is read back from the fit's own `extras.cfg`, not from `inputs_lstm.jld2`: the
 table is regenerated per checkout and could have moved since the fit was made, and what this
@@ -61,9 +63,18 @@ function load_cell(i::Integer; seed::Integer = 1)
     d = load(path)
     e = d["extras"]
     cfg = e.cfg
+    lo = e.losses
+    # ⚠️ **Fits made before 2026-09-18 carry `best_epoch` and no update axis**: the history was
+    # indexed by epoch and validation ran once per epoch. Newer ones carry `update`, `best_index`
+    # and `best_update`. Both shapes are read here rather than migrating the files -- the old fits
+    # ARE the pre-change record, and rewriting them would erase what they are evidence of.
+    # 🔑 The x axis is updates either way: in those old fits an epoch WAS one update.
+    upd = hasproperty(lo, :update) ? lo.update : collect(1:length(lo.val))
+    bidx = hasproperty(lo, :best_index) ? lo.best_index : lo.best_epoch
     return (; i, name = cfg.name, arch = cfg.arch, emission = get(cfg, :emission, :none),
             beta = cfg.beta, L = cfg.L, burn = cfg.burn, lr = cfg.lr,
-            losses = e.losses, best_epoch = e.losses.best_epoch, best_val = e.losses.best_val)
+            losses = lo, upd, best_index = bidx, best_update = upd[bidx],
+            best_val = lo.best_val)
 end
 
 label(c) = @sprintf("%s  beta=%g  (%s)", c.arch, c.beta, c.emission)
@@ -71,10 +82,9 @@ label(c) = @sprintf("%s  beta=%g  (%s)", c.arch, c.beta, c.emission)
 "Draw one cell's train and validation curves onto `ax`: train dashed, validation solid."
 function curves!(ax, c)
     col = get(COLOURS, c.arch, RGBf(0.4, 0.4, 0.4))
-    ep = 1:length(c.losses.train)
-    lines!(ax, ep, c.losses.train; color = (col, 0.45), linestyle = :dash)
-    lines!(ax, ep, c.losses.val; color = col, linewidth = 2, label = label(c))
-    scatter!(ax, [c.best_epoch], [c.best_val]; color = col, markersize = 10)
+    lines!(ax, c.upd, c.losses.train; color = (col, 0.45), linestyle = :dash)
+    lines!(ax, c.upd, c.losses.val; color = col, linewidth = 2, label = label(c))
+    scatter!(ax, [c.best_update], [c.best_val]; color = col, markersize = 10)
     return ax
 end
 
@@ -94,7 +104,7 @@ function fig_losses(cells)
     own = [c for c in cells if c.emission !== :none]
     fig = Figure(; size = (1500, 480))
 
-    ax1 = Axis(fig[1, 1]; xlabel = "epoch (= 1 optimiser step here)", ylabel = "loss per scored step",
+    ax1 = Axis(fig[1, 1]; xlabel = "optimiser updates", ylabel = "loss per scored step",
                title = "emission = :none  (sum of squares)", yscale = log10, xscale = log10)
     for c in shared
         curves!(ax1, c)
@@ -124,14 +134,13 @@ end
 "The table the figure is read with: where the fit got to, and whether it had stopped moving."
 function report(cells)
     @printf("%-14s %-8s %-9s %-8s %7s %10s %10s %10s %9s\n",
-            "cell", "arch", "emission", "beta", "epochs", "best val", "final val",
-            "final trn", "best ep")
+            "cell", "arch", "emission", "beta", "updates", "best val", "final val",
+            "final trn", "best upd")
     println("-"^94)
     for c in cells
-        n = length(c.losses.val)
         @printf("%-14s %-8s %-9s %-8g %7d %10.4g %10.4g %10.4g %9d\n",
-                c.name, c.arch, c.emission, c.beta, n, c.best_val, c.losses.val[end],
-                c.losses.train[end], c.best_epoch)
+                c.name, c.arch, c.emission, c.beta, c.upd[end], c.best_val, c.losses.val[end],
+                c.losses.train[end], c.best_update)
     end
     println()
     for c in cells
@@ -145,8 +154,8 @@ function report(cells)
         # file is in `analysis/`, which V31 does not scan.
         sched = length(unique(c.losses.lr)) == 1 ? "never decayed" :
                 @sprintf("decayed %g -> %g", c.losses.lr[1], c.losses.lr[end])
-        @printf("  %-14s val fell %.2fx over the last decade of epochs (%d -> %d); lr %s\n",
-                c.name, drop, lo, n, sched)
+        @printf("  %-14s val fell %.2fx over the last decade of updates (%d -> %d); lr %s\n",
+                c.name, drop, c.upd[lo], c.upd[n], sched)
     end
 end
 

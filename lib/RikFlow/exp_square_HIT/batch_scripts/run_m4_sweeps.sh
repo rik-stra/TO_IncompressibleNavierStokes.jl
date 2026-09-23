@@ -1,11 +1,19 @@
 #!/bin/bash
 #SBATCH -J m4_sweep
-# 🔒 1 h, from a measurement on THIS partition: the smoke's stage 9 timed the whole scan at
-# **18 min on this node's CPU** against **102 min on its GPU** (`results_LSTMS.md` §5), and
-# 1.5 x 18 + 15 min of package load and compilation is well under an hour.
-# ⚠️ `M4_DEVICE=cuda` needs **3 h** instead -- raise it at submission with `sbatch -t 03:00:00`.
+# 🔴 **2 h, and the old 18 min measurement NO LONGER APPLIES.** It was taken when each point
+# ran to a fixed 3000-UPDATE budget; since 2026-09-18 every point runs to a 3000-EPOCH cap with
+# early stopping, which is ~1.8x the updates before any point converges out. The number has not
+# been re-measured on this node.
+# 🔑 **Re-measure it before trusting it:** `sbatch batch_scripts/run_m4_sweeps.sh smoke` now
+# projects under the new policy and prints a suggested walltime. Until then this is a guess with
+# margin, which is the one thing a walltime may not silently be.
+# ⚠️ The only number in hand is **119 min on the Windows workstation** (its stage 9, 2026-09-18),
+# which suggested `-t 04:00:00` THERE. That machine has run ~4x slower than this node before, but
+# a cross-machine ratio is not a measurement -- that mistake already inverted the GPU verdict once
+# (`claude_memory.md`). So: 2 h here as a bounded guess, and the node's own smoke settles it.
+# ⚠️ `M4_DEVICE=cuda` was 5.7x slower under the old policy -- raise to `-t 08:00:00` if used.
 # ⚠️ The `smoke` mode itself takes ~3 minutes; this is the cap for the scans.
-#SBATCH -t 01:00:00
+#SBATCH -t 02:00:00
 # 🔒 Stays on gpu_h100 (Rik, 2026-09-18). Only the DEVICE moved to the CPU, not the partition --
 # and that is the better-evidenced choice: the 18 min came from this node's CPU, so running here
 # with `M4_DEVICE=cpu` is the configuration that was actually measured. A CPU partition (`rome`,
@@ -15,7 +23,7 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 # 🔑 Explicit, though it is also SLURM's default: the job inherits the SUBMITTING environment.
-# That is what makes `RIKFLOW_M4_UPDATES=5 sbatch ...` and `M4_DEVICE=cpu sbatch ...` work, and it
+# That is what makes `RIKFLOW_M4_EPOCHS=5 sbatch ...` and `M4_DEVICE=cpu sbatch ...` work, and it
 # is what the other scripts here have always relied on -- none of them sets `--export`, and they
 # all need an inherited `PATH` just to find `julia`. Stating it protects against a site default of
 # `NONE`, which would strip both the budget AND the PATH.
@@ -40,7 +48,13 @@
 # Budgets are the scans' own defaults and are overridable from the submitting shell:
 #     RIKFLOW_M4_LR_EPOCHS   epochs per lr point       (default 1500 in the script, 1000 used so far)
 #     RIKFLOW_M4_LRS         comma-separated rates
-#     RIKFLOW_M4_UPDATES     optimiser steps per stride point (default 3000)
+#     RIKFLOW_M4_EPOCHS      epoch CAP per stride point   (default 3000; early stopping ends
+#                            each point once it has converged, so this bounds rather than sets it)
+#     RIKFLOW_M4_STOP_PATIENCE  validations past the best before stopping (default 100)
+#     RIKFLOW_M4_VAL_EVERY   optimiser updates between validations (default 2). 🔴 Everything
+#                            paced by it -- the plateau rule and the early stop -- is then paced
+#                            in UPDATES, identically at every point, rather than by an epoch that
+#                            is 1 update at the tiling stride and 3 at stride 20.
 #
 # ---------------------------------------------------------------------------------------------
 # 🔒 IT TRAINS ON THE CPU (`M4_DEVICE=cpu`), because the GPU was measured 5.7x SLOWER
@@ -58,7 +72,7 @@
 # non-isbits kernel arguments), both found only on the cluster.
 # 🔑 **So make the FIRST submission a test, not a measurement:**
 #
-#     RIKFLOW_M4_UPDATES=5 sbatch batch_scripts/run_m4_sweeps.sh stride
+#     RIKFLOW_M4_EPOCHS=5 sbatch batch_scripts/run_m4_sweeps.sh stride
 #
 # It runs every point at a trivial budget in about a minute and exercises the whole path including
 # the write. `m4_device` refuses `cuda` when no device is functional rather than falling back to
@@ -121,7 +135,7 @@ echo "== M4_DEVICE=$M4_DEVICE"
 # 🔴 One echo, one line. The earlier `"..."\n     "..."` form put a literal `n` into the log
 # (`<default 3000>n`): outside quotes `\n` is an escaped 'n', not a newline and not a line
 # continuation. Same class as the `\r` that once broke the reproduce block in results_LSTMS.md.
-echo "== budget: RIKFLOW_M4_UPDATES=${RIKFLOW_M4_UPDATES:-<default 3000>} RIKFLOW_M4_LR_EPOCHS=${RIKFLOW_M4_LR_EPOCHS:-<default 1500>} RIKFLOW_M4_EPOCHS=${RIKFLOW_M4_EPOCHS:-<unset>} M4_DEVICE_RNG=${M4_DEVICE_RNG:-0}"
+echo "== budget: RIKFLOW_M4_EPOCHS=${RIKFLOW_M4_EPOCHS:-<default 3000>} RIKFLOW_M4_STOP_PATIENCE=${RIKFLOW_M4_STOP_PATIENCE:-<default 100>} RIKFLOW_M4_VAL_EVERY=${RIKFLOW_M4_VAL_EVERY:-<default 2>} RIKFLOW_M4_LR_EPOCHS=${RIKFLOW_M4_LR_EPOCHS:-<default 1500>} M4_DEVICE_RNG=${M4_DEVICE_RNG:-0}"
 
 # Find the drivers from whichever directory the job started in, and say so if it is neither.
 if [ -f 3_track_ref.jl ]; then

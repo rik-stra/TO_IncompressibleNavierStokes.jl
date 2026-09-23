@@ -116,13 +116,19 @@ for s in seeds
     # last epoch's loss is not the loss of the model that was saved -- and on R1's record the two
     # differed by ~8 nats, enough to invert the architecture ranking. `final_val` is kept beside it
     # precisely so a run that ended far from its best is visible rather than silently averaged in.
-    push!(summaries, (; seed = s, best_val = hist_loss.best_val, best_epoch = hist_loss.best_epoch,
+    push!(summaries, (; seed = s, best_val = hist_loss.best_val,
+                      best_update = hist_loss.best_update, updates = hist_loss.updates,
+                      stopped_early = hist_loss.stopped_early,
                       final_train = hist_loss.train[end], final_val = hist_loss.val[end], path))
-    @printf("  seed %d: best val %.4f (epoch %d)  final val %.4f  -> %s\n",
-            s, hist_loss.best_val, hist_loss.best_epoch, hist_loss.val[end], basename(path))
-    if hist_loss.best_epoch < 0.8 * epochs
-        @warn "seed $s peaked early and then got worse -- check the lr schedule" best_epoch =
-            hist_loss.best_epoch epochs
+    @printf("  seed %d: best val %.4f (update %d of %d)  final val %.4f  %s -> %s\n",
+            s, hist_loss.best_val, hist_loss.best_update, hist_loss.updates, hist_loss.val[end],
+            hist_loss.stopped_early ? "converged" : "hit the cap", basename(path))
+    # ⚠️ Against the UPDATES actually taken, not the configured epochs: with early stopping the
+    # two are no longer the same number, and comparing to the cap would fire this warning on every
+    # fit that converged early -- which is the outcome being aimed for.
+    if hist_loss.best_update < 0.8 * hist_loss.updates
+        @warn "seed $s peaked early and then got worse -- check the lr schedule" best_update =
+            hist_loss.best_update updates = hist_loss.updates
     end
 end
 

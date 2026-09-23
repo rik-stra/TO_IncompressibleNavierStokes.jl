@@ -103,9 +103,10 @@ for lr in LRS
                               cfg.L, cfg.burn, epochs = EPOCHS, cfg.batch, lr,
                               cfg.beta, cfg.val_frac, seed, verbose = true, device = DEVICE)
     push!(results, (; lr, wall = time() - t0, train = h.train, val = h.val, lrhist = h.lr,
-                    best_val = h.best_val, best_epoch = h.best_epoch, ps))
+                    best_val = h.best_val, best_update = h.best_update,
+                    upd_axis = h.update, ps))
     @printf("    best val %.5g at epoch %d; final %.5g; lr %g -> %g; %.1f s\n",
-            h.best_val, h.best_epoch, h.val[end], h.lr[1], h.lr[end], time() - t0)
+            h.best_val, h.best_update, h.val[end], h.lr[1], h.lr[end], time() - t0)
     m4_save_progress(out; complete = false, results, cell = cfg.name, cfg, seed, epochs = EPOCHS,
                      spec, points_done = length(results), points_total = length(LRS))
     m4_phase("point saved ($(length(results))/$(length(LRS))) -> $(basename(out))")
@@ -124,7 +125,7 @@ println("-"^104)
 for r in results
     reach = join((@sprintf("%7d", first_below(r.val, t)) for t in THRESHOLDS), " ")
     @printf("%-8g %11.5g %9d %11.5g %8.2g | %s\n",
-            r.lr, r.best_val, r.best_epoch, r.val[end], r.lrhist[end], reach)
+            r.lr, r.best_val, r.best_update, r.val[end], r.lrhist[end], reach)
 end
 println("\n(0 in a reach column = that threshold was never reached inside $EPOCHS epochs)")
 
