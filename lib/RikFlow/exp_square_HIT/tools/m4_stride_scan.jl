@@ -117,6 +117,23 @@ POINTS = [(cfg.L - cfg.burn, cfg.batch),     # 400: the current default, the bas
           (50, cfg.batch),
           (20, cfg.batch)]
 
+# 🔑 `RIKFLOW_M4_POINTS` runs a SUBSET of the rows above, by 1-based index -- e.g. "2,5" for the
+# `(400, b2)` control and `stride = 20`, the two points the 2026-09-23 scan lost to the decay
+# cascade. Default: all five.
+# 🔴 A subset writes to its OWN file (`..._points2-5_cap10000.jld2`), never to the canonical
+# `stride_scan_<cell>_seed<seed>.jld2`: a two-point run saving there would replace a complete
+# five-point scan with a partial one, and `m4_save_progress` overwrites without asking.
+const POINT_SEL = let s = strip(get(ENV, "RIKFLOW_M4_POINTS", ""))
+    isempty(s) ? nothing : parse.(Int, split(s, ","))
+end
+if POINT_SEL !== nothing
+    (!isempty(POINT_SEL) && allunique(POINT_SEL) && all(i -> 1 <= i <= length(POINTS), POINT_SEL)) ||
+        error("RIKFLOW_M4_POINTS = $(ENV["RIKFLOW_M4_POINTS"]): need distinct indices in " *
+              "1:$(length(POINTS)) -- the rows are " *
+              join(("$i=(stride $(p[1]), b$(p[2]))" for (i, p) in enumerate(POINTS)), ", "))
+    POINTS = POINTS[POINT_SEL]
+end
+
 @info "M4 stride scan" cell=cfg.name arch=cfg.arch beta=cfg.beta seed epoch_cap=EPOCHS stop_patience=STOP_PATIENCE val_every=VAL_EVERY L=cfg.L burn=cfg.burn
 @info "data" rows=ncol train_rows=ntrain
 
@@ -140,7 +157,9 @@ end
 
 # 🔴 The output path is fixed BEFORE the loop, because every point writes to it. A scan killed at
 # its walltime then keeps everything that finished -- see `m4_save_progress`.
-out = joinpath(TO_folder, "stride_scan_$(cfg.name)_seed$(seed).jld2")
+out_tag = POINT_SEL === nothing ? "" : "_points$(join(POINT_SEL, "-"))_cap$(EPOCHS)"
+out = joinpath(TO_folder, "stride_scan_$(cfg.name)_seed$(seed)$(out_tag).jld2")
+@info "output" file = basename(out) points = (POINT_SEL === nothing ? "all" : POINT_SEL)
 
 results = NamedTuple[]
 for (stride, batch) in POINTS
@@ -172,7 +191,7 @@ for (stride, batch) in POINTS
     m4_save_progress(out; complete = false, results, cell = cfg.name, cfg, seed,
                      epoch_cap = EPOCHS, stop_patience = STOP_PATIENCE, spec,
                      points_done = length(results),
-                     points_total = length(POINTS))
+                     points_total = length(POINTS), point_selection = POINT_SEL)
     m4_phase("point saved ($(length(results))/$(length(POINTS))) -> $(basename(out))")
 end
 
@@ -216,5 +235,5 @@ end
 m4_save_progress(out; complete = true, results, cell = cfg.name, cfg, seed, epoch_cap = EPOCHS,
                  stop_patience = STOP_PATIENCE,
                  spec, points_done = length(results), points_total = length(POINTS),
-                 thresholds = THRESHOLDS)
+                 point_selection = POINT_SEL, thresholds = THRESHOLDS)
 println("\nwrote $out (complete)")

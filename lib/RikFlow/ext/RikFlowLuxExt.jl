@@ -436,6 +436,34 @@ end
 # ---------------------------------------------------------------------------------------------
 
 """
+    _plateau_step(pl, vl, patience) -> (pl, decay::Bool)
+
+One validation's worth of the decay-on-plateau rule. `pl = (; ref, since)` is the best validation
+loss seen **since the last decay** and the number of validations since it improved; `decay` says
+`since` has reached `patience`. After acting on a decay the caller resets `pl` to
+`_PLATEAU_FRESH`, so the first validation after it becomes the new reference.
+
+🔴 **Why the reference resets at a decay instead of being the all-time best.** Measured on the
+2026-09-23 stride scan: the `(400, batch = 2)` control spiked from a best of 9.2e-3 to 3.6e-2 at
+update 388. Against the all-time best, each decay then had `patience` validations to get back
+below the PRE-spike value at a LOWER rate, never did, and fired again -- at 388, 428, 468, 508,
+548 -- taking the rate to `min_lr` in 160 updates and ending the fit at 586, at 15x the loss of
+its neighbours. `stride = 20` did the same at 3276-3396 while still descending ~28% per quarter.
+Against the best since the decay, a recovering curve keeps setting new references and the rate
+drops again only once it has genuinely stopped improving at the current rate.
+
+⚠️ This rule only paces the SCHEDULE. Best-iterate selection and the early stop both keep reading
+the all-time best, so a spike can never be returned as the fit and cannot hold off the stop.
+Kept pure so the cascade is testable without a fit (V56).
+"""
+function _plateau_step(pl::NamedTuple, vl::Real, patience::Integer)
+    pl = vl < pl.ref ? (; ref = float(vl), since = 0) : (; ref = pl.ref, since = pl.since + 1)
+    return pl, pl.since >= patience
+end
+
+const _PLATEAU_FRESH = (; ref = Inf, since = 0)
+
+"""
     train_stochlstm(spec, X, Y, steps; kwargs...)
 
 Fit an M4 model to a regressor/target pair.
@@ -475,7 +503,10 @@ Fit an M4 model to a regressor/target pair.
   the matched-update budget was supposed to remove. On a fixed update cadence they are not.
   Default 2, at which `patience = 20` is 40 updates.
 - `patience`, `lr_decay`, `min_lr`: decay the learning rate by `lr_decay` after `patience`
-  VALIDATIONS without an improvement, down to `min_lr`.
+  VALIDATIONS without an improvement **on the best seen since the last decay**, down to
+  `min_lr`. 🔴 Not the all-time best: after a loss spike that reference is out of reach at the
+  reduced rate, and the rule then fires every `patience` validations until `min_lr` -- the
+  cascade that ended the 2026-09-23 `(400, b2)` control at update 586 (see `_plateau_step`).
 - `stop_patience`: 🔴 **early stopping, and only once the schedule has bottomed out.** The fit
   ends when the learning rate is at `min_lr` *and* `stop_patience` VALIDATIONS (i.e.
   `stop_patience * val_every` updates) have passed with no new best. Both halves are needed: a fit still above `min_lr` has a decay left that may restart the
@@ -684,7 +715,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # every point. At the default `val_every = 2`, `patience = 20` is 40 updates.
     history = (; update = Int[], train = Float64[], val = Float64[], lr = Float64[])
     best = (; val = Inf, ps = deepcopy(ps), update = 0, index = 0)
-    since_improved = 0
+    plateau = _PLATEAU_FRESH
     since_best = 0
     stopped_early = false
     cur_lr = T(lr)
@@ -726,21 +757,22 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
             if vl < best.val
                 best = (; val = vl, ps = deepcopy(ps), update = upd,
                         index = length(history.val))
-                since_improved = 0
                 since_best = 0
             else
-                since_improved += 1
-                # ⚠️ A SECOND counter, because `since_improved` is reset by every decay and so
-                # can never reach a stopping threshold. This counts validations since the best.
+                # Validations since the ALL-TIME best: what the early stop reads.
                 since_best += 1
             end
 
             # Decay on plateau. The end-of-training oscillation at a constant 1e-3 was several
             # nats wide, which is the other half of why a last-iterate fit was meaningless.
-            if since_improved >= patience && cur_lr > min_lr
+            # 🔴 **Patience counts against the best SINCE THE LAST DECAY, not the all-time best**
+            # -- see `_plateau_step`. Best-iterate selection and the early stop above/below still
+            # use the all-time best.
+            plateau, decay = _plateau_step(plateau, vl, patience)
+            if decay && cur_lr > min_lr
                 cur_lr = max(T(min_lr), cur_lr * T(lr_decay))
                 Optimisers.adjust!(opt, cur_lr)
-                since_improved = 0
+                plateau = _PLATEAU_FRESH
                 verbose && @info "M4 lr decayed" update = upd lr = cur_lr
             end
 

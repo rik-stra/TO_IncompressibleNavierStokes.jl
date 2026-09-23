@@ -600,4 +600,54 @@ const RF = RikFlow
         @test h.update[end] == h.updates
         @test all(isfinite, h.train)
     end
+
+    # -----------------------------------------------------------------------------------------
+    # V56 -- a loss spike costs ONE decay, not a cascade to min_lr
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔴 The 2026-09-23 stride scan: the `(400, b2)` control spiked, and a patience rule counted
+    # against the ALL-TIME best then fired every `patience` validations -- five decays in 160
+    # updates, lr at the floor, fit stopped at 15x its neighbours' loss. `_plateau_step` counts
+    # against the best since the last decay. Tested on a synthetic validation sequence, because
+    # the property is about the rule, and a fit that happens to spike is not a reproducible input.
+    @testset "V56 patience counts from the last decay, so a spike does not cascade" begin
+        ext = Base.get_extension(RikFlow, :RikFlowLuxExt)
+        patience = 3
+        descent = collect(range(1.0, 0.5; length = 10))
+        recovery = [5.0 * 0.9^k for k in 0:40]        # a spike, then a slow monotone recovery
+        vals = vcat(descent, recovery)
+
+        # the new rule, exactly as `train_stochlstm` drives it
+        function decays_new(vals)
+            pl, n = ext._PLATEAU_FRESH, 0
+            for v in vals
+                pl, d = ext._plateau_step(pl, v, patience)
+                d && (n += 1; pl = ext._PLATEAU_FRESH)
+            end
+            return n
+        end
+        # the OLD rule, reproduced as the positive control: all-time best, counter reset at decay
+        function decays_old(vals)
+            best, since, n = Inf, 0, 0
+            for v in vals
+                v < best ? (best = v; since = 0) : (since += 1)
+                since >= patience && (n += 1; since = 0)
+            end
+            return n
+        end
+
+        # 🔑 positive control: the old rule really does cascade on this sequence -- a test whose
+        # failure mode it cannot reproduce proves nothing
+        @test decays_old(vals) >= 5
+        # the spike itself reads as a plateau and costs one decay; the recovery costs none
+        @test decays_new(vals) == 1
+
+        # the rule still does its job on a genuine plateau, after a decay as well as before
+        flat = vcat(descent, fill(0.5, 4 * (patience + 1)))
+        @test decays_new(flat) >= 3
+        # and before the first decay it is the old rule: same first decay on any sequence
+        first_decay(f, vals) = findfirst(k -> f(vals[1:k]) > 0, eachindex(vals))
+        @test first_decay(decays_new, vals) == first_decay(decays_old, vals)
+        @test first_decay(decays_new, flat) == first_decay(decays_old, flat)
+    end
 end

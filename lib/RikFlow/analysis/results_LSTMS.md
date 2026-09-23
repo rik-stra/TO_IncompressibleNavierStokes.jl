@@ -841,6 +841,12 @@ validation loss and cost is reported in its own columns rather than forced equal
   at `stride = 20`, so the points were trained on different recent data. Anchored at the end,
   every stride's last scored training row is 2879 and the gap to the first scored validation row
   is exactly `burn`. The rows dropped are now the **oldest** (101:479 at the tiling stride).
+- 🔴 **Plateau patience counts against the best SINCE THE LAST DECAY** (Rik, 2026-09-23), not
+  the all-time best. Found on the 2026-09-23 re-run: the `(400, batch = 2)` control spiked from
+  9.2e-3 to 3.6e-2 at update 388, and against the pre-spike best each decay fired the next at
+  388/428/468/508/548 — `min_lr` in 160 updates, stopped at 586 at ~15x its neighbours' loss;
+  `stride = 20` cascaded the same way at 3276–3396. Best-iterate selection and the early stop still
+  read the all-time best. `_plateau_step`, **V56** (with the old rule as positive control).
 - 🔴 **Early stopping fires only once the schedule has bottomed out** — at `min_lr` *and*
   `stop_patience` validations past the best. Both halves are needed: a fit still above `min_lr` has
   a decay left that may restart the descent, and one still improving has not converged.
