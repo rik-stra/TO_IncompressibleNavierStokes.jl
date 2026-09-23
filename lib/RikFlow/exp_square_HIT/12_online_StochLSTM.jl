@@ -74,7 +74,17 @@ replicas = replica_arg === nothing ? (1:cfg.n_replicas) : (replica_arg:replica_a
 summary_file = out_dir * "seed_summary.jld2"
 deploy_seed = isfile(summary_file) ? load(summary_file, "median_seed") : 1
 model_file = out_dir * "StochLSTM_seed$(deploy_seed).jld2"
-isfile(model_file) || error("no fitted model at $model_file -- run 11_train_StochLSTM.jl first")
+if !isfile(model_file)
+    # 🔑 Most often this is an exported stride-scan point deployed WITHOUT `RIKFLOW_M4_MODEL_DIR`
+    # reaching the job (set on its own line instead of on the `sbatch` line). Name the candidates.
+    exported = filter(d -> startswith(d, cfg.name * "_") && isdir(joinpath(TO_folder, d)),
+                      readdir(TO_folder))
+    error("no fitted model at $model_file. RIKFLOW_M4_MODEL_DIR = " *
+          (isempty(model_dir_env) ? "<not set>" : "'$model_dir_env'") * ". " *
+          (isempty(exported) ? "Run 11_train_StochLSTM.jl first." :
+           "Exported fits for $(cfg.name) under $TO_folder: " * join(exported, ", ") *
+           " -- deploy one with RIKFLOW_M4_MODEL_DIR=<that dir> on the SAME line as sbatch."))
+end
 @info "Deploying $(cfg.name)" arch=cfg.arch deploy_seed replicas=collect(replicas)
 
 fit = RF.load_stochlstm(model_file)

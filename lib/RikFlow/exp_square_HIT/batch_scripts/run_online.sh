@@ -3,6 +3,11 @@
 #SBATCH -t 06:00:00
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
+# Explicit, though it is SLURM's default: the job inherits the SUBMITTING environment, which is
+# how `RIKFLOW_M4_MODEL_DIR=... sbatch ...` reaches the driver. ⚠️ The variable must be on the
+# SAME line as `sbatch` or `export`ed -- a bare `VAR=...` on its own line is a shell variable
+# `sbatch` never sees.
+#SBATCH --export=ALL
 
 # P2r/R2 -- fit a TO-LRS configuration and run it online, or run one of the other closures.
 # Every case is 64^3 LF, Float64, LMWray3, 100 TU (40,000 steps).
