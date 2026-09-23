@@ -595,7 +595,7 @@ kernels; that `m4_device("cuda")` finds a device; that the performance is anythi
 need a GPU node, and this repository has been bitten twice by exactly the class of defect a CPU
 test cannot see — defeated constant propagation (#56) and non-isbits kernel arguments (#57), both
 found only on the cluster. **Treat the first GPU run as a test, not as a measurement**, and run it
-at a small budget (`RIKFLOW_M4_UPDATES=5`) before anything long.
+at a small budget (`RIKFLOW_M4_EPOCHS=5`) before anything long.
 
 ⚠️ **The expectation is still that it will be slower at the current geometry**, for the reasons
 measured above. The configuration in which it could pay is §6.2's short `stride` with `batch = 32`,
@@ -650,6 +650,11 @@ the segment list rather than by row (§6.2). At the tiling stride the two splits
 which two segments form the validation set, so the shape of the curves and the epoch at which they
 flatten are unaffected; the *values* will move in the third digit. The re-run under the new split
 belongs on the cluster with everything else in §6.2 and has not been made here.
+✅ **Measured, and it really is the third digit.** Scored on §6.4's common validation set at its own
+`beta`, this `:storn` fit reads **8.111e-4** against the **8.134e-4** it reports above — a 0.3%
+difference. 🔴 That is what makes the rest of §6.4 a finding rather than a bookkeeping artefact:
+the post-split re-fit of the *same configuration at the same update count* reads 1.71e-3, so the
+**2.06x between them is the fits, not the yardstick**.
 
 ![M4 training curves](figures/fig11_lstm_losses.png)
 
@@ -740,92 +745,131 @@ available above it.
 1.5075e-3 after 1000 epochs, and the independent 3000-epoch fit of the same cell reads 1.51e-3 at
 its own epoch 1000. Two processes, same number.
 
-### 6.2 Do overlapping (shorter-stride) training segments help?
+### 6.2 Do overlapping (shorter-stride) training segments help? — ⏳ RE-RUNNING
 
-⏳ **PENDING — the scan is written and runs on the cluster, not here** (Rik, 2026-09-18: *"we can
-do that on snellius in a matter of minutes"*). `tools/m4_stride_scan.jl` was started on this
-workstation and stopped; five points at 3000 updates each is ~45 minutes here and minutes there.
-The mechanism below is implemented, tested (V53) and unmeasured.
+🔴 **The scan ran on 2026-09-18. Nothing in it supports shortening the stride — and the scan
+as run cannot settle the question, because three of its five points never converged and the budget
+that was supposed to make them comparable is what stopped them converging.** The mechanism, the
+batching and the stopping rule have been rebuilt since; the numbers below are the *old* run, kept
+because the failure is the instructive part.
 
-**The question, because it is not the obvious one.** Until 2026-09-18 the training segments were
-computed **once** before the epoch loop and reused unchanged; only their order and the latent
-noise draws varied per epoch. With `stride = L - burn` the scored windows exactly **tile** the
-record — every row is scored once per epoch — which at `L = 500` leaves **7 training segments**,
-fewer than `batch = 8`. So an epoch was **one full-batch update**, the shuffle was inert, and
-"3000 epochs" in §6 means 3000 optimiser steps.
+**What ran.** `tools/m4_stride_scan.jl`, cell `StochLSTM2` (`:storn`, `beta = 1e-4`), seed 1, every
+point to the same **3000 optimiser updates**, one process, one dataset, one initialisation. Whole
+scan 791 s = **13.2 min of node CPU**, within 6% of what the smoke's stage 9 had projected per
+point — the cost model was right even though the experiment was not.
 
-`stride` is now a keyword on `train_stochlstm` and a configuration field (defaulting to
-`L - burn`, so nothing moved without being asked to). A shorter stride overlaps the segments and
-makes more of them — 4× as many at `stride = 25`.
+| stride | batch | segs | u/ep | epochs | best val | best upd | lr decays | argmin | row-steps | wall |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 400 | 32 | 7 | 2 | 1500 | **1.712e-3** | 2312 | 6 → 1e-5 | 1156/1500 | 1.00x | 106 s |
+| **400** | **2** | 7 | 4 | 750 | 1.981e-3 | 3000 | 2 → 9e-4 | **750/750** | 0.50x | 92 s |
+| 100 | 32 | 25 | 2 | 1500 | **1.642e-3** | 2770 | 6 → 1e-5 | 1385/1500 | 3.59x | 167 s |
+| 50 | 32 | 49 | 3 | 1000 | 1.820e-3 | 2997 | 2 → 9e-4 | **999/1000** | 4.70x | 187 s |
+| 20 | 32 | 120 | 5 | 600 | 1.714e-3 | 3000 | 2 → 9e-4 | **600/600** | 6.91x | 239 s |
 
-🔴 **It is augmentation, not data.** The same 3599 rows are re-scored at different offsets inside a
-segment, so the extra gradients are correlated and `k ×` the segments is not `k ×` the information.
-Two things it can genuinely buy, and they are different:
+✅ **The geometry came out exactly as §6.2 predicted it would** — 7/25/49/120 segments, 2/4/2/3/5
+updates per epoch, 1500/750/1500/1000/600 epochs, every point landing on exactly 3000 updates. And
+validation is never strided and its epsilons are drawn once at a fixed point in the RNG stream, so
+all five validation losses are measured on the same rows with the same noise and *are* comparable
+to each other.
 
-- **more optimiser steps per epoch** — a pure budget effect, nothing to do with the overlap;
-  lowering `batch` at the tiling stride buys exactly the same thing;
-- **variation in how long the hidden state has been charged** when a given row is scored — a real
-  regulariser for a recurrence, and the only part the overlap alone can supply.
+🔑 **On the stated decision rule the overlap "wins", and the margin is not worth having.**
+`stride = 100` beats the baseline by 4.1% where the `(400, batch = 2)` control is 15.7% *worse*, so
+there is a margin over the control. But it costs 3.6x the row-steps and 1.6x the wall time,
+`stride = 20` ties the baseline exactly at 6.9x the row-steps, and the whole `batch = 32` family
+spans 11% at one seed. Per unit of data or per second, overlap loses outright.
 
-🔑 **So the scan matches every point on optimiser STEPS, and carries `(stride = 400, batch = 2)` as
-the control that separates the two.** Comparing at equal epochs would confound them completely.
+---
 
-🔑 **`batch = 32` (Rik, 2026-09-18) is the other half of the same lever.** It does nothing at the
-current stride — 7 segments cannot fill a batch of 8, let alone 32 — and takes effect only once the
-stride shortens. Its purpose is the amortisation §5 identifies: V50 already made a chunk of
-segments share one recurrence, so the per-timestep Zygote overhead is paid once for `B` segments
-instead of `B` times. At `B = 7` there is nothing to amortise; at `B = 32` there is. **So `stride`
-and `batch` are one lever, not two** — the stride creates the segments and the batch is what makes
-them cheap — and it is also the only route by which a GPU could ever become relevant here (§5).
+#### 🔴 Why this scan does not settle it — three defects, one cause
 
-🔴 **The train/validation split had to change with it, and the old one was a latent trap.** It was
-`segs[1:end-nval]` / `segs[end-nval+1:end]` — by position in the *segment list*. At the tiling
-stride that is safe: consecutive segments overlap by exactly `burn` rows, and those rows are the
-next segment's **burn-in**, which is not scored, so the scored ranges stay disjoint. At any shorter
-stride the scored windows overlap and scored validation rows land inside scored training rows —
-**the validation loss quietly becomes a training loss, with nothing looking wrong.** The split is
-now by **row**, each side segmented independently, which cannot do that at any stride; and the
-embargo comes free, because the validation block's first `burn = 100` rows are burn-in, putting the
-first scored validation row about one 1/e time past the last training row. **V53** pins the whole
-geometry at strides 400 / 75 / 50 / 25 / 1, and refuses a stride past `L - burn`, which would leave
-rows nothing ever scores.
+**1. Three of the five points never converged.** The control, `stride = 50` and `stride = 20` all
+have their best iterate at the **final epoch** and ended at `lr = 9e-4`, two decades above the
+`1e-5` floor, still dropping 8–15% over their last quarter. Their `best_val` is where the budget
+stopped, not where the fit went, and it is not comparable with the two points that did anneal.
 
-⚠️ **§6's table predates this change** and was measured on the old split. It is re-run under the
-new one before it stands.
+**2. The learning-rate schedule was never matched, because `patience` counts EPOCHS.** Matching
+updates *un-matches* epochs by construction — that is the whole point of the design — so the two
+1500-epoch points got six decays and reached the floor while the 750/1000/600-epoch points got two.
+🔑 **The two fully annealed points are ranked first and second.** That correlation is the
+confound, and no reading of the table can separate it from the stride.
 
-**The scan, as it will run** (5 points, each to the same 3000 optimiser steps, so the epoch count
-is derived per point and is *not* the comparison axis):
+**3. A single tail segment owned half the optimiser steps.** `segment_indices` leaves the training
+block as 6 x 500 + 1 x **479**, and segments of different lengths cannot share a recurrence, so the
+short one was batched **alone**:
 
-| stride | batch | train segs | updates/epoch | epochs | isolates |
+| stride | updates/epoch | of which the lone tail | scored rows it carries |
+|---|---|---|---|
+| 400 (b32) | 2 | **50%** | 13.6% |
+| 400 (b2) | 4 | 25% | 13.6% |
+| 100 | 2 | **50%** | 3.8% |
+| 50 | 3 | 33% | 1.9% |
+| 20 | 5 | 20% | 0.8% |
+
+🔑 **This is also the cause of defect 2.** The extra length group inflates `updates/epoch`,
+which shortens `epochs` at a fixed update budget, which starves an epoch-counted patience rule. One
+defect, two symptoms.
+
+⚠️ **And a fourth, found only after the batching was fixed:** validation ran **once per epoch**,
+so pacing anything by the epoch paced it differently at every point. Under the new geometry three
+of the five points take 1 update per epoch, i.e. validation after every single optimiser step,
+while the other two take 3. Fixing the batching alone would have left the confound in place.
+
+---
+
+#### ✅ What changed, and what the re-run does instead
+
+🔒 **Every point now runs to CONVERGENCE, not to a shared budget** (Rik, 2026-09-18). Matching
+epochs instead of updates would have been no better — then the shortest stride simply takes five
+times the updates, which is "more steps" wearing "overlap helps"'s clothes. A converged fit is
+where its objective took it, so the budget disparity stops mattering; quality is the converged
+validation loss and cost is reported in its own columns rather than forced equal.
+
+- 🔴 **Full random minibatches, last partial batch dropped** (Rik). Training keeps only
+  full-length segments, so there is one length group and a minibatch is a uniform random sample of
+  it. The effective size is `min(batch, nseg)`, because at the tiling stride there are 6 segments
+  and a batch of 32 can never be filled — dropping every partial batch *literally* would leave that
+  point with no updates at all.
+- 🔴 **Validation, the plateau rule and the early stop are paced in UPDATES**, via
+  `val_every = 2` (Rik). `patience = 20` is then 40 updates and `stop_patience = 100` is 200
+  updates, identically at every point. 40 updates is what the pre-2026-09-18 tiling-stride baseline
+  actually ran with, so the new fits stay on the old scale.
+- 🔴 **Early stopping fires only once the schedule has bottomed out** — at `min_lr` *and*
+  `stop_patience` validations past the best. Both halves are needed: a fit still above `min_lr` has
+  a decay left that may restart the descent, and one still improving has not converged.
+- ⚠️ `epochs = 3000` is now a **cap**, not a budget. The scan prints a red line naming any point
+  that hit it, because such a point is a truncation and not a result.
+- The fit history is indexed by **optimiser update**, and carries `update`, `best_update`,
+  `best_index`, `updates`, `nseg`, `batch_eff`, `upd_per_epoch` and `stopped_early`. Any epoch count
+  is meaningless without the geometry beside it, and deriving it afterwards is how it came to be
+  wrong twice.
+
+The new geometry, printed by the fit rather than derived:
+
+| stride | batch | segs | batch_eff | updates/epoch | dropped/epoch |
 |---|---|---|---|---|---|
-| 400 (tiling) | 32 | 7 | 2 | 1500 | the baseline |
-| **400** | **2** | 7 | 4 | 750 | 🔑 **control — more steps, no overlap** |
-| 100 | 32 | 25 | 2 | 1500 | overlap 4× |
-| 50 | 32 | 49 | 3 | 1000 | overlap 8× |
-| 20 | 32 | 120 | 5 | 600 | overlap 17× |
+| 400 | 32 | 6 | 6 | 1 | 0 |
+| 400 | 2 | 6 | 2 | 3 | 0 |
+| 100 | 32 | 24 | 24 | 1 | 0 |
+| 50 | 32 | 48 | 32 | 1 | 16 |
+| 20 | 32 | 119 | 32 | 3 | 23 |
 
-🔴 **Strides 100 / 50 / 20** (Rik, 2026-09-18). The first two rows are additions to that list and
-are said so here rather than left to look like part of it: row 1 is the current default, which is
-what the other rows have to be *read against*, and row 2 is the control without which "overlap
-helped" cannot be separated from "more optimiser steps". Together they cost two points of five.
+⚠️ The `dropped/epoch` segments are a **different few each epoch** — the set is reshuffled — so
+they are dropped from an epoch, never from the fit. One short segment is dropped outright at every
+stride, costing 379 scored rows of 2779 at the tiling stride and 399 of 47999 at `stride = 20`.
 
-⚠️ **Segment counts are on the 2879-row TRAINING block, not the whole record**, and `updates/epoch`
-accounts for the two length groups — both are things I got wrong before the smoke run printed them.
-⚠️ **At `batch = 32` matched updates is no longer matched compute**: one update covers up to 32
-segments, so at `stride = 50` an update sees ~9× the row-steps the tiling stride can offer. That is
-the intended asymmetry — a bigger update is the point of a bigger batch — but the wall times the
-scan prints are then not a cost ranking and must not be read as one.
+⚠️ **One test was removed rather than repaired:** V49's decay-on-plateau check asserted that the
+schedule fires within 20 epochs. With one length group the descent is now monotone for ~50 epochs
+and there is no plateau to decay on inside 20 — the old check passed because the lone one-segment
+batch made the curve noisy enough to *manufacture* a plateau. It was testing an artefact.
 
-🔑 **How to read it when it comes back.** If the short strides beat the baseline by no more than
-the `(400, batch = 2)` row does, the gain was budget — more optimiser steps — and the overlap
-itself bought nothing, in which case lower `batch` and leave `stride` alone, because it is
-cheaper per step. Only a margin *over* that control is evidence for the context-position
-augmentation, and that is the part worth carrying into the paper.
+🔑 **How to read the re-run.** Only a margin over the `(400, batch = 2)` control is evidence for
+the context-position augmentation; a margin over the baseline alone is evidence for more optimiser
+steps, which a smaller batch buys more cheaply. And now that every point converges, read the
+converged floor for quality and the updates / row-steps / wall columns for cost — separately.
 
-⚠️ **`epochs` and updates decouple the moment `stride` moves.** `epochs = 3000` at the tiling
-stride is 3000 updates; at `stride = 50` it would be 21 000. Any change to `stride` requires the
-epoch count to be re-derived from the intended update budget, which is what the scan does and what
-the configuration table does **not** do automatically.
+⏳ **Status: the re-run has not happened.** It goes to Snellius (Rik). The smoke's stage 9 projects
+**119 min for the five points at the 3000-epoch cap on the Windows workstation**; the node's own
+smoke settles the walltime, because a cross-machine ratio is not a measurement (§5).
 
 ---
 
@@ -875,6 +919,117 @@ segmentation that is about to change.
 
 ---
 
+### 6.4 Every trained model on one validation set, and on held-out data
+
+🔴 **Every fit reports a validation loss measured on its own validation set, and those sets are
+not the same.** The pre-2026-09-18 fits split by position in the segment list and score rows
+2901:3599; the row split that replaced it scores 2980:3599. Two numbers both called "best val",
+never computed on the same rows, with nothing in either file saying so. `analysis/m4_common_val.jl`
+removes that by scoring every saved model on one set.
+
+**The set** is the row-split validation block, segmented at **`stride = 400`** (Rik, 2026-09-18:
+*"just use 400 stride there so there is no overlap"*) — 2 segments, **620 scored rows, 2980:3599**.
+At `stride = L - burn` the scored windows exactly tile the block, so every row is scored once and
+none is weighted twice; a shorter stride would make the number a function of the segmentation
+rather than of the model. 🔑 **Those rows are disjoint from BOTH training blocks** — the pre-split
+fits trained on scored rows 101:2900 and the post-split ones on 101:2879 — so the set is genuinely
+held out for every model in the table. The driver checks both properties rather than asserting
+them.
+
+⚠️ **The comparable column is the reconstruction term at `beta = 0`.** The models differ in `beta`
+and the KL is weighted by it, so a full ELBO would rank fits partly on how hard each was penalised.
+The ELBO at each model's own `beta` is printed beside it and is *not* comparable across different
+`beta`. The `:lstm` control is a Gaussian log-density and gets its own table (§2).
+
+| model | recon (`beta = 0`) | elbo (own `beta`) | its own reported val | ratio |
+|---|---|---|---|---|
+| `StochLSTM2` `:storn` (pre-split) | **6.220e-4** | 8.111e-4 | 8.134e-4 | 1.00 |
+| `StochLSTM5` `:vrnn` (pre-split) | 6.929e-4 | 1.131e-3 | 1.191e-3 | 1.11 |
+| stride 100, b32 | 1.248e-3 | 1.645e-3 | 1.642e-3 | 2.01 |
+| stride 20, b32 | 1.253e-3 | 1.731e-3 | 1.714e-3 | 2.01 |
+| stride 400, b32 | 1.281e-3 | 1.714e-3 | 1.712e-3 | 2.06 |
+| stride 50, b32 | 1.350e-3 | 1.841e-3 | 1.820e-3 | 2.17 |
+| stride 400, b2 | 1.452e-3 | 2.005e-3 | 1.981e-3 | 2.33 |
+
+🔴 **The post-split re-fits are ~2x worse than the pre-split fit of the identical
+configuration, and it is not the yardstick.** `stride 400, b32` *is* `StochLSTM2`'s configuration
+refitted at the same 3000 updates, and on these rows it is 2.06x worse. The yardstick accounts for
+0.3% of that (above). 🔑 **Every stride point is also beaten by the deterministic `:lstm`
+control on held-out data**, which is not a thing that should happen to a `:storn` cell and is the
+clearest sign that the re-fits are damaged rather than the architecture being wrong.
+
+⚠️ **Which of §6.2's three defects causes it is NOT established.** The lone 479-row tail batch is
+the leading candidate — it is the one change that alters *what the gradient is* rather than how long
+the fit runs — but the re-run is what will say. Until then this is a measured regression with a
+suspected cause, and §6's table should not be quoted against any post-split number without it.
+
+#### Held-out trajectories — `fig12`, `fig12b`
+
+`analysis/` also runs each model forward on the **selection window**, teacher-forced in the
+post-run setting of §8 (`postrun_lstm.jl`'s window, burn-in and forcing): steps **4000–7600**, 3499
+scored after a 100-step burn-in, one latent draw per model.
+
+![stride points on held-out data](figures/fig12_lstm_traj_stride.png)
+![cells on held-out data](figures/fig12b_lstm_traj_cells.png)
+
+🔑 **The trajectory panel alone cannot separate these models** — teacher-forced one-step
+prediction on this record puts every line on top of the truth at full-window scale. The residual is
+what discriminates, which is why it is the left-hand column. Total held-out squared error, pooled
+over the six QoIs (scaled units), single draw:
+
+| model | total SSE | share from ±100 steps of 6501 | residual std |
+|---|---|---|---|
+| `StochLSTM5` `:vrnn` | **6.63** | 17.4% | 0.0178 |
+| `StochLSTM2` `:storn` | **8.67** | 47.4% | 0.0203 |
+| stride 100, b32 | 15.03 | 41.9% | 0.0267 |
+| `StochLSTM7` `:lstm` control | 15.59 | 20.8% | 0.0272 |
+| stride 400, b32 | 16.24 | 41.7% | 0.0278 |
+| stride 50, b32 | 18.93 | 51.1% | 0.0299 |
+| stride 20, b32 | 20.52 | 58.2% | 0.0311 |
+| stride 400, b2 | 25.3 | 50.3% | 0.0347 |
+
+✅ **The held-out ranking reproduces the inner split's**, including the stride ordering, so the
+inner validation split was not lying about the fits — they really are that close, and none of it is
+evidence for overlap.
+
+🔴 **One event owns the error, and it should be said out loud before any window-averaged score
+goes in the paper.** Step **6501** is the record's largest excursion: the truth sits at the
+95.7th–100th percentile of the window in **all six QoIs at once**. A ±100-step window around it is
+5.7% of the record and carries **17–58%** of every model's total squared error. Every model
+under-predicts it, in all six QoIs, with no exception across the eight — a systematic failure to
+reach the extreme, not an unlucky draw. Overall bias is small and negative everywhere
+(−0.0007 to −0.003), i.e. slight under-prediction throughout. 🔑 `:vrnn` is the only model that
+partly tracks the excursion (17.4% share against 42–58% for the `:storn` re-fits).
+
+#### The loss decay of every model — `fig13`
+
+![loss decay, all models](figures/fig13_lstm_loss_decay.png)
+
+🔴 **The x axis is optimiser updates, not epochs, and it has to be.** The three cell fits predate
+the row split and ran at 1 update/epoch; the stride points ran at 2/4/2/3/5. On an epoch axis
+`stride = 20` would sit five times too far right and the comparison inverts.
+
+Six panels: validation and training on a shared log-log axis for the `emission = :none` models, the
+learning-rate schedule for all eight, a linear zoom of the last two thirds, the `:lstm` control on
+its own axis, and §6.1's lr scan for completeness.
+
+- 🔑 **The schedule panel is §6.2's confound, drawn.** Five of the eight reach the `1e-5` floor;
+  three stop two decades above it at `9e-4` and their lines simply end — and those three are exactly
+  the three whose best iterate is their last. The control is the odd one out in the other direction,
+  firing at updates ~120 and ~390 because its spiky objective reads as a plateau to a patience rule.
+- 🔑 **The linear zoom separates two populations cleanly.** The pre-split cells flatten hard at
+  8.1e-4 and 1.19e-3; the five re-fits sit at 1.64–1.98e-3 and most are still sloping down at 3000
+  updates. No overlap between the bands.
+- All seven latent runs share one power-law descent out to ~update 30, after which `StochLSTM2`
+  pulls below and stays there — so the re-fits are not failing to train, they are tracking the same
+  curve from a worse position.
+- ⚠️ **Noise scales with overlap and with small batches.** `stride = 20` and the `batch = 2`
+  control carry the large transient spikes in both curves; `stride = 20` throws one at update ~2200
+  that costs it a factor of 2 before recovering. This is the same one-segment-batch noise §6.2's
+  batching change removes.
+
+---
+
 ## 7. Running the sweeps on Snellius
 
 🔴 **The M4 batch scripts train on the GPU by default since 2026-09-18** (Rik):
@@ -905,7 +1060,7 @@ done
 M4_DEVICE=cpu sbatch batch_scripts/run_m4_sweeps.sh stride
 
 # budgets, from the submitting shell; the defaults are the scans' own
-RIKFLOW_M4_UPDATES=3000 sbatch batch_scripts/run_m4_sweeps.sh stride
+RIKFLOW_M4_EPOCHS=3000 sbatch batch_scripts/run_m4_sweeps.sh stride
 RIKFLOW_M4_EPOCHS=5     sbatch batch_scripts/run_train_lstm.sh 19 1    # smoke one grid cell
 
 # the lr scan is CLOSED (§6.1) -- kept runnable, not part of the programme
@@ -997,9 +1152,9 @@ just to find `julia`.** If the default were anything else, no job in this reposi
 have run. Both M4 scripts now state it (`#SBATCH --export=ALL`) rather than rely on it, which also
 protects against a site default of `NONE`.
 
-🔴 **The trap is the explicit form.** `sbatch --export=RIKFLOW_M4_UPDATES=5 ...` **replaces** `ALL`
+🔴 **The trap is the explicit form.** `sbatch --export=RIKFLOW_M4_EPOCHS=5 ...` **replaces** `ALL`
 rather than adding to it, so the job loses `PATH` and dies before Julia starts. The additive form
-is `--export=ALL,RIKFLOW_M4_UPDATES=5`. The prefix form, `RIKFLOW_M4_UPDATES=5 sbatch ...`, has no
+is `--export=ALL,RIKFLOW_M4_EPOCHS=5`. The prefix form, `RIKFLOW_M4_EPOCHS=5 sbatch ...`, has no
 such hazard and is what §7's examples use.
 
 🔑 **And the log answers it rather than the reader inferring it.** `run_m4_sweeps.sh` echoes the
@@ -1060,16 +1215,23 @@ RIKFLOW_QOI_CACHE=analysis/data/data_track_dns512_..._f64_lmwray3_qois.jld2 \
 # the loss curves (§6)
 julia --project=lib/RikFlow/analysis lib/RikFlow/analysis/plot_lstm_losses.jl 2 5 7
 
-# the two scans (§6.1, §6.2). Runnable here -- ~18 min and ~50 min -- but §7 is how they are
+# the two scans (§6.1, §6.2). ⚠️ The stride scan is ~2 h on this workstation under the
+# convergence policy (the smoke's stage 9 projects 119 min against the 3000-epoch cap, and early
+# stopping can only make it cheaper) -- §7 is how it is
 # meant to be run, and NOT as a GPU job (§5, "Why not a GPU").
 RIKFLOW_M4_LR_EPOCHS=1000 \
   julia --project=lib/RikFlow/training lib/RikFlow/exp_square_HIT/tools/m4_lr_scan.jl 2 1
-RIKFLOW_M4_UPDATES=3000 \
+RIKFLOW_M4_EPOCHS=3000 RIKFLOW_M4_STOP_PATIENCE=100 RIKFLOW_M4_VAL_EVERY=2 \
   julia --project=lib/RikFlow/training lib/RikFlow/exp_square_HIT/tools/m4_stride_scan.jl 2 1
 
 # score it post-run (the faithful Sørensen setting: teacher-forced, no solver)
 RIKFLOW_QOI_CACHE=... \
   julia --project=lib/RikFlow/training lib/RikFlow/analysis/postrun_lstm.jl 2
+
+# every saved model on ONE validation set, so the losses are comparable numbers (§6.4).
+# 🔴 Also under --project=training: `elbo` lives in the Lux extension.
+RIKFLOW_QOI_CACHE=... \
+  julia --project=lib/RikFlow/training lib/RikFlow/analysis/m4_common_val.jl
 
 # per-step cost against the S4 budget (no Lux needed — the deployed path is stdlib)
 julia --project=lib/RikFlow lib/RikFlow/exp_square_HIT/tools/m4_cost_probe.jl
