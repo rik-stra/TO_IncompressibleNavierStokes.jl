@@ -35,6 +35,9 @@
 #     sbatch batch_scripts/run_m4_sweeps.sh smoke           # 🔴 RUN THIS FIRST -- ~3 min, finishes
 #     sbatch batch_scripts/run_m4_sweeps.sh stride          # the stride scan, cell 2, seed 1
 #     sbatch batch_scripts/run_m4_sweeps.sh lr 5 3          # cell 5, seed 3
+#     RIKFLOW_M4_INIT=StochLSTM2_s100b32_points3_cap10000 sbatch batch_scripts/run_m4_sweeps.sh rollout
+#                                                          # rollout fine-tune of an exported fit;
+#                                                          # RIKFLOW_M4_ROLLOUT / _L / _BURN / _LR / _CLIP
 #
 # 🔴 **`smoke` is the first job to run on any new device.** A scan is a bad first job: one point is
 # thousands of updates and prints nothing until it ends, so a slow device and a hung one look
@@ -89,7 +92,8 @@ case "$WHICH" in
     smoke)  SCAN=m4_smoke.jl ;;
     lr)     SCAN=m4_lr_scan.jl ;;
     stride) SCAN=m4_stride_scan.jl ;;
-    *) echo "run_m4_sweeps.sh: first argument must be 'smoke', 'lr' or 'stride'; got '${WHICH}'" >&2
+    rollout) SCAN=m4_rollout_train.jl ;;
+    *) echo "run_m4_sweeps.sh: first argument must be 'smoke', 'lr', 'stride' or 'rollout'; got '${WHICH}'" >&2
        exit 1 ;;
 esac
 if ! [[ "$CELL" =~ ^[0-9]+$ ]] || ! [[ "$SEED" =~ ^[0-9]+$ ]]; then
@@ -144,7 +148,10 @@ fi
 julia --project="$ROOT/training" -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' ||
     echo "precompile step failed — continuing; the run will compile in-process (slower start)" >&2
 
-if [ "$WHICH" = "smoke" ]; then
+if [ "$WHICH" = "rollout" ]; then
+    echo "== M4 rollout fine-tune from ${RIKFLOW_M4_INIT:-<RIKFLOW_M4_INIT NOT SET>} (K ${RIKFLOW_M4_ROLLOUT:-<L-burn>}, L ${RIKFLOW_M4_L:-<fit>}, burn ${RIKFLOW_M4_BURN:-<fit>}, lr ${RIKFLOW_M4_LR:-<1e-4>}, clip ${RIKFLOW_M4_CLIP:-<off>})"
+    julia --project="$ROOT/training" "$EXP/tools/$SCAN"
+elif [ "$WHICH" = "smoke" ]; then
     echo "== M4 smoke (device $M4_DEVICE)"
     julia --project="$ROOT/training" "$EXP/tools/$SCAN"
 else

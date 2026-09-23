@@ -696,4 +696,103 @@ const RF = RikFlow
         @test !h0.stopped_early && h0.stop_reason === :cap
         @test h0.updates == 40 * h0.upd_per_epoch
     end
+
+    # -----------------------------------------------------------------------------------------
+    # V58 -- rollout training: the model's own output fed back into its level lags
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔴 Three properties, each of which a plausible-looking implementation can get wrong silently:
+    # K = 1 must BE teacher forcing (so `rollout = 1` changes nothing); a free run must be the
+    # DEPLOYED closure's loop, `lstm_step!` fed its own `y` in the lag columns; and the gradient
+    # must flow through the feedback, checked against central differences.
+    @testset "V58 rollout training: K = 1 is teacher forcing, K > 1 is the deployed feedback loop ($arch, n_encoder=$ne)" for
+            arch in (:vaernn, :storn, :vrnn), ne in (0, 5)
+        ext = Base.get_extension(RikFlow, :RikFlowLuxExt)
+        T = Float64
+        spec = mkspec(arch; n_qoi = 3, h = 2, n_encoder = ne, emission = :none)
+        ps = RF.init_lstm_params(Xoshiro(41), spec; T)
+        nin, nout, nz = RF.n_input(spec), RF.n_output(spec), spec.n_latent
+        L, burn, B = 30, 8, 3
+        X = randn(Xoshiro(42), T, nin, L, B); X[end, :, :] .= 1       # bias column
+        Y = randn(Xoshiro(43), T, nout, L, B)
+        E = randn(Xoshiro(44), T, nz, L, B)
+        sc = (burn + 1):L
+
+        # (1) K = 1: no step is free, so the rollout pass IS the teacher-forced pass
+        f1 = ext._rollout_mask(L, burn, 1)
+        @test !any(f1)
+        @test RF.elbo(spec, ps, X, Y, sc, E; beta = 1e-3, free = f1) ≈
+              RF.elbo(spec, ps, X, Y, sc, E; beta = 1e-3) rtol = 1e-12
+
+        # (2) a full free run equals the DEPLOYED step fed its own output, at z = mu (eps = 0)
+        ff = ext._rollout_mask(L, burn, L)
+        @test !any(ff[1:burn]) && all(ff[(burn + 1):(L - 1)])
+        o = ext._rollout_forward(spec, ps, X, zero(E), ff)
+        w = RF.LSTMWeights(ps, spec)
+        for b in 1:B
+            st = RF.LSTMState(spec, T)
+            ys = zeros(T, nout, L)
+            for t in 1:L
+                x = X[:, t, b]
+                for k in 1:spec.hist.h
+                    s = t - k
+                    (s >= 1 && ff[s]) && (x[RF.qlag_columns(spec.hist, k)] .= ys[:, s])
+                end
+                RF.lstm_step!(st, w, spec, x; sample_latent = false)
+                ys[:, t] .= st.y
+            end
+            @test o.Y[:, :, b] ≈ ys rtol = 1e-10
+        end
+        # and the feedback really changes the answer -- a rollout that fed the record would pass (2)
+        @test !(o.Y ≈ RF.lstm_forward(spec, ps, X, zero(E)).Y)
+
+        # (3) the gradient THROUGH the feedback, against central differences in a random direction
+        fK = ext._rollout_mask(L, burn, 7)
+        loss(p) = RF.elbo(spec, p, X, Y, sc, E; beta = 1e-3, free = fK)
+        g = Zygote.gradient(loss, ps)[1]
+        v = map(a -> a === nothing ? nothing : randn(Xoshiro(45), T, size(a)), ps)
+        dir(sgn, h) = map((a, d) -> a === nothing ? nothing : a .+ sgn * h .* d, ps, v)
+        fd = (loss(dir(1, 1e-6)) - loss(dir(-1, 1e-6))) / 2e-6
+        ad = sum(sum(gi .* vi) for (gi, vi) in zip(values(g), values(v)) if gi !== nothing && vi !== nothing)
+        @test ad ≈ fd rtol = 1e-5
+    end
+
+    @testset "V58 rollout training runs, warm-starts, and refuses an emission head" begin
+        T = Float32
+        nq, N = 3, 700
+        rng = Xoshiro(98)
+        q = zeros(Float64, nq, N)
+        for t in 2:N
+            q[:, t] = 0.8 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        spec = mkspec(:storn; n_qoi = nq, h = 1, n_hidden = 8, n_latent = 4, n_encoder = 0,
+                      emission = :none)
+        X, Yb, steps = RF.build_history(spec.hist, q[:, 1:(N - 1)], q)
+        Xc, Yc = permutedims(X), permutedims(Yb)
+        kw = (; L = 60, burn = 15, batch = 4, seed = 3, verbose = false, T)
+        _, h = RF.train_stochlstm(spec, Xc, Yc, steps; kw..., epochs = 6, lr = 5e-3, rollout = 45,
+                                  clip = 1.0)
+        @test h.rollout == 45 && h.clip == 1.0 && all(isfinite, h.val) && all(isfinite, h.gmax)
+        @test length(h.gmax) == length(h.val)
+        # warm start: at lr = 0 Adam does not move, so the returned fit IS init_ps
+        p0, _ = RF.train_stochlstm(spec, Xc, Yc, steps; kw..., epochs = 3, lr = 5e-3)
+        p1, h1 = RF.train_stochlstm(spec, Xc, Yc, steps; kw..., epochs = 2, lr = 0.0,
+                                    rollout = 45, init_ps = p0)
+        @test h1.warm_start && p1.Wx ≈ p0.Wx && p1.V1 ≈ p0.V1
+        # the warm start is validated at update 0 and can be returned: a fine-tune never comes back
+        # worse than it started (lr = 0.5 wrecks it within an update)
+        @test h1.update[1] == 0 && isnan(h1.train[1])
+        p2, h2 = RF.train_stochlstm(spec, Xc, Yc, steps; kw..., epochs = 3, lr = 0.5,
+                                    rollout = 45, init_ps = p0)
+        @test h2.best_val <= h2.val[1]
+        h2.best_update == 0 && @test p2.Wx ≈ p0.Wx
+        # a wrong-shaped warm start is refused, and so is an emission head
+        bad = merge(p0, (; Wh = zeros(T, 3, 3)))
+        @test_throws ErrorException RF.train_stochlstm(spec, Xc, Yc, steps; kw..., epochs = 1,
+                                                       init_ps = bad)
+        spec_e = mkspec(:storn; n_qoi = nq, h = 1, n_hidden = 8, n_latent = 4, n_encoder = 0,
+                        emission = :constant)
+        @test_throws ErrorException RF.train_stochlstm(spec_e, Xc, Yc, steps; kw..., epochs = 1,
+                                                       rollout = 10)
+    end
 end

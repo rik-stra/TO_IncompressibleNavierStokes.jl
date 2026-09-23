@@ -368,6 +368,99 @@ function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T}
 end
 
 # ---------------------------------------------------------------------------------------------
+# Rollout forward: the level lags fed from the model's own outputs
+# ---------------------------------------------------------------------------------------------
+
+"""
+    _rollout_mask(L, burn, K) -> Vector{Bool}
+
+Which steps of an `L`-step segment feed their OWN output back as the next steps' level lag.
+`false` for the `burn` warm-up steps (the recorded level is fed, as the deployed closure's
+`nwarm` replay does) and at every `K`-th step after it, where the lag is re-anchored to the
+recorded level. `K = 1` is teacher forcing everywhere; `K >= L - burn` is one free run of
+`L - burn` steps after the warm-up -- deployment's shape.
+"""
+_rollout_mask(L::Integer, burn::Integer, K::Integer) =
+    [s > burn && (s - burn) % K != 0 for s in 1:L]
+
+"Replace rows `r` of `x` by `v`, without mutating (Zygote-safe)."
+_swap_rows(x, r::UnitRange, v) = vcat(x[1:(first(r) - 1), :], v, x[(last(r) + 1):end, :])
+
+"""
+    _rollout_forward(spec, ps, X, epsz, free)
+
+`lstm_forward` with the level-lag columns of each input taken from the model's own output
+wherever `free` says so. Same return value.
+
+🔑 **What is replaced and what is not -- the regime-B surrogate of the online loop.** The deployed
+closure pushes `q* + dQ = qhat` into its history, so online the LEVEL lags are the model's own
+outputs while the predictor `q*` comes from the solver. Here the lag `k` rows of `x_t`
+(`qlag_columns(spec.hist, k)`) are the model's `y_{t-k}` when step `t-k` is free, and the recorded
+level otherwise; every predictor column, and the bias, stays recorded. The solver's response to the
+model's corrections is what this cannot reproduce -- `q*` is replayed, not re-simulated.
+
+⚠️ **Everything is per step**, unlike `lstm_forward`, which projects the whole segment at once:
+`x_t` now depends on `y_{t-1}`, so the encoder, the latent draw (`z_t` reads `x_t`), the input
+projection and the decoder all move inside the loop. Gradients flow through the feedback, which is
+the point -- and why a long free run can explode (Rik, 2026-09-23): shorten `L` or `K`, or clip.
+🔴 `emission = :none` only -- the feedback is then the decoder mean, exactly what the deployed
+closure pushes. With an emission head it would push a DRAW, which this does not model.
+"""
+function _rollout_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3},
+                          epsz::AbstractArray, free::AbstractVector{Bool}) where {T}
+    RF.emission_noise(spec) && error("_rollout_forward: emission = :none only -- the deployed " *
+                                     "closure feeds back a DRAW when there is an emission head")
+    H = spec.n_hidden
+    nin, L, B = size(X)
+    length(free) == L || error("_rollout_forward: free has $(length(free)) entries, segment $L")
+    nz, nout, hh = spec.n_latent, RF.n_output(spec), spec.hist.h
+    encv, hasz = Val(spec.n_encoder > 0), Val(RF.latent_sampled(spec))
+    cellv, decv = Val(RF.latent_to_cell(spec)), Val(RF.latent_to_decoder(spec))
+    lagrows = [RF.qlag_columns(spec.hist, k) for k in 1:hh]
+    any(isnothing, lagrows) && error("_rollout_forward: the history carries no level lags " *
+                                     "(hist_var = $(spec.hist.hist_var)) -- nothing to feed back")
+
+    Xs = _timeslices(X, L)
+    Es = _timeslices(epsz, L)
+    Wh = ps.Wh
+    Yb = Zygote.Buffer(similar(X, T, nout, L, B))
+    MUb = Zygote.Buffer(similar(X, T, nz, L, B))
+    SIGb = Zygote.Buffer(similar(X, T, nz, L, B))
+    Hb = Zygote.Buffer(similar(X, T, H, L, B))
+    h = zero(similar(X, T, H, B))
+    c = zero(similar(X, T, H, B))
+    ys = ntuple(_ -> zero(similar(X, T, nout, B)), hh)   # ys[k] = y_{t-k}
+    for t in 1:L
+        xt = Xs[t]
+        for k in 1:hh
+            s = t - k
+            (s >= 1 && free[s]) && (xt = _swap_rows(xt, lagrows[k], ys[k]))
+        end
+        MU, SIG, Z = _latent(hasz, encv, ps, xt, Es[t], T, nz, B)
+        g = ps.Wx * _cell_input(cellv, xt, Z) .+ ps.b .+ Wh * h
+        gi = @view g[1:H, :]
+        gf = @view g[(H + 1):(2H), :]
+        gc = @view g[(2H + 1):(3H), :]
+        go = @view g[(3H + 1):(4H), :]
+        c = @. _sig(gf) * c + _sig(gi) * tanh(gc)
+        h = @. _sig(go) * tanh(c)
+        y = _decoder_skip(decv, ps.V1 * h .+ ps.cdec, ps, Z)
+        Yb[:, t, :] = y
+        MUb[:, t, :] = MU
+        SIGb[:, t, :] = SIG
+        Hb[:, t, :] = h
+        ys = hh == 1 ? (y,) : (y, ys[1:(end - 1)]...)
+    end
+    Hm = copy(Hb)
+    LOGD2 = ps.Wd * reshape(Hm, H, L * B) .+ ps.bd
+    if spec.uclip !== nothing
+        LOGD2 = clamp.(LOGD2, T(spec.uclip[1]), T(spec.uclip[2]))
+    end
+    return (; Y = copy(Yb), LOGD = reshape(LOGD2, nout, L, B), MU = copy(MUb),
+            SIG = copy(SIGb), Hm)
+end
+
+# ---------------------------------------------------------------------------------------------
 # Objective
 # ---------------------------------------------------------------------------------------------
 
@@ -383,8 +476,12 @@ recurrence and contribute nothing, which is the whole reason they exist.
 parameter in this project and the two must never be conflated.**
 """
 function RF.elbo(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3}, Ytrue::AbstractArray,
-                 score::AbstractUnitRange, epsz::AbstractArray; beta::Real = 1e-4) where {T}
-    out = RF.lstm_forward(spec, ps, X, epsz)
+                 score::AbstractUnitRange, epsz::AbstractArray; beta::Real = 1e-4,
+                 free::Union{Nothing,AbstractVector{Bool}} = nothing) where {T}
+    # `free === nothing` is teacher forcing, the path every existing fit was made on, unchanged.
+    # Otherwise the level lags are fed from the model's own outputs -- see `_rollout_forward`.
+    out = free === nothing ? RF.lstm_forward(spec, ps, X, epsz) :
+          _rollout_forward(spec, ps, X, epsz, free)
     nout = RF.n_output(spec)
     B = size(X, 3)
     ns = length(score) * B            # scored steps summed over the batch
@@ -488,6 +585,9 @@ function _window_stalled(upd_axis::AbstractVector, bsf::AbstractVector, window::
     return (bsf[j] - bsf[end]) / abs(bsf[j]) < rel
 end
 
+"Global L2 norm of a gradient NamedTuple (fields that carry no gradient are `nothing`)."
+_gnorm(g) = sqrt(sum((x === nothing ? 0.0 : Float64(sum(abs2, x)) for x in values(g)); init = 0.0))
+
 """
     train_stochlstm(spec, X, Y, steps; kwargs...)
 
@@ -545,6 +645,19 @@ Fit an M4 model to a regressor/target pair.
   over 500 updates (Rik, 2026-09-23); `stop_window = 0` disables it. See `_window_stalled`.
   `history.stopped_early` records whether either rule fired and `history.stop_reason` which --
   `:floor`, `:window`, or `:cap` for a fit that ran to `epochs`.
+- `rollout`: 🔴 **rollout training (Rik, 2026-09-23).** `1` (default) is teacher forcing, the path
+  every earlier fit used and bit-for-bit unchanged. `K > 1` feeds the model's OWN output back into
+  the level-lag columns after the `burn` warm-up, re-anchoring to the recorded level every `K`
+  steps; `K >= L - burn` is one free run per segment, deployment's shape. The predictor `q*` stays
+  recorded -- the regime-B surrogate of the online loop (`_rollout_forward`). Motivated by the
+  online runs: teacher-forced fits settle into a spurious flat state and never reach the upper
+  tail once their own output is in the loop (`results_LSTMS.md`, fig15/fig16). `emission = :none`
+  only. Validation uses the same rollout.
+- `init_ps`: warm-start parameters (e.g. the `ps` a fit file stores), shape-checked against
+  `spec`. Rollout training is meant as a fine-tune of a teacher-forced fit.
+- `clip`: clip the gradient's global norm to this before Adam; `0` (default) is off.
+  `history.gmax` logs the largest norm seen between validations, so an exploding rollout
+  gradient is visible rather than silent.
 
 🔴 **Returns the best-validation iterate, not the last one**, and the validation epsilons are drawn
 once and held fixed so the curve is a function of the parameters alone. Both matter more than they
@@ -581,7 +694,12 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             device_rng::Bool = false,
                             patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-4,
                             stop_patience::Int = 100, val_every::Int = 2,
-                            stop_window::Int = 500, stop_rel::Real = 0.005)
+                            stop_window::Int = 500, stop_rel::Real = 0.005,
+                            rollout::Int = 1, init_ps = nothing, clip::Real = 0)
+    rollout >= 1 || error("train_stochlstm: rollout must be >= 1 (1 = teacher forcing); got $rollout")
+    (rollout == 1 || !RF.emission_noise(spec)) || error(
+        "train_stochlstm: rollout > 1 needs emission = :none -- with an emission head the deployed " *
+        "closure feeds back a draw, which the rollout does not model")
     size(X, 2) == size(Y, 2) == length(steps) ||
         error("train_stochlstm: X, Y and steps disagree on the number of columns")
     1 <= stride <= L - burn ||
@@ -654,8 +772,29 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # ~3 000 values, and `n_latent x L x B` noise, 256 KiB at the largest geometry, against a
     # gradient step measured at ~200 ms.
     rng = Xoshiro(seed)
-    ps = _to_device(device, RF.init_lstm_params(rng, spec; T))
-    opt = Optimisers.setup(Optimisers.Adam(T(lr)), ps)
+    # 🔑 `init_ps` warm-starts from an existing fit -- rollout training is a FINE-TUNE of the
+    # teacher-forced model, not a fit from scratch. Checked field by field against a fresh init,
+    # so a fit of another shape cannot be loaded into this spec silently.
+    ps0 = if init_ps === nothing
+        RF.init_lstm_params(rng, spec; T)
+    else
+        tmpl = RF.init_lstm_params(Xoshiro(0), spec; T)
+        keys(init_ps) == keys(tmpl) || error("train_stochlstm: init_ps has fields $(keys(init_ps)), " *
+                                             "the spec needs $(keys(tmpl))")
+        for k in keys(tmpl)
+            a, b = getfield(init_ps, k), getfield(tmpl, k)
+            (a === nothing) == (b === nothing) && (a === nothing || size(a) == size(b)) ||
+                error("train_stochlstm: init_ps.$k does not match the spec")
+        end
+        map(v -> v === nothing ? nothing : T.(v), init_ps)
+    end
+    ps = _to_device(device, ps0)
+    # ⚠️ `clip > 0` clips the gradient's global norm before Adam -- the guard against a free
+    # rollout's exploding gradient (Rik, 2026-09-23). Off by default; `history.gmax` shows
+    # whether it is needed.
+    rule = clip > 0 ? Optimisers.OptimiserChain(Optimisers.ClipNorm(T(clip)), Optimisers.Adam(T(lr))) :
+           Optimisers.Adam(T(lr))
+    opt = Optimisers.setup(rule, ps)
 
     # 🔑 Segments of equal length share one recurrence, so they are grouped once here and batched
     # below. Every segment is exactly `L` long except the last of each contiguous block, so in
@@ -725,13 +864,18 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # val loss moved by ~4 nats between consecutive checkpoints while the model was barely
     # changing. A fixed set makes the curve a function of the parameters alone.
     # One fixed batch per validation length-group: the arrays AND the noise draws, built once.
-    val_batches = [(stack(val_segs, idx)..., draw(length(val_segs[first(idx)].rows), length(idx)))
+    # 🔑 With `rollout > 1` validation runs the SAME rollout, per segment length -- the objective
+    # being optimised is the one early stopping and best-iterate selection read.
+    fmask(Lg) = rollout == 1 ? nothing : _rollout_mask(Lg, burn, rollout)
+    val_batches = [(stack(val_segs, idx)..., draw(length(val_segs[first(idx)].rows), length(idx)),
+                    fmask(length(val_segs[first(idx)].rows)))
                    for (_, idx) in sort(collect(val_groups); by = first)]
+    free_tr = fmask(L)
 
     function validate(p)
         num, den = 0.0, 0
-        for (Xb, Yb, sc, ns, eb) in val_batches
-            num += RF.elbo(spec, p, Xb, Yb, sc, eb; beta) * ns
+        for (Xb, Yb, sc, ns, eb, fv) in val_batches
+            num += RF.elbo(spec, p, Xb, Yb, sc, eb; beta, free = fv) * ns
             den += ns
         end
         return num / den
@@ -745,7 +889,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # batching fixed: the plateau rule and the early stop would still have counted epochs.
     # 🔑 `val_every` is in UPDATES, so `patience` and `stop_patience` are too, identically for
     # every point. At the default `val_every = 2`, `patience = 20` is 40 updates.
-    history = (; update = Int[], train = Float64[], val = Float64[], lr = Float64[])
+    history = (; update = Int[], train = Float64[], val = Float64[], lr = Float64[],
+               gmax = Float64[])   # largest gradient norm since the previous validation
     best = (; val = Inf, ps = deepcopy(ps), update = 0, index = 0)
     plateau = _PLATEAU_FRESH
     since_best = 0
@@ -754,7 +899,20 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     bsf = Float64[]                 # best-so-far validation loss, one entry per validation
     cur_lr = T(lr)
     upd = 0
-    tot, nb = 0.0, 0
+    tot, nb, gmax = 0.0, 0, 0.0
+
+    # 🔴 **A warm start is validated BEFORE its first update, and is itself a candidate for best.**
+    # Otherwise a fine-tune can only return an iterate it moved to, and one that makes things worse
+    # -- measured 2026-09-23: 10 rollout updates at lr = 1e-3 took the stride-100 fit from 1.01e-3
+    # to 1.99e-3 -- comes back worse than it started, with nothing saying so. Row 1 of the history
+    # is then update 0 (`train = NaN`: no step has been taken).
+    if init_ps !== nothing
+        vl0 = validate(ps)
+        push!(history.update, 0); push!(history.train, NaN); push!(history.val, vl0)
+        push!(history.lr, cur_lr); push!(history.gmax, 0.0)
+        best = (; val = vl0, ps = deepcopy(ps), update = 0, index = 1)
+        push!(bsf, vl0)
+    end
 
     for epoch in 1:epochs
         # 🔑 Reshuffled every epoch, so which segments meet in a batch changes AND the
@@ -765,7 +923,9 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
             chunk = view(idxs, ((k - 1) * batch_eff + 1):(k * batch_eff))
             Xb, Yb, sc, _ = stack(train_segs, chunk)
             eb = draw(L, batch_eff)
-            loss, gs = Zygote.withgradient(p -> RF.elbo(spec, p, Xb, Yb, sc, eb; beta), ps)
+            loss, gs = Zygote.withgradient(p -> RF.elbo(spec, p, Xb, Yb, sc, eb; beta,
+                                                        free = free_tr), ps)
+            gmax = max(gmax, _gnorm(gs[1]))
             opt, ps = Optimisers.update(opt, ps, gs[1])
             tot += loss
             nb += 1
@@ -781,7 +941,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
             push!(history.train, tot / nb)          # the mean since the previous validation
             push!(history.val, vl)
             push!(history.lr, cur_lr)
-            tot, nb = 0.0, 0
+            push!(history.gmax, gmax)
+            tot, nb, gmax = 0.0, 0, 0.0
 
             # 🔴 **Keep the best iterate, not the last one.** Without this the fit that gets
             # saved is whatever the final update happened to land on. Measured on R1's record: all
@@ -853,7 +1014,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     return _to_host(best.ps),
            (; history..., best_update = best.update, best_index = best.index,
             best_val = best.val, stopped_early, stop_reason, updates = upd,
-            epochs_run = cld(upd, nbatch), nseg, batch_eff, upd_per_epoch = nbatch, val_every)
+            epochs_run = cld(upd, nbatch), nseg, batch_eff, upd_per_epoch = nbatch, val_every,
+            rollout, clip, warm_start = init_ps !== nothing)
 end
 
 # ---------------------------------------------------------------------------------------------

@@ -1066,6 +1066,60 @@ its own axis, and §6.1's lr scan for completeness.
   that costs it a factor of 2 before recovering. This is the same one-segment-batch noise §6.2's
   batching change removes.
 
+### 6.5 In the solver — and rollout training (2026-09-23)
+
+**The fits deployed** are the stride-100 point (`StochLSTM2`, `:storn`, `n_hidden` 16, `n_latent`
+4, `beta = 1e-4`, 10 000 updates — held-out SSE 3.63, the best M4 offline) and the same cell at
+`beta = 1e-2` (`StochLSTM3`, stopped by the windowed rule at update 5334, held-out SSE 4.41).
+Exported with `tools/m4_export_point.jl`, deployed with `RIKFLOW_M4_MODEL_DIR`; figures from
+`analysis/plot_m4_online.jl` (fig15) and `analysis/m4_online_ensemble.jl` (fig16).
+
+![M4 online, 10 TU](figures/fig15_lstm_online_s100.png)
+![M4 online ensembles, 100 TU](figures/fig16_lstm_online_ensembles.png)
+
+✅ **Numerically stable**: 8/8 replicas finite over 100 TU, clamp never fired.
+🔴 **But `beta = 1e-4` is bistable.** Every replica switches between an active state and a flat
+one near Z[16,32] ≈ 1600 — **19–35% of the time flat** (0.5 TU windows with sd < 30% of the
+reference's median) against **3.6%** in the reference, episodes up to **6.3 TU**. Summed KS
+(0.90–1.21) does not see it: the fig15 10 TU run scored 1.23 against the reference's own 10 TU
+windows' 0.38–1.32.
+✅ **`beta = 1e-2` removes the flat state** (2.5–5.2%, episodes ≤ 0.9 TU — the reference's and
+LinReg1's level) but narrows the marginal (Z[16,32] sd ratio 0.79–0.89, summed KS 1.46–1.61).
+🔴 **Both share a ceiling near Z[16,32] ≈ 2800** where the reference reaches 3000–3800, and
+both produce a correction far more persistent than the reference's (lag-1 of `dQ` on E[0,6]
+0.93–0.94 against 0.743). ⚠️ Not an architectural bound — `c ± Σ|V1|` is 4647 — so it is the
+closed loop. And not the hidden state's age: teacher-forced on the held-out window the error does
+not grow past the trained 500-step age (1.07e-3 at 100–500, 0.76–1.56e-3 up to 3500).
+
+**The diagnosis: training never sees the loop.** Online the closure pushes `q* + dQ = qhat` into
+its history, so the level lags are its OWN outputs; training feeds the recorded level at every
+step. 🔑 **Measured directly** by scoring the teacher-forced fit under a rollout: validation
+**2.94e-4 teacher-forced, 1.01e-3 with its own output fed back — 3.4x**, and already 1.00e-3 at
+a 100-step horizon, so the feedback error saturates within 100 steps.
+
+**Rollout training** (`train_stochlstm(...; rollout = K, init_ps, clip)`, `_rollout_forward`,
+driver `tools/m4_rollout_train.jl`, `run_m4_sweeps.sh rollout`; **V58**). After the `burn`
+warm-up the level-lag columns are fed from the model's own output, re-anchored to the record every
+`K` steps (`K = 1` is teacher forcing, bit-identical; `K >= L - burn` is one free run, the
+deployed shape); `q*` is replayed — the regime-B surrogate, which cannot reproduce the solver's
+response to the model's corrections. Gradients flow through the feedback; the latent is recomputed
+per step. `emission = :none` only. It is a FINE-TUNE of a teacher-forced fit, validated at update 0
+so it can never return worse than it started.
+
+Local tests from the stride-100 `beta = 1e-4` fit (seed 1, not results):
+
+| run | updates | teacher-forced val | rollout val | largest grad norm |
+|---|---|---|---|---|
+| start | — | 2.944e-4 | 1.011e-3 (K = 400) | — |
+| L 500, K 400, lr **1e-3** | 10 | 4.73e-4 | 1.99e-3 | 1.93 |
+| L 500, K 400, lr 1e-4 | 40 | **2.905e-4** | **0.978e-3** | 0.18 |
+| L 200, K 100, lr 1e-4 | 20 | 2.904e-4 | 0.972e-3 | 0.08 |
+
+⚠️ lr 1e-3 knocks a tuned model off its minimum within 10 updates; the driver defaults to 1e-4.
+No explosion at `L = 500` so far, but only 40 updates — `history.gmax` is logged and `clip` is
+there for a long run. The criterion for the cluster run is ONLINE: fig16's flat fraction, ceiling
+and `dQ` persistence against the two teacher-forced fits.
+
 ---
 
 ## 7. Running the sweeps on Snellius
