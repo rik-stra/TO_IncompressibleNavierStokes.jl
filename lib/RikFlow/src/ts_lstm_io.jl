@@ -28,10 +28,10 @@ function save_stochlstm(path::AbstractString, spec::LSTMSpec, weights::LSTMWeigh
               # every mode and only the *use* of them differs. It decides whether the deployed
               # closure adds observation noise at all, so it is part of the model.
               emission = spec.emission,
-              arch = spec.arch, uclip = spec.uclip)
+              arch = spec.arch, uclip = spec.uclip, skip = spec.skip)
     wnt = (; weights.Wx, weights.Wh, weights.b, weights.We, weights.be,
            weights.Bmu, weights.Bsig, weights.V1, weights.V2, weights.cdec,
-           weights.Wd, weights.bd, weights.LR)
+           weights.Wd, weights.bd, weights.LR, weights.Ws)
     mkpath(dirname(path))
     jldsave(path; spec = specnt, weights = wnt, scaling, version = 1, extras = (; extras...))
     return path
@@ -64,11 +64,13 @@ function load_stochlstm(path::AbstractString)
         hist = HistorySpec(; h = s.h, n_qoi = s.n_qoi, hist_var = s.hist_var,
                            include_predictor = s.include_predictor),
         n_hidden = s.n_hidden, n_latent = s.n_latent, n_encoder = s.n_encoder,
-        arch = s.arch, uclip = s.uclip, emission = _stored_emission(s))
+        arch = s.arch, uclip = s.uclip, emission = _stored_emission(s),
+        skip = hasproperty(s, :skip) ? s.skip : false)     # absent before 2026-09-24 = no skip
     w = d["weights"]
     T = eltype(w.Wx)
     weights = LSTMWeights{T}(w.Wx, w.Wh, w.b, w.We, w.be, w.Bmu, w.Bsig,
-                             w.V1, w.V2, w.cdec, w.Wd, w.bd, w.LR)
+                             w.V1, w.V2, w.cdec, w.Wd, w.bd, w.LR,
+                             hasproperty(w, :Ws) ? w.Ws : nothing)
     check_shapes(weights, spec)
     return (; spec, weights, scaling = d["scaling"], extras = d["extras"])
 end

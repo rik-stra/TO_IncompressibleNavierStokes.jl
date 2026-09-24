@@ -111,8 +111,14 @@ Base.@kwdef struct LSTMSpec
     # reachable as `:state_dependent` but nothing in the experiment asks for it. See the header.
     emission::Symbol = :none
     uclip::Union{Nothing,Tuple{Float64,Float64}} = nothing
+    # 🔑 A LINEAR SKIP from the regressor to the output, `y += Ws x` (2026-09-24). Without it the
+    # output is `V1 h + ...`, a readout of a saturating state, and the fits never learned the
+    # large-coefficient cancellation between `q*^n` and `q^{n-1}` that a least-squares map on the
+    # same inputs finds at R^2 0.57-0.995: every such fit sat at the h = 0 linear floor
+    # (`results_LSTMS.md` §7c). With it the recurrence models what the linear map misses.
+    skip::Bool = false
 
-    function LSTMSpec(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip)
+    function LSTMSpec(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip)
         arch in (:lstm, :vaernn, :storn, :vrnn) ||
             error("LSTMSpec: arch must be one of :lstm, :vaernn, :storn, :vrnn; got $(arch)")
         emission in (:none, :constant, :state_dependent) ||
@@ -124,7 +130,7 @@ Base.@kwdef struct LSTMSpec
         n_encoder >= 0 || error("LSTMSpec: n_encoder must be >= 0 (0 = linear encoder)")
         (arch === :lstm || n_latent > 0) ||
             error("LSTMSpec: arch $(arch) has a latent path, so n_latent must be positive")
-        new(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip)
+        new(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip)
     end
 end
 
@@ -244,6 +250,8 @@ model trains, the forward pass runs, and the closure is wrong.
   `methods_overview.tex` §"State dependent covariance", driven by `h_t` instead of by the raw
   history vector, and it is a deviation from the source -- see the file header, deviation (a).
 - `LR`: lower Cholesky factor of the constant correlation matrix `R`, so `R = LR * LR'`.
+- `Ws`: the linear skip, `N_Q x n_input`, added to the decoder output; `nothing` unless
+  `spec.skip`. Last, so the 13-argument form every older call site uses still constructs.
 """
 struct LSTMWeights{T}
     Wx::Matrix{T}
@@ -259,7 +267,10 @@ struct LSTMWeights{T}
     Wd::Matrix{T}
     bd::Vector{T}
     LR::Matrix{T}
+    Ws::Union{Nothing,Matrix{T}}
 end
+LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR) where {T} =
+    LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, nothing)
 
 """
     check_shapes(w::LSTMWeights, spec::LSTMSpec)
@@ -290,6 +301,10 @@ function check_shapes(w::LSTMWeights, spec::LSTMSpec)
     if latent_to_decoder(spec)
         w.V2 === nothing && error("arch $(spec.arch) carries the V2 skip but V2 is nothing")
         size(w.V2) == (nout, nz) || error("V2 is $(size(w.V2)), expected $((nout, nz))")
+    end
+    if spec.skip
+        w.Ws === nothing && error("spec.skip but Ws is nothing")
+        size(w.Ws) == (nout, nin) || error("Ws is $(size(w.Ws)), expected $((nout, nin))")
     end
     return true
 end
@@ -428,6 +443,7 @@ function lstm_step!(
     if latent_to_decoder(spec)
         mul!(st.y, w.V2, st.z, one(T), one(T))
     end
+    spec.skip && mul!(st.y, w.Ws, xv, one(T), one(T))
     @inbounds for k in eachindex(st.y)
         st.y[k] += w.cdec[k]
     end

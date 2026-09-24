@@ -118,6 +118,63 @@ const RF = RikFlow
     end
 
     # -----------------------------------------------------------------------------------------
+    # V60 -- the linear skip `y += Ws x` is the same model in training, deployment and on disk
+    # -----------------------------------------------------------------------------------------
+
+    @testset "V60 linear skip: lstm_forward == lstm_step!, save/load ($arch)" for
+            arch in (:lstm, :vaernn, :storn, :vrnn)
+
+        T = Float32
+        spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h = 2, n_qoi = 3), n_hidden = 5, n_latent = 4,
+                           n_encoder = 0, arch, emission = :constant, skip = true)
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        @test size(ps.Ws) == (RF.n_output(spec), RF.n_input(spec))
+        ps = merge(ps, (; Ws = randn(Xoshiro(61), T, size(ps.Ws)...)))
+        L = 7
+        X = randn(Xoshiro(62), T, RF.n_input(spec), L)
+        epsz = zeros(T, spec.n_latent, L)
+        out = RF.lstm_forward(spec, ps, X, epsz)
+        # positive control: the skip actually contributes, so agreement below is not vacuous
+        out0 = RF.lstm_forward(spec, merge(ps, (; Ws = zero(ps.Ws))), X, epsz)
+        @test maximum(abs, out.Y .- out0.Y) > 0.1
+
+        w = RF.LSTMWeights(ps, spec)
+        @test RF.check_shapes(w, spec)
+        st = RF.LSTMState(spec, T)
+        for t in 1:L
+            y, _, _ = RF.lstm_step!(st, w, spec, view(X, :, t); sample_latent = false)
+            @test y ≈ out.Y[:, t] rtol = 1e-5
+        end
+
+        path = joinpath(mktempdir(), "skip.jld2")
+        RF.save_stochlstm(path, spec, w, (; in_scaling = nothing, out_scaling = nothing))
+        back = RF.load_stochlstm(path)
+        @test back.spec.skip
+        @test back.weights.Ws == w.Ws
+
+        # a no-skip spec keeps `Ws = nothing` all the way through
+        spec0 = RF.LSTMSpec(; hist = spec.hist, n_hidden = 5, n_latent = 4, n_encoder = 0, arch,
+                            emission = :constant)
+        w0 = RF.LSTMWeights(RF.init_lstm_params(Xoshiro(3), spec0; T), spec0)
+        @test w0.Ws === nothing && RF.check_shapes(w0, spec0)
+    end
+
+    @testset "V60 linear skip: the rollout forward at K = 1 is the teacher-forced forward" begin
+        T = Float32
+        spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h = 1, n_qoi = 3), n_hidden = 5, n_latent = 4,
+                           n_encoder = 0, arch = :vrnn, skip = true)
+        ps = merge(RF.init_lstm_params(Xoshiro(3), spec; T),
+                   (; Ws = randn(Xoshiro(63), T, RF.n_output(spec), RF.n_input(spec))))
+        L = 6
+        X = randn(Xoshiro(64), T, RF.n_input(spec), L, 2)
+        epsz = randn(Xoshiro(65), T, spec.n_latent, L, 2)
+        tf = RF.lstm_forward(spec, ps, X, epsz)
+        ext = Base.get_extension(RikFlow, :RikFlowLuxExt)
+        ro = ext._rollout_forward(spec, ps, X, epsz, falses(L))
+        @test ro.Y ≈ tf.Y rtol = 1e-5
+    end
+
+    # -----------------------------------------------------------------------------------------
     # the objective and the loop
     # -----------------------------------------------------------------------------------------
 

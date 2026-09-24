@@ -107,6 +107,8 @@ function RF.init_lstm_params(rng::AbstractRNG, spec::RF.LSTMSpec; T::Type = Floa
         Wd = zeros(T, nout, H),            # start homoscedastic: the scale head learns from flat
         bd = zeros(T, nout),
         Araw = Matrix{T}(I, nout, nout) .* zero(T),   # A = I at init, i.e. R = I
+        # the linear skip starts at zero; `init_ps` can seed it (e.g. with the least-squares map)
+        Ws = spec.skip ? zeros(T, nout, nin) : nothing,
     )
 end
 
@@ -210,6 +212,10 @@ _cell_input(::Val{false}, X, Z) = X
 # the V2 decoder skip
 _decoder_skip(::Val{true}, Y, ps, Z) = Y .+ ps.V2 * Z
 _decoder_skip(::Val{false}, Y, ps, Z) = Y
+
+# the linear skip from the regressor (`spec.skip`)
+_linear_skip(::Val{true}, Y, ps, X) = Y .+ ps.Ws * X
+_linear_skip(::Val{false}, Y, ps, X) = Y
 
 # the emission log-scale head: state-dependent, or `bd` alone with `Wd` cut out of the graph
 _logd(::Val{false}, ps, Hm2) = ps.Wd * Hm2 .+ ps.bd
@@ -347,7 +353,7 @@ function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3
     Hm2 = reshape(Hm, H, L * B)
 
     # --- decoder and log-scale head -----------------------------------------------------------
-    Y2 = _decoder_skip(decv, ps.V1 * Hm2 .+ ps.cdec, ps, Z2)
+    Y2 = _linear_skip(Val(spec.skip), _decoder_skip(decv, ps.V1 * Hm2 .+ ps.cdec, ps, Z2), ps, X2)
     # 🔴 `:constant` MEANS constant: the `Wd` path contributes zero value AND zero gradient, so `Wd`
     # stays at its zero initialisation and the deployed `lstm_step!` (which computes `Wd * h + bd`
     # for every emission mode) sees exactly `bd`. Until 2026-09-23 nothing enforced this -- `Wd`
@@ -463,7 +469,7 @@ function _rollout_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,
         go = @view g[(3H + 1):(4H), :]
         c = @. _sig(gf) * c + _sig(gi) * tanh(gc)
         h = @. _sig(go) * tanh(c)
-        y = _decoder_skip(decv, ps.V1 * h .+ ps.cdec, ps, Z)
+        y = _linear_skip(Val(spec.skip), _decoder_skip(decv, ps.V1 * h .+ ps.cdec, ps, Z), ps, xt)
         Yb[:, t, :] = y
         MUb[:, t, :] = MU
         SIGb[:, t, :] = SIG
@@ -715,7 +721,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             stop_patience::Int = 100, val_every::Int = 2,
                             stop_window::Int = 500, stop_rel::Real = 0.005,
                             rollout::Int = 1, init_ps = nothing, clip::Real = 0,
-                            lagmap = nothing)
+                            lagmap = nothing, weight_decay::Real = 0, callback = nothing,
+                            freeze = ())
     rollout >= 1 || error("train_stochlstm: rollout must be >= 1 (1 = teacher forcing); got $rollout")
     (rollout == 1 || !RF.emission_noise(spec)) || error(
         "train_stochlstm: rollout > 1 needs emission = :none -- with an emission head the deployed " *
@@ -799,6 +806,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
         RF.init_lstm_params(rng, spec; T)
     else
         tmpl = RF.init_lstm_params(Xoshiro(0), spec; T)
+        # a fit saved before the linear skip existed has no `Ws`; it is a no-skip fit
+        haskey(init_ps, :Ws) || (init_ps = merge(init_ps, (; Ws = nothing)))
         keys(init_ps) == keys(tmpl) || error("train_stochlstm: init_ps has fields $(keys(init_ps)), " *
                                              "the spec needs $(keys(tmpl))")
         for k in keys(tmpl)
@@ -812,9 +821,17 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # ⚠️ `clip > 0` clips the gradient's global norm before Adam -- the guard against a free
     # rollout's exploding gradient (Rik, 2026-09-23). Off by default; `history.gmax` shows
     # whether it is needed.
-    rule = clip > 0 ? Optimisers.OptimiserChain(Optimisers.ClipNorm(T(clip)), Optimisers.Adam(T(lr))) :
+    # `weight_decay > 0` is decoupled (AdamW-style) decay, applied after Adam's step and scaled by
+    # the current rate, so a learning-rate decay decays it too. Off by default.
+    adam = weight_decay > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(weight_decay)) :
            Optimisers.Adam(T(lr))
+    rule = clip > 0 ? Optimisers.OptimiserChain(Optimisers.ClipNorm(T(clip)), adam) : adam
     opt = Optimisers.setup(rule, ps)
+    # `freeze`: parameter names held at their initial value, e.g. `(:Ws,)` to keep a linear skip
+    # seeded with the least-squares map fixed while the recurrence learns its residual.
+    for k in freeze
+        Optimisers.freeze!(getfield(opt, k))
+    end
 
     # 🔑 Segments of equal length share one recurrence, so they are grouped once here and batched
     # below. Every segment is exactly `L` long except the last of each contiguous block, so in
@@ -963,6 +980,9 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
             push!(history.lr, cur_lr)
             push!(history.gmax, gmax)
             tot, nb, gmax = 0.0, 0, 0.0
+            # `callback(update, ps, val)` at every validation -- e.g. to score checkpoints on a
+            # held-out window the fit never sees. Its return value is ignored.
+            callback === nothing || callback(upd, ps, vl)
 
             # 🔴 **Keep the best iterate, not the last one.** Without this the fit that gets
             # saved is whatever the final update happened to land on. Measured on R1's record: all
@@ -1130,6 +1150,7 @@ function RF.LSTMWeights(ps::NamedTuple, spec::RF.LSTMSpec)
         copy(ps.cdec),
         copy(ps.Wd), T.(ps.bd .+ log.(s)),
         LR,
+        get(ps, :Ws, nothing) === nothing ? nothing : copy(ps.Ws),
     )
 end
 

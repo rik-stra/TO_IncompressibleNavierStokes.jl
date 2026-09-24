@@ -91,9 +91,11 @@ if !isfile(model_file)
            "Exported fits for $(cfg.name) under $TO_folder: " * join(exported, ", ") *
            " -- deploy one with RIKFLOW_M4_MODEL_DIR=<that dir> on the SAME line as sbatch."))
 end
-@info "Deploying $(cfg.name)" arch=cfg.arch deploy_seed replicas=collect(replicas)
-
 fit = RF.load_stochlstm(model_file)
+# The architecture comes from the FIT, not from `cfg`: an exported fit keeps its base cell's name
+# (the explore fits are all `StochLSTM2`) but not that row's `arch`/`emission`/target.
+@info "Deploying $(cfg.name)" arch=fit.spec.arch emission=fit.spec.emission target =
+    RF._lstm_target(fit.scaling) deploy_seed replicas=collect(replicas)
 # 🔴 An exported fit must belong to the cell the index names: `n_replicas` and the seeds come from
 # `cfg`, and deploying cell 2's weights under cell 5's row would label the replicas wrongly.
 fit_cell = hasproperty(fit.extras, :cfg) ? fit.extras.cfg.name : cfg.name

@@ -4,7 +4,9 @@
 #
 # Reads every `output/TO_LSTM/explore/<tag>/data_online_tsim*_replica*.jld2` (CPU `_cpu` and GPU runs), plus -- as
 # baselines -- the first `TSCREEN` TU of the cluster replicas of the two teacher-forced stride-100
-# fits. Environment: `TSCREEN` (TU per run scored, default 10), `QOI_CACHE`.
+# fits. Environment: `TSCREEN` (TU per run scored, default 10), `QOI_CACHE`, `M4_SCREEN_SUBDIR`
+# (the directory under `TO_LSTM/` whose fits are screened, default `explore`; `diag` for
+# `tools/m4_diag_fit.jl`'s).
 #
 # 🔑 **The null is the reference cut into windows of the SAME length** as the screened runs: a 10 TU
 # window of the true flow has its own flat fraction, exceedance and KS, and a candidate is judged
@@ -81,7 +83,7 @@ for (label, dir) in (("baseline beta1e-4 (GPU)", "StochLSTM2_s100b32_points3_cap
         println(rpad(label, 34), rpad(replace(f, "data_online_" => ""), 26), fmt(metrics(cut(load(joinpath(p, f), "data_online"))...)))
     end
 end
-edir = joinpath(TO, "explore")
+edir = joinpath(TO, get(ENV, "M4_SCREEN_SUBDIR", "explore"))
 for tag in (isdir(edir) ? sort(readdir(edir)) : String[])
     p = joinpath(edir, tag)
     # both local CPU runs (`_cpu`) and GPU runs

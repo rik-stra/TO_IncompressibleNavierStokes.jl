@@ -175,8 +175,8 @@ forcing and latent seed across models.
 
 ## 7. Online with the correction as the target — screening (2026-09-23/24)
 
-🔴 **A screen, not results**: one seed, fits from scratch at the §3 protocol (they converge in
-~220–280 updates), one 10 TU replica each, run on this workstation's CPU (a different backend from
+🔴 **A screen, not results**: one seed, fits from scratch at the §3 protocol (they stop at the
+floor after ~220–280 updates, but the **returned iterate is update 18–70** — see §7b), one 10 TU replica each, run on this workstation's CPU (a different backend from
 the cluster runs: statistics, not trajectories, compare). Judged against the reference's own 10 TU
 windows (§4). Fits by `tools/m4_explore_fit.jl`, scored by `analysis/m4_screen.jl`.
 
@@ -197,11 +197,7 @@ exposure: the fed-back level is `q* + dQ`, so the model's own error barely enter
 | `dQ`, `:storn`, state-dependent emission | 5.5% | 17.6% | 4749 | 233 | 1.81 | 0.68 | 0.035 | 34 |
 | `dQ`, `:storn`, constant emission | 2.2% | 28.2% | 8982 | 441 | 2.98 | 1.21 | 0.070 | 0 |
 | **`dQ`, `:vrnn`, beta 1e-4** | **0.0%** | 16.9% | **4181** | **521** | **1.51** | 1.07 | **0.741** | **0** |
-| ⏳ `dQ`, `:vrnn`, beta 1e-4, replica 2 | | | | | | | | |
-| ⏳ `dQ`, `:storn`, L 200 | | | | | | | | |
-| ⏳ `logr`, `:storn`, beta 1e-4 | | | | | | | | |
-| ⏳ `logr`, `:storn`, state-dependent emission | | | | | | | | |
-| ⏳ `logr`, `:vrnn`, beta 1e-4 | | | | | | | | |
+| → the five pending variants were screened at **20 TU × 3 replicas** instead: §7b | | | | | | | | |
 
 1. ✅ **Predicting `dQ` removes the ceiling and the flat state together**: Z16 spends 15–28% of the
    time above 2900 (the level target: 0%), flat time is inside the null, and summed KS is the best
@@ -221,13 +217,171 @@ exposure: the fed-back level is `q* + dQ`, so the model's own error barely enter
    way). The multiplicative target `:logr` is the attack: its correction scales with `q*`, and its
    level cannot go negative.
 
+### 7b. 20 TU × 3 replicas on a GPU (2026-09-24)
+
+Same fits, run on the shared desktop's RTX 3090 (`12_online_StochLSTM.jl`, CUDA, `RIKFLOW_ONLINE_IC`),
+scored by `TSCREEN=20 m4_screen.jl` against the reference cut into five disjoint 20 TU windows.
+
+🔑 **Why 20 TU, not 10**: 11% of the reference's 10 TU windows never exceed 2900 — a capped run can pass
+the ceiling test by chance — against 0 of 81 sliding 20 TU windows. Over 20 TU the reference's flat
+fraction is ≤ 6.9%, sd ratio ≤ 1.18 and `dQ` lag-1 0.727–0.753 (5th–95th percentile of sliding windows),
+tight enough to fail every mode seen so far. Resolving an sd ratio of 1.05 against 1.2 needs ~50 TU;
+that is the refit's job, not the screen's.
+
+| 20 TU, replicas 1–3 | flat | >2900 | Z16 max | Z16 min | sd ratio | summed KS | `dQ` lag-1 | clamp |
+|---|---|---|---|---|---|---|---|---|
+| **reference, five 20 TU windows** | **0.2–6.9%** | **1.9–12.2%** | **3100–3790** | **721–1080** | **0.86–1.14** | **0.27–0.77** | **0.726–0.750** | 0 |
+| `dQ`, `:vrnn`, beta 1e-4 | 0.8–2.5% | 7.5–10.9% | 3750–3815 | 419–743 | 1.26–1.37 | 0.69–0.99 | 0.61–0.67 | 0 |
+| `dQ`, `:storn`, L 200 | 0.0–4.0% | 14.0–19.5% | 4903–6568 | 205–760 | 1.73–1.91 | 0.84–1.04 | 0.98 | 0 |
+| `logr`, `:storn`, beta 1e-4 | 1.1–6.8% | 3.2–6.4% | 3353–4550 | 534–703 | 1.20–1.45 | 1.51–1.71 | 0.98 | 0 |
+| `logr`, `:storn`, state-dependent emission | 0.0–0.8% | 8.5–13.8% | 3644–4323 | 580–692 | 1.34–1.51 | 1.06–1.16 | 0.03–0.04 | 0 |
+| `logr`, `:vrnn`, beta 1e-4 | **NaN at t ≈ 8.45 TU in all three replicas** | | | | | | | |
+
+1. 🔴 **No variant passes.** Every surviving fit is over-dispersed in both tails (sd ratio ≥ 1.20, a
+   minimum below the reference's 721 in 11 of 12 runs).
+2. 🔴 **The `:vrnn` + `dQ` lead does not hold up.** Its 0.741 lag-1 was one 10 TU replica: split by time,
+   all three GPU replicas start near the reference (0.52–0.72 over 0.25–5 TU) and lose persistence
+   later (0.60–0.65 over 10–20 TU, reference 0.72). One CPU replica cannot exclude a backend effect;
+   replica 3's 0.515 in its first 5 TU says realisation spread is enough. Its correction on E[0,6]
+   has 0.24–0.29 of the reference's `dQ` sd (CPU and GPU alike) — §7's conditional-mean finding.
+3. 🔴 **`logr` does not fix the dispersion** (1.20–1.51, no better than `dQ`), and **with `:vrnn` it
+   blows up**. The trigger is shared: all replicas replay the reference's OU forcing, which drives a
+   large-scale excursion at t ≈ 8 (E[0,6] at z = 2.0 in the reference itself). The `dQ` fit's
+   correction stays negative there and the level recovers by t = 8.25; the `logr` fit's correction on
+   E[0,6] turns positive and grows with the level (+1.3 → +4.4 sd in 0.25 TU), and the run overflows
+   0.2 TU later. Consistent with a biased multiplicative correction, `q*·(e^r − 1)`, feeding back in
+   proportion to the level — a reading, not tested.
+4. 🔑 **Persistence follows where the noise enters, not the target** — now for both targets: cell
+   only (`:storn`) 0.98, emission head 0.03–0.04, cell + decoder (`:vrnn`) 0.61–0.67 (`dQ`).
+5. ⚠️ **These are barely-trained networks.** Every fit's best validation came at update **18–70**,
+   still at `lr = 1e-2`; thereafter training loss falls (to 1.1–1.5) while validation rises, the
+   schedule decays to the floor and the stop rule fires ~200 updates later. `logr_b1e-4` and
+   `logr_b1e-4_ems` are 18–20 full-batch steps from their initialisation. 24 segments from 9 TU of
+   record is little data; more updates will not help, more data or regularisation might.
+
+### 7c. Why the fits overfit: they never learned the linear part (2026-09-24)
+
+Diagnosed with `tools/m4_diag_fit.jl`: every checkpoint scored on a **held-out 50–100 TU window**
+(one teacher-forced pass, latent at its mean, 100-step warm-up), in the loss `elbo` trains on
+(0.5 × SSE per step over the six QoIs, standardised `dQ`), beside a **least-squares map on the
+same regressor**. 16 fits per round on the desktop CPU, ~2–10 min each.
+
+🔴 **The LSTMs sat at the h = 0 linear floor.** A least-squares map on the fits' own inputs
+(h = 1: `q*^n`, `q^{n-1}`, `q*^{n-1}`, bias) scores **0.284** held out, R² 0.93 / 0.57 / 0.96 /
+0.98 / 0.995 / 0.99, with coefficients up to **119** — a precise cancellation between the level
+lag and the predictor (`sd(q)/sd(dQ)` is 16–97). Without the lag (h = 0) it scores **1.75**. Every
+M4 fit so far scored 1.6–2.1: **they never learned to use the lag**, fitted what `q*` alone gives,
+then overfitted the rest. More data does not change that (no-skip `:vrnn` on 1–50 TU: 1.70 against
+a floor of 0.262), so it is structural: the output `V1 tanh(·)` has no linear path from the input.
+
+🔑 **Fix: a linear skip `y += Ws x`** (`LSTMSpec(; skip = true)`, V60), seeded with the
+least-squares map and `V1 = 0`, so update 0 IS the linear model. Joint training at `lr = 1e-2`
+wrecks the seed in two updates (0.284 → 1.14 held out) — the map is a cancellation that a 1e-2
+Adam step on every coefficient destroys — so `Ws` is **frozen** (`freeze = (:Ws,)`) and the
+recurrence models the residual.
+
+| round 1: residual mean (`:none` emission) | held out (linear floor) |
+|---|---|
+| no skip, 1–10 TU / 1–50 TU | **2.089** (0.284) / **1.704** (0.262) |
+| skip, 1–10 TU: `:vrnn` `:storn` `:vaernn`, `n_hidden` 8–32, `L` 100–1000, `lr` 1e-2/1e-3, weight decay, joint or frozen | **0.285–0.303** (0.284) |
+| skip, h = 2 | 0.252 (0.249) |
+| skip, 1–50 TU | **0.253** (0.262) — the only fit that beats its floor, still improving at the stop |
+
+**On 1–10 TU the recurrence finds no residual mean at all**; architecture, capacity and sequence
+length are irrelevant once the linear part is in. With 5× the data it finds 3.4%.
+
+**What the linear map leaves is noise** — held out: residual sd 0.07–0.27 of `dQ`'s in five
+QoIs and **0.66 in row 2**, nearly white (lag-1 0.04–0.22, rows 3–4 0.77/0.87 decaying in ~5
+steps), correlated within band pairs (0.90 / 0.67 / 0.89), excess kurtosis 0.7–1.5 — M0's η, not
+something a mean model can predict. That is why a latent-only fit (`:none`) returned a correction
+with 0.25 of the reference's sd online.
+
+| rounds 2–3: noise heads on the frozen skip, 1–10 TU | held-out NLL / step | vs linear + constant η |
+|---|---|---|
+| linear mean + closed-form residual covariance (M0's structure) | −4.564 | — |
+| constant head, trained from Σ = I | −3.1 to −3.7 | worse: the head needs ~440 updates, the mean overfits in ~100 and the schedule stops it |
+| constant head seeded at the residual covariance (`SEEDHEAD`) + LSTM mean | −4.564, best iterate = update 0 | 0: the LSTM mean never helps |
+| **linear mean + LSTM-driven state-dependent scale (`lin_sd`)** | **−4.881** | **+0.32** (h = 2: +0.40; 1–50 TU: +0.41) |
+| LSTM mean + state-dependent scale | −4.82 to −4.87 | +0.25 to +0.30 (`L` 200–1000, `n_hidden` 16/32 alike) |
+| `:storn` / `:vrnn` latent + state-dependent scale | −4.83 / −4.55 | +0.27 / 0 |
+
+🔑 **Offline the well-trained M4 is: linear mean, learned state-dependent noise scale** — the L2
+lever, learned by a recurrence. A latent path and a residual mean only cost, at this data volume.
+
+### 7d. Online: the linear skip fixes persistence; the closed-loop bias is the mean map's (2026-09-24)
+
+20 TU on the desktop's RTX 3090, scored against the reference cut into 20 TU windows (`m4_screen.jl`,
+`M4_SCREEN_SUBDIR=diag`) plus per-QoI moments: the mean offset in reference sd (reference 20 TU
+windows: −0.21…+0.29), the sd ratio, and `sd(dQ)` against the reference correction's. All `dQ`
+target, trained on 1–10 TU. Linear-plus-η models (`rdg_h<h>_l<λ>`) are closed-form ridge fits
+deployed through the same closure (`:lstm`, skip, `V1 = 0`, head seeded at each fit's own residual
+covariance) — M0's structure in the M4 code path.
+
+| model (replicas) | stable | mean offset | sd ratio | dQ lag-1 | >2900 | KS |
+|---|---|---|---|---|---|---|
+| **reference** | | **−0.2…+0.3** | **0.86–1.14** | **0.73–0.75** | **1.9–12.2%** | **0.27–0.77** |
+| `:vrnn` latent on the skip, with or without an emission head (6) | **0/6** — NaN at t = 5–13 | | | | | |
+| linear + LSTM-driven noise scale, h = 1 (3) | 3/3, clamp 34× in one | +0.4…+1.7 | **1.7–2.4** | 0.75–0.78 | 19–38% | 1.5–2.2 |
+| linear + η, h = 1, λ = 0 (3) | 3/3 | **+0.8…+1.1** | 1.04–1.43 | 0.77–0.79 | 19–33% | 2.0–2.3 |
+| — same, noise × 0.5 / noise ≈ 0 (3+3) | 6/6 | +1.0…+1.5 / **+0.8…+1.2** | 0.87–1.10 / 0.76–0.94 | 0.86 / 0.97 | 17–36% | 2.3–3.1 |
+| linear + η, h = 1, λ = 3e-6 (2) | 2/2, clamp 120× in one | 0…+0.57 | 1.42–1.45 | 0.77 | 6–16% | 0.75–0.91 |
+| **linear + η, h = 1, λ = 1e-5 (2)** | 2/2 | **−0.25…+0.12** | 1.33–1.44 | **0.74–0.75** | **9–11%** | **0.67–0.97** |
+| linear + η, h = 1, λ = 3e-5 / 1e-4 / 3e-4 / 1e-3 (2 each) | 8/8, clamp at 1e-3 | −0.3…0 → −0.7…−0.3 | 1.5 → 2.3 | 0.71 → 0.23 | 9–15% | 1.0–1.7 |
+| linear + η, h = 2, λ = 0 (3) | 3/3 | −0.3…+0.6 | 1.08–1.46 | 0.76–0.78 | 10–19% | 0.91–1.11 |
+| linear + η, h = 3 / 5 / 10, λ = 0 (3 each) | 9/9 | +0.2…+2.0 / +1.0…+2.3 / +0.8…+1.6 | **0.81–1.20** | 0.76–0.79 | 22–53% | 2.7–3.9 |
+| 🏆 **M4: linear skip h = 2 + LSTM-driven noise scale (`r3_lin_sd_h2`) (3)** | **3/3**, clamp 0 | −0.65…+0.36 | **1.02, 1.02**, 1.44 | 0.76–0.78 | **2.8, 5.6**, 14.8% | **0.47, 0.64**, 0.95 |
+
+1. ✅ **The skip fixes what every earlier M4 fit got wrong**: the correction's persistence (lag-1
+   0.74–0.79 against the reference's 0.73–0.75; the old fits read 0.03 or 0.98) and its size
+   (row 2's `sd(dQ)` 0.99–1.09 with η, against 0.25 latent-only).
+2. 🔴 **A `:vrnn` latent on the skip diverges** at the shared t ≈ 8 forcing excursion — 6/6, with
+   or without an emission head. Its encoder `μ_z = B_μ x` is linear in the raw inputs, so an
+   excursion off the training range drives it without bound (a reading, not tested).
+3. 🔴 **The best offline model is worse online** (offline→online rank reversal): the LSTM-driven
+   noise scale (+0.32 nats held out) over-disperses 1.7–2.4× in closed loop, plausibly an excursion
+   → larger scale → larger excursion feedback that teacher-forced data cannot show.
+4. 🔑 **The +1 sd bias of the linear map is the MEAN, not the noise**: it is unchanged at noise
+   × 0.5 and ≈ 0. The noise sets the spread and the correction's whiteness — calibrated η gives the
+   reference's lag-1 (0.78 vs 0.74); without it 0.97 and row 2 at 0.55 of its sd.
+5. 🔑 **Ridge λ is a bias dial on the `dQ` target and it crosses zero near λ = 1e-5** (penalty
+   `λ N`, standardised design): +1 sd at 0, −0.5 sd at 1e-3, monotone, while spread grows and
+   persistence falls with λ. The same dial `results.md` §4b found for LinReg1 — and gotcha #63's
+   round-off-regularised LinReg1 (h = 5, runs 6–9% low) sits on the other side of zero from the
+   exact h = 5 fit here (+1 to +2.3 sd high).
+6. 🔑 **Deeper lags get the spread right (sd ratio ≈ 1 at h ≥ 3) but not the bias**, which is not
+   monotone in h (+1, +0.4, +1.8, +2, +1.5 sd at h = 1, 2, 3, 5, 10): a high-gain cancelling map
+   (max |C| 119 → 2527) is sensitive in closed loop to small differences between fits. λ acts on the
+   gain directly; the combination deep h + small λ is the unrun next step (set F/G below).
+
+7. 🏆 **The first M4 variant that passes the screen: `r3_lin_sd_h2`** — frozen least-squares skip
+   at h = 2, head seeded at the residual covariance, an LSTM (16 hidden, `:lstm`, `V1 = 0` frozen)
+   driving only the log-scale `Wd h + bd`; best iterate at update 36. In **2 of 3 replicas** it sits
+   inside the reference band on flat time, the ceiling (2.8 / 5.6%), both tails (Z16 3183–3272 /
+   765–808 — the first M4 run above the reference's minimum of 721), the sd ratio (1.02) and summed KS
+   (0.47 / 0.64); the misses are row 2's mean (−0.5 sd) and a slightly persistent correction (0.76–0.78).
+   Replica 1 is over-dispersed (1.44). 🔑 **Here offline and online agree**: +0.40 nats held out over
+   its linear base, and better than that base online (KS 0.47–0.95 vs 0.91–1.11) — whereas at h = 1
+   the same head over-dispersed. The learned noise scale helps once the mean is good enough.
+
+⚠️ **All of this is 20 TU, 2–3 replicas, one seed** — a screen. Shared GPU; noise-free timings are
+not quoted.
+
 ## 8. Where it stands, and what is open
 
-- **Lead candidate: `dQ` target, `:vrnn`, `beta = 1e-4`** — the only M4 variant that passes the flat,
-  persistence and lower-tail screens; it fails on dispersion (sd ratio 1.51, 17% above 2900).
-- **Before any M4 number is quoted**: a second replica (⏳), then a proper fit (5 seeds, S6) and a
-  100 TU × 5-replica cluster run against LinReg1 and the DDN.
-- **Open**: whether `:logr` fixes the dispersion (⏳); whether rollout training helps the `dQ`/`logr`
+- 🏆 **Lead candidate (2026-09-24): `r3_lin_sd_h2`** — linear skip at h = 2 + LSTM-driven noise scale
+  (§7c/§7d). Passes the 20 TU screen in 2 of 3 replicas; no earlier variant passed at all. The old
+  architecture (no skip) never learned the linear part (§7c) — every §7/§7b fit sat at the h = 0 floor.
+- **Before any M4 number is quoted**: refit it properly (5 seeds, S6), then 100 TU × 5 replicas
+  against LinReg1 and the DDN.
+- **Next screens** (built or trivially buildable with `tools/m4_diag_fit.jl` and the λ recipe in §7d):
+  the (h, λ) grid around the bias zero-crossing (h = 2 at λ = 3e-6 / 1e-5, h = 5 at λ = 3e-6 / 1e-5 /
+  3e-5, h = 10 at 1e-5) — then the LSTM noise scale on the best of those bases.
+- **Open, Rik's call**: the calibrated η over-disperses in closed loop wherever the mean is weak;
+  a noise amplitude fitted *online* would fix it but is online model selection, which the protocol
+  rules out (decisions log 2026-08-14/17).
+- ✅ **Why every fit overfit after 18–70 updates** (§7b point 5): answered in §7c — they never learned
+  the linear map, so there was nothing left to fit but noise. `:logr` is answered (§7b point 3).
+- **Open**: whether rollout training helps the `dQ`/`logr`
   targets online (offline exposure is already 1.00x, so it would have to act through the solver's
   response, which the replayed-`q*` surrogate cannot see); the stride question at matched budgets;
   the §6.3 capacity × `beta` × latent grid, which should now be run on the winning target.
@@ -269,7 +423,23 @@ RIKFLOW_ONLINE_TSIM=10 RIKFLOW_M4_MODEL_DIR=$PWD/exp_square_HIT/output/TO_LSTM/e
 # online scoring
 julia --project=analysis analysis/m4_online_ensemble.jl     # 100 TU ensembles (fig16)
 julia --project=analysis analysis/m4_screen.jl              # short runs against the 10 TU null
+
+# §7c/§7d (2026-09-24): a fit with checkpoints scored on 50-100 TU, and the lead candidate
+RIKFLOW_D_TAG=r3_lin_sd_h2 RIKFLOW_D_ARCH=lstm RIKFLOW_D_EMISSION=state_dependent RIKFLOW_D_H=2 \
+RIKFLOW_D_SKIP=1 RIKFLOW_D_FREEZE=Ws,V1 RIKFLOW_D_SEEDHEAD=1 \
+  julia --project=training exp_square_HIT/tools/m4_diag_fit.jl
+# closed-form linear + eta models (M0's structure in the M4 code path), one per lambda
+RH=1 LAMS=0,3e-6,1e-5,3e-5,1e-4 julia --project=training exp_square_HIT/tools/m4_linear_eta.jl
+# online on a local GPU (desktop RTX 3090; cap CUDA.jl's pool on a shared card)
+JULIA_CUDA_SOFT_MEMORY_LIMIT=4GiB RIKFLOW_ONLINE_IC=$PWD/exp_square_HIT/output/online_ic_data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2 \
+RIKFLOW_ONLINE_TSIM=20 RIKFLOW_M4_MODEL_DIR=$PWD/exp_square_HIT/output/TO_LSTM/diag/r3_lin_sd_h2 \
+  julia --project=. exp_square_HIT/12_online_StochLSTM.jl 2 1
+TSCREEN=20 M4_SCREEN_SUBDIR=diag julia --project=analysis analysis/m4_screen.jl
+julia --project=analysis analysis/m4_online_moments.jl diag/r3_lin_sd_h2 diag/rdg_h1_l1e-05
 ```
+
+⚠️ **Julia 1.13 buffers stderr to a plain file until exit**, so `julia ... > log` shows nothing while
+it runs (the desktop runs used `script -qfec "julia ..." log` for a TTY). A SLURM log is a plain file.
 
 ⚠️ On a 16 GB workstation keep it to three Julia processes and no analysis alongside; Claude Code's
 low-memory reaper stopped background jobs twice at four.
