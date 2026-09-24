@@ -23,6 +23,7 @@
 
 using JLD2
 using Printf
+using Statistics
 
 """
     m4_phase(msg)
@@ -194,7 +195,7 @@ function load_m4_qois(; track_file::AbstractString,
         t0 = time()
         d = load(explicit)
         m4_phase(@sprintf("QoIs read in %.1f s", time() - t0))
-        return (; q = d["q"], q_star = d["q_star"], source = explicit)
+        return (; q = d["q"], q_star = d["q_star"], dQ = get(d, "dQ", nothing), source = explicit)
     end
 
     cache = find_qoi_cache(data_dir)
@@ -203,7 +204,7 @@ function load_m4_qois(; track_file::AbstractString,
         t0 = time()
         d = load(cache)
         m4_phase(@sprintf("QoIs read in %.1f s", time() - t0))
-        return (; q = d["q"], q_star = d["q_star"], source = cache)
+        return (; q = d["q"], q_star = d["q_star"], dQ = get(d, "dQ", nothing), source = cache)
     end
 
     isfile(track_file) || error(
@@ -217,5 +218,63 @@ function load_m4_qois(; track_file::AbstractString,
              Slower to start, and heavy on memory when several jobs overlap. Extract it once:
                julia --project=analysis analysis/extract_qois.jl $track_file""" track_file
     d = load(track_file, "data_track")
-    return (; d.q, d.q_star, source = track_file)
+    return (; d.q, d.q_star, d.dQ, source = track_file)
+end
+
+"""
+    m4_training_data(rec, cfg, hist; target = :q) -> (; Xc, Yc, steps, scaling)
+
+The regressor, target and scaling every M4 driver fits on -- ONE definition, so the stride scan,
+the rollout driver and the export cannot disagree about any of them.
+
+- `target = :q` (every fit before 2026-09-23): the target is the LEVEL `q^n`, scaled with the input
+  scaling, and `scaling = (in_scaling, out_scaling = in_scaling)`.
+- `target = :dQ` (Rik, 2026-09-23): the target is the recorded CORRECTION `dQ^n` -- what the
+  closure returns to the solver -- scaled with its own `_normalise` over the training range, and
+  `scaling = (in_scaling, out_scaling = dQ scaling, target = :dQ)`. The deployed closure reads
+  `scaling.target` and returns the prediction as `dQ` directly instead of `qhat - q*`.
+  🔑 The point: the LEVEL then comes from the solver, `q = q* + dQ`, and the network supplies only
+  a bounded correction -- the level target makes a saturating network produce the level itself,
+  which is where the online ceiling at Z[16,32] ~ 2900 sits in every M4 fit.
+  🔴 The input -- including the LEVEL history -- is unchanged, so only the output head differs.
+
+⚠️ `dQ` is aligned with `q_star`, column for column (step `n` of `build_history` reads
+`q_star[:, n]`); the recorded correction differs from `q^n - q*^n` by the TO's O(|sgs|^2) gap
+(`claude_memory.md`, Phase 0.4: 3-14% of a `dQ` sd), so the alignment is checked against that
+difference rather than assumed -- a one-step shift would be O(1) of a `dQ` sd.
+"""
+function m4_training_data(rec, cfg, hist; target::Symbol = :q)
+    target in (:q, :dQ, :logr) || error("m4_training_data: target must be :q, :dQ or :logr; got $target")
+    a, b = cfg.train_range
+    _, in_scaling = RikFlow._normalise(rec.q[:, a:(b - 1)]; normalization = cfg.normalization)
+    qs = RikFlow.scale_input(rec.q[:, a:b], in_scaling)
+    qss = RikFlow.scale_input(rec.q_star[:, a:(b - 1)], in_scaling)
+    X, Y, steps = RikFlow.build_history(hist, qss, qs)
+    if target === :q
+        return (; Xc = permutedims(X), Yc = permutedims(Y), steps,
+                scaling = (in_scaling = in_scaling, out_scaling = in_scaling))
+    end
+    rec.dQ === nothing && error("m4_training_data: target = :dQ but the QoI source has no dQ")
+    cols = (a - 1) .+ steps                       # record columns of q_star[:, n], hence of dQ
+    D = rec.dQ[:, cols]                           # n_qoi x N, the recorded correction at step n
+    diffq = rec.q[:, cols .+ 1] .- rec.q_star[:, cols]
+    for k in axes(D, 1)
+        r = sqrt(sum(abs2, D[k, :] .- diffq[k, :]) / size(D, 2)) / std(D[k, :])
+        r < 0.3 || error("m4_training_data: dQ and q - q* disagree by $(round(r; digits = 2)) dQ sd " *
+                         "for QoI $k -- the columns are misaligned")
+    end
+    # 🔑 `:logr` (2026-09-23): the MULTIPLICATIVE correction r = log((q* + dQ) / q*) = log1p(dQ / q*),
+    # deployed as dQ = q* (exp(r) - 1). The level q* exp(r) stays positive whatever r is -- a `:dQ`
+    # fit drained Z[16,32] to 4 and E[16,32] below the gate -- and the correction scales with the
+    # solver's own level instead of being additive. Every QoI here is a band energy or enstrophy,
+    # positive by construction, so the ratio is always defined.
+    if target === :logr
+        qsn = rec.q_star[:, cols]
+        all(>(0), qsn) && all(>(-1), D ./ qsn) ||
+            error("m4_training_data: :logr needs q* > 0 and q* + dQ > 0 throughout the training range")
+        D = log1p.(D ./ qsn)
+    end
+    Dn, out_scaling = RikFlow._normalise(D; normalization = cfg.normalization)
+    return (; Xc = permutedims(X), Yc = Dn, steps,
+            scaling = (in_scaling = in_scaling, out_scaling = out_scaling, target))
 end

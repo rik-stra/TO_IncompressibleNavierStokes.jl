@@ -211,6 +211,10 @@ _cell_input(::Val{false}, X, Z) = X
 _decoder_skip(::Val{true}, Y, ps, Z) = Y .+ ps.V2 * Z
 _decoder_skip(::Val{false}, Y, ps, Z) = Y
 
+# the emission log-scale head: state-dependent, or `bd` alone with `Wd` cut out of the graph
+_logd(::Val{false}, ps, Hm2) = ps.Wd * Hm2 .+ ps.bd
+_logd(::Val{true}, ps, Hm2) = ps.bd .+ zero(eltype(Hm2)) .* sum(Hm2; dims = 1)
+
 # the whole latent path, or a constant stand-in for the deterministic architecture
 function _latent(::Val{true}, encv, ps, X, epsz, ::Type{T}, nz, L) where {T}
     E = _encode(encv, ps, X)
@@ -344,7 +348,12 @@ function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3
 
     # --- decoder and log-scale head -----------------------------------------------------------
     Y2 = _decoder_skip(decv, ps.V1 * Hm2 .+ ps.cdec, ps, Z2)
-    LOGD2 = ps.Wd * Hm2 .+ ps.bd
+    # 🔴 `:constant` MEANS constant: the `Wd` path contributes zero value AND zero gradient, so `Wd`
+    # stays at its zero initialisation and the deployed `lstm_step!` (which computes `Wd * h + bd`
+    # for every emission mode) sees exactly `bd`. Until 2026-09-23 nothing enforced this -- `Wd`
+    # was trained under `:constant` too, so a "constant" head was state-dependent in fact: an
+    # `:constant` and a `:state_dependent` fit from one seed came out bit-identical.
+    LOGD2 = _logd(Val(spec.emission === :constant), ps, Hm2)
     if spec.uclip !== nothing
         LOGD2 = clamp.(LOGD2, T(spec.uclip[1]), T(spec.uclip[2]))
     end
@@ -407,7 +416,8 @@ the point -- and why a long free run can explode (Rik, 2026-09-23): shorten `L` 
 closure pushes. With an emission head it would push a DRAW, which this does not model.
 """
 function _rollout_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3},
-                          epsz::AbstractArray, free::AbstractVector{Bool}) where {T}
+                          epsz::AbstractArray, free::AbstractVector{Bool};
+                          lagmap = nothing) where {T}
     RF.emission_noise(spec) && error("_rollout_forward: emission = :none only -- the deployed " *
                                      "closure feeds back a DRAW when there is an emission head")
     H = spec.n_hidden
@@ -417,6 +427,15 @@ function _rollout_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,
     encv, hasz = Val(spec.n_encoder > 0), Val(RF.latent_sampled(spec))
     cellv, decv = Val(RF.latent_to_cell(spec)), Val(RF.latent_to_decoder(spec))
     lagrows = [RF.qlag_columns(spec.hist, k) for k in 1:hh]
+    # 🔑 `lagmap` turns the model's output into the LEVEL lag it deploys. `nothing` is the level
+    # target: the output IS the scaled level. For the `:dQ` target it is `(; a, b)` and the lag is
+    # `qstar_lag + a .* y .+ b` -- the replayed predictor lag plus the model's correction, in the
+    # input scaling (`a = sigma_out ./ sigma_in`, `b = mu_out ./ sigma_in`), which is exactly
+    # `scale_in(q* + dQ)`, what the deployed closure pushes.
+    qsrows = lagmap === nothing ? nothing : [RF.qstarlag_columns(spec.hist, k) for k in 1:hh]
+    lagmap === nothing || !any(isnothing, qsrows) ||
+        error("_rollout_forward: a :dQ-target rollout needs the predictor history (hist_var = :q_star_q)")
+    lagval(k, xt, y) = lagmap === nothing ? y : xt[qsrows[k], :] .+ lagmap.a .* y .+ lagmap.b
     any(isnothing, lagrows) && error("_rollout_forward: the history carries no level lags " *
                                      "(hist_var = $(spec.hist.hist_var)) -- nothing to feed back")
 
@@ -434,7 +453,7 @@ function _rollout_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,
         xt = Xs[t]
         for k in 1:hh
             s = t - k
-            (s >= 1 && free[s]) && (xt = _swap_rows(xt, lagrows[k], ys[k]))
+            (s >= 1 && free[s]) && (xt = _swap_rows(xt, lagrows[k], lagval(k, xt, ys[k])))
         end
         MU, SIG, Z = _latent(hasz, encv, ps, xt, Es[t], T, nz, B)
         g = ps.Wx * _cell_input(cellv, xt, Z) .+ ps.b .+ Wh * h
@@ -452,7 +471,7 @@ function _rollout_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,
         ys = hh == 1 ? (y,) : (y, ys[1:(end - 1)]...)
     end
     Hm = copy(Hb)
-    LOGD2 = ps.Wd * reshape(Hm, H, L * B) .+ ps.bd
+    LOGD2 = _logd(Val(spec.emission === :constant), ps, reshape(Hm, H, L * B))
     if spec.uclip !== nothing
         LOGD2 = clamp.(LOGD2, T(spec.uclip[1]), T(spec.uclip[2]))
     end
@@ -477,11 +496,11 @@ parameter in this project and the two must never be conflated.**
 """
 function RF.elbo(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3}, Ytrue::AbstractArray,
                  score::AbstractUnitRange, epsz::AbstractArray; beta::Real = 1e-4,
-                 free::Union{Nothing,AbstractVector{Bool}} = nothing) where {T}
+                 free::Union{Nothing,AbstractVector{Bool}} = nothing, lagmap = nothing) where {T}
     # `free === nothing` is teacher forcing, the path every existing fit was made on, unchanged.
     # Otherwise the level lags are fed from the model's own outputs -- see `_rollout_forward`.
     out = free === nothing ? RF.lstm_forward(spec, ps, X, epsz) :
-          _rollout_forward(spec, ps, X, epsz, free)
+          _rollout_forward(spec, ps, X, epsz, free; lagmap)
     nout = RF.n_output(spec)
     B = size(X, 3)
     ns = length(score) * B            # scored steps summed over the batch
@@ -695,7 +714,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             patience::Int = 20, lr_decay::Real = 0.3, min_lr::Real = 1e-4,
                             stop_patience::Int = 100, val_every::Int = 2,
                             stop_window::Int = 500, stop_rel::Real = 0.005,
-                            rollout::Int = 1, init_ps = nothing, clip::Real = 0)
+                            rollout::Int = 1, init_ps = nothing, clip::Real = 0,
+                            lagmap = nothing)
     rollout >= 1 || error("train_stochlstm: rollout must be >= 1 (1 = teacher forcing); got $rollout")
     (rollout == 1 || !RF.emission_noise(spec)) || error(
         "train_stochlstm: rollout > 1 needs emission = :none -- with an emission head the deployed " *
@@ -875,7 +895,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     function validate(p)
         num, den = 0.0, 0
         for (Xb, Yb, sc, ns, eb, fv) in val_batches
-            num += RF.elbo(spec, p, Xb, Yb, sc, eb; beta, free = fv) * ns
+            num += RF.elbo(spec, p, Xb, Yb, sc, eb; beta, free = fv, lagmap) * ns
             den += ns
         end
         return num / den
@@ -924,7 +944,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
             Xb, Yb, sc, _ = stack(train_segs, chunk)
             eb = draw(L, batch_eff)
             loss, gs = Zygote.withgradient(p -> RF.elbo(spec, p, Xb, Yb, sc, eb; beta,
-                                                        free = free_tr), ps)
+                                                        free = free_tr, lagmap), ps)
             gmax = max(gmax, _gnorm(gs[1]))
             opt, ps = Optimisers.update(opt, ps, gs[1])
             tot += loss

@@ -655,6 +655,16 @@ function to_sgs_term(u, setup, to_setup, stepper)
     tau = rf_arraytype(setup)(tau)
 
     # construct SGS term
+    if ti isa Array
+        # 🔑 HOST fast path (2026-09-24). The broadcast below materialises `cij .* ti`, a 6-D
+        # temporary of N^3 * 3 * N_Q^2 complex values -- ~450 MB per step at 64^3, single-threaded --
+        # and was, with `innerpoducts`, ~90% of a CPU step (2.5 s). The same contraction is
+        # `sgs_hat = Ti * (cij * (-tau))`: an (N^3*3) x N_Q matrix times an N_Q vector. Identical
+        # arithmetic up to summation order. The device path below is left exactly as it was, so no
+        # GPU result moves.
+        w = cij * (-tau)
+        sgs_hat = reshape(reshape(ti, :, size(ti, 5)) * w, size(ti, 1), size(ti, 2), size(ti, 3), size(ti, 4))
+    else
     #@tensor P_hat2[c,d,e,f,b] := cij[a,b]* ti[c,d,e,f,a]
     cij = reshape(cij, 1,1,1,1,size(cij,1), size(cij,2))
     ti = reshape(ti, size(ti,1), size(ti,2), size(ti,3), size(ti,4), size(ti,5), 1)
@@ -666,6 +676,7 @@ function to_sgs_term(u, setup, to_setup, stepper)
     @. P_hat = -tau * P_hat
     sgs_hat = sum(P_hat; dims = 5)
     sgs_hat = reshape(sgs_hat, size(sgs_hat,1), size(sgs_hat,2), size(sgs_hat,3), size(sgs_hat,4))
+    end
 
     sgs = real(ifft(sgs_hat, [1,2,3]))
 
@@ -683,6 +694,12 @@ function innerpoducts(x,y,setup; mirror_y = false)
         L[2] = L[2]*2
     end
     N = size(x)[1:D]
+    if x isa Array && y isa Array
+        # 🔑 HOST fast path (2026-09-24): ip[e,f] = sum_a x[a,e] conj(y[a,f]) is transpose(Y' X), one
+        # BLAS product, instead of a 6-D broadcast temporary of ~450 MB at 64^3. Device path unchanged.
+        X = reshape(x, :, size(x, 5)); Y = reshape(y, :, size(y, 5))
+        return Matrix(transpose(Y' * X)) .* (prod(L)/(prod(N)^2))
+    end
     #@tensor ip2[e,f] := x[a,b,c,d,e]* conj(y)[a,b,c,d,f]
     x = reshape(x, size(x,1), size(x,2), size(x,3), size(x,4), size(x,5), 1)
     y = reshape(y, size(y,1), size(y,2), size(y,3), size(y,4), 1, size(y,5))

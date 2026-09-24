@@ -746,6 +746,27 @@ const RF = RikFlow
         # and the feedback really changes the answer -- a rollout that fed the record would pass (2)
         @test !(o.Y ≈ RF.lstm_forward(spec, ps, X, zero(E)).Y)
 
+        # (2b) the :dQ target: the fed-back level is q*_lag + a .* y .+ b, not y itself
+        lm = (; a = T[0.5, 2.0, 1.5], b = T[0.1, -0.2, 0.3])
+        od = ext._rollout_forward(spec, ps, X, zero(E), ff; lagmap = lm)
+        for b in 1:B
+            st = RF.LSTMState(spec, T)
+            ys = zeros(T, nout, L)
+            for t in 1:L
+                x = X[:, t, b]
+                for k in 1:spec.hist.h
+                    s = t - k
+                    if s >= 1 && ff[s]
+                        x[RF.qlag_columns(spec.hist, k)] .=
+                            X[RF.qstarlag_columns(spec.hist, k), t, b] .+ lm.a .* ys[:, s] .+ lm.b
+                    end
+                end
+                RF.lstm_step!(st, w, spec, x; sample_latent = false)
+                ys[:, t] .= st.y
+            end
+            @test od.Y[:, :, b] ≈ ys rtol = 1e-10
+        end
+
         # (3) the gradient THROUGH the feedback, against central differences in a random direction
         fK = ext._rollout_mask(L, burn, 7)
         loss(p) = RF.elbo(spec, p, X, Y, sc, E; beta = 1e-3, free = fK)
@@ -794,5 +815,34 @@ const RF = RikFlow
                         emission = :constant)
         @test_throws ErrorException RF.train_stochlstm(spec_e, Xc, Yc, steps; kw..., epochs = 1,
                                                        rollout = 10)
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # V59 -- emission = :constant means constant: Wd is never trained
+    # -----------------------------------------------------------------------------------------
+    #
+    # 🔴 Until 2026-09-23 `lstm_forward` computed `Wd * h + bd` for every emission mode, so a
+    # `:constant` head learned `Wd` like a state-dependent one and a `:constant` and a
+    # `:state_dependent` fit from one seed came out bit-identical. The deployed step computes
+    # `Wd * h + bd` too, so the only way `:constant` can be constant is `Wd` staying at zero.
+    @testset "V59 a :constant emission head never trains Wd" begin
+        T = Float32
+        nq, N = 3, 500
+        rng = Xoshiro(99)
+        q = zeros(Float64, nq, N)
+        for t in 2:N
+            q[:, t] = 0.8 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        kw = (; L = 60, burn = 15, epochs = 4, batch = 4, lr = 5e-3, seed = 3, verbose = false, T)
+        function fit(em)
+            sp = mkspec(:storn; n_qoi = nq, h = 1, n_hidden = 6, n_latent = 3, n_encoder = 0,
+                        emission = em)
+            X, Yb, st = RF.build_history(sp.hist, q[:, 1:(N - 1)], q)
+            return RF.train_stochlstm(sp, permutedims(X), permutedims(Yb), st; kw...)[1]
+        end
+        pc, psd = fit(:constant), fit(:state_dependent)
+        @test all(iszero, pc.Wd)                 # constant: the scale head never moved
+        @test !all(iszero, psd.Wd)               # positive control: state-dependent does train it
+        @test pc.bd != psd.bd || pc.Wx != psd.Wx # and the two are no longer the same fit
     end
 end

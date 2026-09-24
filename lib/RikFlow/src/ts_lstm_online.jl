@@ -123,6 +123,9 @@ Whether the next call will replay rather than predict.
 in_warmup(m::StochLSTM) = m.counter[] < nwarm(m)
 
 # Push one completed step onto the lag window, in the scaled units the regressor is built in.
+"What the fit predicts: `:q` (the level; every fit before 2026-09-23) or `:dQ` (the correction)."
+_lstm_target(scaling) = hasproperty(scaling, :target) ? scaling.target : :q
+
 function _push_scaled!(m::StochLSTM{T}, q, q_star) where {T}
     qs = scale_input(collect(q), m.scaling.in_scaling)
     qss = scale_input(collect(q_star), m.scaling.in_scaling)
@@ -172,8 +175,12 @@ function get_next_item_timeseries(m::StochLSTM{T}, q_star) where {T}
     end
 
     # the model predicts the LEVEL q^n in scaled units; the closure owes the solver the correction
-    qhat = Tsolve.(vec(scale_output(m.scratch, m.scaling.out_scaling)))
-    dQ = qhat .- qs_host
+    # 🔑 `scaling.target` (absent on every fit before 2026-09-23, hence `:q`) says what the output
+    # IS: the level, from which the correction is `qhat - q*`, or the correction itself.
+    out = Tsolve.(vec(scale_output(m.scratch, m.scaling.out_scaling)))
+    tgt = _lstm_target(m.scaling)
+    # :q -- the level, :dQ -- the additive correction, :logr -- the multiplicative one, r = log1p(dQ/q*)
+    dQ = tgt === :dQ ? out : tgt === :logr ? qs_host .* expm1.(out) : out .- qs_host
     any(abs.(qs_host) .< m.gate) && (dQ .= 0)
 
     _push_scaled!(m, qs_host .+ dQ, qs_host)

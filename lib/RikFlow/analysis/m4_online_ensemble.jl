@@ -125,9 +125,21 @@ for (label, reps) in groups
     summary[label] = rows
 end
 
+# the ceiling: fig16 showed every M4 fit capped near Z[16,32] ~ 2800 where the reference reaches 3800
+q999(x) = sort(vec(x))[ceil(Int, 0.999 * length(x))]
+@printf("
+Z[16,32] 99.9th percentile / max -- reference %.0f / %.0f
+", q999(qref[5, :]), maximum(qref[5, :]))
+for (label, reps) in groups
+    @printf("  %-18s %s
+", label, join((@sprintf("%.0f/%.0f", q999(r.q[5, :]), maximum(r.q[5, :])) for r in reps), "  "))
+end
+
 # --- figure: Z[16,32] per replica, flat windows shaded ------------------------------------------
 const INK, INK2, GRID, BG = colorant"#0b0b0b", colorant"#52514e", colorant"#e6e5e1", colorant"#fcfcfb"
-const CM = [colorant"#2a78d6", colorant"#eb6834"]
+# reference palette slots 1-4, validated on the light surface; every panel is titled with its
+# ensemble, so identity never rests on colour (aqua is under 3:1 contrast)
+const CM = [colorant"#2a78d6", colorant"#eb6834", colorant"#1baf7a", colorant"#4a3aa7"]
 const SHADE = (colorant"#eda100", 0.25)
 set_theme!(Theme(fontsize = 12, textcolor = INK,
                  Axis = (xgridcolor = GRID, ygridcolor = GRID, topspinevisible = false,
@@ -135,9 +147,13 @@ set_theme!(Theme(fontsize = 12, textcolor = INK,
                          xticklabelcolor = INK2, yticklabelcolor = INK2, backgroundcolor = BG)))
 const KF = 5          # the QoI the figure shows: Z[16,32]
 t = (0:(ncol - 1)) .* 2.5e-3
-m4groups = [g for g in groups if startswith(g.first, "M4")]
+# the M4 ensembles are the ones named in M4_ENSEMBLES -- the first `length(ENS)` groups, whatever
+# their labels (a prefix test silently dropped every ensemble not labelled "M4 ...")
+m4groups = groups[1:length(ENS)]
 nrow = 1 + maximum(length(g.second) for g in m4groups)
-fig = Figure(size = (1500, 170 * nrow + 120), backgroundcolor = BG)
+length(m4groups) <= length(CM) ||
+    error("$(length(m4groups)) M4 ensembles but only $(length(CM)) colours -- add a slot or split the figure")
+fig = Figure(size = (max(1500, 420 * length(m4groups)), 170 * nrow + 120), backgroundcolor = BG)
 Label(fig[0, 1:length(m4groups)], "$(QNAMES[KF]) online, 100 TU per replica — shaded: 0.5 TU windows with sd < $(Int(100FLAT))% of the reference's median";
       fontsize = 15, halign = :left, tellwidth = false)
 yl = (0, 1.25 * maximum(qref[KF, :]))

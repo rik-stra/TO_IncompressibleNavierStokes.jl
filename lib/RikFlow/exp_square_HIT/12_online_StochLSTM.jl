@@ -44,8 +44,14 @@ Re = T(2_000)
 # output name carries `tsim`, so a smoke never overwrites a full run.
 tsim = T(parse(Float64, get(ENV, "RIKFLOW_ONLINE_TSIM", "100")))
 
-ArrayType = CuArray
-backend = CUDABackend()
+# 🔑 `RIKFLOW_ONLINE_DEVICE=cpu` runs the LES on the host -- for short local screening runs, not for
+# production. Its output files carry `_cpu`, so a local run can never be confused with, or
+# overwritten by, a cluster copy. Different backend = different round-off = a different
+# realisation after ~0.5 TU; statistics, not trajectories, are comparable with the GPU runs.
+const ONCPU = lowercase(strip(get(ENV, "RIKFLOW_ONLINE_DEVICE", "cuda"))) == "cpu"
+ArrayType = ONCPU ? Array : CuArray
+backend = ONCPU ? IncompressibleNavierStokes.CPU() : CUDABackend()
+devtag = ONCPU ? "_cpu" : ""
 
 seeds = (; dns = 123, ou = 333, to = 234)
 
@@ -98,21 +104,26 @@ isempty(model_dir_env) || @info "deploying an exported fit" out_dir source_scan 
     get(fit.extras, :batch, "?")
 
 # --- the reference run this one inherits from --------------------------------------------------
-params_track = load(track_file, "params_track")
-data_track = load(track_file, "data_track")
-
-ustart = if data_track.fields[1].u isa Tuple
-    stack(ArrayType{T}.(data_track.fields[1].u))
+# 🔑 `RIKFLOW_ONLINE_IC` reads the ~6 MB extract `tools/m4_extract_ic.jl` writes instead of the
+# 2.7 GB record -- the same three objects, copied, so the run is the same.
+ic_file = strip(get(ENV, "RIKFLOW_ONLINE_IC", ""))
+if isempty(ic_file)
+    params_track = load(track_file, "params_track")
+    data_track = load(track_file, "data_track")
+    u0 = data_track.fields[1].u
+    dQ_rec = data_track.dQ
 else
-    ArrayType{T}(data_track.fields[1].u)
+    params_track, u0, dQ_rec = load(ic_file, "params_track", "u0", "dQ")
 end
+
+ustart = u0 isa Tuple ? stack(ArrayType{T}.(u0)) : ArrayType{T}(u0)
 
 # The warm-up window. ⚠️ M4's requirement is its own: the replay has to charge the recurrence, not
 # just fill the lag window, so `nwarm` must cover the LSTM's memory. 100 is inherited from the
 # linear cells, where it was sized from the measured ACF; `tools/m4_warmup_probe.jl` measures it
 # for M4 and this number should be set from that, not assumed.
 nwarm = parse(Int, get(ENV, "RIKFLOW_M4_NWARM", "100"))
-dQ_data = data_track.dQ[:, 1:nwarm]
+dQ_data = dQ_rec[:, 1:nwarm]
 
 params = (;
     params_track...,
@@ -141,6 +152,6 @@ for i in replicas
 
     @info "Running sim $i out of $(cfg.n_replicas)"
     data_online = online_sgs(; params..., ustart = ustart, time_series_method = sampler)
-    jldsave(out_dir * "data_online_tsim$(tsim)_replica$(i).jld2";
+    jldsave(out_dir * "data_online_tsim$(tsim)_replica$(i)$(devtag).jld2";
             data_online, params, model_index, deploy_seed, nwarm, model_file)
 end
