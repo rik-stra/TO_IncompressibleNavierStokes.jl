@@ -675,6 +675,9 @@ Fit an M4 model to a regressor/target pair.
 - `init_ps`: warm-start parameters (e.g. the `ps` a fit file stores), shape-checked against
   `spec`. Rollout training is meant as a fine-tune of a teacher-forced fit.
 - `clip`: clip the gradient's global norm to this before Adam; `0` (default) is off.
+- `weight_decay`: decoupled weight decay (AdamW): each update shrinks every weight by this
+  fraction after the Adam step. `0` (default) is off. Added 2026-09-24 against the `:dQ`/`:logr`
+  targets' overfitting (validation best at update 26-70).
   `history.gmax` logs the largest norm seen between validations, so an exploding rollout
   gradient is visible rather than silent.
 
@@ -715,7 +718,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             stop_patience::Int = 100, val_every::Int = 2,
                             stop_window::Int = 500, stop_rel::Real = 0.005,
                             rollout::Int = 1, init_ps = nothing, clip::Real = 0,
-                            lagmap = nothing)
+                            lagmap = nothing, weight_decay::Real = 0)
     rollout >= 1 || error("train_stochlstm: rollout must be >= 1 (1 = teacher forcing); got $rollout")
     (rollout == 1 || !RF.emission_noise(spec)) || error(
         "train_stochlstm: rollout > 1 needs emission = :none -- with an emission head the deployed " *
@@ -812,8 +815,14 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # ⚠️ `clip > 0` clips the gradient's global norm before Adam -- the guard against a free
     # rollout's exploding gradient (Rik, 2026-09-23). Off by default; `history.gmax` shows
     # whether it is needed.
-    rule = clip > 0 ? Optimisers.OptimiserChain(Optimisers.ClipNorm(T(clip)), Optimisers.Adam(T(lr))) :
-           Optimisers.Adam(T(lr))
+    # 🔑 `weight_decay > 0` is DECOUPLED decay (AdamW): Adam first, then every weight shrinks by the
+    # fraction `weight_decay` per update. The coupled form (`WeightDecay` before Adam) is L2 through
+    # Adam's normalisation, which moves weights by ~lr per step whatever lambda is -- measured, not
+    # assumed -- so lambda would not be the knob it looks like. `adjust!` changes only Adam's rate.
+    rules = Any[Optimisers.Adam(T(lr))]
+    clip > 0 && pushfirst!(rules, Optimisers.ClipNorm(T(clip)))
+    weight_decay > 0 && push!(rules, Optimisers.WeightDecay(T(weight_decay)))
+    rule = length(rules) == 1 ? only(rules) : Optimisers.OptimiserChain(rules...)
     opt = Optimisers.setup(rule, ps)
 
     # 🔑 Segments of equal length share one recurrence, so they are grouped once here and batched
@@ -1035,7 +1044,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
            (; history..., best_update = best.update, best_index = best.index,
             best_val = best.val, stopped_early, stop_reason, updates = upd,
             epochs_run = cld(upd, nbatch), nseg, batch_eff, upd_per_epoch = nbatch, val_every,
-            rollout, clip, warm_start = init_ps !== nothing)
+            rollout, clip, weight_decay, warm_start = init_ps !== nothing)
 end
 
 # ---------------------------------------------------------------------------------------------
