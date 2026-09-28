@@ -4,7 +4,8 @@
 #
 # Reads every `output/TO_LSTM/explore/<tag>/data_online_tsim*_replica*.jld2` (CPU `_cpu` and GPU runs), plus -- as
 # baselines -- the first `TSCREEN` TU of the cluster replicas of the two teacher-forced stride-100
-# fits. Environment: `TSCREEN` (TU per run scored, default 10), `QOI_CACHE`, `M4_SCREEN_SUBDIR`
+# fits. Environment: `TSCREEN` (TU per run scored, default 10), `QOI_CACHE`, `REF_TU_MAX` (reference
+# used only up to this time; plan step 1 uses 74), `M4_SCREEN_SUBDIR`
 # (the directory under `TO_LSTM/` whose fits are screened, default `explore`; `diag` for
 # `tools/m4_diag_fit.jl`'s).
 #
@@ -35,6 +36,14 @@ const n = round(Int, TSCREEN / DT) + 1
 
 ref = load(CACHE)
 qref, dQref = ref["q"], ref["dQ"]
+# `REF_TU_MAX` (2026-09-28, plan step 1): use only the reference up to this time, e.g. 74 so the
+# confirmation block (76-97 TU) enters no score -- its marginal, its sd and its null windows alike.
+# Unset = the whole record (the old behaviour).
+if haskey(ENV, "REF_TU_MAX")
+    nref = round(Int, parse(Float64, ENV["REF_TU_MAX"]) / 2.5e-3) + 1
+    qref, dQref = qref[:, 1:nref], dQref[:, 1:(nref - 1)]
+    println("reference truncated to t <= $(ENV["REF_TU_MAX"]) TU ($(nref) columns)")
+end
 const REFSD = [median(std(view(qref, k, i:(i + W - 1))) for i in 1:(size(qref, 2) - W + 1)) for k in 1:6]
 sd100 = vec(std(qref; dims = 2))
 

@@ -332,6 +332,156 @@ function report_ics(sel; io = stdout)
 end
 
 # --------------------------------------------------------------------------------------------
+# the partition -- which ICs a run may use (plan §7, "Screening funnel, partition and training
+# window", 2026-09-28)
+# --------------------------------------------------------------------------------------------
+#
+# 🔑 THE ONE DEFINITION. `tools/run_d6.jl` (which ICs to forecast) and `score_d6.jl` (which ICs to
+# score, and whether a directory mixes blocks) both include this file and read the blocks from here;
+# nothing else may write the numbers down. Tested in `test/test_d6_ics.jl`.
+
+"""
+    D6_BLOCKS
+
+The named IC blocks of plan §7's partition, as closed intervals on the package's own IC time `t_k`
+in TU:
+
+| block | window | used by |
+|---|---|---|
+| `selection` | `[52, 74]` | mini-D6: choosing λ/γ, fit seeds, cells |
+| `confirmation` | `[76, 97]` | full-density D6 of the finalists, **scored once** |
+
+🔴 **No time unit serves two roles.** The existence-stage fits train on `[1, 50]` TU
+(`TRAIN_WINDOW_TU`); 50–52 and 74–76 are 2 TU embargoes. Both are asserted below, so moving a block
+edge into an embargo fails at load rather than in a result.
+
+⚠️ `t_k` is a multiple of `FIELD_DT = 0.25`, so both edges are attainable and both are inclusive. At
+`K = 180` the selection block holds ~45 packages, the confirmation block ~44.
+"""
+const D6_BLOCKS = (selection = (52.0, 74.0), confirmation = (76.0, 97.0))
+
+"The existence-stage training window of plan §7, in TU. Recorded, not used to select anything."
+const TRAIN_WINDOW_TU = (1.0, 50.0)
+
+"The embargo between any two roles, in TU (plan §7: 2 TU; the level's ACF rings for ~10 TU)."
+const EMBARGO_TU = 2.0
+
+let s = D6_BLOCKS.selection, c = D6_BLOCKS.confirmation
+    s[1] - TRAIN_WINDOW_TU[2] >= EMBARGO_TU ||
+        error("D6_BLOCKS: selection starts $(s[1]) TU, inside the embargo after training")
+    c[1] - s[2] >= EMBARGO_TU ||
+        error("D6_BLOCKS: confirmation starts $(c[1]) TU, inside the embargo after selection")
+    all(b -> b[1] < b[2], (s, c)) || error("D6_BLOCKS: an empty block")
+end
+
+"""
+    block_window(name) -> (lo, hi)
+
+The window of a named block (`:selection`, `:confirmation`, or the same as a string).
+"""
+function block_window(name)
+    b = Symbol(lowercase(strip(string(name))))
+    hasproperty(D6_BLOCKS, b) ||
+        error("unknown D6 block $(repr(string(name))); the blocks are $(join(keys(D6_BLOCKS), ", "))")
+    return getproperty(D6_BLOCKS, b)
+end
+
+"""
+    ic_block(t) -> Symbol
+
+Which block the IC time `t` (TU) falls in: `:selection`, `:confirmation` or `:none` (training
+window, an embargo, or past the last block).
+"""
+function ic_block(t::Real)
+    for b in keys(D6_BLOCKS)
+        lo, hi = getproperty(D6_BLOCKS, b)
+        lo <= t <= hi && return b
+    end
+    return :none
+end
+
+"""
+    ic_filter(; block = nothing, tmin = nothing, tmax = nothing, stride = 1)
+
+A run's IC restriction, as `(; block, tmin, tmax, stride, active, label)`. `block` sets the window
+from `D6_BLOCKS`; `tmin`/`tmax` set it explicitly. The two are mutually exclusive -- a block with an
+extra window cut into it is a different block and should not carry its name. `active` is `false`
+for the unrestricted full D6.
+"""
+function ic_filter(; block = nothing, tmin = nothing, tmax = nothing, stride::Integer = 1)
+    stride >= 1 || error("the IC stride must be >= 1, got $stride")
+    if block !== nothing && !isempty(strip(string(block)))
+        (tmin === nothing && tmax === nothing) ||
+            error("a named block (D6_BLOCK) and an explicit window (D6_T_MIN/D6_T_MAX) are " *
+                  "mutually exclusive")
+        lo, hi = block_window(block)
+        b = Symbol(lowercase(strip(string(block))))
+        return (; block = b, tmin = lo, tmax = hi, stride = Int(stride), active = true,
+                label = string(b) * (stride > 1 ? "_s$(stride)" : ""))
+    end
+    lo = tmin === nothing ? -Inf : Float64(tmin)
+    hi = tmax === nothing ? Inf : Float64(tmax)
+    lo <= hi || error("D6_T_MIN = $lo is after D6_T_MAX = $hi")
+    active = isfinite(lo) || isfinite(hi) || stride > 1
+    label = !active ? "" :
+            "t$(isfinite(lo) ? lo : "")-$(isfinite(hi) ? hi : "")" * (stride > 1 ? "_s$(stride)" : "")
+    return (; block = nothing, tmin = lo, tmax = hi, stride = Int(stride), active, label)
+end
+
+"""
+    ic_filter_from_env(env = ENV)
+
+`ic_filter` from `D6_BLOCK`, `D6_T_MIN`, `D6_T_MAX` and `D6_STRIDE`. Empty values count as unset.
+"""
+function ic_filter_from_env(env = ENV)
+    g(k) = (v = strip(get(env, k, "")); isempty(v) ? nothing : v)
+    b, lo, hi, s = g("D6_BLOCK"), g("D6_T_MIN"), g("D6_T_MAX"), g("D6_STRIDE")
+    return ic_filter(; block = b,
+                     tmin = lo === nothing ? nothing : parse(Float64, lo),
+                     tmax = hi === nothing ? nothing : parse(Float64, hi),
+                     stride = s === nothing ? 1 : parse(Int, s))
+end
+
+"""
+    ic_subset(t, filt) -> Vector{Int}
+
+Positions `i` (ordinals, when `t` is the manifest's `t`) of the ICs a run with filter `filt` uses:
+those with `filt.tmin <= t[i] <= filt.tmax`, then every `filt.stride`-th of them, starting with the
+first. `t` must be sorted, as `select_ics` returns it.
+"""
+function ic_subset(t::AbstractVector{<:Real}, filt)
+    issorted(t) || error("ic_subset: IC times are not sorted")
+    inwin = [i for i in eachindex(t) if filt.tmin <= t[i] <= filt.tmax]
+    return inwin[1:(filt.stride):end]
+end
+
+"""
+    d6_run_identity(d) -> (; closure, model_name, block, nlead)
+
+What makes two D6 output files members of the SAME experiment, read from one loaded file `d`
+(a `Dict` from `JLD2.load`). `tools/run_d6.jl` refuses to write into a directory whose files have a
+different identity, and `score_d6.jl` refuses to score one: the scorer's glob cannot tell which
+closure wrote a file, so a shared directory would silently pool two closures -- or a selection and
+a confirmation run -- into one ensemble.
+
+🔑 Files written before 2026-09-28 carry no `model_name`/`block`: the model name is then read off
+the model path (`.../TO_LRS/LinReg1/LinReg.jld2` -> `LinReg1`) and the block is `""` (a full D6).
+The IC stride and time window are deliberately NOT part of the identity: a stride-2 run and its
+fill-in are one experiment, exactly as `--array=1-179:2` and `--array=2-180:2` are.
+"""
+function d6_run_identity(d)
+    closure = string(get(d, "closure", "lrs"))
+    model_name = if haskey(d, "model_name")
+        string(d["model_name"])
+    elseif closure == "ddn"
+        "ddn"
+    else
+        basename(dirname(string(get(d, "model", "?/?"))))
+    end
+    return (; closure, model_name, block = string(get(d, "block", "")), nlead = Int(d["nlead"]))
+end
+
+# --------------------------------------------------------------------------------------------
 # packaging
 # --------------------------------------------------------------------------------------------
 

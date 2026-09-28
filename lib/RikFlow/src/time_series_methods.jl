@@ -170,6 +170,52 @@ function get_next_item_timeseries(time_series_method::ANN, q_star)
     return dQ
 end
 
+"""
+    LinReg(file_name, rng, ArrayType; q_hist = nothing, spinnup_data = nothing)
+
+The linear-regression closure (M0): a level prediction `q^n = scale_output(c [x; 1] + η)`, with
+`x` the scaled predictor + history and `η` the residual draw in **scaled units**.
+
+# The residual `η`
+
+  * **White (every file written before 2026-09-28):** `η ~ stoch_distr`, i.i.d. per step.
+  * **AR(p) (optional, `p ≤ 2`, "M0ᶜ-ridge", `analysis/results_LSTMS.md` §12):** when the file
+    carries the keys `"ar_phi"` (`p × n_qoi`, diagonal AR coefficients, one column per QoI) and
+    `"ar_sigma_xi"` (`n_qoi × n_qoi` innovation covariance),
+
+        η_n = μ_η + z_n,   z_n = Σ_{k=1..p} φ_k ⊙ z_{n-k} + ξ_n,   ξ_n ~ N(0, Σ_ξ),
+
+    with `μ_η = mean(stoch_distr)`. The innovation `ξ`, not `η`, is what is drawn (plan §5 D2): the
+    closure knows its own past draws. `η` enters exactly where the white draw does.
+
+🔴 **Without the AR keys the behaviour is bit-identical to the pre-AR code, RNG stream included**:
+the white branch is the same `rand(rng, stoch_distr)` call at the same point, and nothing else
+touches `rng` (`test/test_linreg_ar.jl` pins this against a verbatim copy of the old code).
+With AR, one `rand(rng, MvNormal(0, Σ_ξ))` replaces that call, so a member seed consumes the same
+number of normals per step in both variants -- which is what makes a CRN pairing of LinReg7 and
+LinReg7_ar2 meaningful.
+
+# Warm start of the AR state
+
+During the replayed warm-up (`spinnup_data`) `dQ` is emitted verbatim, exactly as before. In
+addition, on each of the **last `p` warm-up steps** the residual the record actually realised is
+computed with the history the model holds at that point,
+
+    z = scale(q* + dQ_replayed) − c [x; 1] − μ_η      (scaled units, out_scaling),
+
+and pushed into the AR state, so the forecast's first `z` continues the data's residual rather
+than starting from zero. ⚠️ A warm-up step whose history is not yet full (step index ≤ `hist_len`)
+is skipped. **Fallback:** if fewer than `p` lags got filled that way (warm-up shorter than
+`hist_len + p`, or no history at all), the whole state is replaced at the first prediction by an
+approximately stationary draw: `AR_BURNIN` steps of the recursion from zero with fresh `ξ` draws.
+This consumes `rng`, only in the AR path, and never in the D6 configuration (`nwarm = 100 ≫ h + p`).
+
+# Turbulence gate
+
+When `TURBULENCE_GATE` zeroes `dQ`, the AR state is **still advanced** (the `ξ` draw happens before
+the gate is applied, as the white draw always did). The gate censors the closure's output, not its
+noise process, so a gated step does not shift every later draw of the member's stream.
+"""
 struct LinReg
     c
     stoch_distr
@@ -183,6 +229,7 @@ struct LinReg
     target
     rng
     ArrayType
+    ar          # nothing (white η), or the AR(p) residual state -- see `load_ar_residual`
 
     function LinReg(file_name, rng, ArrayType; q_hist = nothing, spinnup_data = nothing)
 
@@ -190,6 +237,7 @@ struct LinReg
         target = :q
         scaling = adapt(ArrayType, scaling)
         c= adapt(ArrayType, c)
+        ar = load_ar_residual(file_name, stoch_distr)
 
         counter = zeros(Int)
         if !isnothing(q_hist)
@@ -198,41 +246,153 @@ struct LinReg
         if !isnothing(spinnup_data) && isnothing(q_hist)
             @error "Spinnup not implemented without history"
         end
-        new(c, stoch_distr, scaling, q_hist, spinnup_data, counter, hist_var, include_predictor, fitted_qois, target, rng, ArrayType)
+        new(c, stoch_distr, scaling, q_hist, spinnup_data, counter, hist_var, include_predictor, fitted_qois, target, rng, ArrayType, ar)
     end
+end
+
+"Steps of the AR recursion from zero used as the stationary-draw fallback (see `LinReg`)."
+const AR_BURNIN = 2000
+
+"Stationarity of a diagonal AR(p ≤ 2) with coefficients `phi` (`p × n`), per column."
+function ar_stationary(phi::AbstractMatrix)
+    p = size(phi, 1)
+    return all(eachcol(phi)) do f
+        p == 1 ? abs(f[1]) < 1 : (abs(f[2]) < 1 && f[2] + f[1] < 1 && f[2] - f[1] < 1)
+    end
+end
+
+"""
+    load_ar_residual(file_name, stoch_distr)
+
+The optional AR(p) residual of a `LinReg` file: `nothing` when the file has no `"ar_phi"` key
+(every pre-2026-09-28 file), else `(; phi, xi_distr, mu_eta, z, nz)` with `z` the `n × p` state
+(column 1 newest) and `nz[]` how many lags were filled from data. Refuses a non-stationary or
+malformed AR rather than deploying it.
+"""
+function load_ar_residual(file_name, stoch_distr)
+    has_phi, has_sig = jldopen(file_name, "r") do f
+        haskey(f, "ar_phi"), haskey(f, "ar_sigma_xi")
+    end
+    if !has_phi
+        has_sig && error("$file_name has ar_sigma_xi but no ar_phi")
+        return nothing
+    end
+    has_sig || error("$file_name has ar_phi but no ar_sigma_xi")
+    isnothing(stoch_distr) && error("$file_name: an AR residual needs stoch_distr (its mean is μ_η)")
+    phi, S = load(file_name, "ar_phi", "ar_sigma_xi")
+    phi = Matrix{Float64}(phi)
+    p, n = size(phi)
+    n == length(stoch_distr) || error("ar_phi has $n columns, stoch_distr $(length(stoch_distr)) components")
+    1 <= p <= 2 || error("AR order $p: only p = 1, 2 are implemented")
+    ar_stationary(phi) || error("$file_name: AR coefficients $phi are not stationary")
+    size(S) == (n, n) || error("ar_sigma_xi is $(size(S)), expected ($n, $n)")
+    xi_distr = MvNormal(zeros(n), Matrix{Float64}(Symmetric(Matrix{Float64}(S))))
+    return (; phi, xi_distr, mu_eta = Vector{Float64}(mean(stoch_distr)), z = zeros(n, p),
+            nz = zeros(Int))
+end
+
+"AR order of a `LinReg`'s residual; 0 = white."
+ar_order(m::LinReg) = isnothing(m.ar) ? 0 : size(m.ar.phi, 1)
+
+"Push `znew` into the AR state (column 1 newest)."
+function ar_push!(ar, znew)
+    p = size(ar.z, 2)
+    p > 1 && (ar.z[:, 2:p] .= ar.z[:, 1:(p - 1)])
+    ar.z[:, 1] .= znew
+    return ar
+end
+
+"One step of the AR recursion: draw ξ, advance the state, return the new `z`."
+function ar_step!(ar, rng)
+    xi = rand(rng, ar.xi_distr)
+    znew = xi .+ vec(sum(ar.phi' .* ar.z; dims = 2))
+    ar_push!(ar, znew)
+    return znew
+end
+
+"""
+    draw_eta(m::LinReg)
+
+The residual draw in scaled units: `rand(rng, stoch_distr)` for a white `LinReg` (the pre-AR call,
+unchanged), `μ_η + z_n` for an AR one.
+"""
+function draw_eta(m::LinReg)
+    ar = m.ar
+    isnothing(ar) && return rand(m.rng, m.stoch_distr)
+    p = size(ar.z, 2)
+    if ar.nz[] < p            # fallback: approximately stationary state (see the docstring)
+        ar.z .= 0
+        for _ in 1:AR_BURNIN
+            ar_step!(ar, m.rng)
+        end
+        ar.nz[] = p
+    end
+    return ar.mu_eta .+ ar_step!(ar, m.rng)
+end
+
+"The regression input `[x; 1]` (scaled) of the history branch, exactly as the prediction uses it."
+function linreg_data(time_series_method::LinReg, q_star)
+    n_qoi = size(q_star,1)
+    q_star_sc = scale_input(q_star, time_series_method.scaling.in_scaling)
+    if time_series_method.hist_var == :q_star_q
+        q_hist_sc1 = scale_input(time_series_method.q_hist[1:n_qoi,:], time_series_method.scaling.in_scaling)
+        q_hist_sc2 = scale_input(time_series_method.q_hist[n_qoi+1:end,:], time_series_method.scaling.in_scaling)
+        q_hist_sc = cat(q_hist_sc1, q_hist_sc2, dims = 1)
+    else
+        q_hist_sc = scale_input(time_series_method.q_hist, time_series_method.scaling.in_scaling)
+    end
+
+    if time_series_method.include_predictor
+        input = vcat(q_star_sc, q_hist_sc[:])
+    else
+        input = q_hist_sc
+    end
+
+    return vcat(input,ones(eltype(input), (1,1)))
+end
+
+"""
+    ar_warm_residual!(m::LinReg, q_star, dQ)
+
+Warm start: the residual the replayed step realised, `scale(q* + dQ) − c [x; 1] − μ_η`, from the
+history the model holds now (call BEFORE the history shift), pushed into the AR state.
+"""
+function ar_warm_residual!(m::LinReg, q_star, dQ)
+    ar = m.ar
+    n = length(ar.mu_eta)
+    data = linreg_data(m, q_star)
+    mu = zeros(n)
+    mu[m.fitted_qois] .= vec(Array(m.c * data))
+    lev = vec(Array(scale_input(q_star + dQ, m.scaling.out_scaling)))
+    ar_push!(ar, lev .- mu .- ar.mu_eta)
+    ar.nz[] = min(ar.nz[] + 1, size(ar.z, 2))
+    return ar
 end
 
 function get_next_item_timeseries(time_series_method::LinReg, q_star)
     if !isnothing(time_series_method.q_hist)  # if the model uses history
         n_qoi = size(q_star,1)
-        if time_series_method.counter[] < size(time_series_method.spinnup_data,2) # for the first few steps, directly read dQ
+        nspin = size(time_series_method.spinnup_data,2)
+        if time_series_method.counter[] < nspin # for the first few steps, directly read dQ
             time_series_method.counter[] += 1
             dQ = time_series_method.spinnup_data[1:n_qoi, time_series_method.counter[]]
+            # AR warm start: the last p replayed steps whose history is full (see the docstring)
+            if !isnothing(time_series_method.ar)
+                j = time_series_method.counter[]
+                if j > nspin - ar_order(time_series_method) && j > size(time_series_method.q_hist, 2)
+                    ar_warm_residual!(time_series_method, q_star, dQ)
+                end
+            end
         else    # after that, predict dQ  (we now have enough history)
-            q_star_sc = scale_input(q_star, time_series_method.scaling.in_scaling)
-            if time_series_method.hist_var == :q_star_q
-                q_hist_sc1 = scale_input(time_series_method.q_hist[1:n_qoi,:], time_series_method.scaling.in_scaling)
-                q_hist_sc2 = scale_input(time_series_method.q_hist[n_qoi+1:end,:], time_series_method.scaling.in_scaling)
-                q_hist_sc = cat(q_hist_sc1, q_hist_sc2, dims = 1)
+            data = linreg_data(time_series_method, q_star)
+            if !isnothing(time_series_method.stoch_distr)
+                pred = draw_eta(time_series_method).|> Float32 |> adapt(time_series_method.ArrayType)
             else
-                q_hist_sc = scale_input(time_series_method.q_hist, time_series_method.scaling.in_scaling)
+                pred = zeros(eltype(data), (n_qoi,1)) |> adapt(time_series_method.ArrayType)
             end
 
-            if time_series_method.include_predictor                
-                input = vcat(q_star_sc, q_hist_sc[:])
-            else
-                input = q_hist_sc
-            end
-            
-            data = vcat(input,ones(eltype(input), (1,1)))
-            if !isnothing(time_series_method.stoch_distr)
-                pred = rand(time_series_method.rng, time_series_method.stoch_distr).|> Float32 |> adapt(time_series_method.ArrayType)
-            else
-                pred = zeros(eltype(input), (n_qoi,1)) |> adapt(time_series_method.ArrayType)
-            end
-            
             pred[time_series_method.fitted_qois,:] += time_series_method.c * data
-            
+
             pred = scale_output(pred, time_series_method.scaling.out_scaling)[:]
 
             if time_series_method.target == :dq
@@ -257,13 +417,13 @@ function get_next_item_timeseries(time_series_method::LinReg, q_star)
         q_star_sc = scale_input(q_star, time_series_method.scaling.in_scaling)
         data = vcat(q_star_sc, ones(eltype(q_star_sc), (1,1)))
         if !isnothing(time_series_method.stoch_distr)
-            pred = rand(time_series_method.rng, time_series_method.stoch_distr) |> adapt(time_series_method.ArrayType)
+            pred = draw_eta(time_series_method) |> adapt(time_series_method.ArrayType)
         else
             pred = zeros(eltype(q_star_sc), n_qoi)
         end
         pred[time_series_method.fitted_qois,:] += time_series_method.c * data
         pred = scale_output(pred, time_series_method.scaling.out_scaling)[:]
-        
+
         if time_series_method.target == :dq
             dQ = pred
             any(abs.(q_star) .< TURBULENCE_GATE) && (dQ .= 0)

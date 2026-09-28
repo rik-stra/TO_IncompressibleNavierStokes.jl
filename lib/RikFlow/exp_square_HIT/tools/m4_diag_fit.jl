@@ -11,6 +11,7 @@
 #   RIKFLOW_D_L / _BURN / _STRIDE / _BATCH           segmentation and batch
 #   RIKFLOW_D_LR / _WD / _CLIP / _EPOCHS / _SEED     optimiser
 #   RIKFLOW_D_TRAIN_TU   end of the training range in TU (default 10 = the project's 1-10 TU)
+#   RIKFLOW_D_SCORE_TU   `a,b`: the held-out window in TU (default 50 TU to the end of the record)
 #   RIKFLOW_D_EVAL_EVERY updates between held-out scorings (default 10)
 #   RIKFLOW_D_SKIP       1 = linear skip `y += Ws x`, seeded with the least-squares map and `V1 = V2 = 0`,
 #                        so update 0 IS the linear model and the recurrence learns its residual
@@ -95,7 +96,15 @@ function full_record(rec, scaling, hist, a, target)
     return permutedims(X), Y, cols
 end
 Xf, Yf, colsf = full_record(rec, dat.scaling, hist, cfg.train_range[1], target)
-const HELD = findall(c -> 20_000 <= c, colsf)         # 50-100 TU
+# `RIKFLOW_D_SCORE_TU = a,b` (2026-09-28): explicit held-out window in TU; unset = 50 TU to the end
+# (the old convention). 🔴 Under the plan's partition never score past 74 TU.
+score_tu = envs("SCORE_TU", "")
+score_lo, score_hi = isempty(score_tu) ? (50.0, Inf) : Tuple(parse.(Float64, split(score_tu, ",")))
+const HELD = findall(c -> score_lo / DT <= c <= score_hi / DT, colsf)
+isempty(HELD) && error("RIKFLOW_D_SCORE_TU = $score_tu selects no held-out step")
+colsf[HELD[1]] > cfg.train_range[2] || error("held-out window overlaps the training range")
+score_hi > 74 && @warn "held-out window reaches past 74 TU (confirmation block under the 2026-09-28 partition)"
+@info "windows (TU)" train = cfg.train_range .* DT held = (colsf[HELD[1]] * DT, colsf[HELD[end]] * DT)
 const WARM = 100
 Xh, Yh = Float32.(Xf[:, HELD]), Float32.(Yf[:, HELD])
 

@@ -1460,6 +1460,20 @@ pre-saturation measurement and the grid does not bound how much further the erro
 Reported, not extrapolated. The DDN saturates only in the two bands where it is already worse than
 climatology.
 
+✅ **VALIDATION RUN AND PASSED, 2026-09-28** (O10). Ordinal 0 (R1 `fields[1]`), LinReg1, M = 5, on the
+desktop RTX 3090 through the current `run_d6.jl`. Output is in `analysis/output/D6_valid_LinReg1/`, scored with
+`D6_OUT=<that dir> analysis/score_d6.jl`.
+- **Gate:** 5/5 members have `dQ` bit-identical over the replayed warm-up (columns 1:100), with max q deviation
+  2.4–3.4e-15.
+- **Reported:** past the warm-up, per-member rel rms against R2's replicas over the full 1301 columns is
+  **5.8e-6 to 3.0e-4**, with no member diverging. The saturation yardstick for two R2 replicas is 1.22
+  (0.74–1.71).
+- The D6 path does more than reproduce the warm-up: it reproduces R2's online trajectories to round-off-level
+  growth for 3.25 TU.
+- Steady cost is 7.5 s/TU.
+
+The note below is the pre-2026-09-28 record.
+
 ⚠️ **The validation was never run** (`--array=0`): all three directories contain 0 `d6_valid_*`
 files. `compare_validation` is the correctness check on the whole D6 path against a trajectory
 produced by different code years earlier, and it costs one task. It should be run against LinReg1,

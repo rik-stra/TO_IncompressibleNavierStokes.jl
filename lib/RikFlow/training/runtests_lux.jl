@@ -1115,6 +1115,71 @@ const RF = RikFlow
         @test_throws ErrorException RF.LSTMSpec(; hist, arch = :dense, window = 0)
     end
 
+    # V71 -- arch = :dense with n_latent = 0: M3ᶠ's deterministic residual MLP + constant head
+    @testset "V71 arch = :dense, n_latent = 0: no latent, constant noise head, zero-init net = skip (W = $W)" for
+            W in (1, 3)
+        T = Float32
+        nq = 3
+        hist = RF.HistorySpec(; h = 2, n_qoi = nq, hist_var = :q_star_q)
+        spec = RF.LSTMSpec(; hist, n_hidden = 5, n_latent = 0, n_encoder = 0, arch = :dense,
+                           window = W, emission = :constant, skip = true)
+        @test RF.n_cell_input(spec) == W * RF.n_input(spec)
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        @test size(ps.Bmu, 1) == 0
+        Ws = randn(Xoshiro(4), T, nq, RF.n_input(spec)) ./ 3
+        # zero-initialised output (the fit driver's V1 = 0): the model IS the skip
+        p0 = merge(ps, (; Ws, V1 = zero(ps.V1)))
+        X = randn(Xoshiro(6), T, RF.n_input(spec), W, 4)
+        o0 = RF.lstm_forward(spec, p0, X, zeros(T, 0, W, 4))
+        @test o0.Y[:, end, :] ≈ Ws * X[:, end, :]
+        # training forward == deployed window map, with a live network
+        p1 = merge(p0, (; V1 = randn(Xoshiro(5), T, nq, 5), bd = T[-1, -0.5, 0]))
+        w = RF.LSTMWeights(p1, spec)
+        @test RF.check_shapes(w, spec)
+        mu, sd = reshape([0.1, 0.2, 0.3], nq, 1), reshape([2.0, 2.5, 3.0], nq, 1)
+        sc = (; in_scaling = (; mu, sigma = sd), out_scaling = (; mu, sigma = sd), target = :dQ)
+        rng = Xoshiro(11)
+        q_star = randn(rng, nq, 12) .+ 1.0
+        m = RF.StochLSTM(spec, w, sc; spinnup_data = randn(rng, nq, 6) ./ 10, rng = Xoshiro(5),
+                         gate = 0.0, stochastic = true)
+        for k in 1:12
+            RF.get_next_item_timeseries(m, q_star[:, k])
+            k > 6 || continue
+            o = RF.lstm_forward(spec, p1, reshape(copy(m.xwin), :, W, 1), zeros(T, 0, W, 1))
+            @test o.Y[:, end, 1] ≈ m.state.y rtol = 1e-5
+            @test o.LOGD[:, end, 1] ≈ T[-1, -0.5, 0]      # constant head: the scale is bd alone
+        end
+        path = joinpath(mktempdir(), "dense0.jld2")
+        RF.save_stochlstm(path, spec, w, sc)
+        back = RF.load_stochlstm(path)
+        @test back.spec.arch === :dense && back.spec.n_latent == 0
+        # a short fit runs, with weight decay and the skip frozen, and leaves Ws untouched
+        N = 200
+        Xc = randn(Xoshiro(12), T, RF.n_input(spec), N); Yc = randn(Xoshiro(13), T, nq, N)
+        pf, h = RF.train_stochlstm(spec, Xc, Yc, collect(1:N); L = W, burn = W - 1, stride = 1,
+                                   epochs = 2, batch = 8, verbose = false, T, init_ps = p0,
+                                   freeze = (:Ws,), weight_decay = 1e-3)
+        @test all(isfinite, h.val)
+        @test pf.Ws == Ws
+        # `decay_exclude`: with a zero learning signal on nothing but decay, an exempt leaf is
+        # untouched and a decayed one shrinks. Y = the model's own output makes every gradient ~0
+        # at init except through the head, so compare a huge decay with and without the exemption.
+        pz = merge(p1, (; Wx = ps.Wx))
+        Xz = randn(Xoshiro(14), T, RF.n_input(spec), N)
+        kw = (; L = W, burn = W - 1, stride = 1, epochs = 1, batch = 8, verbose = false, T,
+              init_ps = pz, freeze = (:Ws, :V1, :Wx, :Wh, :b, :cdec, :Araw), weight_decay = 10.0,
+              val_every = 1000)
+        Yz = Float32.(p1.Ws * Xz)          # a V1 h term remains, so bd sees a small gradient
+        pa, _ = RF.train_stochlstm(spec, Xz, Yz, collect(1:N); kw...)
+        pb, _ = RF.train_stochlstm(spec, Xz, Yz, collect(1:N); kw..., decay_exclude = (:bd,))
+        @test norm(pa.bd .- p1.bd) > 3 * norm(pb.bd .- p1.bd)
+        # no stochasticity at all, or a conditional encoder with nothing to encode: refused
+        @test_throws ErrorException RF.LSTMSpec(; hist, arch = :dense, window = W, n_latent = 0)
+        @test_throws ErrorException RF.LSTMSpec(; hist, arch = :dense, window = W, n_latent = 0,
+                                                emission = :constant, posterior = :xy)
+        @test_throws ErrorException RF.LSTMSpec(; hist, arch = :vrnn, n_latent = 0)
+    end
+
     # -----------------------------------------------------------------------------------------
     # V70 -- prior = :learned, the VRNN prior p(z_t | h_{t-1}): learned colour
     # -----------------------------------------------------------------------------------------

@@ -5,14 +5,33 @@
 # deterministic, so scaling `--array=1-5` to `--array=1-180` renumbers nothing and the pilot's five
 # ICs are the first five of the same set the full run uses.
 #
-# Usage:
-#   julia --project tools/run_d6.jl <ordinal>
+# Usage (from exp_square_HIT/, i.e. `--project` = lib/RikFlow -- for EVERY closure, M4 included):
+#   julia --project tools/run_d6.jl <ordinal>     # one IC (an array task); 0 = the validation IC
+#   julia --project tools/run_d6.jl --all         # every IC the filter below selects, one process
+#   julia --project tools/run_d6.jl --list        # print the selected ordinals and stop
 #
 # Environment overrides, all optional:
 #   D6_IC_DIR    where the `d6_ic_<k>.jld2` packages live
-#   D6_MODEL     the fitted M0 to deploy (default: LinReg1 under this experiment's output tree)
-#   D6_OUT       where to write `d6_online_ic<k>_m<member>.jld2`
+#   D6_CLOSURE   lrs (default) | ddn | lstm  (`stochlstm`/`m4` = lstm)
+#   D6_MODEL     lrs: the fitted `LinReg.jld2` (default: LinReg1 under this experiment's output tree)
+#                lstm: an M4 fit DIRECTORY (absolute, or relative to output/TO_LSTM, e.g.
+#                `diag/r3_lin_sd_h2`; the median seed is deployed as `12_online_StochLSTM.jl`
+#                does) or one `StochLSTM_seed<s>.jld2` file. Required for lstm.
+#   D6_OUT       where to write `d6_online_ic<k>_m<member>.jld2`. ONE directory per closure, model,
+#                block and N_LEAD -- the driver refuses to write into a directory holding another
 #   D6_MEMBERS   M, default 10
+#   D6_NLEAD     forecast steps after the warm-up, default the package's 1200. The mini-D6 uses 400;
+#                the scorer truncates its lead grid to <= this. At most the package's own nlead.
+#   D6_BLOCK     selection | confirmation -- plan §7's partition, IC time t in [52,74] / [76,97] TU
+#                (`D6_BLOCKS` in analysis/build_d6_ics.jl, the one definition)
+#   D6_T_MIN, D6_T_MAX   an explicit IC-time window in TU instead (exclusive with D6_BLOCK)
+#   D6_STRIDE    take every n-th IC of the window (default 1)
+#     An ordinal outside the filter is SKIPPED (exit 0), so `--array=1-180` with D6_BLOCK set runs
+#     the block and idles the rest. Ordinal 0 (validation) ignores the filter.
+#
+# 🔑 Mini-D6 (plan §7 stage 3), on the desktop, one process so the solver compiles once:
+#   D6_CLOSURE=lstm D6_MODEL=diag/r3_lin_sd_h2 D6_BLOCK=selection D6_MEMBERS=5 D6_NLEAD=400 \
+#     D6_OUT=output/D6_mini_r3_lin_sd_h2 julia --project tools/run_d6.jl --all
 #
 # 🔴 Three things in here are load-bearing and none of them is obvious.
 #
@@ -59,6 +78,9 @@ using CUDA
 
 # `select_ics`, `ic_path`, `manifest_path`, `N_WARM`, `N_LEAD` -- the one definition of D6's IC set.
 include(normpath(joinpath(@__DIR__, "..", "..", "analysis", "build_d6_ics.jl")))
+# `parse_closure`, `resolve_lstm_model`, `make_lstm_sampler`, `gate_census`, `check_out_dir` -- the
+# M4 path, in a file the offline suite loads too (`test/test_d6_lstm.jl`).
+include(joinpath(@__DIR__, "d6_lib.jl"))
 
 const EXP_DIR = normpath(joinpath(@__DIR__, ".."))
 
@@ -79,26 +101,29 @@ end
 
 model_file() = get(ENV, "D6_MODEL", joinpath(EXP_DIR, "output", "TO_LRS", "LinReg1", "LinReg.jld2"))
 
+"Where `D6_MODEL` is resolved for `D6_CLOSURE=lstm` when it is not a path of its own."
+const LSTM_ROOT = joinpath(EXP_DIR, "output", "TO_LSTM")
+
 """
     closure()
 
-Which closure to forecast with: `:lrs` (default) or `:ddn`, from `D6_CLOSURE`.
+Which closure to forecast with: `:lrs` (default), `:ddn` or `:lstm` (M4, `StochLSTM`), from
+`D6_CLOSURE`.
 
 🔴 **The DDN needs this to enter D6 at all**, and until 2026-09-16 it could not: `MVG_sampler` took
 no `spinnup_data`, so a DDN forecast would have started sampling immediately while the LRS was being
 advanced through `nwarm` recorded steps. The two closures would then forecast from **different
 physical states** and every lead-resolved difference would carry that offset (memory #55).
 """
-function closure()
-    c = Symbol(lowercase(get(ENV, "D6_CLOSURE", "lrs")))
-    c in (:lrs, :ddn) || error("D6_CLOSURE must be lrs or ddn; got $c")
-    return c
-end
+closure() = parse_closure(get(ENV, "D6_CLOSURE", "lrs"))
 
 "The DDN's training slice, written once beside the IC packages by `analysis/build_d6_ics.jl`."
 ddn_file() = get(ENV, "D6_DDN_DATA", joinpath(ic_dir(), "d6_ddn_traindata.jld2"))
 out_dir() = get(ENV, "D6_OUT", joinpath(EXP_DIR, "output", "D6"))
 n_members() = parse(Int, get(ENV, "D6_MEMBERS", "10"))
+
+"`D6_NLEAD`, or `nothing` for the package's own forecast length."
+n_lead_env() = (s = strip(get(ENV, "D6_NLEAD", "")); isempty(s) ? nothing : parse(Int, s))
 
 """
     member_seed(k, member)
@@ -272,12 +297,17 @@ end
 
 Run all `M` members for one initial condition and write one file per member.
 
-`nlead` shortens the forecast and `od` redirects the output; both exist for `smoke_d6.jl` and must
-be left at their defaults for anything whose numbers are reported. A short run is a pipeline check,
-not a measurement -- the lead grid's longest entry is 1086 steps.
+`nlead` shortens the forecast (default `D6_NLEAD`, else the package's 1200) and `od` redirects the
+output. 🔑 Since 2026-09-28 a shortened forecast is a legitimate measurement -- the mini-D6 runs at
+400 steps (plan §7 stage 3) and `score_d6.jl` truncates its lead grid to the run's own `nlead` --
+but it must be the same for every member of an experiment, which `check_out_dir` enforces.
+
+`filt` is the IC restriction (`ic_filter_from_env()`, `D6_BLOCK` & co.). It is recorded in every
+output file; an ordinal whose IC falls outside it is an error here (the entry point skips such
+ordinals before calling this).
 """
 function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
-                nlead = nothing, od = out_dir())
+                nlead = n_lead_env(), od = out_dir(), filt = ic_filter_from_env())
     # 🔴 **Float64, changed 2026-09-16 (Rik).** It was `Float32`, and that was wrong in three ways at
     # once on the rebaselined pipeline:
     #
@@ -312,9 +342,18 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     q_window_offsets = pkg["q_window_offsets"]
     nwarm = pkg["provenance"].nwarm
     nlead = nlead === nothing ? pkg["provenance"].nlead : Int(nlead)
+    1 <= nlead <= pkg["provenance"].nlead || error(
+        "D6_NLEAD = $nlead is outside 1..$(pkg["provenance"].nlead), the package's own forecast " *
+        "length; the IC pool was capped for that length, so a longer run overruns the truth")
     nlead == pkg["provenance"].nlead ||
-        @warn "forecast shortened to $nlead steps from $(pkg["provenance"].nlead); this is a " *
-              "pipeline check, not a measurement -- the lead grid reaches 1086 steps"
+        @info "forecast shortened to $nlead steps from $(pkg["provenance"].nlead); the scorer " *
+              "truncates its lead grid to leads <= $nlead"
+    # 🔴 The package's own IC time decides the block, not the manifest's copy of it -- they are
+    # checked against each other in `load_ic`, but this is the value the output file records.
+    validation || (filt.tmin <= t_k <= filt.tmax) || error(
+        "IC k = $k is at t = $t_k TU, outside the requested window [$(filt.tmin), $(filt.tmax)]")
+    validation || filt.block === nothing || ic_block(t_k) === filt.block ||
+        error("IC k = $k at t = $t_k TU is not in block $(filt.block)")
 
     Δt = T(params_ic.Δt)
     nt = nwarm + nlead
@@ -326,11 +365,34 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
                                  "reference would step the chain differently")
 
     cl = closure()
+    lstm_fit = nothing
+    lstm_meta = (;)
+    ar_meta = (; ar_order = 0, ar_phi = zeros(0, 0))
     if cl === :lrs
         mdl = model_file()
         isfile(mdl) || error("no model at $mdl (set D6_MODEL)")
         hist_len, hist_var = load(mdl, "hist_len", "hist_var")
         dQ_train = nothing
+        model_name = basename(dirname(abspath(mdl)))
+        # 🔑 AR(p) residual (M0ᶜ-ridge, results_LSTMS §12): recorded per member file. The run's
+        # identity already separates LinReg7 from LinReg7_ar2 (`model_name` is the model dir).
+        ar_meta = lrs_ar_record(mdl)
+    elseif cl === :lstm
+        # 🔑 M4 through D6 (plan Start here, 0(a)). Stdlib closure, so no Lux: this driver still
+        # runs under `--project=lib/RikFlow`. The fit is resolved exactly as
+        # `12_online_StochLSTM.jl` resolves it (median seed from `seed_summary.jld2`).
+        res = resolve_lstm_model(get(ENV, "D6_MODEL", ""); root = LSTM_ROOT)
+        mdl = res.file
+        lstm_fit = load_stochlstm(mdl)
+        model_name = res.name
+        hist_len, hist_var = lstm_fit.spec.hist.h, lstm_fit.spec.hist.hist_var
+        dQ_train = nothing
+        lstm_meta = (; lstm_record(lstm_fit)..., deploy_seed = res.deploy_seed)
+        # The window-mode constructor check, raised here rather than inside member 1's solve.
+        W = lstm_fit.spec.window
+        nwarm >= max(W - 1, lstm_fit.spec.hist.h) || error(
+            "the M4 fit needs a warm-up of >= $(max(W - 1, lstm_fit.spec.hist.h)) steps " *
+            "(window $W, h = $(lstm_fit.spec.hist.h)); the IC package replays $nwarm")
     else
         mdl = ddn_file()
         isfile(mdl) || error("no DDN training data at $mdl; run analysis/build_d6_ics.jl " *
@@ -339,16 +401,28 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
         # The DDN has no history at all -- that is what makes its warm-up "pseudo". Reported as 0
         # rather than left undefined, so the output file says which closure produced it.
         hist_len, hist_var = 0, :none
+        model_name = "ddn"
     end
     nq = size(params_ic.qois, 1)
 
+    block = filt.block === nothing ? "" : string(filt.block)
+    run_id = (; closure = string(cl), model_name, block, nlead)
+    # Validation files are `d6_valid_*`, which neither this check nor the scorer's glob sees.
+    validation || check_out_dir(od, run_id)
     mkpath(od)
 
     @printf("D6 ordinal %d -> field k = %d, n_k = %d, t_k = %.2f TU\n", ordinal, k, n_k, t_k)
     @printf("  %s, %d members, %d steps (%d warm-up + %d forecast) = %.4f TU, Δt = %g\n",
             gpu ? "GPU (CuArray)" : "CPU (Array)", M, nt, nwarm, nlead, tsim, Δt)
-    @printf("  closure %s, model %s: hist_len = %d, hist_var = %s\n", cl,
-            basename(mdl), hist_len, hist_var)
+    @printf("  closure %s, model %s (%s): hist_len = %d, hist_var = %s\n", cl,
+            model_name, basename(mdl), hist_len, hist_var)
+    ar_meta.ar_order > 0 && println("  AR(", ar_meta.ar_order, ") residual, phi = ",
+                                    round.(ar_meta.ar_phi; digits = 4))
+    cl === :lstm && @printf("  M4: arch %s, emission %s, window %d, target %s, knobs [%s], deploy seed %d\n",
+                            lstm_meta.lstm_arch, lstm_meta.lstm_emission, lstm_meta.lstm_window,
+                            lstm_meta.lstm_target, lstm_meta.lstm_knobs, lstm_meta.deploy_seed)
+    filt.active && @printf("  IC filter %s: t in [%g, %g] TU, stride %d; this IC t = %.2f (block %s)\n",
+                           filt.label, filt.tmin, filt.tmax, filt.stride, t_k, ic_block(t_k))
     @printf("  ou_advance = %d, savefreq = %d (> nt, so no fields)\n", n_k, nt + 1)
     if validation
         println("  🔑 VALIDATION run, not a scored one. This is R2's own online initial")
@@ -377,7 +451,16 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
         end
 
         seed = validation ? validation_seed(member) : member_seed(k, member)
-        sampler = if cl === :lrs
+        sampler = if cl === :lstm
+            # 🔑 Same `dQ_warm`, same member seed, same IC, and the SAME gate constant `LinReg`
+            # reads (`make_lstm_sampler`'s docstring). `Array{T}`, not `ArrayType{T}`: `StochLSTM`
+            # is CPU-side, and at `T = Float64` these are the package's own bits.
+            s = make_lstm_sampler(lstm_fit, Array{T}(dQ_warm), seed;
+                                  gate = RikFlow.TURBULENCE_GATE)
+            s.gate == RikFlow.TURBULENCE_GATE || error("StochLSTM gate $(s.gate) is not " *
+                                                       "TURBULENCE_GATE = $(RikFlow.TURBULENCE_GATE)")
+            s
+        elseif cl === :lrs
             q_hist = ArrayType{T}(zeros(T, nq, hist_len))
             hist_var == :q_star_q && (q_hist = cat(q_hist, q_hist, dims = 1))
             RikFlow.LinReg(mdl, Xoshiro(seed), ArrayType;
@@ -443,6 +526,16 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
         chk.ok || error(chk.message)
         member == 1 && print(chk.report)
 
+        # 🔴 The replayed warm-up must come back bit-identical (#48) -- for every closure, and
+        # checked on the node rather than only by the validation scorer: it is the one exact check
+        # the D6 path has, and a Lux/M4 closure is the newest code on it.
+        dQ_run = Array(data.dQ)
+        nchk = min(nwarm, nstep_run)
+        warm_identical = view(dQ_run, :, 1:nchk) == view(dQ_warm, :, 1:nchk)
+        warm_identical || error("member $member: dQ[:, 1:$nchk] is NOT bit-identical to the " *
+                                "package's dQ_warm -- the warm-up replay is broken")
+        gc = gate_census(view(dQ_run, :, 1:nstep_run), nwarm)
+
         # 🔴 TRUNCATE `dQ` AND `tau`. `allocate_arrays_outputs` builds them as
         # `Array{T}(undef, N_qois, nstep)` -- **uninitialised**, not zeros -- so on a short run the
         # tail past `nstep_run` is whatever was in that memory. Writing it would hand every consumer
@@ -453,7 +546,17 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
                 dQ = Array(data.dQ)[:, 1:nstep_run], tau = Array(data.tau)[:, 1:nstep_run],
                 k, n_k, t_k, ordinal, member, seed, ou_advance = n_k, validation,
                 nwarm, nlead, M, model = abspath(mdl), closure = string(cl), hist_len,
-                hist_var,
+                hist_var, model_name,
+                # 🔑 The partition (plan §7) and the IC filter, recorded per file: the scorer
+                # refuses a directory whose members disagree on `block` (`d6_run_identity`).
+                block, ic_block = string(ic_block(t_k)), ic_filter_label = filt.label,
+                ic_tmin = filt.tmin, ic_tmax = filt.tmax, ic_stride = filt.stride,
+                # 🔴 The turbulence-gate census, the same statistic for every closure (#59/#65):
+                # identically-zero forecast `dQ` columns. `gate_threshold` is NaN for the DDN,
+                # which has no gate by decision (#65).
+                gate_threshold = cl === :ddn ? NaN : RikFlow.TURBULENCE_GATE,
+                gate_nfired = gc.nfired, gate_first_lead = gc.first_lead,
+                warm_identical, lstm_meta..., ar_meta...,
                 # 🔑 `diverged` is the flag every consumer must branch on; `nstep` says where it
                 # stopped. A complete member carries `diverged = false` and `nstep = nt`, so the
                 # keys exist unconditionally and no reader needs a `haskey` fallback.
@@ -463,8 +566,8 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
 
         push!(walls, wall)
         diverged && push!(diverged_members, member)
-        @printf("  member %2d/%d: %.1f s, q0 median rel %.1e, %.0f kB%s\n",
-                member, M, wall, chk.median_rel, filesize(out) / 1024,
+        @printf("  member %2d/%d: %.1f s, q0 median rel %.1e, warm-up dQ bit-identical, gate %d/%d, %.0f kB%s\n",
+                member, M, wall, chk.median_rel, gc.nfired, gc.nsteps, filesize(out) / 1024,
                 diverged ? @sprintf("  🔴 partial, %d/%d steps", nstep_run, nt) : "")
         flush(stdout)
     end
@@ -514,8 +617,72 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     return nothing
 end
 
+"""
+    lrs_ar_record(mdl)
+
+`(; ar_order, ar_phi)` of a `LinReg` file: `ar_order = 0` and an empty `ar_phi` for a white
+residual (no `"ar_phi"` key, every pre-2026-09-28 file), else the file's AR coefficients
+(`p × n_qoi`, see `RikFlow.LinReg`).
+"""
+function lrs_ar_record(mdl)
+    phi = jldopen(mdl, "r") do f
+        haskey(f, "ar_phi") ? Matrix{Float64}(f["ar_phi"]) : zeros(0, 0)
+    end
+    return (; ar_order = size(phi, 1), ar_phi = phi)
+end
+
+"""
+    selected_ordinals(filt = ic_filter_from_env(); dir = ic_dir())
+
+The scored ordinals the IC filter keeps, read off the manifest's own IC times (which `load_ic`
+cross-checks against each package). Every ordinal when the filter is inactive.
+"""
+function selected_ordinals(filt = ic_filter_from_env(); dir = ic_dir())
+    man = load(manifest_path(dir))
+    return ic_subset(man["t"], filt), man
+end
+
+"""
+    main(args = ARGS)
+
+`<ordinal>` runs one IC (skipping it, with a message, when the IC filter excludes it); `--all` runs
+every selected ordinal in this process, so the solver compiles once (the desktop mini-D6);
+`--list` prints the selection and stops.
+"""
+function main(args = ARGS)
+    isempty(args) && error("usage: run_d6.jl <ordinal> | --all | --list   (ordinal 1..K is the " *
+                           "array task id; 0 = the validation IC, fields[1] of the record)")
+    filt = ic_filter_from_env()
+    if args[1] in ("--all", "--list")
+        ords, man = selected_ordinals(filt)
+        @printf("IC filter %s: %d of %d ordinals, t in [%g, %g] TU, stride %d\n",
+                filt.active ? filt.label : "(none)", length(ords), man["K"], filt.tmin,
+                filt.tmax, filt.stride)
+        isempty(ords) || @printf("  ordinals %s\n  k        %s\n  t [TU]   %s\n",
+                                 join(ords, ","), join(man["k"][ords], ","),
+                                 join(man["t"][ords], ","))
+        flush(stdout)
+        args[1] == "--list" && return ords
+        isempty(ords) && error("the IC filter selects no ordinal")
+        for o in ords
+            run_ic(o; filt)
+        end
+        return ords
+    end
+    ordinal = parse(Int, args[1])
+    if ordinal != 0 && filt.active
+        ords, man = selected_ordinals(filt)
+        if !(ordinal in ords)
+            @printf("ordinal %d (k = %d, t = %.2f TU) is outside the IC filter %s -- skipped\n",
+                    ordinal, man["k"][ordinal], man["t"][ordinal], filt.label)
+            flush(stdout)
+            return Int[]
+        end
+    end
+    run_ic(ordinal; filt)
+    return [ordinal]
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
-    isempty(ARGS) && error("usage: run_d6.jl <ordinal>   (1..K the array task id; " *
-                           "0 = the validation IC, fields[1] of the 10 TU record)")
-    run_ic(parse(Int, ARGS[1]))
+    main()
 end

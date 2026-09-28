@@ -8,7 +8,11 @@
 # `m4_screen.jl`'s >2900 and KS columns show only indirectly.
 using JLD2, Statistics, Printf
 ref = load(get(ENV, "QOI_CACHE", joinpath(@__DIR__, "data", "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2")))
-qr = ref["q"]; mu = vec(mean(qr; dims = 2)); sd = vec(std(qr; dims = 2)); dsd = vec(std(ref["dQ"]; dims = 2))
+qr = ref["q"]
+# `REF_TU_MAX` (2026-09-28): the reference only up to this time (plan step 1: 74, keeping the 76-97
+# TU confirmation block out of every score); unset = the whole record
+haskey(ENV, "REF_TU_MAX") && (qr = qr[:, 1:(round(Int, parse(Float64, ENV["REF_TU_MAX"]) / 2.5e-3) + 1)]; println("reference truncated to t <= $(ENV["REF_TU_MAX"]) TU"))
+mu = vec(mean(qr; dims = 2)); sd = vec(std(qr; dims = 2)); dsd = vec(std(ref["dQ"][:, 1:(size(qr, 2) - 1)]; dims = 2))
 # null: 20 TU windows of the reference itself
 n = 8001
 nul = [((vec(mean(qr[:, s:s+n-1]; dims = 2)) .- mu) ./ sd) for s in 1:(n-1):(size(qr, 2) - n + 1)]

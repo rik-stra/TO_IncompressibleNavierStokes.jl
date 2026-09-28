@@ -8,6 +8,16 @@
 # Usage:
 #   julia --startup-file=no --project=analysis analysis/score_d6.jl            # score what is there
 #   julia --startup-file=no --project=analysis analysis/score_d6.jl --preview  # design only, no runs
+#   julia --startup-file=no --project=analysis analysis/score_d6.jl --paired <dirA> <dirB>
+#       # the plan's PRIMARY score (§7): paired fair CRPS, leads <= 0.5 TU, IC-block bootstrap
+#
+# 🆕 2026-09-28 (plan Start here 0(a)/(b)):
+#   * a run's own `nlead` sets the lead grid -- a mini-D6 at D6_NLEAD = 400 is scored on leads
+#     <= 400 (`truncate_leads`); any subset of ICs scores;
+#   * `D6_BLOCK=selection|confirmation`, `D6_T_MIN`/`D6_T_MAX`, `D6_STRIDE` restrict the SCORED ICs
+#     by their recorded t_k (the partition is `D6_BLOCKS` in build_d6_ics.jl), e.g. to score an
+#     existing full D6 on the selection block alone;
+#   * a directory mixing closures, models, blocks or N_LEAD is refused (`d6_run_identity`).
 #
 # Writes `analysis/output/d6_scores_<run dir>.jld2` and prints the tables that go into
 # `analysis/results.md`. ⚠️ The report belongs in `results.md`, beside the script that made it --
@@ -147,6 +157,24 @@ per band, and `lead_grid` is still the right tool for a series whose bands reall
 different rates -- the channel's, or anything scored on `dQ`.
 """
 d6_leads(nq::Integer = length(T_INT)) = [copy(LEADS) for _ in 1:nq]
+
+"""
+    truncate_leads(leads, nlead)
+
+The per-QoI grids restricted to leads `<= nlead`, the forecast length of the run being scored.
+
+🔑 **Truncation, not clipping.** A mini-D6 at `D6_NLEAD = 400` is scored on 25, 50, 100, 200, 400 --
+the leads it has -- and the 1000-step lead is simply absent, never read off the last column (a clipped
+lead reads as a saturated one). An empty result is an error: a run shorter than the first lead has
+nothing to score.
+"""
+function truncate_leads(leads::AbstractVector{<:AbstractVector{<:Integer}}, nlead::Integer)
+    out = [filter(<=(nlead), l) for l in leads]
+    all(!isempty, out) ||
+        error("the run's forecast is $nlead steps, shorter than the first lead " *
+              "$(minimum(minimum, leads)); nothing to score")
+    return out
+end
 
 "Which record supplies the verification truth. See the header."
 const TRUTH_SOURCE = get(ENV, "D6_TRUTH", "hf_reference")
@@ -304,7 +332,11 @@ const POLICY_TAG = !THINNING ? "" : isempty(EXCLUDE_ICS) ? "_thin" : "_thin_k87"
 """
     load_members(dir = D6_DIR)
 
-Every `d6_online_ic<k>_m<member>.jld2` in `dir`, grouped by IC and sorted by member.
+Every `d6_online_ic<k>_m<member>.jld2` in `dir`, grouped by IC and sorted by member, restricted to
+the ICs the IC filter `filt` keeps (by each IC's recorded `t_k`). Refuses a directory whose files
+disagree on `d6_run_identity` -- closure, model, partition block, `nlead` -- and a block-X run
+scored as block Y. The result carries `t` (IC times, aligned with `ks`), `identity`, `nlead` and
+`filt`.
 
 Refuses a ragged ensemble: `spread_skill`'s finite-`M` correction is a function of `M`, so an IC
 with fewer members than the rest would be silently down-weighted and its correction wrong. The two
@@ -312,7 +344,7 @@ ways of *avoiding* raggedness after a divergence are [`EXCLUDE_ICS`](@ref) -- dr
 [`THIN_MEMBERS`](@ref) -- keep it and drop the member from every closure. They are policies, not
 mechanisms, and the score file records which one produced it.
 """
-function load_members(dir = D6_DIR)
+function load_members(dir = D6_DIR; filt = ic_filter_from_env())
     isdir(dir) || return nothing
     pat = r"^d6_online_ic(\d+)_m(\d+)\.jld2$"
     byic = Dict{Int,Vector{Tuple{Int,String}}}()
@@ -323,6 +355,43 @@ function load_members(dir = D6_DIR)
               (parse(Int, m[2]), joinpath(dir, f)))
     end
     isempty(byic) && return nothing
+
+    # 🔴 ONE EXPERIMENT PER DIRECTORY (2026-09-28). The glob cannot tell which closure, model,
+    # partition block or forecast length wrote a file, so a directory holding two would be pooled
+    # into one ensemble with nothing looking wrong. `d6_run_identity` (build_d6_ics.jl) is the one
+    # definition of "same experiment"; `run_d6.jl` refuses to write a mixed directory and this
+    # refuses to score one. Every file is loaded here once and the pieces the rest needs are kept.
+    info = Dict{String,Any}()
+    ids = Dict{Any,Vector{String}}()
+    for (k, entries) in byic, (_, path) in entries
+        d = load(path)
+        info[path] = (; t_k = Float64(d["t_k"]), diverged = get(d, "diverged", false) === true)
+        push!(get!(ids, d6_run_identity(d), String[]), basename(path))
+    end
+    length(ids) == 1 || error(
+        "$dir mixes members of $(length(ids)) different experiments -- refusing to pool them:\n" *
+        join(("  $id: $(length(fs)) files, e.g. $(first(fs))" for (id, fs) in ids), "\n") *
+        "\nOne directory per closure, model, block and N_LEAD.")
+    identity = only(keys(ids))
+
+    # 🔑 The IC filter (`D6_BLOCK`, `D6_T_MIN`/`D6_T_MAX`, `D6_STRIDE`; the partition's one
+    # definition is `D6_BLOCKS` in build_d6_ics.jl), applied on each IC's OWN recorded `t_k`, BEFORE
+    # the divergence census: restricting the score to a block chooses the experiment, so the census
+    # is the block's. A run made for one block cannot be scored as another.
+    if filt.block !== nothing && !isempty(identity.block) && identity.block != string(filt.block)
+        error("$dir is a D6_BLOCK=$(identity.block) run; it cannot be scored as $(filt.block)")
+    end
+    tk = Dict(k => info[last(first(v))].t_k for (k, v) in byic)
+    if filt.active
+        keep = Set(sort(collect(keys(byic)), by = k -> tk[k])[ic_subset(sort(collect(values(tk))), filt)])
+        filter!(p -> p.first in keep, byic)
+        isempty(byic) && return nothing
+    end
+    if !isempty(identity.block)
+        bad = [k for k in keys(byic) if ic_block(tk[k]) !== Symbol(identity.block)]
+        isempty(bad) || error("IC(s) $bad of $dir lie outside block $(identity.block), which its " *
+                              "files record")
+    end
 
     # 🔴 DIVERGED MEMBERS ARE DROPPED FROM THE ENSEMBLE AND COUNTED, NEVER SCORED.
     #
@@ -337,7 +406,7 @@ function load_members(dir = D6_DIR)
     # have raised, so a missing key reads as `false`.
     divergences = Dict{Int,Vector{Int}}()
     for (k, entries) in byic
-        bad = [mid for (mid, path) in entries if get(load(path), "diverged", false) === true]
+        bad = [mid for (mid, path) in entries if info[path].diverged]
         isempty(bad) && continue
         divergences[k] = sort(bad)
         filter!(e -> !(first(e) in bad), entries)
@@ -437,7 +506,8 @@ function load_members(dir = D6_DIR)
         THINNING || (ids == collect(1:Ms[1]) || error("IC $k has member ids $ids"))
     end
     return (; ks, M = Ms[1], files = byic, divergences, incomplete, thinned,
-            member_ids = Dict(k => first.(byic[k]) for k in ks))
+            member_ids = Dict(k => first.(byic[k]) for k in ks),
+            t = [tk[k] for k in ks], identity, nlead = identity.nlead, filt)
 end
 
 "Relative deviation, in units of each QoI's own sd, allowed across the replayed warm-up window."
@@ -785,8 +855,12 @@ function report_grids(leads; io = stdout)
     println(io, "\nLead grid -- ONE grid for every band, in physical time (Rik, 2026-09-17).")
     println(io, "  The per-QoI grid was sized by T_int of the CORRECTION (spread 36.8x); on the")
     println(io, "  LEVEL the 1/e times span only 1.22x, so it added spread rather than removing it.")
+    g = union_grid(leads)
+    length(g) < length(LEADS) &&
+        @printf(io, "  ⚠️ truncated to the run's forecast length: %d of the %d leads\n",
+                length(g), length(LEADS))
     @printf(io, "  %-14s %10s\n", "lead [steps]", "TU")
-    for l in LEADS
+    for l in g
         @printf(io, "  %-14d %10.4f\n", l, l * DT)
     end
     @printf(io, "  T_int(level) per band, reported but no longer setting the grid: %s\n",
@@ -833,6 +907,197 @@ function saturation(ss, ref::AbstractMatrix, M::Integer)
     lev = [climatological_skill(collect(float.(view(ref, i, :))), M) for i in 1:size(ref, 1)]
     sat = [saturation_lead(ss.leads[i], ss.skill[i]; sat_level = lev[i]) for i in eachindex(lev)]
     return sat, lev
+end
+
+# ---------------------------------------------------------------------------------------------
+# the primary score (plan §7, "Primary score, declared now") and its paired comparison
+# ---------------------------------------------------------------------------------------------
+#
+# 🔑 Declared before any cell is screened: paired ensemble CRPS (fair form, `metrics.md` §3 item 2 --
+# the `1/(2M(M-1))` denominator; the `1/(2M^2)` one rewards under-dispersion at small M), averaged
+# over leads <= 0.5 TU and all six bands, each band standardised by the truth's own climatological
+# sd, with an IC-block bootstrap. The in-band count is reported, never tested.
+#
+# ⚠️ Pairing is by IC only. The same member seed does NOT give common random numbers across an MVG
+# and an LSTM sampler (plan §7), so the pairing removes the IC-to-IC variance and nothing else.
+#
+# These functions take plain arrays so that `analysis/d6_power.jl` can subsample K and M from
+# existing runs through the same code path the verdict uses.
+
+"Longest lead (steps) entering the primary score: 0.5 TU."
+const PRIMARY_MAX_LEAD = 200
+
+"""
+Default IC-block length of the primary score's bootstrap, in TU.
+
+The level's ACF falls to 0.1 within 0.43-0.60 TU and then rings at +-0.2 with a ~1 TU period (#67),
+so ICs closer than ~1 TU are not independent. The block length is `floor(block_tu / spacing) + 1`
+ICs, so any two ICs less than `block_tu` apart can fall in one block: 3 at K = 180 (median spacing
+0.5 TU), 2 at K = 90 (1.0 TU). Override with `blocklen` or `block_tu`; always report what was used.
+"""
+const PRIMARY_BLOCK_TU = 1.0
+
+"""
+    primary_band_scale(truth_q) -> Vector
+
+Per-band standardisation of the primary score: the sd of the truth's level over the whole
+reference record. A fixed property of the testbed, identical for both sides of any comparison.
+"""
+primary_band_scale(ref::AbstractMatrix) = vec(std(Float64.(ref); dims = 2))
+
+"""
+    crps_by_ic(fc, tr, scale) -> Array{Float64,3}
+
+Fair ensemble CRPS per (IC, band, lead), divided by `scale[band]`. `fc` is `K x N_Q x M x L`, `tr`
+is `K x N_Q x L` (`assemble`'s layout). `M >= 2`: the fair form is undefined for one member.
+"""
+function crps_by_ic(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3},
+                    scale::AbstractVector{<:Real})
+    K, nq, M, L = size(fc)
+    size(tr) == (K, nq, L) ||
+        throw(DimensionMismatch("truth is $(size(tr)), expected $((K, nq, L))"))
+    length(scale) == nq ||
+        throw(DimensionMismatch("scale has $(length(scale)) bands, expected $nq"))
+    M >= 2 || error("the fair ensemble CRPS needs M >= 2, got $M")
+    out = Array{Float64}(undef, K, nq, L)
+    for k in 1:K, i in 1:nq, j in 1:L
+        out[k, i, j] = crps_ensemble(view(fc, k, i, :, j), tr[k, i, j]; fair = true) / scale[i]
+    end
+    return out
+end
+
+"""
+    primary_score_by_ic(fc, tr, grid, scale; max_lead = PRIMARY_MAX_LEAD) -> Vector (length K)
+
+The primary score per IC: `crps_by_ic` averaged over the six bands and the grid's leads
+`<= max_lead`, equally weighted. Lower is better.
+"""
+function primary_score_by_ic(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3},
+                             grid::AbstractVector{<:Integer}, scale::AbstractVector{<:Real};
+                             max_lead::Integer = PRIMARY_MAX_LEAD)
+    length(grid) == size(fc, 4) || throw(DimensionMismatch("grid has $(length(grid)) leads"))
+    js = findall(<=(max_lead), grid)
+    isempty(js) && error("no lead <= $max_lead on the grid $(collect(grid))")
+    c = crps_by_ic(view(fc, :, :, :, js), view(tr, :, :, js), scale)
+    return vec(mean(c; dims = (2, 3)))
+end
+
+"""
+    ic_block_bootstrap_ci(d, t_ic; blocklen = nothing, block_tu = PRIMARY_BLOCK_TU,
+                          nboot = 10_000, level = 0.90, rng = Xoshiro(SEED))
+
+Moving-block bootstrap over initial conditions of the mean of `d` (one value per IC, e.g. a paired
+difference), with blocks of consecutive ICs in initialisation time `t_ic`. Percentile interval at
+`level`. `blocklen` defaults to `floor(block_tu / median IC spacing) + 1` (see `PRIMARY_BLOCK_TU`).
+
+Returns `(; mean, lo, hi, se, blocklen, nboot, level, K)`.
+"""
+function ic_block_bootstrap_ci(d::AbstractVector{<:Real}, t_ic::AbstractVector{<:Real};
+                               blocklen = nothing, block_tu::Real = PRIMARY_BLOCK_TU,
+                               nboot::Integer = 10_000, level::Real = 0.90,
+                               rng = Xoshiro(SEED))
+    K = length(d)
+    length(t_ic) == K || throw(DimensionMismatch("t_ic has $(length(t_ic)) entries, d has $K"))
+    K >= 2 || error("a bootstrap over ICs needs at least 2 ICs, got $K")
+    o = sortperm(t_ic)
+    x = Float64.(d[o])
+    sp = sort(diff(Float64.(t_ic[o])))
+    b = blocklen === nothing ?
+        floor(Int, block_tu / max(sp[cld(length(sp), 2)], eps())) + 1 : Int(blocklen)
+    b = clamp(b, 1, K)
+    boots = Vector{Float64}(undef, nboot)
+    for r in 1:nboot
+        boots[r] = mean(view(x, block_bootstrap_indices(K, b, rng)))
+    end
+    sort!(boots)
+    a = (1 - level) / 2
+    q(p) = boots[clamp(round(Int, p * nboot), 1, nboot)]
+    return (; mean = mean(x), lo = q(a), hi = q(1 - a), se = std(boots), blocklen = b,
+            nboot = Int(nboot), level = Float64(level), K)
+end
+
+"""
+    restrict(ens, ks)
+
+`load_members`'s result restricted to the ICs `ks` (a subset of `ens.ks`), for pairing.
+"""
+function restrict(ens, ks::AbstractVector{<:Integer})
+    issubset(ks, ens.ks) || error("restrict: ICs $(setdiff(ks, ens.ks)) are not in the ensemble")
+    pos = [findfirst(==(k), ens.ks) for k in ks]
+    return (; ens..., ks = collect(ks), t = ens.t[pos],
+            files = Dict(k => ens.files[k] for k in ks))
+end
+
+"""
+    paired_primary(dir_a, dir_b; truth = load_truth(), max_lead = PRIMARY_MAX_LEAD,
+                   blocklen = nothing, nboot = 10_000, level = 0.90, io = stdout)
+
+The plan's **declared primary score**: `A - B` of `primary_score_by_ic`, IC by IC, over the ICs
+both directories scored, with an IC-block bootstrap interval. **Negative means A is better.**
+
+🔴 Refuses to pair two runs from different partition blocks, and reports (never hides) ICs that one
+side lacks -- an IC dropped for a divergence on one side is dropped from both, which is policy A
+(`results.md` §4c); each side's divergence count is printed for that reason. Each side's
+`load_members` honours the same environment (`D6_EXCLUDE_ICS`, `D6_THIN_*`, the IC filter).
+
+Returns `(; diff, lo, hi, se, blocklen, K, ks, t, score_a, score_b, per_ic_a, per_ic_b,
+per_band, grid, M_a, M_b, id_a, id_b, dropped_a, dropped_b, level)`; `per_band` is the `A - B`
+difference per band, averaged over ICs and the primary leads.
+"""
+function paired_primary(dir_a, dir_b; truth = load_truth(), max_lead::Integer = PRIMARY_MAX_LEAD,
+                        blocklen = nothing, nboot::Integer = 10_000, level::Real = 0.90,
+                        rng = Xoshiro(SEED), io = stdout)
+    ea = load_members(dir_a)
+    eb = load_members(dir_b)
+    ea === nothing && error("no D6 members in $dir_a")
+    eb === nothing && error("no D6 members in $dir_b")
+    ea.identity.block == eb.identity.block ||
+        error("refusing to pair a block-$(repr(ea.identity.block)) run with a " *
+              "block-$(repr(eb.identity.block)) run")
+    ks = sort(intersect(ea.ks, eb.ks))
+    length(ks) >= 2 || error("the two runs share $(length(ks)) scored ICs; nothing to pair")
+    dropped_a, dropped_b = setdiff(ea.ks, ks), setdiff(eb.ks, ks)
+    nl = min(ea.nlead, eb.nlead)
+    grid = filter(l -> l <= min(max_lead, nl), LEADS)
+    isempty(grid) && error("no lead <= $(min(max_lead, nl)) on the grid $LEADS")
+    a, b = restrict(ea, ks), restrict(eb, ks)
+    fa, tra = assemble(a, truth, grid)
+    fb, trb = assemble(b, truth, grid)
+    tra == trb || error("the two runs verify against different truth at the same ICs -- " *
+                        "their n_k or nwarm disagree")
+    sc = primary_band_scale(truth.q)
+    sa = primary_score_by_ic(fa, tra, grid, sc; max_lead)
+    sb = primary_score_by_ic(fb, trb, grid, sc; max_lead)
+    ci = ic_block_bootstrap_ci(sa .- sb, a.t; blocklen, nboot, level, rng)
+    per_band = vec(mean(crps_by_ic(fa, tra, sc) .- crps_by_ic(fb, trb, sc); dims = (1, 3)))
+
+    lab(e) = "$(e.identity.closure):$(e.identity.model_name)"
+    @printf(io, "\nPRIMARY SCORE (plan §7): paired fair ensemble CRPS, leads <= %d steps (%.3g TU), 6 bands standardised\n",
+            max_lead, max_lead * DT)
+    @printf(io, "  A = %s  (%s, M = %d, %d diverged member(s))\n", lab(ea), dir_a, ea.M,
+            sum(length, values(ea.divergences); init = 0))
+    @printf(io, "  B = %s  (%s, M = %d, %d diverged member(s))\n", lab(eb), dir_b, eb.M,
+            sum(length, values(eb.divergences); init = 0))
+    @printf(io, "  K = %d paired ICs, t = %.2f..%.2f TU, block %s; leads %s\n", length(ks),
+            first(a.t), last(a.t), isempty(ea.identity.block) ? "(none)" : ea.identity.block,
+            join(grid, ","))
+    if !(isempty(dropped_a) && isempty(dropped_b))
+        @printf(io, "  ⚠️ unpaired ICs dropped: from A %s, from B %s\n",
+                isempty(dropped_a) ? "none" : join(dropped_a, ","),
+                isempty(dropped_b) ? "none" : join(dropped_b, ","))
+    end
+    @printf(io, "  score A %.5f   B %.5f   A - B %+.5f  (%+.2f%% of B)\n", mean(sa), mean(sb),
+            ci.mean, 100 * ci.mean / mean(sb))
+    @printf(io, "  %.0f%% IC-block bootstrap CI [%+.5f, %+.5f], block %d ICs, %d resamples -> %s\n",
+            100 * level, ci.lo, ci.hi, ci.blocklen, ci.nboot,
+            ci.hi < 0 ? "A better, CI excludes 0" : ci.lo > 0 ? "B better, CI excludes 0" :
+            "not resolved (CI contains 0)")
+    @printf(io, "  per band A - B: %s\n",
+            join((@sprintf("%s %+.4f", LABELS[i], per_band[i]) for i in eachindex(per_band)), "  "))
+    return (; diff = ci.mean, ci.lo, ci.hi, ci.se, ci.blocklen, K = length(ks), ks, t = a.t,
+            score_a = mean(sa), score_b = mean(sb), per_ic_a = sa, per_ic_b = sb, per_band, grid,
+            M_a = ea.M, M_b = eb.M, id_a = ea.identity, id_b = eb.identity, dropped_a, dropped_b,
+            level = Float64(level))
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -886,8 +1151,17 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
         return nothing
     end
 
+    # 🔑 The grid is the run's own: a mini-D6 (D6_NLEAD = 400) scores the leads it has.
+    leads = truncate_leads(leads, ens.nlead)
+    length(ens.ks) >= 4 || error("$dir holds $(length(ens.ks)) scorable IC(s); spread-skill and " *
+                                 "the rank histogram (its block length) need >= 4; use --paired")
     grid = union_grid(leads)
     truth = load_truth()
+    @printf(io, "experiment: closure %s, model %s, block %s, N_LEAD %d; K = %d ICs, t = %.2f..%.2f TU%s\n",
+            ens.identity.closure, ens.identity.model_name,
+            isempty(ens.identity.block) ? "(none)" : ens.identity.block, ens.nlead,
+            length(ens.ks), first(ens.t), last(ens.t),
+            ens.filt.active ? " (scored under IC filter " * ens.filt.label * ")" : "")
     report_grids(leads; io)
 
     # 🔴 METRIC #16, printed before any skill number, because a skill table computed on the ICs a
@@ -989,7 +1263,11 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
     mkpath(outdir)
     # 🔴 Named after the run directory. A fixed name meant scoring three closures in a row left
     # only the last one on disk, with no sign anything had been lost.
-    p = joinpath(outdir, "d6_scores_$(basename(rstrip(dir, ['/', '\\'])))" * POLICY_TAG * ".jld2")
+    # The IC filter is part of the name for the same reason: a full D6 directory scored on the
+    # selection block alone is a different score file from the whole run's.
+    ftag = ens.filt.active ? "_" * ens.filt.label : ""
+    p = joinpath(outdir, "d6_scores_$(basename(rstrip(dir, ['/', '\\'])))" * POLICY_TAG * ftag *
+                         ".jld2")
     # Named explicitly rather than splatted: `jldsave`'s keywords must be symbols, and a `Dict`
     # splat is the kind of thing that works until the dictionary's key type changes.
     #
@@ -1004,6 +1282,9 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
             excluded_ics = sort(collect(EXCLUDE_ICS)),
             thinned_members = ens.thinned, member_ids = ens.member_ids,
             divergences = ens.divergences,
+            ic_t = ens.t, nlead = ens.nlead, closure = ens.identity.closure,
+            model_name = ens.identity.model_name, block = ens.identity.block,
+            ic_filter = ens.filt.label,
             written = string(now()))
     @printf(io, "\nwrote %s (%.1f kB)\n", p, filesize(p) / 1024)
     println(io, "⚠️  The report goes into `analysis/results.md`, not into meta_files/ and not left " *
@@ -1012,5 +1293,10 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main(; preview_only = ("--preview" in ARGS))
+    if !isempty(ARGS) && ARGS[1] == "--paired"
+        length(ARGS) == 3 || error("usage: score_d6.jl --paired <dir A> <dir B>")
+        paired_primary(ARGS[2], ARGS[3])
+    else
+        main(; preview_only = ("--preview" in ARGS))
+    end
 end

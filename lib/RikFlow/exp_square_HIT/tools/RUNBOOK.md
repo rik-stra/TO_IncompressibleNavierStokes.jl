@@ -265,6 +265,94 @@ difference would carry that offset.
 
 ⚠️ Set `D6_OUT` to a separate directory per closure, or the two write the same filenames.
 
+### Running a StochLSTM (M4) fit — `D6_CLOSURE=lstm` (2026-09-28)
+
+```bash
+cd $REPO/lib/RikFlow/exp_square_HIT
+D6_CLOSURE=lstm D6_MODEL=diag/r3_lin_sd_h2 D6_OUT=output/D6_r3_lin_sd_h2 \
+  julia --project tools/run_d6.jl <ordinal>
+```
+
+🔑 **Same project as the LRS: `--project` = `lib/RikFlow`, NOT `lib/RikFlow/training`.** The deployed
+M4 closure (`StochLSTM`, `src/ts_lstm_online.jl`) is stdlib and part of RikFlow proper; Lux,
+Optimisers and Zygote are needed only to *train* (`RikFlowLuxExt`). `load_stochlstm` needs JLD2 only.
+So the existing batch scripts and depot serve M4 unchanged — `12_online_StochLSTM.jl` has always run
+this way. Do not add `using Lux` to the driver.
+
+What to copy for M4: the fit directory, `exp_square_HIT/output/TO_LSTM/<subdir>/` —
+`StochLSTM_seed<s>.jld2` (plus `seed_summary.jld2` if there is one). `D6_MODEL` is that directory,
+absolute or relative to `output/TO_LSTM`; the **median seed** named by `seed_summary.jld2` is deployed,
+else seed 1, exactly as `12_online_StochLSTM.jl` resolves it. A single `StochLSTM_seed<s>.jld2` path is
+also accepted. Calibration / colour knobs (`noise_scale`, `dq_offset`, `eta_ar`, …) live in the fit's
+`scaling` and are applied by `StochLSTM` itself; the output file lists which the fit carries
+(`lstm_knobs`). `RIKFLOW_M4_UNTIED` (a diagnostic ablation) is not deployable through D6.
+
+**The contract is `LinReg`'s**, and each part is pinned in `test/test_d6_lstm.jl` (V72):
+
+- the same IC package and the same `dQ_warm`, replayed verbatim for `N_WARM = 100` steps, returned
+  unconverted — 🔴 **`run_d6.jl` now checks `dQ[:, 1:nwarm]` bit-identity on the node, for every
+  closure**, and aborts the task if it fails (`warm_identical = true` in every file written);
+- the member seed `member_seed(k, member)`, and the replay draws nothing from it (V38/V42);
+- 🔴 **`TURBULENCE_GATE`**, passed explicitly as `RikFlow.TURBULENCE_GATE` (not the constructor's
+  literal default) and applied where `LinReg` applies it: on the final correction, after the output
+  map and any calibration offset, before the step enters the history, never during the replay. Every
+  output file — LRS, DDN and M4 — now records `gate_threshold` (NaN for the DDN, which has none by
+  decision, #65), `gate_nfired` and `gate_first_lead`; the scorer's `clamp_report` counts the same
+  identically-zero `dQ` columns. ✅ **Every M4 online run to date had the gate**: it has been in
+  `StochLSTM` since the closure was written (`fce0d767`, 2026-09-17) and `12_online_StochLSTM.jl`
+  never overrides it. (Only the offline replay analyses `m4_noise_colour.jl` and
+  `m4_replay_rollout.jl` pass `gate = 0.0`; they are not in-solver runs.)
+- divergence handling, `ou_advance = n_k`, `savefreq > nt` and the output format are unchanged; the
+  file adds `model_name` (e.g. `diag/r3_lin_sd_h2`), the `lstm_*` fields and `deploy_seed`.
+
+⚠️ The warm-up is 100 steps for every closure, so a window-mode fit needs `W − 1 <= 100` and
+`h <= 100` (checked before member 1). `RIKFLOW_M4_NWARM` does not apply here.
+
+### The mini-D6 and the partition (plan §7, 2026-09-28)
+
+The partition is defined once, `D6_BLOCKS` in `analysis/build_d6_ics.jl` (V70):
+**selection** = IC time `t ∈ [52, 74]` TU (46 packages at K = 180: ordinals 88–133), **confirmation**
+= `t ∈ [76, 97]` TU, with 2 TU embargoes after the 1–50 TU training window and between the blocks.
+
+| variable | meaning |
+|---|---|
+| `D6_BLOCK` | `selection` \| `confirmation` |
+| `D6_T_MIN`, `D6_T_MAX` | an explicit IC-time window in TU instead (mutually exclusive with `D6_BLOCK`) |
+| `D6_STRIDE` | every n-th IC of the window |
+| `D6_NLEAD` | forecast steps after the warm-up; default 1200, **mini-D6 400** |
+| `D6_MEMBERS` | M; mini-D6 5 |
+
+```bash
+# which ICs a filter selects (reads the manifest; no GPU)
+D6_BLOCK=selection julia --project tools/run_d6.jl --list
+
+# desktop: the whole block in ONE process, so the solver compiles once
+D6_CLOSURE=lstm D6_MODEL=diag/r3_lin_sd_h2 D6_BLOCK=selection D6_MEMBERS=5 D6_NLEAD=400 \
+  D6_OUT=output/D6mini_r3_lin_sd_h2 julia --project tools/run_d6.jl --all
+
+# Snellius: the same --array for every cell; ordinals outside the block exit at once
+D6_BLOCK=selection ... sbatch --array=88-133 batch_scripts/run_d6.sh
+```
+
+🔴 **One directory per closure, model, block and N_LEAD.** `run_d6.jl` refuses to write into a
+directory holding members of another experiment, and `score_d6.jl` refuses to score one
+(`d6_run_identity`). Stride and time window are *not* part of the identity, so a stride-2 run and its
+fill-in may share a directory.
+
+Scoring a mini-D6 needs nothing special — the lead grid is truncated to the run's own `nlead`
+(25, 50, 100, 200, 400 at 400) and any IC subset scores. To score an existing *full* D6 on one block
+(e.g. LinReg1 on the selection ICs), set `D6_BLOCK` for the scorer; the score file name then carries
+the block. The plan's **primary score** — paired fair ensemble CRPS over leads <= 0.5 TU and the six
+bands (each standardised by the truth's sd), with a 90% IC-block bootstrap CI (blocks of `floor(1 TU / spacing) + 1` ICs) — is
+
+```bash
+julia --startup-file=no --project=analysis analysis/score_d6.jl --paired <dir A> <dir B>
+```
+
+negative = A better. It pairs over the ICs both directories scored (dropped ICs are printed) and
+refuses two different blocks. ⚠️ Pairing is by IC only: the same member seed is not common random
+numbers across different samplers.
+
 ---
 
 ## Three traps worth repeating
@@ -318,3 +406,181 @@ grid that could have stopped before the slowest band saturated.
 and that was the entire argument for a per-QoI grid. On the level they span **2.18** (0.5430 /
 0.2489). The per-QoI grid is kept because it is still correct and costs nothing, but it is no longer
 load-bearing, and a single shared grid would now be defensible.
+
+---
+
+## Snellius grid (plan step 1+, 2026-09-28)
+
+This section implements the plan's screening funnel (plan.md §3, *reduced ladder*; §7, *Screening funnel*) as SLURM arrays.
+**The grid values are provisional; the pipeline is not.** Every value lives in ONE declarative file,
+`batch_scripts/p4grid/spec.toml`: per-h λ, weight decay, capacity and seeds. The table
+`batch_scripts/p4grid/fits.csv` is generated from it by `tools/p4grid_generate.jl` and committed. Never
+hand-edit the CSV, and never name an output directory by hand.
+
+| stage | where | script | what |
+|---|---|---|---|
+| 0 λ calibration | desktop CPU, 25 s | `analysis/skip_lambda_calibration.jl` | maps M4-path skip λ ↔ LinReg λ (effective dof, held-out residual lag-1/2/5, SSE, ρ(C̃)); proposes 3 λ per h |
+| A fits | Snellius array (CPU work on `gpu_h100`), or the desktop | `batch_scripts/run_p4grid_fit.sh` | one row of `fits.csv` per task: M0@50, M3ᶠ, M0ᵛ; fit on 1–50 TU, held out 52–74 TU |
+| B offline selection | desktop | `analysis/p4grid_select.jl` | one row per config; rule below; writes `smoke_list.txt` |
+| C 20 TU smoke | Snellius GPU array | `batch_scripts/run_p4grid_online.sh` | median seed of every config that passed offline, plus its matched M0; 3 replicas |
+| C→D cap | desktop | `analysis/p4grid_select.jl --after-smoke` | smoke gate + cap at ≤ 6 configs; writes `d6_list.txt`, `d6_pairs.csv` |
+| D mini-D6 | Snellius GPU array | `batch_scripts/run_p4grid_d6.sh` (+ `tools/p4grid_d6_chunk.jl`) | selection block (46 ICs, ordinals 88–133), M = 5, N_LEAD = 400; fit seeds 1–3 + matched M0 |
+| E long runs | Snellius GPU array | `run_p4grid_online.sh` with `P4GRID_TSIM=100` | mini-D6 survivors + matched M0; 3 × 100 TU; pass/fail |
+| F ridge + colour | Snellius GPU array | `batch_scripts/run_d6mini_lrs_ar.sh <LinRegN>` | mini-D6 of LinReg{2,7,8} and their `_ar2` variants (Agent D's builder, `tools/lrs_ar_variant.jl`) |
+| G collect | desktop | `analysis/p4grid_collect.jl` | B tables, paired primary scores for D and F, E census; writes `long_list.txt` |
+
+### Declared rules (2026-09-28)
+
+- **B, offline.**
+  - **M3ᶠ** is scored by held-out ensemble CRPS (`diag.held_crps`). Its matched M0(h, λ) is `diag.skip0.crps`: the same frozen skip with seeded η at update 0, which is the M0@50 fit of that (h, λ). The script checks the M0 directory's `Ws` against it.
+  - **M0ᵛ** is scored by held-out NLL per step, against `diag.linear_nll`.
+  - **PASS:** the gain over the best linear model across h, at the same λ, is > 0 for every seed, with at least 3 seeds.
+  - Printed next to the verdict, for information only: per-seed min/median/max, the gain over the matched M0, and the gain over the best linear model across all h *and* λ. λ is the online-stability knob, which no one-step score can see.
+- **C, the smoke is a gate, never a ranking.** Plan §24 rules out selecting on 20 TU free runs. A config passes if:
+  - all 3 replicas complete and are finite;
+  - the gate fires zero times after the warm-up;
+  - its median level offset, max_k |Δmean_k|/sd_k, is no larger than max(the reference's own 20 TU windows, the matched M0's) + 0.1 sd (`P4GRID_SMOKE_TOL`).
+  - The reference is used only up to t ≤ 74 TU.
+- **Cap for D.** Take the configs that pass both offline and smoke. Keep the best per (cell, h, λ) by median-seed gain, then the top **6** (`P4GRID_MAX_D6`). Each kept config runs fit seeds 1–3, and the matched M0s run too.
+- **D pass (plan §7, stage 3).** The `score_d6.jl --paired` CI excludes zero in the fit's favour in ≥ 2 of 3 seeds. ⚠️ The mini-D6 only resolves CRPS gains of ≥ 13–18% (`results_LSTMS.md` §10a).
+- **E pass.** Every replica completes (40001 columns) and is finite, and the whole-run level offset is no larger than the matched M0's. For drift and basins across 20 TU chunks, use `m4_screen_long.jl`.
+
+### What to copy to Snellius (from `lib/RikFlow` on the workstation)
+
+```bash
+# $SNEL = login node, $REPO = the fork root there (/gpfs/home6/rhoekstra/time_series_INS per the fits' provenance)
+D=$REPO/lib/RikFlow/exp_square_HIT/output
+# code: Rik commits and pushes; on Snellius, `git pull` (spec.toml, fits.csv, the scripts, tools/p4grid_*)
+ssh $SNEL "mkdir -p $D/TO_LSTM $D/d6_ics $REPO/lib/RikFlow/analysis/data"
+rsync -av analysis/data/data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2 \
+      $SNEL:$REPO/lib/RikFlow/analysis/data/                                   # 7.7 MB: the fits' QoI cache
+rsync -av exp_square_HIT/output/TO_LSTM/inputs_lstm.jld2 $SNEL:$D/TO_LSTM/        # 22 kB: the cfg row
+rsync -av exp_square_HIT/output/online_ic_data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2 \
+      $SNEL:$D/                                                                 # 7 MB: the stage C/E IC
+rsync -av --ignore-existing analysis/output/d6_ics/ $SNEL:$D/d6_ics/              # manifest + packages (88-133 needed)
+# stage F only, once Agent D has built the variants:
+rsync -av exp_square_HIT/output/TO_LRS/LinReg{2,7,8}{,_ar2} $SNEL:$D/TO_LRS/
+```
+
+To print the `k` of the selection-block IC packages, run `D6_BLOCK=selection julia --project tools/run_d6.jl --list`.
+The manifest is mandatory: `ic_dir()` finds the directory by it.
+
+### Submit order (from `exp_square_HIT/` on Snellius)
+
+```bash
+export JULIA_DEPOT_PATH=$HOME/julia/julia_h100:
+export JULIA_CPU_TARGET="generic;znver2,clone_all;znver4,clone_all;icelake-server,clone_all"
+julia --project=../training -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'   # warm once, on the login node
+julia --project=..          -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()'
+
+# A -- fits. The generator prints the exact range: 72 runnable rows with the provisional spec.
+A=$(P4GRID_PACK=8 sbatch --parsable --array=1-9 batch_scripts/run_p4grid_fit.sh)   # or --array=1-72%20 unpacked
+# F -- independent of A. One submission per base: base + _ar2, 2 IC chunks each.
+for b in LinReg2 LinReg7 LinReg8; do sbatch --array=1-4 batch_scripts/run_d6mini_lrs_ar.sh $b; done
+```
+
+**Between A and C (desktop).** Check a few `output/TO_LSTM/p4grid/_logs/<tag>.log` files:
+- `windows (TU)` should read train (1, 50) and held (52, 74);
+- note `stop_reason`, and whether the M3ᶠ fits hit the epoch cap.
+
+Then:
+
+```bash
+rsync -av --exclude 'data_online_*' $SNEL:$D/TO_LSTM/p4grid/ exp_square_HIT/output/TO_LSTM/p4grid/   # ~100 kB/fit
+julia --startup-file=no --project=analysis analysis/p4grid_select.jl            # stage B -> analysis/output/p4grid/
+scp analysis/output/p4grid/smoke_list.txt $SNEL:$REPO/lib/RikFlow/exp_square_HIT/batch_scripts/p4grid/
+```
+
+```bash
+# C -- 20 TU smoke; the select script prints --array=1-<3 x lines>
+sbatch -t 00:45:00 --array=1-<3n>%12 batch_scripts/run_p4grid_online.sh
+```
+
+**Between C and D.** Pull the replicas (61 MB each), then apply the gate and the cap:
+
+```bash
+rsync -av --include '*/' --include 'data_online_tsim20.0_*' --exclude '*' \
+      $SNEL:$D/TO_LSTM/p4grid/ exp_square_HIT/output/TO_LSTM/p4grid/
+julia --startup-file=no --project=analysis analysis/p4grid_select.jl --after-smoke
+TSCREEN=20 REF_TU_MAX=74 M4_SCREEN_SUBDIR=p4grid julia --project=analysis analysis/m4_screen.jl   # the human-readable view
+scp analysis/output/p4grid/d6_list.txt $SNEL:$REPO/lib/RikFlow/exp_square_HIT/batch_scripts/p4grid/
+```
+
+```bash
+# D -- mini-D6, 2 IC chunks per closure; <= 24 closures -> --array=1-<=48
+sbatch --array=1-<2n>%16 batch_scripts/run_p4grid_d6.sh
+```
+
+**Between D and E.** Pull and score. The collector reads `analysis/output/p4grid/d6_pairs.csv`:
+
+```bash
+mkdir -p analysis/output/snellius_p4grid
+rsync -av $SNEL:$D/D6mini_p4grid analysis/output/snellius_p4grid/
+rsync -av $SNEL:"$D/D6mini_LinReg*" analysis/output/snellius_p4grid/    # stage F
+julia --startup-file=no --project=analysis analysis/p4grid_collect.jl     # B + D + F tables, long_list.txt
+scp analysis/output/p4grid/long_list.txt $SNEL:$REPO/lib/RikFlow/exp_square_HIT/batch_scripts/p4grid/
+```
+
+🔑 `analysis/output/snellius_p4grid/` keeps the pulled D6 directories apart from the desktop's own
+`analysis/output/D6mini_*`. Agent D's local LinReg7 runs have the same names.
+
+```bash
+# E -- 100 TU x 3 replicas of the survivors + matched M0
+P4GRID_ONLINE_LIST=batch_scripts/p4grid/long_list.txt P4GRID_TSIM=100 \
+  sbatch --array=1-<3n> batch_scripts/run_p4grid_online.sh
+```
+
+Pull `data_online_tsim100.0_*` (276 MB each) and rerun `p4grid_collect.jl`. It prints the
+`m4_screen_long.jl` command for the drift/basin view.
+
+`--dependency=afterok:<job>` only helps inside Snellius. Every stage boundary is a desktop check by
+design, because the scores need the reference and the reference stays local. Use it to chain a rerun
+onto its own stage's first submission, e.g.
+`sbatch --dependency=afterok:$A --array=<lost rows> batch_scripts/run_p4grid_fit.sh`.
+Finished rows, replicas and D6 members are skipped, so rerunning a whole range is also safe.
+
+### Cost (budget; measured where stated)
+
+| stage | tasks | per task | GPU-h |
+|---|---|---|---|
+| A | 72 rows, packed 8 per task → 9 tasks | M3ᶠ fit 0.7–1.5 min (measured: desktop, C's h = 2 fits) + ~1 min load | ~1.5 packed (~5 unpacked). **Desktop: 0 GPU-h, ~30 min at 4 in parallel** |
+| C | ≤ 3 × (passing configs + their M0s), ~30 | 20 TU × 12 s/TU + 2 min compile ≈ 6 min | ≤ 3 |
+| D | ≤ 24 closures × 2 chunks | 288 TU per closure × 12 s/TU / 2 + 1.5 min ≈ 30 min | ≤ 24 (≈ 13 at LRS's 6.5 s/TU) |
+| E | ≤ 6 dirs × 3 | 100 TU × 12 s/TU ≈ 20 min | ≤ 6 |
+| F | 3 bases × 2 models × 2 chunks | 288 TU × 6.5 s/TU / 2 ≈ 16 min | ~3.4 |
+
+- **LSTM closure rate.** 12 s/TU is the upper end measured on the desktop 3090 (7.5–12 s/TU, shared GPU).
+- **H100 rate.** Only LRS has been measured there: ~6.5 s/TU steady, ~60–90 s compile per process (`handoff_p2c_d6.md`).
+- **Dry run.** Compile + one M = 1 ordinal took 66 s on the 3090.
+- **SBU.** Multiply GPU-h by the partition's SBU rate from Snellius accounting.
+
+### Dry runs (2026-09-28, desktop, toy size; outputs in the job scratch, not in `output/`)
+
+The dry runs used these switches:
+
+| variable | effect |
+|---|---|
+| `P4GRID_LOCAL=1` | keep the desktop depot and CPU target |
+| `P4GRID_ROW=<r>` / `P4GRID_TASK=<t>` | run one row/task without SLURM |
+| `P4GRID_OUTROOT=<abs dir>` | write fits there, never into `output/` |
+| `P4GRID_EXTRA="RIKFLOW_W_EPOCHS=1 RIKFLOW_D_EPOCHS=1"` | cut the training budget |
+| `P4GRID_D6_ROOT=<abs dir>` | write D6 output there |
+| `P4GRID_NCHUNK=46` | one ordinal per chunk |
+
+All of these ran clean:
+- all three fit tools;
+- the D6 chunk wrapper (ordinal 88, warm-up bit-identical, gate 0/25);
+- the offline and after-smoke selection, on Agent C's `p4/`;
+- the collector, including the paired primary score on a partial LinReg7_ar2 vs LinReg7.
+
+### Known gaps (tool options that do not exist; not added here)
+
+- **`m4_diag_fit.jl` has no skip-λ option**; its skip is always least squares. The M0ᵛ λ > 0 rows are
+  generated with status `blocked:` and not run. They need a `RIKFLOW_D_LAMBDA` (Agent C's file).
+- **`m4_diag_fit.jl` has no output-subdir option.** The generator routes its output with `RIKFLOW_D_TAG=../p4grid/<tag>`.
+- **`m4_diag_fit.jl` does not record its held-out window** in `diag`; only the log shows 52–74 TU. So B
+  cannot verify it from the file, as it does for M3ᶠ.
+- **`m4_window_fit.jl` and `m4_linear_eta.jl` load the whole 0–100 TU QoI cache** and build the history over
+  it. They fit only on 1–50 TU and score only on 52–74 TU (printed in each log), but data past 74 TU are in memory.
+- **`m4_window_fit.jl` always names its file `StochLSTM_seed1.jld2`**, whatever the seed. This is harmless here
+  (one seed per directory), and D6 and the online runs deploy that file.

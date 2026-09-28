@@ -157,8 +157,17 @@ Base.@kwdef struct LSTMSpec
             "it has no stochasticity at all and cannot produce an ensemble.")
         n_hidden > 0 || error("LSTMSpec: n_hidden must be positive")
         n_encoder >= 0 || error("LSTMSpec: n_encoder must be >= 0 (0 = linear encoder)")
-        (arch === :lstm || n_latent > 0) ||
+        # 🔑 `arch = :dense` with `n_latent = 0` (2026-09-28, plan step 1, M3ᶠ): a DETERMINISTIC
+        # residual MLP on the window -- no latent path at all -- whose only noise is the emission
+        # head. It needs that head, exactly as `:lstm` does.
+        (arch === :lstm || n_latent > 0 || (arch === :dense && n_latent == 0)) ||
             error("LSTMSpec: arch $(arch) has a latent path, so n_latent must be positive")
+        n_latent >= 0 || error("LSTMSpec: n_latent must be >= 0")
+        (arch !== :dense || n_latent > 0 || emission !== :none) || error(
+            "LSTMSpec: arch = :dense with n_latent = 0 and emission = :none is a deterministic " *
+            "point predictor -- it has no stochasticity at all and cannot produce an ensemble.")
+        (arch !== :dense || n_latent > 0 || posterior === :x) ||
+            error("LSTMSpec: posterior = :xy needs a latent path; n_latent = 0 has none")
         window >= 0 || error("LSTMSpec: window must be >= 0 (0 = persistent state); got $window")
         posterior in (:x, :xy) || error("LSTMSpec: posterior must be :x or :xy; got $posterior")
         prior in (:standard, :learned) || error("LSTMSpec: prior must be :standard or :learned; got $prior")
@@ -216,6 +225,8 @@ latent_to_cell(spec::LSTMSpec) = spec.arch === :storn || spec.arch === :vrnn || 
 `arch = :dense` (Phase D, 2026-09-27): no recurrence -- a two-layer tanh MLP on the whole window,
 `y_n = V1 tanh(Wh tanh(Wx [x_{n-W+1..n}; z_{n-W+1..n}] + b1) + b2) + cdec (+ Ws x_n)`. `Wx` is
 `H x W (n_input + n_latent)` (all inputs first, then all latents), `Wh` is `H x H`, `b = [b1; b2]`.
+`n_latent = 0` is allowed here (and only here among the latent archs): a deterministic residual MLP
+whose noise is the emission head alone (M3ᶠ, plan step 1).
 """
 is_dense(spec::LSTMSpec) = spec.arch === :dense
 

@@ -888,7 +888,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             stop_window::Int = 500, stop_rel::Real = 0.005,
                             rollout::Int = 1, init_ps = nothing, clip::Real = 0,
                             lagmap = nothing, weight_decay::Real = 0, callback = nothing,
-                            freeze = (), kl_mode::Symbol = :per_step, split = nothing)
+                            freeze = (), kl_mode::Symbol = :per_step, split = nothing,
+                            decay_exclude = ())
     rollout >= 1 || error("train_stochlstm: rollout must be >= 1 (1 = teacher forcing); got $rollout")
     (rollout == 1 || !RF.emission_noise(spec)) || error(
         "train_stochlstm: rollout > 1 needs emission = :none -- with an emission head the deployed " *
@@ -1024,6 +1025,13 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # seeded with the least-squares map fixed while the recurrence learns its residual.
     for k in freeze
         Optimisers.freeze!(getfield(opt, k))
+    end
+    # `decay_exclude` (2026-09-28): parameter names trained WITHOUT weight decay, e.g. `(:bd, :Araw)`
+    # so the decay acts on the network only and not on the noise head (decay would pull log sd -> 0)
+    if weight_decay > 0
+        for k in decay_exclude
+            getfield(opt, k) === nothing || Optimisers.adjust!(getfield(opt, k); lambda = zero(T))
+        end
     end
 
     # 🔑 Segments of equal length share one recurrence, so they are grouped once here and batched

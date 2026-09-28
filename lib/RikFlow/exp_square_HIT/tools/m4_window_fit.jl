@@ -38,15 +38,29 @@
 #   RIKFLOW_W_VAL        tail (default: the trailing 20%) | blocked (chunks 3 and 8 of 10 validate,
 #                        EMBARGO rows dropped around each -- selects worse fits here, see below)
 #   RIKFLOW_W_TRAIN_TU   end of the training range in TU (default 10 = the project's 1-10 TU)
+#   RIKFLOW_W_SCORE_TU   `a,b`: the held-out window, TU (default: 50 TU to the end of the record,
+#                        the pre-2026-09-28 convention). 🔴 Plan step 1 (1-50 TU fits): `52,74`, the
+#                        selection block -- never score past 74 TU (76-97 is the confirmation block)
+#   RIKFLOW_W_OUTSUB     subdirectory of output/TO_LSTM the fit is written to (default `window`)
+#   RIKFLOW_W_NZ = 0     with ARCH=dense: a deterministic residual MLP, no latent at all (M3ᶠ);
+#                        needs an emission head (EMISSION=constant, SEEDHEAD=1 for M0's eta at update 0)
+#   RIKFLOW_W_WD         decoupled (AdamW, coupled to the rate: shrink lr*WD per update) weight
+#                        decay on the trained blocks (default 0); RIKFLOW_W_WD_EXCLUDE = bd,Araw
+#                        exempts the noise head
 #
 # 🔑 **Two linear floors are printed beside every fit**, both least squares on the fits' own
-# training rows and scored on the held-out 50-100 TU window in the fit's loss unit (0.5 x SSE per
+# training rows and scored on the held-out window (SCORE_TU; default 50-100 TU) in the fit's loss unit (0.5 x SSE per
 # step over the six standardised QoIs): on the current input `[q*_n; 1]` alone, and on the whole
 # stacked window `[q*_{n-W+1}; ...; q*_n; 1]`. The second is what a linear model can get out of the
 # same information the LSTM sees. A fit that does not beat it has not learned the linear part
 # (`results_LSTMS.md` §7c) -- the check that caught every pre-2026-09-24 fit.
 #
-# Writes `output/TO_LSTM/window/<tag>/StochLSTM_seed1.jld2` -- deployable with
+# 🔑 With a skip, also printed: **M0(lambda)** = the skip alone at update 0 (held-out loss, CRPS and
+# spread/skill; with SEEDHEAD = 1 that is the linear map + M0's eta at the SAME lambda -- the matched
+# floor for LAMBDA > 0), and the **nonlinearity used**, RMS of the network's output g(x) = y - Ws x
+# over the skip's Ws x and over the skip's held-out residual.
+#
+# Writes `output/TO_LSTM/<OUTSUB>/<tag>/StochLSTM_seed1.jld2` -- deployable with
 # `RIKFLOW_M4_MODEL_DIR` and model index 2, like the diag fits -- and `curve.jld2`.
 
 using RikFlow
@@ -83,6 +97,8 @@ feat = Symbol(envs("FEAT", "raw"))
 feat in (:raw, :diff) || error("RIKFLOW_W_FEAT must be raw or diff; got $feat")
 kl_mode = Symbol(envs("KL", envs("EMISSION", "none") == "none" ? "reference" : "per_step"))
 wd = parse(Float64, envs("WD", "0"))
+# `WD_EXCLUDE = bd,Araw`: no decay on the noise head (the network alone is decayed); default none
+wdx = (v = envs("WD_EXCLUDE", ""); isempty(v) ? () : Tuple(Symbol.(strip.(split(v, ",")))))
 kl_mode in (:reference, :per_step) || error("RIKFLOW_W_KL must be reference or per_step; got $kl_mode")
 epochs = envi("EPOCHS", 200)
 seed = envi("SEED", 1)
@@ -164,6 +180,10 @@ else
     error("RIKFLOW_W_VAL must be blocked or tail; got $valmode")
 end
 @info "split" valmode train_rows = length(tr) val_rows = length(va) dropped = ncolt - length(tr) - length(va)
+# the windows in TU, printed so a fit's partition is in its log (`dat.steps` are 1-based within
+# `train_range`, so row k sits at record column train_range[1] - 1 + steps[k])
+tu(k) = (cfg.train_range[1] - 1 + dat.steps[k]) * DT
+@info "windows (TU)" train_fit = (tu(first(tr)), tu(last(tr))) validation = isempty(va) ? () : (tu(first(va)), tu(last(va)))
 "Window ends among `cols` whose W-1 predecessors are also in `cols` and contiguous."
 function wends(cols, W)
     s = Set(cols)
@@ -194,8 +214,19 @@ Xf = P * permutedims(Xr)
 # held-out targets are ALWAYS the standardised correction, whatever the fit predicts, so fits on
 # different targets share one number
 Ydf = RF.scale_input(rec.dQ[:, colsf], datD.scaling.out_scaling)
-ends = findall(c -> c >= 20_000, colsf)          # window ends in 50-100 TU
+# 🔑 `SCORE_TU = a,b` (2026-09-28, plan step 1): the held-out window is explicit, window ends with
+# a <= t <= b TU. Unset = the old convention, every step from 50 TU to the end of the record (so old
+# runs reproduce). 🔴 Under the plan's partition (plan.md §7) scoring must stay inside the selection
+# block 52-74 TU; 76-97 TU is the reserved confirmation block.
+score_tu = envs("SCORE_TU", "")
+score_lo, score_hi = isempty(score_tu) ? (50.0, Inf) : Tuple(parse.(Float64, split(score_tu, ",")))
+ends = findall(c -> score_lo / DT <= c <= score_hi / DT, colsf)
+isempty(ends) && error("RIKFLOW_W_SCORE_TU = $score_tu selects no held-out step")
 first(ends) > W || error("held-out window starts too early for a $W-step window")
+score_hi > 74 &&
+    @warn "held-out window reaches past 74 TU -- under the 2026-09-28 partition 76-97 TU is the confirmation block" score_lo score_hi
+colsf[ends[1]] > cfg.train_range[2] ||
+    error("held-out window starts at step $(colsf[ends[1]]), inside the training range $(cfg.train_range)")
 const WH = W
 
 "`n_in x W x N` windows ending at the given columns of `X`."
@@ -210,6 +241,7 @@ Xh = Float32.(windows(Xf, ends))
 Xh_raw = Xh
 oor = vec(any((Xh_raw[:, end, :] .< lo) .| (Xh_raw[:, end, :] .> hi); dims = 1))
 Yh = Ydf[:, ends]
+@info "held-out score window (TU)" first = colsf[ends[1]] * DT last = colsf[ends[end]] * DT rows = length(ends)
 qsh = rec.q_star[:, colsf[ends]]
 nh = length(ends)
 
@@ -242,7 +274,18 @@ wtr = wends(tr, W)
 Xtrw = stackwin(Float64.(windows(Xc, wtr)))
 Ctrw = Xtrw' \ Float64.(datD.Yc[:, wtr])'
 floorw = 0.5 * sum(abs2, Yh .- Ctrw' * stackwin(Float64.(Xh))) / nh
-@info "linear floors (held-out 50-100 TU, dQ units)" current_input = floor0 whole_window = floorw
+# (c) with level history (h > 0), the whole window of the FULL regressor stacked,
+# [x_{n-W+1}; ...; x_n] (one bias) -- the linear model on exactly what a W > 1 network sees, so a
+# window network's gain over the skip splits into "more lags" (this floor) and "nonlinearity"
+stackfull(Xw) = vcat(reshape(Xw[1:(end - 1), :, :], (size(Xw, 1) - 1) * size(Xw, 2), :), ones(1, size(Xw, 3)))
+floorwf = if hh > 0 && W > 1
+    Xtrf = stackfull(Float64.(windows(Xc, wtr)))
+    Cf = Xtrf' \ Float64.(datD.Yc[:, wtr])'
+    0.5 * sum(abs2, Yh .- Cf' * stackfull(Float64.(Xh))) / nh
+else
+    floor0
+end
+@info "linear floors (held-out window, dQ units)" current_input = floor0 whole_window = floorw whole_window_full_regressor = floorwf
 # the skip's seed is the same least-squares map in the fit's OWN target units
 # `LAMBDA > 0` seeds the skip with the RIDGE map instead (plan B2; §7d: the unregularised map runs
 # +1 sd high online and lambda ~ 1e-5 zeroes it). Penalty `lambda N` on every column but the bias.
@@ -313,7 +356,7 @@ ps, h = RF.train_stochlstm(spec, Xc, dat.Yc, dat.steps; L = W, burn, stride = 1,
                            split = (; train = tr, val = va),
                            cfg.beta, cfg.val_frac, seed, epochs, cfg.lr, val_every, patience,
                            stop_patience, stop_window, verbose = false, callback = cb, init_ps,
-                           freeze, kl_mode, weight_decay = wd)
+                           freeze, kl_mode, weight_decay = wd, decay_exclude = wdx)
 wall = time() - t0
 hbest, r2 = heldout(ps)
 hnll = heldnll(ps)
@@ -356,7 +399,23 @@ end
 lcrps = lincrps()
 ib = isempty(curve.held) ? 0 : argmin(curve.held)
 
-out_dir = joinpath(TO_folder, "window", tag)
+# the skip alone = M0(lambda): update 0 of a skip fit (V1 = 0), with the seeded head when SEEDHEAD = 1
+skip0 = init_ps === nothing ? (; held = NaN, crps = NaN, ss = fill(NaN, nq)) :
+        (h0 = heldout(init_ps)[1]; (c0, s0) = heldcrps(init_ps); (; held = h0, crps = c0, ss = s0))
+# how much NONLINEARITY the fit uses: the network's output g(x) = y - Ws x against the skip's Ws x,
+# RMS over the held-out rows and QoIs (and against the skip's held-out residual)
+nlr = if skip
+    o = RF.lstm_forward(spec, ps, Xh, zeros(Float32, spec.n_latent, WH, nh))
+    sx = Float64.(ps.Ws * Xh[:, end, :]); g = Float64.(o.Y[:, end, :]) .- sx
+    (; net_over_skip = sqrt(sum(abs2, g) / sum(abs2, sx)),
+     net_over_resid = sqrt(sum(abs2, g) / sum(abs2, Yh .- sx)),
+     per_qoi = vec(sqrt.(sum(abs2, g; dims = 2) ./ sum(abs2, sx; dims = 2))))
+else
+    (; net_over_skip = NaN, net_over_resid = NaN, per_qoi = fill(NaN, nq))
+end
+@info "M0(lambda) = the skip at update 0, and the nonlinearity used" skip_held = skip0.held skip_crps = skip0.crps skip_ss = round.(skip0.ss; digits = 2) nlr.net_over_skip nlr.net_over_resid
+
+out_dir = joinpath(TO_folder, envs("OUTSUB", "window"), tag)
 mkpath(out_dir)
 RF.save_stochlstm(joinpath(out_dir, "StochLSTM_seed1.jld2"), spec, RF.LSTMWeights(ps, spec),
                   scaling; cfg, seed, train_range = cfg.train_range, qoi_source = rec.source,
@@ -365,11 +424,17 @@ RF.save_stochlstm(joinpath(out_dir, "StochLSTM_seed1.jld2"), spec, RF.LSTMWeight
                   diag = (; held = hbest, held_nll = hnll, held_crps = hcrps, spread_skill = hss, lin_crps = lcrps, r2, floor_current = floor0, floor_window = floorw, skip,
                           freeze, score, kl_mode, feat, valmode, embargo, posterior, prior, hvar,
                           h = hh, lambda = lam, sumk,
-                          floor_current_clamped = floor0c, frac_out_of_range = mean(oor)))
-jldsave(joinpath(out_dir, "curve.jld2"); curve, floor0, floorw, hbest, hnll, linnll, hcrps, lcrps, r2,
+                          floor_current_clamped = floor0c, frac_out_of_range = mean(oor),
+                          score_tu = (score_lo, score_hi), wd, skip0, nlr, floor_window_full = floorwf))
+jldsave(joinpath(out_dir, "curve.jld2"); curve, floor0, floorw, hbest, hnll, linnll, hcrps, lcrps, r2, skip0, nlr,
+        score_tu = (score_lo, score_hi),
         best_update = h.best_update, ov, target, skip, freeze, score, wall, kl_mode, feat)
 @printf("%-24s %-6s p%-2s h%d%-1s l%.0e %-4s %-4s %-4s W %2d %-4s kl %-3s b %.0e nh %2d nz %d sk %d | %5d upd (%d/ep), best@%5d (%s) %.1f min | val %.4f | held %.3f crps %.4f (lin+eta %.4f) ss %s nll %.3f (lin+eta %.3f)  floors: q*_n %.3f, window %.3f | held-best %.3f@%d | R2 %s\n",
         tag, cfg.arch, string(posterior), hh, hvar === :q_star_q ? "q" : "", lam, string(target), string(feat), string(valmode)[1:4], W, score, string(kl_mode)[1:3], cfg.beta, cfg.n_hidden, cfg.n_latent, skip, h.updates, h.upd_per_epoch,
         h.best_update, h.stop_reason, wall / 60, h.best_val, hbest, hcrps, lcrps, join((@sprintf("%.2f", x) for x in hss), "/"), hnll, linnll, floor0, floorw,
         ib == 0 ? NaN : curve.held[ib], ib == 0 ? 0 : curve.update[ib],
         join((@sprintf("%.2f", x) for x in r2), " "))
+@printf("%-24s vs M0(lambda = %.0e): held %.4f / %.4f (%+.2f%%; stacked-window LS %.4f) | crps %.5f / %.5f (%+.2f%%) | ss %s / %s | wd %.0e | |g|/|Ws x| %.4f, |g|/|resid| %.3f | score %g-%g TU\n",
+        tag, lam, hbest, skip0.held, 100 * (hbest / skip0.held - 1), floorwf, hcrps, skip0.crps, 100 * (hcrps / skip0.crps - 1),
+        join((@sprintf("%.2f", x) for x in hss), "/"), join((@sprintf("%.2f", x) for x in skip0.ss), "/"), wd,
+        nlr.net_over_skip, nlr.net_over_resid, score_lo, score_hi)

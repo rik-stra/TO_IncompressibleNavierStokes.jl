@@ -324,3 +324,95 @@ end
     @test Float32(nsteps * 2.5e-3) / nsteps === Float32(2.5e-3)
     @test round(Int, Float32(nsteps * 2.5e-3) / Float32(2.5e-3)) == nsteps
 end
+
+# ---------------------------------------------------------------------------------------------
+# V70 -- plan §7's partition (2026-09-28): one definition, used by the driver and the scorer
+# ---------------------------------------------------------------------------------------------
+
+@testitem "V70 the partition blocks, their embargoes and ic_block" default_imports = false setup = [D6] begin
+    using Test
+    @test D6.D6_BLOCKS.selection == (52.0, 74.0)
+    @test D6.D6_BLOCKS.confirmation == (76.0, 97.0)
+    @test D6.TRAIN_WINDOW_TU == (1.0, 50.0)
+    # 2 TU embargoes, on both sides of the selection block
+    @test D6.D6_BLOCKS.selection[1] - D6.TRAIN_WINDOW_TU[2] >= D6.EMBARGO_TU
+    @test D6.D6_BLOCKS.confirmation[1] - D6.D6_BLOCKS.selection[2] >= D6.EMBARGO_TU
+    # closed intervals on the field grid (t = 0.25 (k - 1)); both edges attainable and inclusive
+    @test D6.ic_block(52.0) === :selection
+    @test D6.ic_block(74.0) === :selection
+    @test D6.ic_block(51.75) === :none            # embargo after training
+    @test D6.ic_block(74.25) === :none            # embargo between the blocks
+    @test D6.ic_block(75.75) === :none
+    @test D6.ic_block(76.0) === :confirmation
+    @test D6.ic_block(97.0) === :confirmation
+    @test D6.ic_block(97.25) === :none
+    @test D6.ic_block(30.0) === :none             # training window
+    @test D6.block_window("Selection") == (52.0, 74.0)
+    @test D6.block_window(:confirmation) == (76.0, 97.0)
+    @test_throws ErrorException D6.block_window("training")
+
+    # On the production IC set: ~45 packages per block, and no IC in both or in an embargo.
+    sel = D6.select_ics(; K = 180)
+    b = D6.ic_block.(sel.t)
+    ns, nc = count(==(:selection), b), count(==(:confirmation), b)
+    @test 44 <= ns <= 47
+    @test 42 <= nc <= 46
+    @test all(t -> !(74.0 < t < 76.0) && !(50.0 < t < 52.0), sel.t[b .!== :none])
+    # the confirmation block reaches the end of the pool (t_max = 96.75 at N_LEAD = 1200)
+    @test maximum(sel.t[b .=== :confirmation]) == last(sel.t)
+end
+
+@testitem "V70 ic_filter and ic_subset: block, window, stride" default_imports = false setup = [D6] begin
+    using Test
+    sel = D6.select_ics(; K = 180)
+
+    f0 = D6.ic_filter()
+    @test !f0.active && f0.label == "" && f0.block === nothing
+    @test D6.ic_subset(sel.t, f0) == collect(1:180)
+
+    fs = D6.ic_filter(; block = "selection")
+    @test fs.active && fs.block === :selection && fs.label == "selection"
+    o = D6.ic_subset(sel.t, fs)
+    @test all(t -> 52.0 <= t <= 74.0, sel.t[o])
+    @test o == findall(t -> D6.ic_block(t) === :selection, sel.t)       # exactly the block
+    # stride: every n-th of the block, starting with its first
+    fs2 = D6.ic_filter(; block = :selection, stride = 2)
+    @test fs2.label == "selection_s2"
+    @test D6.ic_subset(sel.t, fs2) == o[1:2:end]
+
+    fw = D6.ic_filter(; tmin = 20.0, tmax = 30.0)
+    @test fw.active && fw.block === nothing
+    @test all(t -> 20.0 <= t <= 30.0, sel.t[D6.ic_subset(sel.t, fw)])
+    @test D6.ic_filter(; tmin = 20.0).tmax == Inf
+
+    # a block with a window cut into it is not that block
+    @test_throws ErrorException D6.ic_filter(; block = "selection", tmin = 60.0)
+    @test_throws ErrorException D6.ic_filter(; tmin = 30.0, tmax = 20.0)
+    @test_throws ErrorException D6.ic_filter(; stride = 0)
+    @test_throws ErrorException D6.ic_subset(reverse(sel.t), f0)
+
+    # from the environment (a Dict stands in for ENV); empty values are unset
+    e = D6.ic_filter_from_env(Dict("D6_BLOCK" => "confirmation", "D6_STRIDE" => "3",
+                                   "D6_T_MIN" => ""))
+    @test e.block === :confirmation && e.stride == 3 && (e.tmin, e.tmax) == (76.0, 97.0)
+    @test !D6.ic_filter_from_env(Dict{String,String}()).active
+    @test D6.ic_filter_from_env(Dict("D6_T_MAX" => "40")).tmax == 40.0
+end
+
+@testitem "V70 the partition is written down once: driver and scorer read it from here" default_imports = false begin
+    using Test
+    RF = normpath(joinpath(@__DIR__, ".."))
+    # 🔑 Neither the driver nor the scorer may carry the block edges as literals in CODE (comments
+    # may quote them). Each must reach the partition through build_d6_ics.jl's functions.
+    codelines(p) = [l for l in eachline(p) if !startswith(lstrip(l), "#")]
+    edge = r"\b(52|74|76|97)\.0\b|\(\s*(52|76)\s*,"
+    for (p, uses) in ((joinpath(RF, "exp_square_HIT", "tools", "run_d6.jl"),
+                       ["ic_filter_from_env", "ic_subset", "ic_block"]),
+                      (joinpath(RF, "analysis", "score_d6.jl"),
+                       ["ic_filter_from_env", "ic_subset", "ic_block", "d6_run_identity"]))
+        src = read(p, String)
+        @test occursin("build_d6_ics.jl", src)
+        @test all(u -> occursin(u, src), uses)
+        @test !any(l -> occursin(edge, l), codelines(p))
+    end
+end

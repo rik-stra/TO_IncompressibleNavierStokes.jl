@@ -145,8 +145,10 @@ end
     mktempdir() do dir
         D6Score.write_run(dir, 42, 4100, 1; nwarm = 100, nt = 1308, nq)
         D6Score.write_run(dir, 42, 4100, 2; nwarm = 90, nt = 1308, nq)   # wrong on purpose
-        ens = D6Score.load_members(dir)
-        @test_throws ErrorException D6Score.assemble(ens, ref, [0, 5])
+        # 🔑 Since 2026-09-28 this is refused one step EARLIER, at load: the two members then
+        # disagree on `nlead` too (1208 vs 1218), which `d6_run_identity` makes part of what "one
+        # experiment" means. `assemble`'s own per-IC `nwarm` check stays as the second line.
+        @test_throws ErrorException D6Score.load_members(dir)
     end
     # And a disagreement on the initial condition itself.
     mktempdir() do dir
@@ -563,4 +565,179 @@ end
     # A single replica has no pair, and that must read as "no scale", not as agreement.
     sp1 = D6Score.replica_spread((; q = [a]), n)
     @test sp1.npairs == 0 && isnan(sp1.median)
+end
+
+# ---------------------------------------------------------------------------------------------
+# V71 -- mini-D6 scoring (2026-09-28): the run's own nlead sets the grid, a directory holds one
+# experiment, and the plan's primary score
+# ---------------------------------------------------------------------------------------------
+
+@testitem "V71 the lead grid is truncated to the run's nlead, never clipped" default_imports = false setup = [D6Score] begin
+    using Test
+    L = D6Score.d6_leads()
+    @test D6Score.truncate_leads(L, 1200) == L
+    @test D6Score.truncate_leads(L, 400) == [[25, 50, 100, 200, 400] for _ in 1:6]
+    @test D6Score.truncate_leads(L, 399) == [[25, 50, 100, 200] for _ in 1:6]
+    @test D6Score.truncate_leads(L, 100) == [[25, 50, 100] for _ in 1:6]
+    @test_throws ErrorException D6Score.truncate_leads(L, 24)
+
+    # a 400-step run: the truncated grid assembles, the full one refuses (lead 1000 is absent)
+    mktempdir() do dir
+        nwarm, nlead = 100, 400
+        for (i, k) in enumerate((209, 213)), m in 1:2
+            D6Score.write_run(dir, k, 100 * (k - 1), m; nwarm, nt = nwarm + nlead)
+        end
+        ens = D6Score.load_members(dir; filt = D6Score.ic_filter())
+        @test ens.nlead == 400
+        @test ens.t == [52.0, 53.0]
+        truth = D6Score.planted_truth(6, 30000)
+        g = D6Score.union_grid(D6Score.truncate_leads(D6Score.d6_leads(), ens.nlead))
+        fc, tr = D6Score.assemble(ens, truth, g)
+        @test size(fc) == (2, 6, 2, 5)
+        @test fc[1, 1, 1, :] == [100 + l for l in g]           # planted step index = nwarm + lead
+        @test_throws ErrorException D6Score.assemble(ens, truth, D6Score.union_grid(D6Score.d6_leads()))
+    end
+end
+
+@testitem "V71 one experiment per directory: closures, models, blocks and nlead do not mix" default_imports = false setup = [D6Score] begin
+    using Test
+    using JLD2
+    # a member with explicit identity keys, on top of the planted layout
+    function member(dir, k, m; closure = "lstm", model_name = "diag/x", block = "selection",
+                    nwarm = 100, nlead = 400)
+        p = D6Score.write_run(dir, k, 100 * (k - 1), m; nwarm, nt = nwarm + nlead)
+        d = load(p)
+        jldsave(p; (Symbol(a) => b for (a, b) in d)..., closure, model_name, block)
+        return p
+    end
+    sel = D6Score.ic_filter()
+    mktempdir() do dir                                         # homogeneous: fine
+        for k in (209, 213), m in 1:2
+            member(dir, k, m)
+        end
+        ens = D6Score.load_members(dir; filt = sel)
+        @test ens.identity == (; closure = "lstm", model_name = "diag/x", block = "selection",
+                               nlead = 400)
+        # a selection run cannot be scored as the confirmation block
+        @test_throws ErrorException D6Score.load_members(dir;
+                                                         filt = D6Score.ic_filter(; block = "confirmation"))
+        # scoring it as its own block is fine
+        @test D6Score.load_members(dir; filt = D6Score.ic_filter(; block = "selection")).ks == [209, 213]
+    end
+    for (kw, what) in (((; closure = "lrs"), "closure"), ((; model_name = "diag/y"), "model"),
+                       ((; block = "confirmation"), "block"), ((; nlead = 300), "nlead"))
+        mktempdir() do dir
+            member(dir, 209, 1); member(dir, 209, 2)
+            member(dir, 213, 1; kw...); member(dir, 213, 2; kw...)
+            @test_throws ErrorException D6Score.load_members(dir; filt = sel)
+        end
+    end
+    # old files (no closure/model_name/block keys) are one experiment with each other
+    mktempdir() do dir
+        for k in (209, 300), m in 1:2
+            D6Score.write_run(dir, k, 100 * (k - 1), m; nwarm = 100, nt = 500)
+        end
+        @test D6Score.load_members(dir; filt = sel).identity.block == ""
+        # 🔑 a full-D6 directory scored on one block keeps exactly the block's ICs, by t_k
+        ens = D6Score.load_members(dir; filt = D6Score.ic_filter(; block = "selection"))
+        @test ens.ks == [209]                                  # t = 52; k = 300 is t = 74.75
+        @test D6Score.load_members(dir; filt = D6Score.ic_filter(; tmin = 70.0)).ks == [300]
+    end
+end
+
+@testitem "V71 the primary score: fair CRPS per IC, standardised, leads <= 0.5 TU" default_imports = false setup = [D6Score] begin
+    using Test
+    using Random
+    using Statistics
+    rng = Xoshiro(3)
+    K, nq, M, L = 7, 6, 5, 6
+    fc = randn(rng, K, nq, M, L)
+    tr = randn(rng, K, nq, L)
+    sc = collect(1.0:6.0)
+    c = D6Score.crps_by_ic(fc, tr, sc)
+    @test size(c) == (K, nq, L)
+    @test c[3, 4, 2] ≈ D6Score.crps_ensemble(fc[3, 4, :, 2], tr[3, 4, 2]; fair = true) / 4
+    grid = [25, 50, 100, 200, 400, 1000]
+    s = D6Score.primary_score_by_ic(fc, tr, grid, sc)
+    @test length(s) == K
+    @test s ≈ vec(mean(c[:, :, 1:4]; dims = (2, 3)))           # leads 25..200 only
+    @test D6Score.primary_score_by_ic(fc, tr, grid, sc; max_lead = 1000) ≈ vec(mean(c; dims = (2, 3)))
+    @test_throws ErrorException D6Score.primary_score_by_ic(fc, tr, grid, sc; max_lead = 10)
+    @test_throws ErrorException D6Score.crps_by_ic(fc[:, :, 1:1, :], tr, sc)   # fair needs M >= 2
+    # a perfect deterministic ensemble scores 0; scale divides
+    fz = repeat(reshape(tr, K, nq, 1, L), 1, 1, M, 1)
+    @test all(x -> abs(x) < 1e-12, D6Score.crps_by_ic(fz, tr, sc))    # zero up to round-off
+    @test D6Score.PRIMARY_MAX_LEAD == 200                      # 0.5 TU at Δt = 2.5e-3
+    @test D6Score.primary_band_scale([1.0 2 3; 0 0 2]) ≈ [1.0, std([0, 0, 2])]
+end
+
+@testitem "V71 the IC-block bootstrap: block length from spacing, coverage, degenerate cases" default_imports = false setup = [D6Score] begin
+    using Test
+    using Random
+    using Statistics
+    t = collect(52.0:0.5:74.0)                                 # 45 ICs at 0.5 TU
+    r = D6Score.ic_block_bootstrap_ci(fill(0.3, length(t)), t)
+    @test r.mean ≈ 0.3 && r.lo ≈ 0.3 && r.hi ≈ 0.3             # nothing to resample
+    @test r.blocklen == 3                                      # floor(1 TU / 0.5 TU) + 1
+    @test D6Score.ic_block_bootstrap_ci(randn(45), t; blocklen = 5).blocklen == 5
+    @test D6Score.ic_block_bootstrap_ci(randn(45), collect(1.0:45.0)).blocklen == 2
+    @test D6Score.ic_block_bootstrap_ci(randn(45), collect(1.0:2.0:89.0)).blocklen == 1
+    # coverage of the 90% interval for iid N(mu, 1), over replications
+    rng = Xoshiro(11)
+    hits = count(1:200) do _
+        x = 0.2 .+ randn(rng, 45)
+        ci = D6Score.ic_block_bootstrap_ci(x, t; nboot = 1000, rng)
+        ci.lo <= 0.2 <= ci.hi
+    end
+    @test 0.80 <= hits / 200 <= 0.97
+    # the ordering is by time, not by position: a shuffled input gives the same answer
+    x = randn(Xoshiro(2), 45)
+    p = randperm(Xoshiro(4), 45)
+    a = D6Score.ic_block_bootstrap_ci(x, t; rng = Xoshiro(9))
+    b = D6Score.ic_block_bootstrap_ci(x[p], t[p]; rng = Xoshiro(9))
+    @test (a.lo, a.hi) == (b.lo, b.hi)
+    @test_throws ErrorException D6Score.ic_block_bootstrap_ci([1.0], [52.0])
+end
+
+@testitem "V71 paired_primary: pairs by IC, finds the better closure, refuses mixed blocks" default_imports = false setup = [D6Score] begin
+    using Test
+    using JLD2
+    using Random
+    truth = D6Score.planted_truth(6, 30000)
+    ks = collect(209:2:247)                                    # 20 ICs, t = 52 .. 61.5
+    nwarm, nlead, nq = 100, 400, 6
+    nt = nwarm + nlead
+    # members = truth + noise (+ bias), in the planted-step layout `assemble` reads
+    function run!(dir, bias; M = 5, seed = 1, block = "selection", skip = Int[], ics = ks)
+        rng = Xoshiro(seed)
+        for k in ics
+            k in skip && continue
+            n_k = 100 * (k - 1)
+            for m in 1:M
+                q = [Float64(n_k + c - 1) + 30 * randn(rng) + bias for _ in 1:nq, c in 1:(nt + 1)]
+                jldsave(joinpath(dir, "d6_online_ic$(k)_m$(m).jld2"); q, dQ = zeros(nq, nt),
+                        tau = zeros(nq, nt), k, n_k, t_k = 0.25 * (k - 1), ordinal = 1, member = m,
+                        seed = UInt64(m), nwarm, nlead, M, closure = "lstm",
+                        model_name = "m$(bias)", block)
+            end
+        end
+    end
+    mktempdir() do root
+        a, b, c = mkpath(joinpath(root, "a")), mkpath(joinpath(root, "b")), mkpath(joinpath(root, "c"))
+        run!(a, 0.0; seed = 1)
+        run!(b, 60.0; seed = 2, skip = [247])                  # biased, and one IC short
+        r = D6Score.paired_primary(a, b; truth, nboot = 2000, io = devnull)
+        @test r.K == 19 && r.dropped_a == [247] && isempty(r.dropped_b)
+        @test r.grid == [25, 50, 100, 200]
+        @test r.diff < 0 && r.hi < 0                           # A (unbiased) is better, resolved
+        @test r.diff ≈ r.score_a - r.score_b
+        @test length(r.per_band) == 6 && all(<(0), r.per_band)
+        # A against itself: exactly zero
+        z = D6Score.paired_primary(a, a; truth, nboot = 500, io = devnull)
+        @test z.diff == 0 && z.lo == 0 && z.hi == 0
+        # a confirmation-block run is never paired with a selection-block one
+        run!(c, 0.0; block = "confirmation", ics = collect(305:2:343))     # t = 76 .. 85.5
+        @test D6Score.load_members(c; filt = D6Score.ic_filter()).identity.block == "confirmation"
+        @test_throws ErrorException D6Score.paired_primary(a, c; truth, io = devnull)
+    end
 end

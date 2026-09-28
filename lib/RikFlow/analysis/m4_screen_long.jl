@@ -6,6 +6,13 @@ using Statistics, Printf, JLD2
 const TO = normpath(joinpath(@__DIR__, "..", "exp_square_HIT", "output", "TO_LSTM"))
 ref = load(joinpath(@__DIR__, "data", "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2"))
 qref, dQref = ref["q"], ref["dQ"]
+# `REF_TU_MAX` (2026-09-28, plan step 1): the reference only up to this time (74 keeps the 76-97 TU
+# confirmation block out of every score); unset = the whole record
+if haskey(ENV, "REF_TU_MAX")
+    nref = round(Int, parse(Float64, ENV["REF_TU_MAX"]) / 2.5e-3) + 1
+    qref, dQref = qref[:, 1:nref], dQref[:, 1:(nref - 1)]
+    println("reference truncated to t <= $(ENV["REF_TU_MAX"]) TU")
+end
 const DT, W, FLAT, THR = 2.5e-3, 200, 0.3, 2900.0
 const REFSD = [median(std(view(qref, k, i:(i + W - 1))) for i in 1:(size(qref, 2) - W + 1)) for k in 1:6]
 sd100 = vec(std(qref; dims = 2))

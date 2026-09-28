@@ -398,7 +398,9 @@ end
         body = stop === nothing ? body : body[1:first(stop)]
 
         counter = findfirst("counter[] +=", body)
-        rnd = findfirst("rand(", body)
+        # `LinReg` draws through `draw_eta` since the AR residual (2026-09-28): its white branch is
+        # the same `rand(rng, stoch_distr)`, and test_linreg_ar.jl pins the RNG stream behaviourally.
+        rnd = findfirst(r"rand\(|draw_eta\(", body)
         @test counter !== nothing            # it has a replay at all
         @test rnd !== nothing                # and it does sample, after
         @test first(counter) < first(rnd)    # replay strictly precedes the draw

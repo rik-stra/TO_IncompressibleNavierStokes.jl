@@ -820,3 +820,826 @@ it runs (the desktop runs used `script -qfec "julia ..." log` for a TTY). A SLUR
 
 ⚠️ On a 16 GB workstation keep it to three Julia processes and no analysis alongside; Claude Code's
 low-memory reaper stopped background jobs twice at four.
+
+## 10. Plan step 0 checks (2026-09-28): mini-D6 power and M0ᶜ gates
+
+`analysis/d6_power.jl` (step 0(c)) and `analysis/m0c_checks.jl` (M0ᶜ checks (i), (ii) and the acceptance
+diagnostic, plan §3 / §21 item 3 / gotcha #72(iii)). CPU only. **What ran on what:** M0ᶜ (i)–(iii) ran on
+**real data** (R1's tracked cache, the existing 20 TU online runs, the measured response kernel). The mini-D6 power
+analysis ran on a **synthetic surrogate only**, because the D6 member files were not on the desktop yet (see
+10a for the command). 🔒 No step past 74 TU was read.
+
+### 10a. Mini-D6 power — ✅ REAL D6 (LinReg1 vs LinReg7), run 2026-09-28
+
+Real run: `analysis/d6_power.jl` on the full D6 member files, 87 paired ICs, t = 10.25–96.25 TU, M = 10.
+Log: `analysis/output/d6_power_D6_LinReg1_D6_LinReg7.jld2`. The per-IC CRPS difference has ACF 0.12 / −0.05 /
+0.10 at lags 1–3, inside the ±0.21 band, so b = 1–2 is adequate: b = 1/2/4 changes the full-set half-width by
+≤ 8%.
+
+**The known difference (full set, A − B).**
+- Primary CRPS (grid): 0.1982 vs 0.2346, Δ = **−0.036**. LinReg1 is 16% better.
+- Skill: 0.4957 vs 0.5099, Δ −0.014.
+- In-band: 27 vs 5.
+
+**Minimum detectable difference (MDD).** 90% CI half-width of the paired primary CRPS, in reference-sd units
+(real data):
+
+| pool | K | M | pairing | N_LEAD | CRPS MDD | resolves LinReg1−LinReg7? | skill MDD |
+|---|---|---|---|---|---|---|---|
+| all | 87 | 10 | CRN | 400 | 0.014 | yes | 0.019 (Δ −0.018: **no**) |
+| all | 87 | 5 | noCRN | 400 | 0.021 | yes | 0.030 |
+| t ≥ 52 | 45 | 10 | CRN | 400 | 0.017 | yes (Δ −0.028) | 0.022 |
+| t ≥ 52 | 45 | 5 | CRN | 400 | 0.016 | yes | 0.024 |
+| **t ≥ 52** | **45** | **5** | **noCRN** | **400** | **0.026** | **yes (Δ −0.028), barely** | 0.030 |
+| t ≥ 52 | 30 | 5 | noCRN | 400 | 0.036 | 8–17% of subsets | 0.039 |
+| all | 30 | 5 | noCRN | 400 | 0.031–0.036 | 50–83% | 0.039–0.047 |
+
+**What this means for the funnel (plan §7).**
+1. **Primary score: CRPS is the right choice.** Skill/climatology cannot resolve even the known LinReg1–LinReg7
+   gap at any size tested (MDD 0.019–0.047 against |Δ| ≤ 0.027). The in-band count resolves that gap easily
+   (MDD 6–9 against +22), but only because the gap is large.
+2. **30 ICs is not enough. Use every package in the block.** For a cross-family screen (noCRN), 45 late ICs ×
+   M = 5 give MDD ≈ 0.026 CRPS ≈ **13% of LinReg1's CRPS**. So the mini-D6 detects an improvement of about
+   LinReg1-vs-LinReg7 size, 13–16%, and **not a few-percent gain**.
+3. **M = 5 costs little against M = 10** (0.016 vs 0.017 with CRN). N_LEAD 400 costs nothing on the primary
+   score, whose leads are ≤ 200 steps.
+4. ⚠️ **The "t ≥ 52" pool here is D6's 1 TU-spaced ICs over 52–96 TU**, i.e. selection *and* confirmation
+   blocks. The selection block alone (52–74 TU) has ~22 of D6's ICs, or ~46 packages at the full 0.48 TU
+   spacing. Adjacent packages are ~0.5 TU apart, and whether they add independent information is unmeasured
+   here: the lag-1 ACF at 1 TU is 0.12. So the table's 45-IC row is an **optimistic** bound for the selection
+   block. Plan on MDD ≈ 0.026–0.036, i.e. a mini-D6 that sees **≥ 13–18% CRPS improvements only**.
+5. **Consequence for the kill criterion (D-13).** A null at mini-D6 size means "no gain ≥ ~15%", not "no gain".
+   A smaller real gain needs the confirmation D6 at M = 10 with CRN-free pairing, MDD ~0.02 at 45 ICs, or more ICs.
+
+#### Synthetic validation (the machinery; written before the real files arrived)
+
+
+Method. Paired A − B on the same ICs, policy A (an IC is dropped if either closure lost a member). Three scores:
+- (a) **primary**: fair ensemble CRPS in reference-sd units, averaged over 6 bands × leads ≤ 0.5 TU. Two lead
+  sets: the grid {25, 50, 100, 200} and every 5th step ("dense").
+- (b) mean skill/climatology over the cells ≤ N_LEAD.
+- (c) the in-band count.
+
+Subsamples: K ∈ {30, 45, 90 (= all 87)}, drawn as contiguous or strided IC sets, from all ICs or only those with
+t ≥ 52 TU. M ∈ {10, 5, 5-noCRN}, N_LEAD ∈ {1000, 400}. Each subsample gets an IC moving-block bootstrap (2000
+replicates). The block length is b = ⌈1 TU / narrowest spacing⌉, which gives 1–2. MDD = the 90% CI half-width.
+
+🔴 **"noCRN" is the row to size a cross-family screen on.** LinReg1 and LinReg7 share member seeds, so their
+members 1..M are common random numbers. An LSTM-vs-MVG screen is paired by IC only (plan §7). noCRN scores A's
+members 1–5 against B's members 6–10.
+
+**Validation on the surrogate.** Six ringing AR(2) bands (1 TU period), D6's IC spacing, and B's error set 3%
+larger with 0.8× the spread, so the difference is known. Checks:
+- A scored against itself gives differences of exactly 0.
+- Bootstrap 90% CI coverage of the known difference over 60 independent replicates is **83–90%**: CRPS 85/83–88%,
+  skill 83–90%. It is slightly liberal, so read the MDDs as ~10% optimistic.
+- The b ∈ {1, 2, 4} sensitivity moves the MDD by ≤ 20%.
+- N_LEAD 400 vs 1000 does not change (a) at all, since its leads are ≤ 200 steps. It moves (b) and (c) only through
+  the cell set.
+
+The synthetic MDDs (CRPS, sd units, CRN / noCRN) are **not transferable numbers**. They depend on the surrogate's
+error model: CRN pairing shrinks the MDD ~5× here (K = 45 strided: 0.005 vs 0.028). Only the machinery is
+validated.
+
+**To run on the real files once they are copied** (`analysis/output/D6_LinReg1/`, `D6_LinReg7/`,
+`analysis/data/hf_reference_new_tsim100.0_f64_lmwray3_qois.jld2`):
+
+```bash
+cd lib/RikFlow && julia --startup-file=no --project=analysis analysis/d6_power.jl   # ~minutes; caches the arrays
+# other pair / dirs: D6_POWER_A=<dir> D6_POWER_B=<dir>;  D6_POWER_NBOOT, D6_POWER_NSUB, D6_POWER_TAU
+```
+
+It prints the full-set A − B, the per-IC ACF check on the block length, and one row per (pool, mode, K, M, N_LEAD).
+Each row gives est / sd-across-subsamples / MDD / %-resolved for each score. Reference: §4c has skill 0.4957 vs
+0.5099 (Δ −0.014) and in-band 27 vs 5.
+
+### 10b. M0ᶜ check (i): does the closed loop with white η already make the middle-band persistence? — **yes**
+
+`m0c_checks.jl i`. Every 20 TU online run of a linear + η closure on disk, steps 101–8000:
+- **ONLINE dQ ACF**: the correction the closure actually applied.
+- **online residual**: dQ − μ(x_online), with μ the deployed closure run `stochastic = false` on the online inputs.
+  The method is validated by `colour/lin_h1_ar`, where it recovers the imposed AR(1) (0.73 / 0.82).
+- The tracked record over the same 0.25–20 TU window, for comparison.
+
+Middle bands, lag 1 / 5 / 20:
+
+| | Z[7,15] dQ | E[7,15] dQ | Z/E[7,15] residual lag 1 |
+|---|---|---|---|
+| **tracked record** | 0.98 / 0.74 / 0.34 | 0.99 / 0.82 / 0.32 | 0.76 / 0.86 (data, h = 1 mean) |
+| white M0, h = 1 (`r2_lin_const`, 3 runs) | 0.98 / 0.87 / 0.49 | 0.99 / 0.92 / 0.44 | −0.00 / −0.00 |
+| same, noise × 0.5 / noise ≈ 0 (`_n05`, `_n0`) | 0.99 / 0.92 / 0.59 · 1.00 / 0.93 / 0.60 | 1.00 / 0.93 / 0.44 · 1.00 / 0.94 / 0.42 | ≈ 0 |
+| white M0, h = 1, window (`b_lin_eta_h1`, 5) | 0.98 / 0.85 / 0.47 | 0.99 / 0.90 / 0.34 | ≈ 0 |
+| white M0, h = 2 / 3 / 5 / 10 | 0.98–0.99 / 0.77–0.90 / 0.44–0.71 | 0.99 / 0.83–0.90 / 0.37–0.61 | ≈ 0 (data 0.28/0.18 at h = 2, ≈ 0 at h ≥ 3) |
+| M0ᶜ, AR(1) η (`colour/lin_h1_ar`, 5) | 0.99 / 0.88 / 0.44 | 1.00 / 0.91 / 0.26 | 0.73 / 0.82 (imposed) |
+
+🔑 **The white closed loop already makes all of the correction's persistence, and more.** At every h and every lag
+≥ 1 the online middle-band dQ ACF is ≥ the tracked one. It is +0.1 to +0.2 too persistent at lags 5–20, and it
+stays that way with the noise switched off. So the persistence comes from the mean map plus the solver, not from η.
+The exception is ridge: `rdg_h1_l1e-05` (λ = 1e-5) has lag 1 of 0.91 / 0.90, below the data's, but it is still
+above the data at lags ≥ 5.
+
+The data residual's 0.76 / 0.86 is colour *relative to μ on the tracked states*. The loop reproduces it in dQ
+without any help. AR(1) η adds nothing to dQ's lag 1 (0.99 → 0.99–1.00) and removes the lag-20 memory in E[7,15]
+(0.44 → 0.26).
+
+⚠️ `m4_screen.jl`'s "dQ lag-1 0.73–0.75 / 0.77–0.79" is **E[0,6]**; the same number here is 0.74 tracked and
+0.77–0.79 online.
+
+### 10c. M0ᶜ check (ii): the h control — **the middle-band colour vanishes at h ≥ 5**
+
+`m0c_checks.jl ii`. Float64 least squares on the M0 design (`build_history`, `:q_star_q`, level target, bias last).
+Residual ACF lags 1 / 2 / 5 / 10, in-sample → held-out 52–74 TU:
+
+| fit | cond(X) raw / std | max\|C_std\| | Z[7,15] | E[7,15] | other bands, \|lag 1\| max (held) | sd held/fit |
+|---|---|---|---|---|---|---|
+| 1–10, h = 1 | 2.9e8 / 4.9e3 | 1.1 | 0.76 0.41 −0.20 0.00 → **0.78** 0.44 −0.14 | 0.86 0.69 0.12 −0.26 → **0.87** 0.70 0.16 −0.24 | 0.23 (E[16,32]) | 0.89–0.99 |
+| 1–10, h = 2 | 2.3e9 / 4.1e4 | 2.1 | 0.30 0.04 → 0.35 0.02 | 0.18 0.11 → 0.24 0.07 | 0.06; lag 2 −0.24 (Z[16,32]) | 0.88–0.99 |
+| 1–10, h = 5 | 7.9e10 / 1.9e6 | 18.7 | −0.01 −0.00 → **0.07** −0.07 | −0.02 0.00 → **0.05** −0.09 | 0.04 | 0.89–1.00 |
+| 1–10, h = 6 | 1.3e11 / 2.8e6 | 39.3 | 0.01 → 0.09 −0.06 | 0.00 → 0.07 −0.07 | 0.05 | 0.90–1.00 |
+| 1–50, h = 1 | 2.7e8 / 4.6e3 | 1.1 | 0.76 0.40 → 0.79 0.45 | 0.86 0.69 → 0.88 0.70 | 0.24 | 0.84–0.92 |
+| 1–50, h = 2 | 2.1e9 / 3.7e4 | 2.1 | 0.28 → 0.37 | 0.18 → 0.27 | 0.08 | 0.83–0.93 |
+| 1–50, h = 5 | 6.9e10 / 1.6e6 | 21.5 | −0.01 → **0.11** −0.03 | −0.02 → **0.09** −0.07 | 0.04 | 0.83–0.93 |
+| 1–50, h = 6 | 1.1e11 / 2.6e6 | 17.6 | 0.00 → 0.12 −0.02 | 0.00 → 0.11 −0.05 | 0.04 | 0.83–0.93 |
+
+🔑 **§7j's 0.73 / 0.82 is an h = 1 artefact.** It is the part of the dynamics that two more lags of q/q* absorb.
+At h = 2 it is already 0.2–0.4, and at LinReg1's h = 5 the in-sample residual is white to ±0.02. Held out, a
+residual lag-1 of 0.05–0.12 is left, with a small negative lag 2. h + 1 (h = 6) changes nothing further.
+
+⚠️ The standardised design's cond is ~2e6 at h = 5–6 (the §3 identifiability warning stands). ⚠️ The held-out
+residual sd is **0.83–0.93×** the in-sample sd on the 1–50 TU fits. The 52–74 TU block is quieter than the fit
+window, which is not the "14–18% wider" of RH-1 on 50–100 TU.
+
+### 10d. Acceptance diagnostic (iii): kernel-weighted noise power
+
+`m0c_checks.jl iii`. P = Var(Σ_{k=1..200} G_k e_{n−k}), with G the measured impulse kernel (§7h(e),
+`response/response_kernel.jld2`; its diagonal step response at k = 200 is −0.8 / 115.5 / −19.4 / 55.5 / −0.7 /
+29.2). Every noise is set to the residual's variance. The table gives the ratio to white, diagonal kernel, per band;
+"data" is the residual series itself filtered, in-sample / held-out 52–74 (the latter rescaled to the fit
+variance).
+
+| residual of | band | ρ₁ | AR(1) | AR(2)-YW | AR(2)-LS (lags 1–20) | data fit / held |
+|---|---|---|---|---|---|---|
+| **h = 5, 1–10 TU (M0)** | Z[7,15] | −0.01 | 0.98 | 0.98 | 0.98 | 1.08 / 1.14 |
+| | E[7,15] | −0.02 | 0.97 | 0.97 | 0.96 | 1.07 / 1.21 |
+| | other four | ≈ 0 | 1.00 | 1.00 | 1.00 | 0.89–0.98 / 0.87–1.30 |
+| h = 5, 1–50 TU | all | ≈ 0 | 0.97–1.00 | 0.97–1.00 | 0.96–1.00 | 0.95–1.02 / 1.01–1.20 |
+| h = 1, 1–10 TU (§7j's) | Z[7,15] | 0.76 | 5.12 | 3.07 | **2.73** | 2.74 / 2.86 |
+| | E[7,15] | 0.86 | 11.13 | 8.17 | **4.58** | 3.54 / 4.42 |
+| | Z/E[0,6], Z/E[16,32] | 0.01–0.21 | 1.02–1.50 | 0.82–1.45 | 0.73–1.54 | 1.00–1.79 / 1.53–2.22 |
+
+With the full 6 × 6 kernel (simulated, lag-0 cross-correlation kept), every ratio lies in 0.92–1.11 for the AR fits
+and 0.84–1.30 for the data. Cross-band terms dominate the output variance there, and the diagonal colour barely
+registers.
+
+🔑 **Where there is colour (h = 1), no AR fit is at or below white.** AR(1) is 5–11× white, which is §7j's
+over-dispersion with its mechanism. The ACF-fitted AR(2) matches the data residual in Z[7,15] (2.73 vs 2.74 / 2.86)
+and is 1.3× above it in-sample in E[7,15] (4.58 vs 3.54; held out 4.42). So the plan's corrected expectation holds
+(#72(iii)): faithful colour *raises* the kernel-weighted power, it never lowers it. At h = 5 there is nothing to
+fit. The AR fits collapse to white (0.96–1.00), and the data residual sits at 0.84–1.30× white, with no band-
+specific excess.
+
+⚠️ The kernel is truncated at 200 steps (0.5 TU) and bands 2 / 4 / 6 have not settled by then (§7h(e)), so P
+under-weights the lowest frequencies. That strengthens the AR(1) conclusion.
+
+### 10e. Verdict — **do not build M0ᶜ** (plan §21 item 3)
+
+Both of §21 item 3's stop conditions hold, independently:
+- (i) The online middle-band ACF of the white M0 already matches the data's persistence, and exceeds it at
+  lags ≥ 5, at every h. With noise off it is the same.
+- (ii) The colour vanishes at h = 5: in-sample |ρ₁| ≤ 0.02, held-out 0.05–0.12.
+
+The acceptance diagnostic agrees. At the M0 design (h = 5) an AR(p) fit is white. At h = 1, where the colour exists,
+every AR fit raises the kernel-weighted power 2.7–11× over white.
+
+The one open end is the small held-out residual lag-1 of 0.05–0.12 at h = 5–6 (1–50 TU fit). It is too small to
+carry a cell, and it is below the online loop's own excess persistence.
+
+### 10f. Per-QoI breakdown (Rik asked: does the verdict hold for all six QoIs?) — 2026-09-28
+
+Same `m0c_checks.jl i ii iii` run, all six QoIs. Full log: job scratch `m0c_full.log`.
+
+**(ii) Tracked-record residual ACF of the LS mean, lags 1 / 2.** 1–10 TU fit, in-sample → held-out 52–74 TU.
+
+| QoI | h = 1 | h = 2 | h = 3 (from (i)'s tracked resid) | **h = 5 (M0)** |
+|---|---|---|---|---|
+| Z[0,6] | 0.09 0.11 → 0.13 0.11 | −0.01 0.01 → 0.03 −0.00 | 0.03 −0.00 | −0.00 −0.00 → 0.04 −0.01 |
+| E[0,6] | 0.03 0.02 → 0.06 0.02 | −0.00 −0.01 → 0.02 −0.02 | 0.02 0.01 | −0.00 0.00 → 0.03 −0.01 |
+| Z[7,15] | **0.76 0.41** → 0.78 0.44 | **0.30** 0.04 → **0.35** 0.02 | 0.06 −0.01 | −0.01 −0.00 → 0.07 −0.07 |
+| E[7,15] | **0.86 0.69** → 0.87 0.70 | **0.18** 0.11 → **0.24** 0.07 | 0.01 0.04 | −0.02 0.00 → 0.05 −0.09 |
+| Z[16,32] | 0.01 −0.14 → 0.04 −0.14 | −0.01 **−0.22** → 0.01 **−0.24** | 0.00 0.03 (lag 5: 0.16) | −0.00 0.00 → 0.03 −0.04 |
+| E[16,32] | 0.21 0.03 → 0.23 0.02 | 0.06 **−0.15** → 0.06 **−0.19** | −0.00 −0.01 (lag 5: 0.14) | 0.00 0.00 → 0.02 −0.05 |
+
+On the 1–50 TU fit at h = 5, the held-out lag 1 is 0.01 / 0.01 / **0.11 / 0.09** / 0.04 / 0.04, and lag 2 is
+−0.01…−0.07.
+
+**(i) Online dQ ACF of the white-η linear closure at h = 5 (`diag/rdg_h5_l0`, 3 × 20 TU) against the tracked
+record, lags 1 / 5 / 20.**
+
+| QoI | online | tracked | online − tracked at lag 20 |
+|---|---|---|---|
+| Z[0,6] | 0.98 / 0.89 / 0.71 | 0.95 / 0.80 / 0.50 | +0.21 |
+| E[0,6] | 0.78 / 0.34 / 0.06 | 0.74 / 0.21 / −0.02 | +0.08 |
+| Z[7,15] | 0.99 / 0.80 / 0.50 | 0.98 / 0.74 / 0.34 | +0.16 |
+| E[7,15] | 0.99 / 0.85 / 0.55 | 0.99 / 0.82 / 0.32 | +0.23 |
+| Z[16,32] | 1.00 / 0.99 / 0.96 | 1.00 / 0.99 / 0.96 | 0.00 |
+| E[16,32] | 1.00 / 0.98 / 0.95 | 1.00 / 0.97 / 0.94 | +0.01 |
+
+The same pattern holds at h = 1, 2, 3 and 10 and in window mode: online ≥ tracked at every lag, in every QoI.
+
+**(iii) Kernel-weighted power at h = 5, P/P_white.** AR(1) / AR(2) fits are 0.96–1.01 in all six QoIs. The data
+residual is 0.89–1.08 in-sample and 0.87–1.30 held out.
+
+**Per-QoI reading.**
+1. **At h = 5 the M0ᶜ verdict holds for all six QoIs.** The in-sample residual is white to ±0.02 at lags 1, 2, 5
+   and 10 everywhere. Held out, the largest residual is in the middle bands: lag 1 0.05–0.07 on the 1–10 TU fit,
+   0.09–0.11 on 1–50. That is small, but twice the other bands'.
+2. **Check (i) has no power in the small-scale bands.** Their dQ ACF is 0.94–1.00 out to lag 20 both tracked and
+   online (the correction follows the slowly varying level), so "online ≥ tracked" is automatic there. The verdict
+   for Z/E[16,32] rests on (ii) and (iii) alone.
+3. **In the large and middle bands the loop is TOO persistent.** Online exceeds tracked by +0.08 to +0.23 at
+   lag 20. That is a mean-map + solver property, not a missing-noise property, and it is a target for the mean
+   (M3ᶠ), not for colour.
+4. 🔴 **At h = 2, the design of M3ᶠ and M0ᵛ, colour remains in 4 of 6 QoIs.** The middle bands have lag 1
+   0.18–0.37. The small-scale bands have a **negative lag 2 of −0.15 to −0.24**, which is new: it is absent at
+   h = 1 and h = 5. The matched M0@h2 baseline carries the same residual, so the paired comparisons stay fair.
+   But a closure at h = 2 leaves this structure in the noise, while h = 3 removes it (all |ρ₁,₂| ≤ 0.06, with a
+   residual lag-5 of 0.14–0.16 in the small-scale bands).
+5. ⚠️ **The online residuals at h ≥ 5 show small-scale ρ₁ −0.07…−0.16 and ρ₂ +0.11…+0.19.** The deployed noise
+   is white, so this is a reconstruction artefact of μ(x_online): likely Float32 inputs through a cond ~2e6 design.
+   It is not colour.
+
+### 10g. Under ridge: the deployed λ ladder's residual is coloured, strongly from λ = 1e-2 on (2026-09-28, Rik asked)
+
+`analysis/m0c_ridge.jl` applies every archived `TO_LRS/LinReg<n>` fit **exactly as deployed** (per-QoI scaling,
+`c · [x; 1]`, output scaling, level target), teacher-forced on R1's tracked record at h = 5. The fit window is
+1–10 TU (the ladder's train range) and the held-out window is 52–74 TU.
+
+*Wiring check.* Deployed LinReg1 against the Float64 LS refit of (ii): the per-QoI residual ACFs agree to
+≤ 0.01. The max point difference is 0.17 sd, the expected round-off spread of two fits at cond ~2e6 (#63).
+
+Residual lag 1 per QoI, fit → held out (lags 2/5/10 in the log), and residual sd relative to LinReg1:
+
+| fit | λ (LinReg, `:normal`) | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] | sd / sd(LinReg1) |
+|---|---|---|---|---|---|---|---|---|
+| LinReg1 | 0 | −0.00 → 0.04 | −0.00 → 0.03 | −0.01 → 0.07 | −0.02 → 0.05 | −0.00 → 0.02 | −0.00 → 0.02 | 1 |
+| LinReg5 | 1e-5 | −0.00 → 0.04 | −0.00 → 0.03 | 0.05 → 0.13 | 0.03 → 0.09 | −0.00 → 0.02 | 0.01 → 0.03 | 1.00–1.02 |
+| LinReg6 | 1e-4 | 0.00 → 0.05 | −0.00 → 0.03 | **0.20 → 0.27** | **0.21 → 0.27** | 0.00 → 0.03 | 0.03 → 0.05 | 1.00–1.08 |
+| LinReg2 | 1e-2 | 0.11 → 0.14 | 0.02 → 0.05 | **0.76 → 0.78** | **0.83 → 0.85** | 0.19 → 0.21 | 0.30 → 0.32 | 1.0–2.6 |
+| **LinReg7** | **1** (on the D6 front) | **0.77** | **0.44** | **0.95** | **0.97** | **0.81** | **0.85** | **1.2–11.4** |
+| LinReg8 | 10 | 0.94 | 0.70 | 0.98 | 0.98 | 0.94 | 0.95 | 1.8–26 |
+| LinReg9 | 100 | 0.97 | 0.89 | 0.99 | 0.99 | 0.97 | 0.97 | 3.4–47 |
+| LinReg10 | 1e4 | 1.00 | 0.99 | 1.00 | 1.00 | 1.00 | 1.00 | 15–200 |
+
+(From λ = 1 on, fit and held-out lag 1 agree to ±0.02.)
+
+**Reading.**
+1. **The λ = 0 verdict (10b–10f) does not transfer to ridge.** Ridge shrinks the mean's dynamics, and whatever it
+   takes out reappears as a *coloured* residual.
+   - First in the middle bands: λ = 1e-4 gives lag 1 0.20–0.27.
+   - At λ = 1e-2 the middle bands are back at the h = 1 level (0.76–0.85).
+   - At **λ = 1 (LinReg7) all six QoIs are coloured**: lag 1 0.44–0.97, lags 5–10 up to 0.53. The residual sd is
+     1.2× (E[0,6]) to 11× (E[7,15]) LinReg1's.
+2. **LinReg7's MVG noise is white with that inflated variance, and D6 still finds it under-dispersed** (spread–skill
+   median 0.559, 5/36 in band, `results.md` §4c). The closed loop sets its spread, not the one-step Σ. The coloured
+   residual has far more low-frequency power than the white draw at the same variance (§10d: AR(1) at 0.8 is
+   5–11× white). So **a coloured residual on the ridge-stabilised mean is a plausible fix for exactly the
+   calibration price ridge pays on the D6 front.** This is untested; it is a hypothesis, not a result.
+3. **Consequence for M0ᶜ (plan §21 item 3):** the gate is closed for the λ = 0 baseline, but **open for the
+   ridge-stabilised cells**: LinReg7-type M0, and M3ᶠ's ridge skip.
+   - Next checks, all CPU: (i) the kernel-weighted power of an AR fit to LinReg7's residual against its white Σ;
+     (ii) the D1 joint (mean, AR) fit at λ = 1, which also lets part of the dynamics back into the mean;
+     (iii) the online dQ ACF of LinReg7's D6 members against the tracked record.
+   - The GPU test would be a mini-D6 of LinReg7 + AR(p) against LinReg7, which is a same-family pairing.
+4. **M3ᶠ inherits this.** Its frozen skip is ridge-fitted. Which skip λ matters depends on the M4-path convention,
+   which is not LinReg's (#72(i)). So the skip's residual ACF must be measured per λ before its noise head is
+   declared white.
+
+### 10h. Ridge + colour, three CPU checks on LinReg7 (λ = 1, h = 5) — 2026-09-28
+
+`analysis/m0c_ridge_colour.jl`. Log in job scratch: `m0c_ridge_colour.log`. Fit window 1–10 TU, held out
+52–74 TU. The D6 ICs used end by 74 TU.
+
+**(3) Online: LinReg7's white noise destroys the correction's persistence; LinReg1 keeps it.** Per-member dQ ACF
+over the 1200-step forecasts, averaged, against the tracked record on the same steps. 63 ICs, ~630 members per
+closure.
+
+| QoI | tracked, lag 1 / 2 / 5 / 20 | **LinReg1** online | **LinReg7** online | sd(dQ) on/trk, LR1 / LR7 |
+|---|---|---|---|---|
+| Z[0,6] | 0.95 0.90 0.78 0.44 | 0.95 0.90 0.77 0.48 | **0.40** 0.52 0.42 0.22 | 1.01 / 0.73 |
+| E[0,6] | 0.74 0.54 0.21 −0.01 | 0.75 0.57 0.27 0.02 | **0.39** 0.35 0.15 0.01 | 1.02 / 0.90 |
+| Z[7,15] | 0.98 0.92 0.70 0.25 | 0.98 0.92 0.71 0.32 | **0.05** 0.30 0.25 0.13 | 1.06 / 1.01 |
+| E[7,15] | 0.99 0.96 0.80 0.27 | 0.99 0.96 0.80 0.34 | **0.06** 0.35 0.28 0.12 | 1.04 / 0.83 |
+| Z[16,32] | 0.99 0.99 0.98 0.92 | 1.00 0.99 0.98 0.94 | 0.96 0.97 0.96 0.91 | 1.26 / 1.01 |
+| E[16,32] | 0.99 0.98 0.96 0.90 | 0.99 0.99 0.97 0.91 | 0.90 0.93 0.92 0.87 | 1.25 / 1.01 |
+
+- **LinReg1 reproduces the tracked persistence to ≤ 0.07 at every lag, in every QoI.**
+- **LinReg7 does not.** Its lag 1 is below its lag 2 in the four large/middle QoIs: a white component carries most
+  of the variance on top of a persistent signal. That is the white MVG draw at the inflated residual variance of
+  §10g (8–11× LinReg1's in the middle bands).
+- So ridge does not remove the dynamics from the correction. It moves them from the mean into a residual, and then
+  **samples that residual as white noise**.
+
+**(1) Kernel-weighted power: LinReg7's white Σ under-delivers low-frequency power by ~3×.** P/P_white at LinReg7's
+residual variance, measured solver kernel (§10d):
+
+| QoI | ρ₁ | AR(1) | AR(2)-LS | data residual | full 6×6 kernel: AR(1) / AR(2)-LS / data |
+|---|---|---|---|---|---|
+| Z[0,6] | 0.77 | 6.4 | 8.4 | 11.0 | 2.72 / 2.55 / 2.80 |
+| E[0,6] | 0.44 | 2.5 | 2.2 | 2.3 | 2.37 / 2.09 / 2.96 |
+| Z[7,15] | 0.95 | 13.9 | 6.8 | 8.6 | 3.72 / 2.89 / 3.08 |
+| E[7,15] | 0.97 | 33.6 | 9.9 | 10.7 | 4.21 / 3.02 / 3.18 |
+| Z[16,32] | 0.81 | 6.3 | 7.2 | 6.3 | 3.21 / 2.72 / 2.72 |
+| E[16,32] | 0.85 | 10.4 | 6.8 | 8.3 | 3.22 / 2.73 / 2.74 |
+
+- With the full kernel, the data residual carries **2.7–3.2×** the white noise's power.
+- The ACF-fitted AR(2) comes within ≈ 10% of it (2.1–3.0). AR(1) overshoots in the middle bands (3.7–4.2).
+- 🔑 **A consistency check, not a proof.** A ~3× power deficit is a spread deficit of √(2.7–3.2) = 1.64–1.79.
+  D6 measured LinReg7's spread–skill median at **0.559**, i.e. a deficit of **1/0.559 = 1.79** (`results.md`
+  §4c). The two agree to within the precision of either.
+- The white noise *also* over-delivers absolute power against LinReg1's (white7/white1 = 1.4–1.5, full kernel).
+  So LinReg7 has more total noise than LinReg1 but in the wrong frequencies.
+
+**(2) Joint (mean, AR) fit at λ = 1** (`fit_ridge(λ = 1)` reproduces the deployed LinReg7 `c` to 1.7e-3, so the
+convention matches).
+
+| model | held-out NLL/row | AR a₁ (a₂) | held-out innovation lag 1 | innovation sd / white sd | ‖C − c₇‖/‖c₇‖ |
+|---|---|---|---|---|---|
+| LinReg7 mean + AR(1), two-stage | −32.61 | 1.00 0.85 0.98 0.96 0.94 0.94 | −0.11 −0.20 0.77 0.83 0.12 0.34 | 0.25–0.98 | 0 |
+| LinReg7 mean + AR(2), two-stage | −34.38 | a₁ 1.07–1.89, a₂ −0.16…−0.95 | −0.30…0.46 | 0.13–0.99 | 0 |
+| **joint mean + AR(1)** | **−36.68** | 0.79 0.30 0.93 0.95 0.95 0.95 | **0.02–0.09** | 0.08–0.88 | 4.5 |
+| joint mean + AR(2) | −36.68 | ≈ AR(1) (a₂ small) | 0.02–0.08 | 0.08–0.88 | 4.5 |
+
+- The joint fit is the only one with white held-out innovations, and it beats the two-stage colour by 2.3–4.1
+  nats/row. For reference, LinReg7 white is −21.43 under a full-covariance Gaussian; that is a different
+  normalisation, so only the ordering is comparable.
+- ⚠️ **One-step likelihood is exactly what failed to predict online before** (§25 of plan.md: LR+C had the best
+  NLL and was +87% over-dispersed).
+- ⚠️ **Both fits put AR poles at 0.93–1.00.** Two-stage AR(1) has **a = 1.00 in Z[0,6], a unit root**, and the
+  two-stage AR(2) roots sit near the unit circle (a₁ 1.89, a₂ −0.95 in Z[7,15]). The joint fit re-estimates the mean
+  wholesale (‖ΔC‖ = 4.5‖c₇‖) and lets a near-integrating residual carry the dynamics that ridge removed. That
+  risks reintroducing the loop gain ridge was bought for.
+
+**Verdict.**
+- The hypothesis of §10g survives all three checks.
+  - (3) LinReg7's online correction has lost the persistence LinReg1 keeps.
+  - (1) Its white Σ is short of low-frequency power by the factor that matches its D6 under-dispersion.
+  - (2) An AR(2) fitted to its residual ACF restores that power to within ~10%.
+- **Candidate cell: "M0ᶜ-ridge" = LinReg7's mean + a stationary AR(2) fitted to the residual ACF** (two-stage,
+  mean untouched, so ridge's stability argument is kept).
+  - Prefer the ACF-fitted AR(2) (stationary by construction, power within ~10%) over the likelihood-optimal fits,
+    whose poles are at the unit circle.
+  - The joint fit is a second variant, flagged for stability.
+  - Test: mini-D6 on the selection block against LinReg7, same member seeds (a same-family pairing, so CRN
+    applies).
+  - Pass: spread–skill moves toward 1 with no loss of stability and no loss of CRPS.
+- **Needs code.** `LinReg` has no AR residual, and the M4 path's `scaling.eta_ar` is AR(1) only (V69). An AR(2)
+  η on the LinReg sampler must also be warm-started, from the replayed residuals, not zero.
+
+**Reproduce:** `julia --startup-file=no --project=training analysis/m0c_checks.jl [i] [ii] [iii]`. Part (i) takes
+a few minutes, (ii) + (iii) about 1 min. It writes `analysis/output/m0c_checks_*.jld2`.
+
+## 11. M3ᶠ and the matched M0@50 (plan step 1, 2026-09-28)
+
+**Question.** On the existence window, does a small residual network on top of a frozen ridge skip beat
+the matched linear model on the same inputs (plan.md §3, *The reduced ladder*; §7, *Screening funnel*)?
+
+**Partition used (plan.md §7).** Training on R1, 1–50 TU. Fit rows are the first 80% (1.0–40.2 TU).
+The tail (40.2–50 TU) is the early-stopping validation, as in every window fit. Offline held-out
+scoring is on **52–74 TU only** (8801 one-step rows, teacher-forced). The reference for the online
+scores is truncated to **t ≤ 74 TU** (`REF_TU_MAX=74`). Nothing here reads 76–97 TU.
+
+**Design.**
+- h = 2 inputs `[q*_n; q_{n-1}, q*_{n-1}; q_{n-2}, q*_{n-2}; 1]` (31 regressors).
+- **M0@50** = ridge skip + constant correlated η seeded at the training-residual covariance
+  (`tools/m4_linear_eta.jl`, deployed as `:lstm`, `V1 = 0`).
+- **M3ᶠ** = the SAME skip, frozen, plus a 2-layer tanh MLP with `n_hidden = 16` on the same regressor.
+  - It uses `arch = :dense`, `n_latent = 0`, `W = 1`: no latent path and no extra lags, so "same
+    inputs" is literal.
+  - The output layer is zero-initialised (`V1 = 0`), so update 0 **is** M0@50(λ).
+  - The noise head is **constant, white, correlated Gaussian** (`emission = :constant`, `SEEDHEAD=1`,
+    trained jointly).
+  - Weight decay acts on the network only (`WD_EXCLUDE=bd,Araw`).
+  - Training: `BATCH=256 LR=1e-2 VAL_EVERY=100 PATIENCE=30 STOP_PATIENCE=80 STOP_WINDOW=20000 EPOCHS=400`.
+    That is 13–24k updates, about 1.5 min per fit on the CPU.
+- **λ convention (M4 code path, not LinReg's; gotcha #72(i)).**
+  - The objective is `‖Y − C X‖² + λ N_fit ‖C_{-bias}‖²`, with the regressor standardised by the
+    1–50 TU training mean and sd and `dQ` standardised likewise.
+  - So λ is a **per-row** penalty, and every column except the trailing bias is penalised (checked in
+    `m4_window_fit.jl` and `m4_linear_eta.jl`: `Diagonal([fill(λ N, nin − 1); 0])`, where the bias is
+    the last regressor).
+- Weight decay is Optimisers' coupled AdamW: each update shrinks the weights by `lr × WD`.
+
+### 11a. Offline, held-out 52–74 TU (one-step, teacher-forced; loss = 0.5 SSE/step over the six standardised dQ)
+
+**The linear floor on the same inputs** is least squares, λ = 0: **held 0.2098, ensemble CRPS
+0.10101**. Adding one more set of lags does not change this much: the stacked W = 10 window of the
+full regressor, fitted by least squares, scores 0.2074 (−1.1%).
+
+| model | held loss | vs M0(λ) | CRPS | vs M0(λ) | spread/skill per QoI | ‖g‖/‖Ws x‖ | ‖g‖/‖resid‖ |
+|---|---|---|---|---|---|---|---|
+| **M0@50 λ = 0** | **0.2098** | — | **0.10101** | — | 1.05 1.05 1.17 1.18 1.17 1.16 | — | — |
+| M0@50 λ = 1e-5 | 0.2623 | — | 0.13361 | — | 1.06 1.06 1.07 1.11 1.15 1.12 | — | — |
+| M0@50 λ = 1e-4 | 0.4478 | — | 0.18811 | — | 1.05 1.06 1.01 1.10 1.12 1.08 | — | — |
+| M3ᶠ λ = 0, WD 1e-2 (s1/s2/s3) | 0.2098 ×3 | 0.00 / −0.00 / −0.00% | 0.10101 / 0.10090 / 0.10098 | 0.00 / −0.11 / −0.03% | ≈ M0 | 0 / 0.004 / 0.004 | 0 / 0.014 / 0.013 |
+| M3ᶠ λ = 0, WD 1e-1 | 0.2098 ×3 | −0.01% ×3 | 0.10097 / 0.10090 / 0.10100 | −0.05 / −0.11 / −0.02% | ≈ M0 | 0.003 / 0.003 / 0.004 | 0.011 / 0.011 / 0.014 |
+| M3ᶠ λ = 1e-5, WD 1e-2 | 0.2527 / 0.2490 / 0.2482 | −3.7 / −5.1 / −5.4% | 0.1292 / 0.1278 / 0.1274 | −3.3 / −4.3 / −4.6% | 1.05–1.14 | 0.059 / 0.060 / 0.069 | 0.17 / 0.17 / 0.20 |
+| M3ᶠ λ = 1e-5, WD 1e-1 | 0.2617 / 0.2608 / 0.2613 | −0.2 / −0.6 / −0.4% | 0.1334 / 0.1329 / 0.1331 | −0.2 / −0.5 / −0.4% | 1.06–1.14 | 0.020 ×3 | 0.057 ×3 |
+
+Held-out Gaussian NLL at λ = 0: M3ᶠ −7.207…−7.214 per step, against linear + η −7.210.
+
+🔴 **Verdict: no network beats the linear floor on the same inputs.**
+- **At λ = 0**, the network stays near its zero initialisation. Its output is 1–1.4% of the skip's
+  held-out residual, and it changes CRPS by 0.00 to −0.11% (noise level). The held-out loss does not
+  move.
+  - The same holds for every pilot: `n_hidden` 32, batch 64 at `LR 3e-3`, and `W = 10` (which
+    returned update 0 at `LR 1e-2`, and −0.09% CRPS / +0.03% loss at `3e-3`).
+  - §7c's +3.4% for a recurrent `:vrnn` on 1–50 TU is **not** reproduced by a feed-forward residual
+    on the matched h = 2 regressor. That gain may have come from its longer memory, not from
+    nonlinearity; this was not tested here.
+- **At λ = 1e-5**, the network "beats M0(λ)" by 3.7–5.4% (WD 1e-2), but **that gain is linear**.
+  - Regress g(x) on x over the training rows. The linear part explains **86–92%** of g's held-out
+    variance.
+  - Skip + linear part scores **0.2475–0.2510, better than skip + g** (0.2482–0.2527). The
+    nonlinear remainder hurts.
+  - At WD 1e-1 the linear share is 0.46.
+  - So the network is rebuilding the part of the least-squares map that ridge shrank (skip-residual
+    sd grows 2.7–3.6× in the middle bands at 1e-5, §11c). It stays 18–20% worse than the λ = 0 floor
+    (0.2098).
+  - This is gotcha #72(i)'s concern seen from the other side. A frozen ridge skip does not hold the
+    loop gain if the residual network is free to put it back. **Weight decay 1e-1 mostly stops it**:
+    the gain falls to −0.2…−0.6%.
+- The linear-share numbers come from `tools/m4_linfrac.jl`. Attribution in one sentence: **L1 (nonlinear mean)
+  is zero offline at h = 2 on 1–50 TU.**
+
+### 11b. Stage-2 smoke, 20 TU × 3 free-running (GPU, local IC extract), reference truncated to ≤ 74 TU
+
+`m4_screen.jl` and `m4_online_moments.jl` with `REF_TU_MAX=74`.
+- The reference null now has only 3 windows of 20 TU: flat 0.3–7%, >2900 1.9–12%, sd ratio
+  0.93–1.12, KS 0.28–0.72, dQ lag-1 on E[0,6] 0.73–0.75, dmean ±0.28 sd.
+- **All 15 runs are stable. The clamp/gate fired 0 times.**
+
+| run (replicas r1/r2/r3) | KS | Z16 sd ratio | >2900 | Z16 min | dQ lag-1 E06 | mean offset, worst QoI (sd) | sd ratio range, six QoIs |
+|---|---|---|---|---|---|---|---|
+| M0@50 λ = 0 | 0.90 / 0.55 / 0.69 | 1.38 / 1.02 / 1.15 | 13 / 1.8 / 8.0% | 679 / 689 / 807 | 0.75–0.76 | E06 −0.40 / −0.56 / −0.32 | 1.02–1.45 |
+| M0@50 λ = 1e-5 | 0.64 / 0.83 / 0.62 | 1.31 / 1.10 / 1.11 | 12 / 4.2 / 7.4% | 792 / 726 / 1027 | 0.72–0.74 | −0.07 / −0.27 / −0.19 | 1.01–1.37 |
+| M0@50 λ = 1e-4 | 0.96 / 0.65 / 0.43 | 1.41 / 1.19 / 1.10 | 11 / 9.4 / 6.3% | 740 / 739 / 1090 | **0.55–0.57** | −0.17 / −0.19 / +0.07 | 0.95–1.41 |
+| M3ᶠ λ = 0, WD 1e-1, s1 | 1.06 / 0.63 / 0.53 | 1.46 / 0.94 / 1.02 | 14 / 1.6 / 5.9% | 563 / 718 / 1012 | 0.75–0.76 | E06 −0.43 / −0.61 / −0.39 | 0.94–1.54 |
+| M3ᶠ λ = 1e-5, WD 1e-2, s2 | 0.72 / 0.72 / 0.58 | 1.39 / 1.18 / 1.02 | 14 / 4.5 / 4.1% | 828 / 466 / 884 | 0.74–0.75 | −0.05 / −0.26 / −0.12 | 1.02–1.41 |
+
+- **At h = 2 on 1–50 TU there is no large closed-loop bias to remove.** λ = 0 is within about
+  ±0.2 sd everywhere except E[0,6] (−0.3…−0.6 sd). λ = 1e-5 is at −0.05…−0.27 sd in all QoIs. So
+  the "zero crossing" is weak and lies between 0 and 1e-5 for E[0,6] only. The +1 sd bias of §7d
+  (h = 1, 1–10 TU) does not appear here.
+- λ = 1e-4 decorrelates the correction (lag-1 0.55 against the reference's 0.73–0.75) and shrinks
+  sd(dQ) to 0.65–0.88 of the reference's.
+- The M3ᶠ runs track their M0 replica by replica, as expected from 11a.
+  - λ = 0: the same pattern, slightly wider in r1.
+  - λ = 1e-5: the network restores sd(dQ) in the middle bands, 1.13–1.25 of the reference against
+    0.71–0.77 for M0(1e-5), and moves the level statistics little.
+- Every cell over-disperses in r1 (sd ratio 1.3–1.5). This is a replica effect common to all
+  models: the same seed and IC give the same excursion.
+- **Smoke only; no winner is claimed** (plan §7).
+
+### 11c. Is a white constant head adequate at each skip λ? (coordinator request; cf. §10g)
+
+This is the per-QoI ACF of the **skip-only (M0@50) residual**, teacher-forced on 52–74 TU, at lags
+1/2/5, with the residual sd in standardised dQ units. Standardisation is by the 1–50 TU training
+dQ statistics; QoIs are Z/E by band.
+
+| skip λ | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
+|---|---|---|---|---|---|---|
+| 0 | .01/−.01/.01 (sd .231) | .01/−.02/.01 (.589) | **.37**/.04/−.05 (.099) | **.27**/.10/−.04 (.052) | .02/**−.23**/.08 (.053) | .08/−.17/.08 (.059) |
+| 1e-5 | .21/.13/.08 (.250) | .06/−.02/.01 (.589) | **.88/.64/.20** (.265) | **.93/.79/.32** (.185) | .30/−.02/.16 (.060) | .47/.17/.03 (.084) |
+| 1e-4 | .61/.48/.43 (.332) | .27/.03/.04 (.616) | **.96/.86/.56** (.501) | **.97/.91/.63** (.359) | .71/.52/.53 (.085) | .76/.56/.28 (.119) |
+
+- **λ = 0**: the white head is adequate in the outer bands. The middle bands carry a weak lag-1
+  (0.27–0.37) that is gone by lag 2, and the small-scale band has a lag-2 lobe of −0.2.
+- **λ = 1e-5**: the white head is **not** adequate in Z/E[7,15]. The residual there is lag-1
+  0.88–0.93, and its sd is 2.7–3.6× the λ = 0 value. That persistent part is exactly what M3ᶠ's
+  network re-learns linearly in 11a.
+- **λ = 1e-4**: coloured in every QoI but E[0,6].
+- This matches §10g's LinReg ladder at h = 5: ridge re-colours the residual.
+- The numbers come from `tools/m4_residacf.jl`.
+
+### 11d. Stage-4 long free runs (100 TU × 1 replica)
+
+This is `m4_screen_long.jl` with `REF_TU_MAX=74`. Each chunk is scored against the 3-window
+(0–74 TU) reference band. The whole run is scored against the 0–74 TU reference marginal. Stage 4 is
+a pass/fail gate, not a selection score, and one replica is far short of the plan's 3.
+
+| run | chunk KS, 0–20 … 80–100 TU | chunk Z16 sd ratio | Z16 min | clamp | dQ lag-1 E06 | whole run: KS / sd ratio | mean offset per QoI (sd) |
+|---|---|---|---|---|---|---|---|
+| M0@50 λ = 0 | 0.90 0.84 1.04 0.49 1.05 | 1.38 0.77 1.17 0.97 0.85 | **341** (40–60 TU) | 0 | 0.75–0.76 | 0.65 / 1.06 | −0.22 **−0.49** −0.05 −0.01 −0.27 −0.24 |
+| M0@50 λ = 1e-5 | 0.64 0.65 1.18 0.41 0.92 | 1.31 0.93 1.04 1.15 0.84 | 716 | 0 | 0.73 | 0.59 / 1.08 | −0.20 −0.13 −0.18 −0.19 −0.25 −0.24 |
+| M3ᶠ λ = 1e-5, WD 1e-2, s2 | 0.72 0.50 1.31 0.57 0.81 | 1.39 1.09 1.12 1.18 1.07 | 483 (80–100 TU) | 0 | 0.73–0.75 | 0.68 / 1.19 | −0.15 −0.07 −0.19 −0.18 −0.26 −0.25 |
+| M3ᶠ λ = 0, WD 1e-1, s1 | 1.06 0.78 1.30 0.72 1.07 | 1.46 0.87 1.18 0.86 0.91 | **358** (40–60 TU) | 0 | 0.75–0.76 | 0.74 / 1.10 | −0.26 **−0.57** −0.08 −0.04 −0.30 −0.27 |
+
+- **All runs are stable, with 0 clamp over 100 TU.**
+- There is **no drift and no locked basin**. The offsets are a steady −0.1…−0.3 sd from about
+  20 TU on, and E[0,6] sits at −0.5 sd at λ = 0.
+- λ = 0 makes one deep Z[16,32] excursion, to 341 for M0 and 358 for M3ᶠ (reference minimum 721).
+  It happens in the same 40–60 TU chunk, as the shared seed and IC would predict.
+- M3ᶠ λ = 0 reproduces M0 λ = 0 chunk by chunk: same E[0,6] offset, KS 0.74 against 0.65.
+- The M3ᶠ λ = 1e-5 run sits between its two M0 neighbours and is somewhat wider (sd 1.19).
+- Nothing here separates M3ᶠ from M0.
+
+### 11e. Verdict for the next stage
+
+- **M3ᶠ does not pass stage 1 in any meaningful sense.**
+  - At λ = 0 it passes the "no worse than M0 on CRPS" gate trivially, because it *is* M0 to within
+    0.1%.
+  - At λ = 1e-5 its offline gain is the ridge being undone, not a nonlinear mean.
+  - Under the recommended kill criterion (D-13), the mini-D6 is expected to show no resolvable
+    paired difference for λ = 0 M3ᶠ. That is the "stop and talk to Rik" branch.
+- **If the mini-D6 is run anyway, it is cheap to include:**
+  - (i) the pair **M0@50 λ = 0 vs M3ᶠ λ = 0, WD 1e-1, s1** — the L1 test proper; expect a null;
+  - (ii) **M0@50 λ = 1e-5** — the smallest-bias M0 online here.
+  - M3ᶠ λ = 1e-5 WD 1e-2 is effectively a partially un-ridged linear map, a point *between* M0(0) and
+    M0(1e-5). It should not be read as L1.
+- Not done here and worth one line to Rik: M3ᶠ with **more memory** (W = 10 or a recurrence on the
+  h = 2 regressor) against the stacked-window linear floor (0.2074). That is the only place §7c's
+  +3.4% could live, and it would be a memory effect, not a nonlinear-mean effect.
+
+### 11f. Fits and runs (all under `exp_square_HIT/output/TO_LSTM/p4/`)
+
+- M0@50: `m0_50_h2_l0`, `m0_50_h2_l1e-05`, `m0_50_h2_l0.0001`, each with 20 TU replicas 1–3.
+  - `m0_50_h2_l0` and `m0_50_h2_l1e-05` also have a 100 TU replica 1.
+- M3ᶠ grid (12 fits): `m3f_l{0,1e-5}_wd{1e-2,1e-1}_s{1,2,3}`.
+  - 20 TU × 3 for `m3f_l0_wd1e-1_s1` and `m3f_l1e-5_wd1e-2_s2` (the median seeds by held-out CRPS).
+  - 100 TU r1 for `m3f_l1e-5_wd1e-2_s2`.
+- Pilots, not part of the grid:
+  - `m3f_l0_wd0_s1` (default stopping, 2000 updates);
+  - `pilot_a…j` (W, `n_hidden`, LR, batch, WD scans at λ = 0 / 1e-5);
+  - `probe_m0_l1e-4` (1 epoch; only its update-0 = M0(1e-4) scores are used).
+
+### 11g. Reproduce
+
+```bash
+cd lib/RikFlow
+# M0@50 (closed form, seconds)
+RH=2 LAMS=0,1e-5,1e-4 TRAIN_TU=50 SCORE_TU=52,74 OUTSUB=p4 TAGPFX=m0_50 \
+  julia --project=training exp_square_HIT/tools/m4_linear_eta.jl
+# one M3f fit (~1.5 min CPU); the grid is LAMBDA in {0,1e-5} x WD in {1e-2,1e-1} x SEED in {1,2,3}
+RIKFLOW_W_TAG=m3f_l0_wd1e-1_s1 RIKFLOW_W_OUTSUB=p4 RIKFLOW_W_ARCH=dense RIKFLOW_W_NZ=0 RIKFLOW_W_NH=16 \
+RIKFLOW_W_W=1 RIKFLOW_W_H=2 RIKFLOW_W_HIST_VAR=q_star_q RIKFLOW_W_EMISSION=constant RIKFLOW_W_SEEDHEAD=1 \
+RIKFLOW_W_LAMBDA=0 RIKFLOW_W_WD=1e-1 RIKFLOW_W_WD_EXCLUDE=bd,Araw RIKFLOW_W_SEED=1 \
+RIKFLOW_W_TRAIN_TU=50 RIKFLOW_W_SCORE_TU=52,74 RIKFLOW_W_BATCH=256 RIKFLOW_W_VAL_EVERY=100 \
+RIKFLOW_W_PATIENCE=30 RIKFLOW_W_STOP_PATIENCE=80 RIKFLOW_W_STOP_WINDOW=20000 RIKFLOW_W_EPOCHS=400 \
+  julia --project=training exp_square_HIT/tools/m4_window_fit.jl
+# online smoke (GPU, ~3.5 min alone, ~7 min with 3 concurrent); TSIM=100 for stage 4
+JULIA_CUDA_SOFT_MEMORY_LIMIT=4GiB RIKFLOW_ONLINE_TSIM=20 \
+RIKFLOW_ONLINE_IC=$PWD/exp_square_HIT/output/online_ic_data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2 \
+RIKFLOW_M4_MODEL_DIR=$PWD/exp_square_HIT/output/TO_LSTM/p4/m3f_l0_wd1e-1_s1 \
+  script -qfec "julia --project=. exp_square_HIT/12_online_StochLSTM.jl 2 1" log
+REF_TU_MAX=74 TSCREEN=20 M4_SCREEN_SUBDIR=p4 julia --project=analysis analysis/m4_screen.jl
+REF_TU_MAX=74 julia --project=analysis analysis/m4_online_moments.jl p4/m0_50_h2_l0 p4/m3f_l0_wd1e-1_s1
+REF_TU_MAX=74 julia --project=analysis analysis/m4_screen_long.jl p4/m0_50_h2_l1e-05 p4/m3f_l1e-5_wd1e-2_s2
+```
+
+```bash
+# the linear share of g (11a) and the skip-residual ACF (11c); both hold the held-out block at 52-74 TU
+julia --project=training exp_square_HIT/tools/m4_linfrac.jl m3f_l1e-5_wd1e-2_s1 m3f_l0_wd1e-1_s2
+julia --project=training exp_square_HIT/tools/m4_residacf.jl m0_50_h2_l0 m0_50_h2_l1e-05 m0_50_h2_l0.0001
+```
+
+- **Code added this step (additive; all defaults reproduce old runs):**
+  - `LSTMSpec` accepts `arch = :dense, n_latent = 0`, and refuses it without an emission head or
+    with `posterior = :xy`.
+  - `train_stochlstm(...; decay_exclude)`.
+  - `m4_window_fit.jl`: `SCORE_TU`, `OUTSUB`, `WD_EXCLUDE`; prints the train, validation and score
+    windows, the M0(λ) = update-0 scores, ‖g‖ ratios, and the stacked full-regressor floor.
+  - `m4_linear_eta.jl`: `TRAIN_TU`, `SCORE_TU`, `OUTSUB`, `TAGPFX`.
+  - `m4_diag_fit.jl`: `SCORE_TU`.
+  - New: `tools/m4_linfrac.jl` and `tools/m4_residacf.jl`.
+  - `m4_screen.jl`, `m4_screen_long.jl`, `m4_online_moments.jl`: `REF_TU_MAX`.
+  - Test V71: 46 new tests. The Lux suite is **841/841**; the stdlib suite is 2071 pass / 8 broken.
+
+## 12. M0ᶜ-ridge: LinReg7 + AR(2) residual, mini-D6 (2026-09-28)
+
+**Question** (from §10g/§10h): LinReg7's residual is coloured, and its white Σ under-delivers kernel-weighted
+low-frequency power by ~3×. Does sampling that residual as a stationary AR(2) fix LinReg7's D6
+under-dispersion (spread–skill median 0.559) without costing CRPS or stability?
+
+**Answer.** It fixes the calibration and improves CRPS by a clearly resolved margin. But it fails the
+declared gate-census clause: one member of 230 collapsed to a low-energy state. There is also a
+low-energy tail across the ensemble (11 vs 0 members with a QoI below half the truth at 1 TU).
+**Verdict: not a pass as declared** (four of five clauses met). It is a strong candidate whose one
+failure is a stability signal, and that signal must be run down before promotion.
+
+### 12a. Code
+
+- **`src/time_series_methods.jl`, `LinReg`: optional AR(p ≤ 2) residual.** The model is
+  η_n = μ_η + z_n, with z_n = Σ φ_k ⊙ z_{n−k} + ξ_n and ξ ~ N(0, Σ_ξ). μ_η is `mean(stoch_distr)`. The AR is
+  diagonal. It lives in scaled units and enters exactly where the white draw enters.
+  - Two new optional JLD2 keys: `ar_phi` (p × 6) and `ar_sigma_xi` (6 × 6).
+  - Malformed or non-stationary AR keys are refused.
+  - **Without the keys, the behaviour is bit-identical, RNG stream included.** The white branch is the same
+    `rand(rng, stoch_distr)` call. It now sits inside `draw_eta`.
+  - The AR path makes one `MvNormal(0, Σ_ξ)` draw per step, the same number of normals as the white path.
+    So the member seeds give common random numbers across the two variants.
+- **Warm start.** The replay is unchanged (dQ is emitted verbatim).
+  - On the last p warm-up steps whose history is full, the model also computes the realised residual,
+    `scale(q* + dQ) − c[x; 1] − μ_η`, from its own history and pushes it into the AR state.
+  - Fallback: if fewer than p lags were filled (warm-up shorter than h + p), the state is replaced at the
+    first prediction by 2000 burn-in steps of the recursion. This never happens in D6 (nwarm = 100).
+- **Gate.** When `TURBULENCE_GATE` zeroes dQ, the AR state still advances. The draw comes before the gate, so
+  the member's stream is not shifted.
+- **`tools/run_d6.jl`** records `ar_order` and `ar_phi` in every member file and prints them. The run
+  identity already separates the variants, because `model_name` is the model directory
+  (`LinReg7` vs `LinReg7_ar2`).
+
+### 12b. Variants built
+
+Built with `exp_square_HIT/tools/lrs_ar_variant.jl`.
+- Each variant directory holds a **byte copy of LinReg7's `LinReg.jld2`** plus the keys `ar_phi`,
+  `ar_sigma_xi` and `ar_provenance`, and a copy of `parameters.jld2`. Every source key was checked equal.
+- The AR is fitted to LinReg7's own scaled residual on steps 400–4000 (1–10 TU), evaluated as deployed.
+- Σ_ξ = D R D:
+  - R is the lag-0 correlation of the implied innovations (off-diagonal −0.39…0.76).
+  - D matches the AR's stationary marginal variance to var(z).
+- `var(z)` equals the deployed white Σ's diagonal to ≤ 0.5%.
+
+**`LinReg7_ar2`** (`ar2_ls` on ACF lags 1–20):
+
+| QoI | ρ₁(resid) | φ₁ | φ₂ | poles \|·\| | σ_ξ/sd(z) |
+|---|---|---|---|---|---|
+| Z[0,6] | 0.772 | 0.446 | 0.358 | 0.862, 0.416 | 0.672 |
+| E[0,6] | 0.438 | 0.451 | −0.047 | 0.290, 0.162 | 0.901 |
+| Z[7,15] | 0.948 | 1.221 | −0.340 | 0.792, 0.429 | 0.387 |
+| E[7,15] | 0.967 | 1.608 | −0.669 | 0.818, 0.818 | 0.200 |
+| Z[16,32] | 0.810 | 0.389 | 0.427 | 0.876, 0.487 | 0.665 |
+| E[16,32] | 0.854 | 0.833 | −0.054 | 0.762, 0.071 | 0.612 |
+
+All poles are ≤ 0.88: well inside the unit circle, unlike the likelihood fits of §10h(2).
+
+**Kernel-weighted power, P/P_white (full 6×6 kernel, raw units):**
+- AR(2): **2.04–2.99**. The data residual gives 2.72–3.18. This reproduces §10h (2.09–3.02).
+- As built (Σ_ξ against the deployed white Σ): 1.92–3.34.
+- Diagonal kernel: AR(2) gives 8.4 / 2.2 / 6.8 / 9.9 / 7.2 / 6.8, identical to §10h.
+
+`LinReg7_ar1` (φ = ρ₁) is also built. Its full-kernel power is 2.35–4.23, overshooting in the middle bands
+as §10h found.
+
+**Offline sanity.** The deployed `RikFlow.LinReg` was run on the new file, teacher-forced on 1–10 TU.
+- The warm-start state equals the data residual to 1.3e-15.
+- The model noise ACF (lags 1/2/5/10) reproduces the fitted AR ACF to ≤ 0.05. Examples: Z[7,15] 0.91 0.76
+  0.36 0.10 against the AR's 0.91 0.77 0.41 0.13; E[7,15] 0.96 0.87 0.49 0.02 against 0.96 0.88 0.53 0.10.
+- **Marginal spread is calibrated**: sd(model)/sd(resid) = 0.98–1.03.
+- The fit's lag-1 is below the residual's in the middle bands (0.91/0.96 against 0.95/0.97), because it is an
+  ACF least-squares fit over 20 lags. So the data's one-step innovation under the fitted φ is smaller than
+  σ_ξ:
+  - xi_data/σ_ξ = 1.01 / 1.00 / **0.62 / 0.72** / 1.04 / 0.84.
+  - So **one-step spread is over-dispersed ~1.4–1.6× in Z/E[7,15]**, by construction. The marginal
+    variance, not the one-step variance, was matched.
+
+### 12c. Tests
+
+- New `test/test_linreg_ar.jl` (V73): **84/84**. It includes `test/legacy_linreg.jl`, a verbatim copy of the
+  pre-AR `LinReg`, as the oracle. It covers:
+  - bit-identity with the legacy code, on synthetic files and on the archived LinReg1/LinReg7 files: dQ,
+    q_hist, and the RNG position, with gate firings included;
+  - that the AR(2) path gives the AR ACF, marginal variance and Σ_ξ;
+  - the warm start from the replay, the "replay draws nothing" property, the first-step recursion, and the
+    short-warm-up fallback (with the RNG consumption checked);
+  - that the gate zeroes dQ, still advances the state, and does not shift the stream;
+  - the file round trip, the built variants, and that malformed or non-stationary AR is refused.
+- `test_sources.jl`: **41 pass, 1 broken** (pre-existing). V38 now accepts `draw_eta(` as the draw site.
+- `test_d6_ics/lstm/score.jl`: 508 pass, 1 broken.
+- **Online, same draws.** The fresh `D6mini_LinReg7` run was compared with the existing full-length
+  `D6_LinReg7` run: same member seeds, 95 members whose full run ends by 74 TU.
+  - dQ agrees to a max relative difference of **6.6e-9** over all 500 columns.
+  - It is not bitwise equal: GPU round-off, and the IC's recomputed QoIs already differ at 3.5e-16.
+  - A different RNG stream would give O(1) differences from the first forecast column. So the online no-AR
+    path makes the same draws as the pre-AR code.
+- The warm-up is bit-identical in **230/230** members of each run (the node-side check in `run_d6.jl`).
+
+### 12d. Mini-D6
+
+- Setup: selection block, K = 46 (ordinals 88–133), M = 5, nlead = 400, the same member seeds. Paired by IC
+  with common random numbers.
+- Both runs took ~19–47 s per member depending on how many other sims were on the card.
+- No member diverged in either run.
+
+**Primary score** (`score_d6.jl --paired D6mini_LinReg7_ar2 D6mini_LinReg7`: fair CRPS, leads ≤ 0.5 TU, 6
+standardised bands):
+
+| | A = LinReg7_ar2 | B = LinReg7 | A − B | 90% IC-block CI |
+|---|---|---|---|---|
+| CRPS | 0.17966 | 0.19870 | **−0.01904 (−9.6%)** | **[−0.02766, −0.01209]** |
+
+Per band A − B: −0.021 / −0.015 / −0.018 / −0.019 / −0.021 / −0.020. The improvement is in every band.
+
+**Spread–skill on the level q** (30 cells, 6 bands × 5 leads 25–400 steps; S7 band [0.8, 1.25]):
+
+| | median | in band | median \|log r\| | per-band medians (Z0 E0 Z7 E7 Z16 E16) |
+|---|---|---|---|---|
+| LinReg7 | 0.589 | 2/30 | 0.529 | 0.57 0.69 0.54 0.54 0.52 0.52 |
+| **LinReg7_ar2** | **1.127** | **26/30** | **0.119** | 1.17 1.04 1.15 1.14 1.08 1.08 |
+
+- The 4 out-of-band AR(2) cells are all **over**-dispersed (1.26–1.30), in Z/E[7,15] and E[16,32], at
+  leads 25–100. This fits the middle-band one-step over-dispersion of 12b.
+- LinReg7's own mini-D6 median, 0.589, agrees with the full D6 value of 0.559.
+
+**Online dQ ACF against tracked on the same steps.** 215 members / 43 ICs whose run ends by 74 TU; lags 1 / 2 / 5 / 20.
+
+| QoI | tracked | LinReg7 | **LinReg7_ar2** | sd(dQ) on/trk, LR7 / ar2 |
+|---|---|---|---|---|
+| Z[0,6] | 0.93 0.88 0.72 0.32 | 0.31 0.45 0.33 0.14 | **0.84 0.82 0.63 0.20** | 0.84 / 1.00 |
+| E[0,6] | 0.73 0.53 0.21 −0.01 | 0.38 0.34 0.14 0.00 | **0.71 0.54 0.23 0.00** | 0.99 / 1.16 |
+| Z[7,15] | 0.97 0.91 0.66 0.17 | −0.02 0.25 0.20 0.08 | **0.93 0.86 0.67 0.17** | 1.17 / 1.09 |
+| E[7,15] | 0.98 0.95 0.76 0.15 | −0.01 0.31 0.23 0.07 | **0.98 0.94 0.74 0.12** | 0.99 / 1.05 |
+| Z[16,32] | 0.99 0.97 0.95 0.82 | 0.89 0.91 0.89 0.78 | **0.97 0.97 0.94 0.80** | 1.12 / 1.32 |
+| E[16,32] | 0.98 0.96 0.90 0.76 | 0.78 0.83 0.80 0.70 | **0.96 0.95 0.90 0.75** | 1.13 / 1.30 |
+
+- AR(2) restores the correction's persistence: lag 1 is within 0.09 of tracked in every QoI.
+- The lag 1 < lag 2 signature of §10h(3) is gone.
+- The cost is a larger dQ amplitude in the small-scale bands (1.30× tracked, against 1.13×).
+
+**Stability and gate census.**
+
+| | diverged | gate firings (forecast steps) | members with a QoI < 0.5× truth at lead 1 TU | mean level bias at lead 1 TU (sd units) |
+|---|---|---|---|---|
+| LinReg7 | 0/230 | 0 / 92000 | 0 / 215 | −0.04 … −0.07 |
+| LinReg7_ar2 | 0/230 | **3 / 92000** (1 member) | **11 / 215** | **−0.05 … −0.16** |
+
+The gate firings are all in `ic260_m1` (t_k = 64.75 TU), at leads 397–400, all through E[16,32] = 0.0097–0.0100.
+- That member drained its energy: Z[0,6] 316 against the truth's 860, Z[16,32] 260 against 1640.
+- Its same-seed LinReg7 twin also drifted low (Z[0,6] 675, E[16,32] 0.036) but stayed above the gate.
+- The AR's extra low-frequency power carries the same draws further. The bias columns and the 11-member
+  low tail show that this is a skewed low-energy tail, not one bad member.
+- As `TURBULENCE_GATE`'s docstring says, a firing on HIT means the run has left the attractor.
+
+### 12e. Verdict against the pass criterion (declared before looking)
+
+| clause | result | |
+|---|---|---|
+| spread–skill median closer to 1 | 0.589 → 1.127 (\|log\| 0.529 → 0.119) | ✅ |
+| more cells in [0.8, 1.25] | 2 → 26 of 30 | ✅ |
+| paired CRPS: 90% CI upper bound ≤ +0.005 | −0.0190, CI [−0.0277, −0.0121] | ✅ (A better, resolved) |
+| no diverged members | 0 / 230 | ✅ |
+| gate census not worse | 0 → 3 firings (1 member) | ❌ |
+
+**Not a pass as declared.**
+- Calibration and CRPS improve by far more than the power analysis could resolve (≈ 0.016; the observed
+  effect is 0.019 with a CI clear of 0).
+- The failing clause is small in count, but it is backed by a real low-energy tail (11 vs 0 members at
+  < 0.5× truth) and a 2–3× larger mean negative level bias at 1 TU.
+- This is the loop-gain risk §10h flagged, in a milder form: the poles are stationary, but more power at low
+  frequency lets closed-loop energy drain further.
+
+Next checks before promoting M0ᶜ-ridge:
+- (i) Look at the low tail over the full 3 TU D6 horizon: does it grow or recover?
+- (ii) Test a variance-matched AR whose one-step σ_ξ is also calibrated in the middle bands, which would
+  remove the 1.26–1.30 over-dispersed cells. For example, a Yule–Walker lag-1-exact AR(2), or ar2_ls with a
+  lag-1 constraint.
+- (iii) Check whether the tail is a property of the E[16,32] channel. E[16,32] parks low in the gate
+  failures here, as in the 2026-09-15 runs.
+
+⚠️ The selection-block forecasts read the truth up to 75.25 TU inside the scorer. That is in the 74–76 TU
+embargo, not the confirmation block, and is the plan §7 protocol. Every analysis in this section beyond the
+scorer is restricted to runs ending by 74 TU.
+
+### 12e′. The AR(1) comparator (`LinReg7_ar1`), scored after the verdict (2026-09-28)
+
+Same mini-D6: selection block, K = 46, M = 5, nlead 400, same seeds. AR(1) at each QoI's residual lag 1
+(φ = 0.772 0.438 0.948 0.967 0.810 0.854), with the marginal variance matched.
+
+| | LinReg7 | **LinReg7_ar1** | LinReg7_ar2 |
+|---|---|---|---|
+| paired CRPS vs LinReg7 | — | **−0.0120 (−6.0%)**, 90% CI [−0.0225, −0.0049] | −0.0190 (−9.6%), [−0.0277, −0.0121] |
+| spread–skill on q: median / in [0.8, 1.25] | 0.589 / 2 of 30 | **≈ 1.14 / 21 of 30** (9 misses, all over-dispersed at 1.27–1.32) | 1.127 / 26 of 30 |
+| diverged | 0 / 230 | 0 / 230 | 0 / 230 |
+| gate firings (forecast steps) | 0 | **19 / 92000** | 3 / 92000 |
+| dQ lag 5, Z/E[7,15] (tracked 0.66 / 0.76) | 0.20 / 0.23 | **0.82 / 0.88** (too persistent) | 0.67 / 0.74 |
+| sd(dQ) on/trk, Z/E[7,15] | 1.17 / 0.99 | 1.23 / 1.23 | 1.09 / 1.05 |
+
+**Reading.**
+- AR(1) is better than LinReg7 on CRPS and calibration, but worse than AR(2) on every row.
+- It overshoots the middle bands' persistence at lags ≥ 5. The negative lobe that AR(2) reproduces is missing
+  (§10d: AR(1) has 3.7–4.2× white power against the data's 3.1–3.2).
+- It fires the gate 6× as often as AR(2).
+- This confirms the §12e reading: the low-energy tail grows with the noise's low-frequency power. AR(2) is the
+  better of the two; neither passes the gate clause as declared.
+- Scored by the main session. The logs `score_ar1_paired.log`, `score_ar1_main.log` and `census_ar.log` are in
+  job scratch.
+
+### 12f. Reproduce
+
+```bash
+cd lib/RikFlow
+# variants (+ fit tables, kernel power, offline sanity); --report re-prints without writing
+julia --startup-file=no --project=training exp_square_HIT/tools/lrs_ar_variant.jl LinReg7 2 1
+# tests
+julia --project=test -e 'using TestItemRunner; TestItemRunner.run_tests("test"; filter = t -> endswith(t.filename, "test_linreg_ar.jl"))'
+# mini-D6 (from exp_square_HIT/), once per V in LinReg7, LinReg7_ar2
+JULIA_CUDA_SOFT_MEMORY_LIMIT=4GiB D6_CLOSURE=lrs D6_MODEL=$PWD/output/TO_LRS/$V/LinReg.jld2 \
+  D6_BLOCK=selection D6_MEMBERS=5 D6_NLEAD=400 D6_OUT=$PWD/../analysis/output/D6mini_$V \
+  julia --startup-file=no --project=.. tools/run_d6.jl --all
+# scoring
+julia --startup-file=no --project=analysis analysis/score_d6.jl --paired analysis/output/D6mini_LinReg7_ar2 analysis/output/D6mini_LinReg7
+D6_OUT=analysis/output/D6mini_LinReg7_ar2 julia --startup-file=no --project=analysis analysis/score_d6.jl   # and _LinReg7
+julia --startup-file=no --project=training analysis/m0c_ar_online.jl D6mini_LinReg7 D6mini_LinReg7_ar2 --vs-full D6_LinReg7
+```
+The logs are in the job scratch: `lrs_ar_variant*.log`, `logs/D6mini_*.log`, `score_*.log`, `m0c_ar_online.log`.
+The level-bias and low-tail census is a short ad-hoc script: for runs ending by 74 TU, it computes
+(member − truth)/sd(truth over 1–74 TU) at leads 100/200/400.

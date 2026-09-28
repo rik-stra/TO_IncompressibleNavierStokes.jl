@@ -1,0 +1,82 @@
+# Snellius grid, plan step 1+ (2026-09-28): the ONE declarative spec the fit grid is generated from.
+#
+#     julia --startup-file=no exp_square_HIT/tools/p4grid_generate.jl      # from lib/RikFlow
+#
+# writes batch_scripts/p4grid/fits.csv (committed), one array task per row of it. Edit THIS file, rerun
+# the generator, commit both. Never hand-edit fits.csv, never hand-name an output directory.
+#
+# ⚠️⚠️ PROVISIONAL VALUES. Every number under [m3f.hN] / [m0v.hN] is a placeholder (coordinator,
+# 2026-09-28): the grid VALUES are expected to change, the scripts and the pipeline are not.
+#   * lambda: the "current values" {0, 1e-5, 1e-4} for every h. Stage 0,
+#     `analysis/skip_lambda_calibration.jl`, proposes per-h ladders by matching LinReg's effective
+#     dof: h = 2 [0, 2e-5, 1e-3], h = 3 [0, 8e-6, 6e-4], h = 5 [0, 3e-6, 3e-4]
+#     (0 / LinReg2-equivalent / LinReg7-equivalent). Rik picks; swap them in below.
+#   * wd, nh: to be set from Agent C's h = 2 pilot results (results_LSTMS.md §11, not yet written).
+#   * The M4 path's lambda is `lambda N` on the standardised design (dQ target), NOT LinReg's lambda:
+#     M4 1e-5 ~ LinReg 0.03, M4 1e-4 ~ LinReg 0.4, M4 3e-4 ~ LinReg 1 (LinReg7) at h = 5.
+
+[meta]
+provisional = true
+outsub = "p4grid"            # every fit lands in output/TO_LSTM/p4grid/<tag>
+train_tu = 50                # 1-50 TU training window (plan §7, existence stage)
+score_tu = "52,74"           # held-out = the selection block; 🔒 nothing past 74 TU is scored
+seeds = [1, 2, 3]            # fit seeds, all cells (plan: >= 3)
+
+# ---------------------------------------------------------------------------------------------------
+# M3ᶠ = frozen ridge skip + small residual MLP (tools/m4_window_fit.jl).
+# `env` is copied VERBATIM from Agent C's h = 2 fits (output/TO_LSTM/p4/m3f_*; its fit.sh + grid.sh,
+# 2026-09-28): dense arch, NZ = 0, W = 1, level history HIST_VAR = q_star_q, constant emission seeded
+# at the linear residual covariance, weight decay exempting the noise head. The generator adds
+# TAG, OUTSUB, H, LAMBDA, WD, NH, SEED, TRAIN_TU, SCORE_TU per row.
+# ⚠️ At lambda = 1e-5 every one of C's fits stopped at the EPOCHS = 400 cap ("(cap)", best update within
+# 200 of the last) -- still improving. Raise EPOCHS here if the pilot says so.
+[m3f]
+tool = "m4_window_fit"
+env = { RIKFLOW_W_ARCH = "dense", RIKFLOW_W_NZ = "0", RIKFLOW_W_W = "1", RIKFLOW_W_HIST_VAR = "q_star_q", RIKFLOW_W_EMISSION = "constant", RIKFLOW_W_SEEDHEAD = "1", RIKFLOW_W_WD_EXCLUDE = "bd,Araw", RIKFLOW_W_BATCH = "256", RIKFLOW_W_VAL_EVERY = "100", RIKFLOW_W_PATIENCE = "30", RIKFLOW_W_STOP_PATIENCE = "80", RIKFLOW_W_STOP_WINDOW = "20000", RIKFLOW_W_EPOCHS = "400" }
+
+[m3f.h2]
+lambda = [0, 1e-5, 1e-4]     # PROVISIONAL (stage-0 proposal: [0, 2e-5, 1e-3])
+wd = [1e-2, 1e-1]            # PROVISIONAL (Agent C's pilot)
+nh = [16]                    # PROVISIONAL (capacity)
+
+[m3f.h3]
+lambda = [0, 1e-5, 1e-4]     # PROVISIONAL (stage-0 proposal: [0, 8e-6, 6e-4])
+wd = [1e-2, 1e-1]
+nh = [16]
+
+[m3f.h5]
+lambda = [0, 1e-5, 1e-4]     # PROVISIONAL (stage-0 proposal: [0, 3e-6, 3e-4])
+wd = [1e-2, 1e-1]
+nh = [16]
+
+# ---------------------------------------------------------------------------------------------------
+# M0ᵛ = frozen least-squares skip + LSTM-driven state-dependent noise scale: the `r3_lin_sd_h2` recipe
+# (results_LSTMS.md §7c/§7d, §9) through tools/m4_diag_fit.jl, on 1-50 TU. `V1` frozen at 0, so the
+# mean IS the linear map and only the log-scale is learned.
+# 🔴 m4_diag_fit.jl has NO skip-lambda option (its skip is always least squares) and NO output-subdir
+# option (always output/TO_LSTM/diag/<tag>). The generator routes the output with
+# TAG = ../p4grid/<tag>; rows with lambda > 0 are emitted with status `blocked:...` and are not run
+# until a RIKFLOW_D_LAMBDA exists (Agent C's file -- not added here).
+[m0v]
+tool = "m4_diag_fit"
+env = { RIKFLOW_D_ARCH = "lstm", RIKFLOW_D_EMISSION = "state_dependent", RIKFLOW_D_SKIP = "1", RIKFLOW_D_FREEZE = "Ws,V1", RIKFLOW_D_SEEDHEAD = "1" }
+
+[m0v.h2]
+lambda = [0, 1e-5]           # PROVISIONAL; lambda > 0 blocked (see above)
+nh = [16]
+
+[m0v.h3]
+lambda = [0, 1e-5]
+nh = [16]
+
+[m0v.h5]
+lambda = [0, 1e-5]
+nh = [16]
+
+# ---------------------------------------------------------------------------------------------------
+# M0@50 = linear skip + constant eta, closed form (tools/m4_linear_eta.jl). One row per (h, lambda)
+# that ANY cell above uses -- the matched baseline, derived, never listed by hand. Deterministic: no
+# seed. Output name is the tool's own, <tagpfx>_h<h>_l<%g lambda>.
+[m0]
+tool = "m4_linear_eta"
+tagpfx = "m0_50"
