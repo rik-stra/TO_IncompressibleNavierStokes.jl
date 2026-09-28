@@ -50,10 +50,12 @@ function resolve_lstm_model(spec::AbstractString; root::AbstractString)
     s = strip(spec)
     isempty(s) && error("D6_CLOSURE=lstm needs D6_MODEL: a fit directory under $root " *
                         "(e.g. diag/r3_lin_sd_h2) or a StochLSTM_seed<s>.jld2 file")
-    p = ispath(s) ? abspath(s) : joinpath(root, s)
+    # `normpath`: on Windows `joinpath(root, "diag/fitA")` keeps the '/', so without it `file`
+    # and `dir` carry mixed separators and compare unequal to the same path built by `joinpath`
+    p = normpath(ispath(s) ? abspath(s) : joinpath(root, s))
     ispath(p) || error("D6_MODEL = $(repr(s)) is neither a path nor a directory under $root")
     if isdir(p)
-        dir = rstrip(p, '/')
+        dir = rstrip(p, ['/', '\\'])
         summary = joinpath(dir, "seed_summary.jld2")
         deploy_seed = isfile(summary) ? Int(load(summary, "median_seed")) : 1
         file = joinpath(dir, "StochLSTM_seed$(deploy_seed).jld2")
@@ -65,8 +67,10 @@ function resolve_lstm_model(spec::AbstractString; root::AbstractString)
         m = match(r"StochLSTM_seed(\d+)\.jld2$", basename(p))
         deploy_seed = m === nothing ? 0 : parse(Int, m[1])
     end
-    rroot = rstrip(abspath(root), '/')
-    name = startswith(dir, rroot * "/") ? relpath(dir, rroot) : basename(dir)
+    # `name` is written into D6 output, so it uses '/' on every platform
+    rroot = rstrip(normpath(abspath(root)), ['/', '\\'])
+    name = startswith(dir, rroot * Base.Filesystem.path_separator) ?
+           replace(relpath(dir, rroot), '\\' => '/') : basename(dir)
     return (; file, dir, deploy_seed, name)
 end
 
