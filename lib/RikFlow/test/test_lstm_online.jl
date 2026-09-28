@@ -52,6 +52,50 @@
         dQ = randn(rng, Float64, nq, nwarm) ./ 10
         return q_star, dQ
     end
+
+    # --- V61, window mode -----------------------------------------------------------------
+    module WindowFix
+    using Random
+    import ..LSTMSpec, ..HistorySpec, ..NQ, ..weights, ..stream, ..StochLSTM,
+           ..get_next_item_timeseries, ..scale_input, ..scale_output, ..scaling, ..LSTMState,
+           ..lstm_step!
+
+    const W = 4
+    const NWARM = 5
+    const N = 14
+    const SEED = 77
+
+    # q*-only input, [q*^n; 1], the simple window model
+    spec(arch = :vrnn; emission = :none, window = W) =
+        LSTMSpec(; hist = HistorySpec(; h = 0, n_qoi = NQ, hist_var = :q_star),
+                 n_hidden = 4, n_latent = 3, n_encoder = 0, arch, emission, window)
+
+    "Run the closure over a synthetic stream; returns (closure, outputs, q_star, dQ warm-up)."
+    function run(spec; seed = SEED, nwarm = NWARM, n = N)
+        w = weights(spec)
+        q_star, dQ = stream(; n, nwarm)
+        m = StochLSTM(spec, w, scaling(); spinnup_data = dQ, rng = Xoshiro(seed), gate = 0.0)
+        got = [get_next_item_timeseries(m, q_star[:, k]) for k in 1:n]
+        return m, w, got, q_star
+    end
+
+    "The scaled input row [q*; 1] the closure builds, in the model's precision."
+    xrow(q_star, k) = Float32.(vcat(vec(scale_input(q_star[:, k], scaling().in_scaling)), 1))
+
+    "Reference: fresh state per prediction, replaying the given per-step draws."
+    function reference(spec, w, q_star, eps; nwarm = NWARM, n = N)
+        out = Vector{Vector{Float64}}()
+        for k in (nwarm + 1):n
+            st = LSTMState(spec, Float32)
+            for t in (k - W + 1):k
+                lstm_step!(st, w, spec, xrow(q_star, t); eps = eps[t])
+            end
+            qhat = Float64.(vec(scale_output(st.y, scaling().out_scaling)))
+            push!(out, qhat .- q_star[:, k])
+        end
+        return out
+    end
+    end # WindowFix
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -235,4 +279,202 @@ end
 
     c = run(true, 1)
     @test c.scratch != a.scratch      # an emission draw really was added
+end
+
+# ---------------------------------------------------------------------------------------------
+# V61 -- window mode: reset + replay of the last W inputs, latent draws tied to the physical step
+# ---------------------------------------------------------------------------------------------
+
+@testitem "V61 window mode: each prediction is a reset + replay with the step's own draw" default_imports = false setup = [OnlineFix] begin
+    using Test
+    using Random
+    WF = OnlineFix.WindowFix
+
+    spec = WF.spec(:vrnn)
+    m, w, got, q_star = WF.run(spec)
+    nz = spec.n_latent
+
+    # the draws the closure must have made: none during the warm-up (eps = 0 there), then
+    # n_latent scalar draws per predicted step, in step order
+    rng = Xoshiro(WF.SEED)
+    eps = [zeros(Float32, nz) for _ in 1:WF.N]
+    for k in (WF.NWARM + 1):WF.N
+        eps[k] = [Float32(randn(rng)) for _ in 1:nz]
+    end
+    ref = WF.reference(spec, w, q_star, eps)
+    for (j, k) in enumerate((WF.NWARM + 1):WF.N)
+        @test got[k] ≈ ref[j] rtol = 1e-6
+    end
+
+    # 🔑 the tying itself, read off the closure: the stored draws ARE the last W steps' draws
+    for (j, t) in enumerate((WF.N - WF.W + 1):WF.N)
+        @test m.ewin[:, j] == eps[t]
+    end
+
+    # 🔴 positive control: re-drawing every step's latent in every window (the bug this mode must
+    # not have) gives different predictions, so the agreement above is not vacuous
+    rng2 = Xoshiro(WF.SEED)
+    redrawn = [[Float32(randn(rng2)) for _ in 1:nz] for _ in 1:WF.N]
+    alt = WF.reference(spec, w, q_star, redrawn)
+    @test maximum(maximum(abs, got[k] .- alt[j]) for (j, k) in enumerate((WF.NWARM + 1):WF.N)) > 1e-3
+end
+
+@testitem "V61 window mode: the output depends on exactly the last W inputs" default_imports = false setup = [OnlineFix] begin
+    using Test
+    using Random
+    WF = OnlineFix.WindowFix
+
+    # deterministic path (`:lstm` + emission mean), so only the inputs matter
+    spec = WF.spec(:lstm; emission = :constant)
+    w = OnlineFix.weights(spec)
+    q_star, dQ = OnlineFix.stream(; n = WF.N, nwarm = WF.NWARM)
+    function last_out(qs)
+        m = OnlineFix.StochLSTM(spec, w, OnlineFix.scaling(); spinnup_data = dQ,
+                                rng = Xoshiro(1), gate = 0.0, stochastic = false)
+        return [OnlineFix.get_next_item_timeseries(m, qs[:, k]) for k in 1:WF.N][end]
+    end
+    base = last_out(q_star)
+
+    # changing an input OUTSIDE the last window changes nothing (the state was reset) ...
+    q1 = copy(q_star); q1[:, WF.N - WF.W] .+= 0.5
+    @test last_out(q1) == base
+    # ... and changing the OLDEST input inside it does (the replay really covers W steps)
+    q2 = copy(q_star); q2[:, WF.N - WF.W + 1] .+= 0.5
+    @test maximum(abs, last_out(q2) .- base) > 1e-4
+end
+
+@testitem "V61 window mode: the warm-up draws nothing and must fill the window" default_imports = false setup = [OnlineFix] begin
+    using Test
+    using Random
+    WF = OnlineFix.WindowFix
+
+    spec = WF.spec(:vrnn)
+    w = OnlineFix.weights(spec)
+    q_star, dQ = OnlineFix.stream(; n = WF.N, nwarm = WF.NWARM)
+    m = OnlineFix.StochLSTM(spec, w, OnlineFix.scaling(); spinnup_data = dQ,
+                            rng = Xoshiro(4242))
+    replayed = [OnlineFix.get_next_item_timeseries(m, q_star[:, k]) for k in 1:WF.NWARM]
+    @test randn(m.rng) == randn(Xoshiro(4242))           # V38: the replay is RNG-free
+    @test all(replayed[k] == dQ[:, k] for k in 1:WF.NWARM) # and returns the record unconverted
+
+    # a warm-up shorter than W - 1 would make the first prediction see a partial window
+    short = dQ[:, 1:(WF.W - 2)]
+    @test_throws ErrorException OnlineFix.StochLSTM(spec, w, OnlineFix.scaling();
+                                                    spinnup_data = short, rng = Xoshiro(1))
+    @test OnlineFix.StochLSTM(spec, w, OnlineFix.scaling(); spinnup_data = dQ[:, 1:(WF.W - 1)],
+                              rng = Xoshiro(1)) isa OnlineFix.StochLSTM
+end
+
+@testitem "V63 the input_map is applied to every regressor the closure builds" default_imports = false setup = [OnlineFix] begin
+    using Test
+    using Random
+    using LinearAlgebra
+    WF = OnlineFix.WindowFix
+
+    # `scaling.input_map = P` must turn [q*_n; q*_{n-1}; 1] into P * that, in the window too
+    spec = OnlineFix.LSTMSpec(; hist = OnlineFix.HistorySpec(; h = 1, n_qoi = OnlineFix.NQ,
+                                                           hist_var = :q_star),
+                              n_hidden = 4, n_latent = 3, n_encoder = 0, arch = :lstm,
+                              emission = :constant, window = WF.W)
+    w = OnlineFix.weights(spec)
+    nin = OnlineFix.n_input(spec)
+    P = Matrix{Float64}(I, nin, nin) .+ 0.3 .* randn(Xoshiro(3), nin, nin)
+    sc = merge(OnlineFix.scaling(), (; input_map = P))
+    q_star, dQ = OnlineFix.stream(; n = WF.N, nwarm = WF.NWARM)
+    m = OnlineFix.StochLSTM(spec, w, sc; spinnup_data = dQ, rng = Xoshiro(1), gate = 0.0,
+                            stochastic = false)
+    for k in 1:WF.N
+        OnlineFix.get_next_item_timeseries(m, q_star[:, k])
+    end
+    s(k) = vec(OnlineFix.scale_input(q_star[:, k], sc.in_scaling))
+    for (j, k) in enumerate((WF.N - WF.W + 1):WF.N)
+        @test m.xwin[:, j] ≈ Float32.(P * vcat(s(k), s(k - 1), 1.0)) rtol = 1e-5
+    end
+    # positive control: without the map the window holds the raw rows, which differ
+    m0 = OnlineFix.StochLSTM(spec, w, OnlineFix.scaling(); spinnup_data = dQ, rng = Xoshiro(1),
+                             gate = 0.0, stochastic = false)
+    for k in 1:WF.N
+        OnlineFix.get_next_item_timeseries(m0, q_star[:, k])
+    end
+    @test maximum(abs, m0.xwin .- m.xwin) > 1e-2
+end
+
+@testitem "V67 noise_scale scales every draw (window mode)" default_imports = false setup = [OnlineFix] begin
+    using Test
+    using Random
+    WF = OnlineFix.WindowFix
+
+    spec = WF.spec(:vrnn; emission = :constant)
+    w = OnlineFix.weights(spec)
+    q_star, dQ = OnlineFix.stream(; n = WF.N, nwarm = WF.NWARM)
+    function run(sc, seed)
+        m = OnlineFix.StochLSTM(spec, w, sc; spinnup_data = dQ, rng = Xoshiro(seed), gate = 0.0)
+        return [OnlineFix.get_next_item_timeseries(m, q_star[:, k]) for k in 1:WF.N][end]
+    end
+    base = OnlineFix.scaling()
+    # scale 0: no noise at all, so the seed no longer matters
+    s0 = merge(base, (; noise_scale = 0.0))
+    @test run(s0, 1) == run(s0, 2)
+    # scale 1 is the unscaled closure, bit for bit
+    @test run(merge(base, (; noise_scale = 1.0)), 7) == run(base, 7)
+    # positive control: the unscaled closure does depend on the seed
+    @test run(base, 1) != run(base, 2)
+end
+
+@testitem "V68 dq_offset: constant, and state-proportional with offset_ref" default_imports = false setup = [OnlineFix] begin
+    using Test
+    using Random
+    WF = OnlineFix.WindowFix
+
+    spec = WF.spec(:vrnn; emission = :constant)
+    w = OnlineFix.weights(spec)
+    q_star, dQ = OnlineFix.stream(; n = WF.N, nwarm = WF.NWARM)
+    function run(sc)
+        m = OnlineFix.StochLSTM(spec, w, sc; spinnup_data = dQ, rng = Xoshiro(3), gate = 0.0)
+        return [OnlineFix.get_next_item_timeseries(m, q_star[:, k]) for k in 1:WF.N]
+    end
+    base = OnlineFix.scaling()
+    c = [0.1, -0.2, 0.3]
+    a = run(base)
+    b = run(merge(base, (; dq_offset = c)))
+    ref = [2.0, 1.0, 4.0]
+    r = run(merge(base, (; dq_offset = c, offset_ref = ref)))
+    for k in (WF.NWARM + 1):WF.N
+        @test b[k] ≈ a[k] .+ c
+        @test r[k] ≈ a[k] .+ c .* q_star[:, k] ./ ref
+    end
+    # the replayed warm-up is never offset
+    @test all(b[k] == dQ[:, k] for k in 1:WF.NWARM)
+end
+
+@testitem "V69 eta_ar colours the emission noise: AR(1), same marginal variance" default_imports = false setup = [OnlineFix] begin
+    using Test
+    using Random
+    using Statistics
+    WF = OnlineFix.WindowFix
+
+    # `:lstm` + constant head: all the noise is emission noise, so its ACF is the AR(1)'s
+    spec = WF.spec(:lstm; emission = :constant)
+    w = OnlineFix.weights(spec)
+    n = 6000
+    q_star = 1.0 .+ 0.1 .* randn(Xoshiro(2), OnlineFix.NQ, n)
+    dQ = zeros(OnlineFix.NQ, WF.NWARM)
+    a = [0.0, 0.5, 0.9]
+    function noise(sc, seed)
+        m = OnlineFix.StochLSTM(spec, w, sc; spinnup_data = dQ, rng = Xoshiro(seed), gate = 0.0)
+        mm = OnlineFix.StochLSTM(spec, w, sc; spinnup_data = dQ, rng = Xoshiro(seed), gate = 0.0,
+                                 stochastic = false)
+        d = [OnlineFix.get_next_item_timeseries(m, q_star[:, k]) for k in 1:n]
+        d0 = [OnlineFix.get_next_item_timeseries(mm, q_star[:, k]) for k in 1:n]
+        return reduce(hcat, d[(WF.NWARM + 1):end] .- d0[(WF.NWARM + 1):end])
+    end
+    base = OnlineFix.scaling()
+    E = noise(merge(base, (; eta_ar = a)), 5)
+    E0 = noise(base, 5)
+    lag1(x) = (y = x .- mean(x); sum(y[1:(end - 1)] .* y[2:end]) / sum(abs2, y))
+    for k in 1:3
+        @test abs(lag1(E[k, :]) - a[k]) < 0.05
+        @test std(E[k, :]) / std(E0[k, :]) ≈ 1 atol = 0.08
+    end
+    @test abs(lag1(E0[3, :])) < 0.05            # without it: white
 end

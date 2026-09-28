@@ -85,6 +85,11 @@ Shape and architecture of an M4 model.
   Same device, and the same reason, as [`JointModel`](@ref)'s `uclip`: `d_i = exp(u_i)` grows
   exponentially once the input leaves the training range, and the fraction of steps on which the
   clip activates is a diagnostic that the trajectory has left the regime the head was fitted on.
+- `skip`: a linear skip `y += Ws x` from the regressor to the output.
+- `window`: `0` (default) carries the recurrent state across solver steps. `W > 0` resets it for
+  every prediction and replays the last `W` inputs -- see [`StochLSTM`](@ref).
+- `posterior`: `:x` (default, the source's encoder `q(z | x)`) or `:xy` (a conditional VAE:
+  `q(z | x, y)` in training, the prior `N(0, I)` at deployment).
 
 # The four architectures
 
@@ -117,10 +122,34 @@ Base.@kwdef struct LSTMSpec
     # same inputs finds at R^2 0.57-0.995: every such fit sat at the h = 0 linear floor
     # (`results_LSTMS.md` §7c). With it the recurrence models what the linear map misses.
     skip::Bool = false
+    # 🔑 WINDOW MODE (2026-09-24). `0` is the persistent recurrence every earlier fit uses: the
+    # hidden state is carried from one solver step to the next. `W > 0` RESETS the state for every
+    # prediction and replays the last `W` inputs, so the deployed prediction is exactly what a
+    # training segment of length `W` produces from `h = c = 0`, and training can use every row as
+    # a window end. Part of the model, not of the run: stored with the fit, and `train_stochlstm`
+    # refuses `L != window`. See `StochLSTM` for the noise tying that makes the replay consistent.
+    window::Int = 0
+    # 🔑 THE POSTERIOR (2026-09-24). `:x` is the source's: the encoder sees only `x_t`, so the latent
+    # can carry no information about the target -- the KL pulls it onto N(0, I), the decoder learns
+    # to ignore it, and the one-step spread comes out 10-20x too narrow (§7f). `:xy` is a
+    # conditional VAE: in TRAINING the encoder sees `[x_t; y_t]`, so `z_t` must encode the
+    # unpredictable part of step t; at DEPLOYMENT `z_t` is drawn from the prior N(0, I) and the
+    # encoder is not used at all.
+    posterior::Symbol = :x
+    # 🔑 THE PRIOR (2026-09-27). `:standard` is N(0, I), i.i.d. per step -- with it the conditional
+    # encoder explains each step's residual by that step's own z, the decoder has no use for past z's,
+    # and the model's noise is WHITE although the data's residual is coloured (§7j). `:learned` is
+    # Chung et al.'s VRNN prior, p(z_t | h_{t-1}) = N(Wm h + bm, softplus(Ws h + bs)^2): the KL then
+    # rewards predicting the innovation from the recurrent state -- LEARNED colour. Needs
+    # `posterior = :xy` and a recurrent arch; deployment draws each new z from it (`StochLSTM`).
+    prior::Symbol = :standard
 
-    function LSTMSpec(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip)
-        arch in (:lstm, :vaernn, :storn, :vrnn) ||
-            error("LSTMSpec: arch must be one of :lstm, :vaernn, :storn, :vrnn; got $(arch)")
+    function LSTMSpec(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip, window,
+                      posterior, prior)
+        arch in (:lstm, :vaernn, :storn, :vrnn, :dense) ||
+            error("LSTMSpec: arch must be one of :lstm, :vaernn, :storn, :vrnn, :dense; got $(arch)")
+        (arch !== :dense || window > 0) ||
+            error("LSTMSpec: arch = :dense is a feed-forward map of the window -- it needs window > 0")
         emission in (:none, :constant, :state_dependent) ||
             error("LSTMSpec: emission must be :none, :constant or :state_dependent; got $(emission)")
         (emission !== :none || arch !== :lstm) || error(
@@ -130,7 +159,14 @@ Base.@kwdef struct LSTMSpec
         n_encoder >= 0 || error("LSTMSpec: n_encoder must be >= 0 (0 = linear encoder)")
         (arch === :lstm || n_latent > 0) ||
             error("LSTMSpec: arch $(arch) has a latent path, so n_latent must be positive")
-        new(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip)
+        window >= 0 || error("LSTMSpec: window must be >= 0 (0 = persistent state); got $window")
+        posterior in (:x, :xy) || error("LSTMSpec: posterior must be :x or :xy; got $posterior")
+        prior in (:standard, :learned) || error("LSTMSpec: prior must be :standard or :learned; got $prior")
+        (prior === :standard || (posterior === :xy && arch in (:storn, :vrnn, :vaernn))) ||
+            error("LSTMSpec: prior = :learned needs posterior = :xy and a recurrent latent arch")
+        (posterior === :x || arch !== :lstm) ||
+            error("LSTMSpec: posterior = :xy needs a latent path; arch = :lstm has none")
+        new(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip, window, posterior, prior)
     end
 end
 
@@ -172,7 +208,16 @@ Whether `z_t` is fed into the recurrence. This is the **upstream stochasticity**
 STORN/VRNN from the deterministic and output-only variants, and it is the property Sørensen et al.
 report as the one that matters.
 """
-latent_to_cell(spec::LSTMSpec) = spec.arch === :storn || spec.arch === :vrnn
+latent_to_cell(spec::LSTMSpec) = spec.arch === :storn || spec.arch === :vrnn || spec.arch === :dense
+
+"""
+    is_dense(spec)
+
+`arch = :dense` (Phase D, 2026-09-27): no recurrence -- a two-layer tanh MLP on the whole window,
+`y_n = V1 tanh(Wh tanh(Wx [x_{n-W+1..n}; z_{n-W+1..n}] + b1) + b2) + cdec (+ Ws x_n)`. `Wx` is
+`H x W (n_input + n_latent)` (all inputs first, then all latents), `Wh` is `H x H`, `b = [b1; b2]`.
+"""
+is_dense(spec::LSTMSpec) = spec.arch === :dense
 
 """
     latent_to_decoder(spec)
@@ -201,7 +246,14 @@ n_output(spec::LSTMSpec) = spec.hist.n_qoi
 Width of whatever the encoder heads read: the dense layer's output, or the raw regressor when
 `n_encoder == 0`.
 """
-n_encoder_out(spec::LSTMSpec) = spec.n_encoder > 0 ? spec.n_encoder : n_input(spec)
+n_encoder_out(spec::LSTMSpec) = spec.n_encoder > 0 ? spec.n_encoder : n_encoder_in(spec)
+
+"""
+    n_encoder_in(spec)
+
+Width of what the encoder reads: the regressor, plus the target when `posterior = :xy`.
+"""
+n_encoder_in(spec::LSTMSpec) = n_input(spec) + (spec.posterior === :xy ? n_output(spec) : 0)
 
 """
     n_cell_input(spec)
@@ -210,6 +262,7 @@ Width of what the LSTM cell actually consumes: the regressor, plus `z` where the
 feeds it upstream.
 """
 n_cell_input(spec::LSTMSpec) =
+    is_dense(spec) ? spec.window * (n_input(spec) + spec.n_latent) :
     n_input(spec) + (latent_to_cell(spec) ? spec.n_latent : 0)
 
 # ---------------------------------------------------------------------------------------------
@@ -268,9 +321,13 @@ struct LSTMWeights{T}
     bd::Vector{T}
     LR::Matrix{T}
     Ws::Union{Nothing,Matrix{T}}
+    # the learned prior (`spec.prior = :learned`): (; Wm, bm, Ws, bs), n_latent x H / n_latent
+    P::Union{Nothing,NamedTuple}
 end
 LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR) where {T} =
-    LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, nothing)
+    LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, nothing, nothing)
+LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, Ws) where {T} =
+    LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, Ws, nothing)
 
 """
     check_shapes(w::LSTMWeights, spec::LSTMSpec)
@@ -281,9 +338,10 @@ Assert that a weight set matches a spec. Called on load, because the alternative
 function check_shapes(w::LSTMWeights, spec::LSTMSpec)
     H, nin, nout, nz = spec.n_hidden, n_input(spec), n_output(spec), spec.n_latent
     ncin, nenc = n_cell_input(spec), n_encoder_out(spec)
-    size(w.Wx) == (4H, ncin) || error("Wx is $(size(w.Wx)), expected $((4H, ncin))")
-    size(w.Wh) == (4H, H) || error("Wh is $(size(w.Wh)), expected $((4H, H))")
-    length(w.b) == 4H || error("b is $(length(w.b)), expected $(4H)")
+    G = is_dense(spec) ? H : 4H          # rows of the first layer: LSTM gates, or the dense layer
+    size(w.Wx) == (G, ncin) || error("Wx is $(size(w.Wx)), expected $((G, ncin))")
+    size(w.Wh) == (G, H) || error("Wh is $(size(w.Wh)), expected $((G, H))")
+    length(w.b) == (is_dense(spec) ? 2H : 4H) || error("b is $(length(w.b)), expected $(is_dense(spec) ? 2H : 4H)")
     size(w.V1) == (nout, H) || error("V1 is $(size(w.V1)), expected $((nout, H))")
     length(w.cdec) == nout || error("cdec is $(length(w.cdec)), expected $(nout)")
     size(w.Wd) == (nout, H) || error("Wd is $(size(w.Wd)), expected $((nout, H))")
@@ -291,7 +349,8 @@ function check_shapes(w::LSTMWeights, spec::LSTMSpec)
     size(w.LR) == (nout, nout) || error("LR is $(size(w.LR)), expected $((nout, nout))")
     if spec.n_encoder > 0 && latent_sampled(spec)
         w.We === nothing && error("n_encoder = $(spec.n_encoder) but We is nothing")
-        size(w.We) == (nenc, nin) || error("We is $(size(w.We)), expected $((nenc, nin))")
+        size(w.We) == (nenc, n_encoder_in(spec)) ||
+            error("We is $(size(w.We)), expected $((nenc, n_encoder_in(spec)))")
         length(w.be) == nenc || error("be is $(length(w.be)), expected $(nenc)")
     end
     if latent_sampled(spec)
@@ -301,6 +360,11 @@ function check_shapes(w::LSTMWeights, spec::LSTMSpec)
     if latent_to_decoder(spec)
         w.V2 === nothing && error("arch $(spec.arch) carries the V2 skip but V2 is nothing")
         size(w.V2) == (nout, nz) || error("V2 is $(size(w.V2)), expected $((nout, nz))")
+    end
+    if spec.prior === :learned
+        w.P === nothing && error("spec.prior = :learned but the prior weights P are nothing")
+        size(w.P.Wm) == (nz, H) && size(w.P.Ws) == (nz, H) && length(w.P.bm) == nz &&
+            length(w.P.bs) == nz || error("learned prior weights have the wrong shape")
     end
     if spec.skip
         w.Ws === nothing && error("spec.skip but Ws is nothing")
@@ -355,15 +419,19 @@ function reset!(st::LSTMState{T}) where {T}
 end
 
 """
-    lstm_step!(st, w, spec, x; rng = nothing, sample_latent = true)
+    lstm_step!(st, w, spec, x; rng = nothing, sample_latent = true, eps = nothing)
 
 Advance one step. Mutates `st` and returns `(y, logd, z)` as views into it -- copy them if they
 must outlive the next call.
 
 # Arguments
 - `x`: the regressor row for this step, length `n_input(spec)`, already standardised.
-- `rng`: consumed **only** when `sample_latent` is true and the architecture has a latent path.
+- `rng`: consumed **only** when `sample_latent` is true, `eps` is `nothing` and the architecture
+  has a latent path.
 - `sample_latent`: `false` substitutes the posterior mean `z = mu_z(x)` and draws nothing.
+- `eps`: a given standard-normal draw, length `n_latent`, used as `z = mu_z + sigma_z .* eps`
+  instead of drawing from `rng`. What window mode replays with (`StochLSTM`): the draw belongs to
+  the physical step, not to the window it is replayed in. Takes precedence over `sample_latent`.
 
 🔴 **`sample_latent = false` is what the warm-up uses, and it is not a performance shortcut.**
 V38 requires that a closure's warm-up replay does not touch the RNG, so that a member seed means
@@ -372,7 +440,7 @@ invariant; sampling during the warm-up would break it.
 """
 function lstm_step!(
     st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, x::AbstractVector;
-    rng = nothing, sample_latent::Bool = true,
+    rng = nothing, sample_latent::Bool = true, eps = nothing,
 ) where {T}
     H = spec.n_hidden
     nin = n_input(spec)
@@ -384,7 +452,22 @@ function lstm_step!(
     xv = view(st.xz, 1:nin)
 
     # --- encoder: q(z_t | x_t) --------------------------------------------------------------
-    if latent_sampled(spec)
+    # `posterior = :xy`: the encoder needs the target, which deployment does not have -- `z_t` is
+    # drawn from the prior N(0, I) instead: `mu_z = 0`, `sigma_z = 1`, so `z = eps`
+    if latent_sampled(spec) && spec.posterior === :xy
+        if eps !== nothing
+            @inbounds for k in eachindex(st.z)
+                st.z[k] = T(eps[k])
+            end
+        elseif sample_latent
+            rng === nothing && error("lstm_step!: sample_latent = true needs an rng")
+            @inbounds for k in eachindex(st.z)
+                st.z[k] = T(randn(rng))
+            end
+        else
+            fill!(st.z, zero(T))
+        end
+    elseif latent_sampled(spec)
         # ⚠️ The two `mul!` pairs are written out per branch rather than hoisted behind one
         # `enc` variable. Hoisting gives `enc` the type `Union{Vector, SubArray}`, which Julia
         # boxes -- and that box was a per-step heap allocation on exactly the `n_encoder == 0`
@@ -403,7 +486,11 @@ function lstm_step!(
         @inbounds for k in eachindex(st.sigz)
             st.sigz[k] = _softplus(st.sigz[k])
         end
-        if sample_latent
+        if eps !== nothing
+            @inbounds for k in eachindex(st.z)
+                st.z[k] = st.muz[k] + st.sigz[k] * T(eps[k])
+            end
+        elseif sample_latent
             rng === nothing && error("lstm_step!: sample_latent = true needs an rng")
             @inbounds for k in eachindex(st.z)
                 st.z[k] = st.muz[k] + st.sigz[k] * T(randn(rng))
@@ -505,6 +592,60 @@ function sample_emission!(out::AbstractVector{T}, st::LSTMState{T}, w::LSTMWeigh
         out[k] = st.y[k] + exp(st.logd[k]) * out[k]
     end
     return out
+end
+
+"""
+    learned_prior_z!(z, st, w, eps)
+
+`prior = :learned`: `z = Wm h + bm + softplus(Ws h + bs) .* eps` from the CURRENT recurrent state
+`st.h` (= h_{t-1} before the step is taken). Writes `z` in place.
+"""
+function learned_prior_z!(z::AbstractVector, st::LSTMState{T}, w::LSTMWeights{T}, eps) where {T}
+    P = w.P
+    mu = P.Wm * st.h .+ P.bm
+    sg = _softplus.(P.Ws * st.h .+ P.bs)
+    @inbounds for k in eachindex(z)
+        z[k] = mu[k] + sg[k] * T(eps[k])
+    end
+    return z
+end
+
+"""
+    dense_window!(st, w, spec, xwin, ewin)
+
+`arch = :dense`, deployed: the output for the LAST column of the window, from the stored inputs
+`xwin` (`n_input x W`) and latent draws `ewin` (`n_latent x W`). Writes `st.y` and `st.logd` exactly
+as `lstm_step!` does for the recurrent architectures. The latent of every window step is formed
+from its own stored draw, as the training forward pass forms it (`posterior = :xy`: z = eps).
+"""
+function dense_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin::AbstractMatrix,
+                       ewin::AbstractMatrix) where {T}
+    H, nin, nz, W = spec.n_hidden, n_input(spec), spec.n_latent, spec.window
+    size(xwin, 2) == W || error("dense_window!: the window holds $(size(xwin, 2)) steps, needs $W")
+    F = zeros(T, W * (nin + nz))
+    for t in 1:W
+        F[((t - 1) * nin + 1):(t * nin)] .= T.(view(xwin, :, t))
+        xt = view(xwin, :, t)
+        if spec.posterior === :xy
+            z = T.(view(ewin, :, t))
+        else
+            enc = spec.n_encoder > 0 ? tanh.(w.We * xt .+ w.be) : xt
+            z = w.Bmu * enc .+ _softplus.(w.Bsig * enc) .* T.(view(ewin, :, t))
+        end
+        F[(W * nin + (t - 1) * nz + 1):(W * nin + t * nz)] .= z
+    end
+    h1 = tanh.(w.Wx * F .+ w.b[1:H])
+    h2 = tanh.(w.Wh * h1 .+ w.b[(H + 1):(2H)])
+    st.h .= h2
+    st.y .= w.V1 * h2 .+ w.cdec
+    spec.skip && (st.y .+= w.Ws * T.(view(xwin, :, W)))
+    if emission_noise(spec)
+        st.logd .= w.Wd * h2 .+ w.bd
+        spec.uclip !== nothing && (st.logd .= clamp.(st.logd, T(spec.uclip[1]), T(spec.uclip[2])))
+    else
+        fill!(st.logd, zero(T))
+    end
+    return st.y, st.logd
 end
 
 # ---------------------------------------------------------------------------------------------

@@ -90,14 +90,17 @@ function RF.init_lstm_params(rng::AbstractRNG, spec::RF.LSTMSpec; T::Type = Floa
     ncin, nenc = RF.n_cell_input(spec), RF.n_encoder_out(spec)
     has_latent = RF.latent_sampled(spec)
 
-    b = zeros(T, 4H)
-    b[(H + 1):(2H)] .= one(T)              # forget-gate bias
+    dense = RF.is_dense(spec)
+    G = dense ? H : 4H                     # the dense arch's first layer is H wide, no gates
+    b = zeros(T, dense ? 2H : 4H)
+    dense || (b[(H + 1):(2H)] .= one(T))   # forget-gate bias (recurrent archs only)
 
     return (;
-        Wx = T.(Lux.glorot_uniform(rng, 4H, ncin)),
-        Wh = T.(Lux.glorot_uniform(rng, 4H, H)),
+        Wx = T.(Lux.glorot_uniform(rng, G, ncin)),
+        Wh = T.(Lux.glorot_uniform(rng, G, H)),
         b,
-        We = (has_latent && spec.n_encoder > 0) ? T.(Lux.glorot_uniform(rng, nenc, nin)) : nothing,
+        We = (has_latent && spec.n_encoder > 0) ?
+             T.(Lux.glorot_uniform(rng, nenc, RF.n_encoder_in(spec))) : nothing,
         be = (has_latent && spec.n_encoder > 0) ? zeros(T, nenc) : nothing,
         Bmu = has_latent ? T.(Lux.glorot_uniform(rng, nz, nenc)) : zeros(T, nz, nenc),
         Bsig = zeros(T, nz, nenc),         # softplus(0) = log 2
@@ -109,6 +112,11 @@ function RF.init_lstm_params(rng::AbstractRNG, spec::RF.LSTMSpec; T::Type = Floa
         Araw = Matrix{T}(I, nout, nout) .* zero(T),   # A = I at init, i.e. R = I
         # the linear skip starts at zero; `init_ps` can seed it (e.g. with the least-squares map)
         Ws = spec.skip ? zeros(T, nout, nin) : nothing,
+        # the learned prior p(z_t | h_{t-1}); starts at exactly N(0, I): softplus(log(e - 1)) = 1
+        Pm = spec.prior === :learned ? zeros(T, nz, H) : nothing,
+        Pbm = spec.prior === :learned ? zeros(T, nz) : nothing,
+        Ps = spec.prior === :learned ? zeros(T, nz, H) : nothing,
+        Pbs = spec.prior === :learned ? fill(T(log(exp(1) - 1)), nz) : nothing,
     )
 end
 
@@ -243,6 +251,19 @@ function _latent(::Val{false}, encv, ps, X, epsz, ::Type{T}, nz, L) where {T}
     return (mu, zero(similar(X, T, nz, L)) .+ one(T), z)
 end
 
+# The encoder's input, by posterior -- dispatched, like every branch Zygote must not merge.
+#   :x     the source's q(z | x): the regressor
+#   :xy    the conditional VAE's q(z | x, y) in training: regressor and target stacked
+#   :prior deployment-side / scoring for `:xy`: no encoder, z = eps ~ N(0, I)
+_zpath(::Val{:x}, hasz, encv, ps, X2, Y2, epsz2, ::Type{T}, nz, n) where {T} =
+    _latent(hasz, encv, ps, X2, epsz2, T, nz, n)
+_zpath(::Val{:xy}, hasz, encv, ps, X2, Y2, epsz2, ::Type{T}, nz, n) where {T} =
+    _latent(hasz, encv, ps, vcat(X2, Y2), epsz2, T, nz, n)
+function _zpath(::Val{:prior}, hasz, encv, ps, X2, Y2, epsz2, ::Type{T}, nz, n) where {T}
+    mu = zero(similar(X2, T, nz, n))
+    return mu, mu .+ one(T), epsz2 .+ zero(T)
+end
+
 # ---------------------------------------------------------------------------------------------
 # Forward
 # ---------------------------------------------------------------------------------------------
@@ -261,7 +282,99 @@ are all applied to the whole segment as matrix products, which is both faster an
 Zygote to get wrong.
 """
 function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3},
-                         epsz::AbstractArray) where {T}
+                         epsz::AbstractArray; Y = nothing) where {T}
+    # `arch = :dense` and `prior = :learned` have their own forward passes; dispatched, not
+    # branched, so Zygote traces one
+    spec.prior === :learned && return _forward_lp(spec, ps, X, epsz, Y)
+    return _forward(Val(RF.is_dense(spec)), spec, ps, X, epsz, Y)
+end
+
+"""
+    _forward_lp(spec, ps, X, epsz, Y)
+
+`prior = :learned` (Chung et al.'s VRNN prior, 2026-09-27): a per-step loop, because the prior at
+step t is `p(z_t | h_{t-1}) = N(Pm h + Pbm, softplus(Ps h + Pbs)^2)` and depends on the state the
+previous step left. With the target `Y` (training): `z_t` from the posterior q(z_t | x_t, y_t), and
+the prior is evaluated for the KL. Without it (scoring, deployment parity): `z_t` from the prior.
+Returns `lstm_forward`'s fields plus `MUP`, `SIGP`.
+"""
+function _forward_lp(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3}, epsz, Y) where {T}
+    H = spec.n_hidden
+    nin, L, B = size(X)
+    nz, nout = spec.n_latent, RF.n_output(spec)
+    encv, cellv, decv = Val(spec.n_encoder > 0), Val(RF.latent_to_cell(spec)), Val(RF.latent_to_decoder(spec))
+    Xs = _timeslices(X, L)
+    Es = _timeslices(reshape(epsz, nz, L, B), L)
+    Ys = Y === nothing ? nothing : _timeslices(reshape(Y, nout, L, B), L)
+    Wh = ps.Wh
+    Yb = Zygote.Buffer(similar(X, T, nout, L, B))
+    MUb = Zygote.Buffer(similar(X, T, nz, L, B)); SIGb = Zygote.Buffer(similar(X, T, nz, L, B))
+    MUPb = Zygote.Buffer(similar(X, T, nz, L, B)); SIGPb = Zygote.Buffer(similar(X, T, nz, L, B))
+    Hb = Zygote.Buffer(similar(X, T, H, L, B))
+    h = zero(similar(X, T, H, B))
+    c = zero(similar(X, T, H, B))
+    for t in 1:L
+        xt = Xs[t]
+        mup = ps.Pm * h .+ ps.Pbm
+        sigp = _sp.(ps.Ps * h .+ ps.Pbs)
+        if Ys === nothing
+            mu, sig = mup, sigp
+        else
+            E = _encode(encv, ps, vcat(xt, Ys[t]))
+            mu, sig = ps.Bmu * E, _sp.(ps.Bsig * E)
+        end
+        z = mu .+ sig .* Es[t]
+        g = ps.Wx * _cell_input(cellv, xt, z) .+ ps.b .+ Wh * h
+        gi = @view g[1:H, :]
+        gf = @view g[(H + 1):(2H), :]
+        gc = @view g[(2H + 1):(3H), :]
+        go = @view g[(3H + 1):(4H), :]
+        c = @. _sig(gf) * c + _sig(gi) * tanh(gc)
+        h = @. _sig(go) * tanh(c)
+        y = _linear_skip(Val(spec.skip), _decoder_skip(decv, ps.V1 * h .+ ps.cdec, ps, z), ps, xt)
+        Yb[:, t, :] = y
+        MUb[:, t, :] = mu; SIGb[:, t, :] = sig
+        MUPb[:, t, :] = mup; SIGPb[:, t, :] = sigp
+        Hb[:, t, :] = h
+    end
+    Hm = copy(Hb)
+    LOGD2 = _logd(Val(spec.emission === :constant), ps, reshape(Hm, H, L * B))
+    spec.uclip !== nothing && (LOGD2 = clamp.(LOGD2, T(spec.uclip[1]), T(spec.uclip[2])))
+    return (; Y = copy(Yb), LOGD = reshape(LOGD2, nout, L, B), MU = copy(MUb), SIG = copy(SIGb),
+            MUP = copy(MUPb), SIGP = copy(SIGPb), Hm)
+end
+
+"""
+    _forward(::Val{true}, spec, ps, X, epsz, Y)
+
+`arch = :dense`: a two-layer tanh MLP on the whole window (all inputs, then all latents), returning
+the output in the window's LAST column only -- the only one a reset window deploys -- and zeros
+elsewhere, so it must be trained with `burn = W - 1` (`score` = the last step). The latents of every
+step are formed as for the recurrent archs, so the KL and the conditional encoder work unchanged.
+"""
+function _forward(::Val{true}, spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3}, epsz, Y) where {T}
+    H = spec.n_hidden
+    nin, L, B = size(X)
+    nz, nout = spec.n_latent, RF.n_output(spec)
+    L == spec.window || error("dense forward: segment length $L != window $(spec.window)")
+    encv, hasz = Val(spec.n_encoder > 0), Val(true)
+    X2 = reshape(X, nin, L * B)
+    post = spec.posterior === :x ? Val(:x) : Y === nothing ? Val(:prior) : Val(:xy)
+    Y2 = Y === nothing ? nothing : reshape(Y, nout, L * B)
+    MU2, SIG2, Z2 = _zpath(post, hasz, encv, ps, X2, Y2, reshape(epsz, nz, L * B), T, nz, L * B)
+    F = vcat(reshape(X, nin * L, B), reshape(Z2, nz * L, B))
+    H1 = tanh.(ps.Wx * F .+ ps.b[1:H])
+    H2 = tanh.(ps.Wh * H1 .+ ps.b[(H + 1):(2H)])
+    ylast = _linear_skip(Val(spec.skip), ps.V1 * H2 .+ ps.cdec, ps, X[:, L, :])
+    ld = _logd(Val(spec.emission === :constant), ps, H2)
+    spec.uclip !== nothing && (ld = clamp.(ld, T(spec.uclip[1]), T(spec.uclip[2])))
+    pad = zero(similar(X, T, nout, L - 1, B))
+    return (; Y = cat(pad, reshape(ylast, nout, 1, B); dims = 2),
+            LOGD = cat(pad, reshape(ld, nout, 1, B); dims = 2),
+            MU = reshape(MU2, nz, L, B), SIG = reshape(SIG2, nz, L, B), Hm = reshape(H2, H, 1, B))
+end
+
+function _forward(::Val{false}, spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3}, epsz, Y) where {T}
     H = spec.n_hidden
     nin, L, B = size(X)
     nz, nout = spec.n_latent, RF.n_output(spec)
@@ -283,7 +396,12 @@ function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3
     # encoder, the latent draw, the decoder and the log-scale head are four matrix products for
     # the whole batch rather than 4*L*B small ones. Only the recurrence has to be a loop.
     X2 = reshape(X, nin, L * B)
-    MU2, SIG2, Z2 = _latent(hasz, encv, ps, X2, reshape(epsz, nz, L * B), T, nz, L * B)
+    # 🔑 `posterior = :xy` reads the target `Y` in training (`elbo` passes it); called without one
+    # -- scoring, V41-style parity -- it is the deployed model, `z` from the prior
+    post = !RF.latent_sampled(spec) || spec.posterior === :x ? Val(:x) :
+           Y === nothing ? Val(:prior) : Val(:xy)
+    Y2 = Y === nothing ? nothing : reshape(Y, nout, L * B)
+    MU2, SIG2, Z2 = _zpath(post, hasz, encv, ps, X2, Y2, reshape(epsz, nz, L * B), T, nz, L * B)
 
     # --- recurrence, batched over segments ----------------------------------------------------
     #
@@ -375,9 +493,10 @@ Single-segment form, kept so `iwae_nll` and V41 read the way they did. It is the
 with `B = 1`, so there is only ever one implementation of the recurrence to get wrong.
 """
 function RF.lstm_forward(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T},
-                         epsz::AbstractMatrix) where {T}
+                         epsz::AbstractMatrix; Y = nothing) where {T}
     nin, L = size(X)
-    o = RF.lstm_forward(spec, ps, reshape(X, nin, L, 1), reshape(epsz, spec.n_latent, L, 1))
+    o = RF.lstm_forward(spec, ps, reshape(X, nin, L, 1), reshape(epsz, spec.n_latent, L, 1);
+                        Y = Y === nothing ? nothing : reshape(Y, :, L, 1))
     return (; Y = reshape(o.Y, :, L), LOGD = reshape(o.LOGD, :, L),
             MU = reshape(o.MU, :, L), SIG = reshape(o.SIG, :, L), Hm = reshape(o.Hm, :, L))
 end
@@ -502,14 +621,43 @@ parameter in this project and the two must never be conflated.**
 """
 function RF.elbo(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3}, Ytrue::AbstractArray,
                  score::AbstractUnitRange, epsz::AbstractArray; beta::Real = 1e-4,
-                 free::Union{Nothing,AbstractVector{Bool}} = nothing, lagmap = nothing) where {T}
+                 free::Union{Nothing,AbstractVector{Bool}} = nothing, lagmap = nothing,
+                 kl_mode::Symbol = :per_step, kl_batch::Integer = 0) where {T}
     # `free === nothing` is teacher forcing, the path every existing fit was made on, unchanged.
     # Otherwise the level lags are fed from the model's own outputs -- see `_rollout_forward`.
-    out = free === nothing ? RF.lstm_forward(spec, ps, X, epsz) :
+    # `posterior = :xy` trains on the posterior q(z | x, y): the forward pass sees the target
+    (free === nothing || spec.posterior === :x) ||
+        error("elbo: rollout training is not defined for posterior = :xy")
+    out = free === nothing ?
+          RF.lstm_forward(spec, ps, X, epsz; Y = spec.posterior === :xy ? Ytrue : nothing) :
           _rollout_forward(spec, ps, X, epsz, free; lagmap)
     nout = RF.n_output(spec)
     B = size(X, 3)
     ns = length(score) * B            # scored steps summed over the batch
+
+    # 🔑 `kl_mode = :reference` is the source's objective, `vae_loss_2D` in
+    # `ben-barthel/learning_dynamics/ML_Code/loss_funs_qg.py` (Rik, 2026-09-24):
+    #     yloss_bt = sum_k (y - yhat)^2                       per (batch, time), NO 1/2
+    #     kl       = 0.5 sum_{b,t,k} (sig^2 + mu^2 - 1 - log(1e-8 + sig^2))   ONE scalar
+    #     loss     = mean_{b,t}(yloss_bt + lam * kl) = mean(yloss) + lam * kl
+    # i.e. the reconstruction is AVERAGED over the batch's steps and the KL is SUMMED over the batch,
+    # the time steps and the latent dimensions -- so its weight grows with batch size and window
+    # length (at theirs, 32 x 100, `lam = 1e-4` is 0.32 per z-vector against one step's SSE).
+    # The KL covers EVERY step of the segment, scored or not: every step draws a `z`, as theirs do.
+    # 🔴 That sum makes the loss depend on the batch size, so a validation batch of `B` segments is
+    # scaled to the TRAINING batch size `kl_batch` -- what Keras's validation in batches of 32 gives
+    # -- and the loss of a chunk no longer depends on how the chunk is split.
+    if kl_mode === :reference
+        RF.emission_noise(spec) && error("elbo: kl_mode = :reference is the source's objective, " *
+                                         "which has no emission head -- use emission = :none")
+        kl_batch > 0 || error("elbo: kl_mode = :reference needs kl_batch, the training batch size")
+        sse = sum(abs2, Ytrue[:, score, :] .- out.Y[:, score, :]) / ns
+        klr = RF.latent_sampled(spec) ?
+              T(0.5) * sum(out.SIG .^ 2 .+ out.MU .^ 2 .- one(T) .- log.(T(1e-8) .+ out.SIG .^ 2)) :
+              zero(T)
+        return sse + T(beta) * klr * T(kl_batch / B)
+    end
+    kl_mode === :per_step || error("elbo: kl_mode must be :per_step or :reference; got $kl_mode")
 
     # 🔴 `:none` is a deterministic decoder, so there is no density to evaluate and the
     # reconstruction term is a plain sum of squares -- the source's objective. `Wd`, `bd` and
@@ -528,9 +676,20 @@ function RF.elbo(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArray{T,3}, Ytrue
     nll = recon
 
     kl = if RF.latent_sampled(spec)
-        S = out.SIG[:, score, :]
-        M = out.MU[:, score, :]
-        sum(T(0.5) .* (S .^ 2 .+ M .^ 2 .- one(T)) .- log.(S))
+        # 🔴 `posterior = :xy`: EVERY step's posterior `z` is a code of its own target, so the KL
+        # covers all steps -- over the scored ones only, a burn-in `z` could carry its target into
+        # the state for free, and at deployment that `z` is a prior draw
+        kcols = spec.posterior === :xy ? (1:size(out.SIG, 2)) : score
+        S = out.SIG[:, kcols, :]
+        M = out.MU[:, kcols, :]
+        if spec.prior === :learned
+            # KL( q(z_t | x_t, y_t) || p(z_t | h_{t-1}) ), the learned prior
+            SP = out.SIGP[:, kcols, :]
+            MP = out.MUP[:, kcols, :]
+            sum(log.(SP ./ S) .+ (S .^ 2 .+ (M .- MP) .^ 2) ./ (2 .* SP .^ 2) .- T(0.5))
+        else
+            sum(T(0.5) .* (S .^ 2 .+ M .^ 2 .- one(T)) .- log.(S))
+        end
     else
         zero(T)
     end
@@ -680,6 +839,13 @@ Fit an M4 model to a regressor/target pair.
   only. Validation uses the same rollout.
 - `init_ps`: warm-start parameters (e.g. the `ps` a fit file stores), shape-checked against
   `spec`. Rollout training is meant as a fine-tune of a teacher-forced fit.
+- `kl_mode`: `:per_step` (default) -- `(0.5 SSE + beta KL)` averaged per scored step, every
+  earlier fit. `:reference` -- the source's `vae_loss_2D`: mean SSE (no 1/2) plus `beta` times the
+  KL SUMMED over batch, all steps and latent dimensions, validation scaled to the training batch
+  size. `emission = :none` only. See `elbo`.
+- `split`: `nothing` (default) splits by `val_frac`, the trailing rows validating. Otherwise
+  `(; train, val)`, sorted disjoint column indices -- e.g. validation blocks spread through the
+  record, with embargo columns in neither set. Segments never cross a gap in either set.
 - `clip`: clip the gradient's global norm to this before Adam; `0` (default) is off.
   `history.gmax` logs the largest norm seen between validations, so an exploding rollout
   gradient is visible rather than silent.
@@ -722,7 +888,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             stop_window::Int = 500, stop_rel::Real = 0.005,
                             rollout::Int = 1, init_ps = nothing, clip::Real = 0,
                             lagmap = nothing, weight_decay::Real = 0, callback = nothing,
-                            freeze = ())
+                            freeze = (), kl_mode::Symbol = :per_step, split = nothing)
     rollout >= 1 || error("train_stochlstm: rollout must be >= 1 (1 = teacher forcing); got $rollout")
     (rollout == 1 || !RF.emission_noise(spec)) || error(
         "train_stochlstm: rollout > 1 needs emission = :none -- with an emission head the deployed " *
@@ -732,6 +898,15 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     1 <= stride <= L - burn ||
         error("train_stochlstm: need 1 <= stride <= L - burn = $(L - burn); got $stride. " *
               "A larger stride would leave rows no segment ever scores.")
+    # 🔴 Window mode: the deployed closure resets the state and replays exactly `window` inputs,
+    # so a training segment of any other length is a different model from the one deployed.
+    # `burn = L - 1` scores only the window's last output -- the deployed prediction -- and
+    # `burn = 0` also scores the shorter-context outputs inside each window.
+    (spec.window == 0 || L == spec.window) ||
+        error("train_stochlstm: spec.window = $(spec.window) but L = $L -- in window mode the " *
+              "training segment IS the deployed window, so they must be equal")
+    (spec.window == 0 || rollout == 1) ||
+        error("train_stochlstm: rollout > 1 is not defined in window mode (no level lags to feed)")
 
     # 🔴 **The whole record is staged on the device ONCE, and batches are gathered THERE.** Until
     # 2026-09-18 every batch was assembled on the host and copied per optimiser update — 3 copies
@@ -776,12 +951,30 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # the stride scan would have compared points trained on different recent data. Anchored at
     # the end, every stride's last scored training row is `ntrain`. ⚠️ The NUMBER of rows lost
     # still depends on the stride (same 379 vs 19); only where they sit has changed.
-    train_all = RF.segment_indices(view(steps, 1:ntrain); L, burn, stride, anchor = :end)
-    train_segs = [sg for sg in train_all if length(sg.rows) == L]
     # ⚠️ Validation is NEVER strided. Overlapping validation segments would re-weight some rows
     # more than others for no gain; augmentation is a training-set device.
-    val_raw = RF.segment_indices(view(steps, (ntrain + 1):ncol); L, burn)
-    val_segs = [(; rows = s.rows .+ ntrain, score = s.score .+ ntrain) for s in val_raw]
+    if split === nothing
+        train_all = RF.segment_indices(view(steps, 1:ntrain); L, burn, stride, anchor = :end)
+        val_raw = RF.segment_indices(view(steps, (ntrain + 1):ncol); L, burn)
+        val_segs = [(; rows = s.rows .+ ntrain, score = s.score .+ ntrain) for s in val_raw]
+    else
+        # 🔑 An explicit split: `split.train` / `split.val` are column indices, e.g. validation
+        # blocks spread through the record with an embargo gap around each (Rik, 2026-09-24 --
+        # the trailing 20% of 1-10 TU is off the stationary regime and misranked the fits).
+        # Columns left out of both are dropped. A gap in the kept columns is a jump in `steps`, so
+        # `segment_indices` never lets a segment cross it; within a block positions and columns
+        # are both consecutive, which is what makes the position -> column map a range map.
+        tr, va = collect(split.train), collect(split.val)
+        (issorted(tr) && issorted(va) && isempty(intersect(tr, va))) ||
+            error("train_stochlstm: split.train and split.val must be sorted and disjoint")
+        ntrain = length(tr)
+        colseg(sg, idx) = (; rows = idx[first(sg.rows)]:idx[last(sg.rows)],
+                           score = idx[first(sg.score)]:idx[last(sg.score)])
+        train_all = [colseg(sg, tr)
+                     for sg in RF.segment_indices(view(steps, tr); L, burn, stride, anchor = :end)]
+        val_segs = [colseg(sg, va) for sg in RF.segment_indices(view(steps, va); L, burn)]
+    end
+    train_segs = [sg for sg in train_all if length(sg.rows) == L]
 
     isempty(train_segs) && error("train_stochlstm: no FULL-LENGTH training segment survived " *
                                  "L = $L, burn = $burn, stride = $stride on $(ntrain) columns " *
@@ -912,7 +1105,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     function validate(p)
         num, den = 0.0, 0
         for (Xb, Yb, sc, ns, eb, fv) in val_batches
-            num += RF.elbo(spec, p, Xb, Yb, sc, eb; beta, free = fv, lagmap) * ns
+            num += RF.elbo(spec, p, Xb, Yb, sc, eb; beta, free = fv, lagmap, kl_mode,
+                           kl_batch = batch_eff) * ns
             den += ns
         end
         return num / den
@@ -961,7 +1155,8 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
             Xb, Yb, sc, _ = stack(train_segs, chunk)
             eb = draw(L, batch_eff)
             loss, gs = Zygote.withgradient(p -> RF.elbo(spec, p, Xb, Yb, sc, eb; beta,
-                                                        free = free_tr, lagmap), ps)
+                                                        free = free_tr, lagmap, kl_mode,
+                                                        kl_batch = batch_eff), ps)
             gmax = max(gmax, _gnorm(gs[1]))
             opt, ps = Optimisers.update(opt, ps, gs[1])
             tot += loss
@@ -1055,7 +1250,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
            (; history..., best_update = best.update, best_index = best.index,
             best_val = best.val, stopped_early, stop_reason, updates = upd,
             epochs_run = cld(upd, nbatch), nseg, batch_eff, upd_per_epoch = nbatch, val_every,
-            rollout, clip, warm_start = init_ps !== nothing)
+            rollout, clip, warm_start = init_ps !== nothing, kl_mode)
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -1082,6 +1277,8 @@ function RF.iwae_nll(spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractMatrix{T},
     # likelihood to bound. Refusing is the honest behaviour: the alternative is a number that looks
     # like an NLL and is not one. Score these cells with `crps_ensemble` and the rank histogram,
     # which are defined for them and read the same on every cell of the ladder.
+    spec.posterior === :x || error("iwae_nll: posterior = :xy is not supported -- the importance " *
+                                   "weights here assume the encoder q(z | x)")
     RF.emission_noise(spec) || error(
         "iwae_nll: emission = :none has no predictive density, so no likelihood is defined. " *
         "Use crps_ensemble and the rank histogram, or fit with emission = :constant.")
@@ -1151,6 +1348,8 @@ function RF.LSTMWeights(ps::NamedTuple, spec::RF.LSTMSpec)
         copy(ps.Wd), T.(ps.bd .+ log.(s)),
         LR,
         get(ps, :Ws, nothing) === nothing ? nothing : copy(ps.Ws),
+        get(ps, :Pm, nothing) === nothing ? nothing :
+        (; Wm = copy(ps.Pm), bm = copy(ps.Pbm), Ws = copy(ps.Ps), bs = copy(ps.Pbs)),
     )
 end
 

@@ -12,7 +12,7 @@
 #   RIKFLOW_D_LR / _WD / _CLIP / _EPOCHS / _SEED     optimiser
 #   RIKFLOW_D_TRAIN_TU   end of the training range in TU (default 10 = the project's 1-10 TU)
 #   RIKFLOW_D_EVAL_EVERY updates between held-out scorings (default 10)
-#   RIKFLOW_D_SKIP       1 = linear skip `y += Ws x`, seeded with the least-squares map and `V1 = 0`,
+#   RIKFLOW_D_SKIP       1 = linear skip `y += Ws x`, seeded with the least-squares map and `V1 = V2 = 0`,
 #                        so update 0 IS the linear model and the recurrence learns its residual
 #   RIKFLOW_D_SEEDHEAD   1 = (with SKIP and an emission head) seed the head at the linear map's
 #                        training-residual covariance -- `bd = log sd`, `A'A = R^{-1}` -- so update 0
@@ -74,7 +74,10 @@ hist = RF.HistorySpec(; h = cfg.h, n_qoi = size(rec.q, 1), cfg.hist_var, cfg.inc
 skip = envs("SKIP", "0") == "1"
 frz = envs("FREEZE", "0")
 freeze = frz == "0" ? () : frz == "1" ? (:Ws,) : Tuple(Symbol.(strip.(split(frz, ","))))
-spec = RF.LSTMSpec(; hist, cfg.n_hidden, cfg.n_latent, cfg.n_encoder, cfg.arch, cfg.uclip, cfg.emission, skip)
+# `POST = xy`: the conditional-VAE encoder q(z | x, dQ) in training, the prior online (§7f)
+posterior = Symbol(envs("POST", "x"))
+spec = RF.LSTMSpec(; hist, cfg.n_hidden, cfg.n_latent, cfg.n_encoder, cfg.arch, cfg.uclip, cfg.emission, skip,
+                   posterior)
 
 # --- training data: exactly what every M4 driver fits on ------------------------------------------
 dat = m4_training_data(rec, cfg, hist; target)
@@ -98,7 +101,8 @@ Xh, Yh = Float32.(Xf[:, HELD]), Float32.(Yf[:, HELD])
 
 # held-out NLL: `elbo` at beta = 0 over the whole window as one segment -- the Gaussian NLL per step
 # for an emission head, 0.5 x SSE for `:none` (no density: then it equals the first number)
-heldnll(ps) = RF.elbo(spec, ps, reshape(Xh, size(Xh, 1), :, 1), reshape(Yh, size(Yh, 1), :, 1),
+# 🔴 not for `posterior = :xy` (elbo hands the encoder the true target): NaN there
+heldnll(ps) = posterior === :xy ? NaN : RF.elbo(spec, ps, reshape(Xh, size(Xh, 1), :, 1), reshape(Yh, size(Yh, 1), :, 1),
                       (WARM + 1):size(Xh, 2), zeros(Float32, spec.n_latent, size(Xh, 2), 1); beta = 0)
 function heldout(ps)
     o = RF.lstm_forward(spec, ps, Xh, zeros(Float32, spec.n_latent, size(Xh, 2)))
@@ -128,7 +132,11 @@ lagmap = target !== :dQ ? nothing :
 init_ps = nothing
 if skip
     p0 = RF.init_lstm_params(Xoshiro(seed), spec)
-    init_ps = merge(p0, (; Ws = Float32.(permutedims(Clin)), V1 = zero(p0.V1)))
+    # 🔴 `V2 = 0` too: `:vrnn`/`:vaernn` reach the output through the latent decoder skip `V2 z` as
+    # well as through `V1 h`, and at the latent's mean `z = Bmu x` that is a RANDOM linear map of the
+    # inputs -- a seed with only `V1 = 0` scored 3.01 held out against the linear map's 0.284.
+    init_ps = merge(p0, (; Ws = Float32.(permutedims(Clin)), V1 = zero(p0.V1),
+                         V2 = p0.V2 === nothing ? nothing : zero(p0.V2)))
     if envs("SEEDHEAD", "0") == "1"
         RF.emission_noise(spec) || error("RIKFLOW_D_SEEDHEAD needs an emission head")
         Rtr = Float64.(dat.Yc[:, 1:ntr]) .- Clin' * Float64.(dat.Xc[:, 1:ntr])

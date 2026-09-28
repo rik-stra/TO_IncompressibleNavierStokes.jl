@@ -65,6 +65,27 @@ Measure `‖h_t − h_t^∞‖` against warm-up length on tracked data and repor
 `n_latent` draws for `z`, then `N_Q` draws for the emission — in that order, and only after the
 warm-up. Nothing else consumes `rng`.
 
+# Window mode (`spec.window = W > 0`)
+
+The recurrent state is **reset for every prediction** and the last `W` inputs -- this step's and
+the `W - 1` before it -- are replayed from `h = c = 0`. The deployed prediction is then exactly the
+last output of a training segment of length `W`, which is what lets training use every row as the
+end of a short window.
+
+🔴 **The latent draw belongs to the PHYSICAL STEP, not to the window it is replayed in.** Step `t`
+is fed through the cell in `W` consecutive windows. Drawing `z_t` afresh each time would give the
+model a different noise history at every prediction, so consecutive corrections would not come
+from one noise realisation at all. So each step's standard-normal `eps_t` is drawn ONCE, when the
+step is first predicted, and stored beside its input; every replay forms
+`z_t = mu_z(x_t) + sigma_z(x_t) .* eps_t` from the stored pair. Because the encoder reads only
+`x_t`, which is also stored, the replayed `z_t` is bit-identical to the one first used.
+
+- **Warm-up steps enter the window with `eps = 0`**, i.e. the posterior mean -- the replay draws
+  nothing (V38), as in the persistent mode. That touches only the first `W - 1` predictions.
+- The warm-up must be at least `W - 1` steps, so the first prediction already sees a full window.
+- Per predicted step the `rng` gives `n_latent` draws for `eps_t`, then `N_Q` for the emission --
+  the same order and count as the persistent mode.
+
 # Fields
 - `spec`, `weights`: the model. `check_shapes` is run at construction.
 - `scaling`: the `(in_scaling, out_scaling)` pair, applied exactly as `LinReg` applies it.
@@ -73,6 +94,8 @@ warm-up. Nothing else consumes `rng`.
   `MVG_sampler` has none, which is a known asymmetry.
 - `stochastic`: `false` returns the emission mean instead of a draw. A diagnostic, not a mode to
   run the paper on.
+- `tie_noise`: window mode only. `true` (default) draws each step's latent once and replays it;
+  `false` re-draws the whole window at every prediction -- an ablation, not a model.
 """
 struct StochLSTM{T,S}
     spec::LSTMSpec
@@ -86,12 +109,26 @@ struct StochLSTM{T,S}
     gate::Float64
     stochastic::Bool
     scratch::Vector{T}
+    # window mode only (`spec.window = W > 0`; zero columns otherwise): the last `W` inputs and
+    # their latent draws, oldest in column 1, and how many columns are filled
+    xwin::Matrix{T}
+    ewin::Matrix{T}
+    nwin::Vector{Int}
+    tie_noise::Bool
+    eprev::Vector{T}        # the previous step's emission noise, for `scaling.eta_ar`
 
     function StochLSTM(spec::LSTMSpec, weights::LSTMWeights{T}, scaling;
                        spinnup_data = nothing, rng, gate::Real = 1e-2,
-                       stochastic::Bool = true) where {T}
+                       stochastic::Bool = true, tie_noise::Bool = true) where {T}
         check_shapes(weights, spec)
         nq = spec.hist.n_qoi
+        W = spec.window
+        if W > 0
+            nw = spinnup_data === nothing ? 0 : size(spinnup_data, 2)
+            nw >= W - 1 || error(
+                "StochLSTM: window = $W needs a warm-up of at least $(W - 1) steps so the first " *
+                "prediction sees a full window; got $nw.")
+        end
         if spinnup_data !== nothing
             size(spinnup_data, 1) >= nq || error(
                 "StochLSTM: spinnup_data has $(size(spinnup_data, 1)) rows but N_Q = $nq")
@@ -102,8 +139,60 @@ struct StochLSTM{T,S}
         end
         new{T,typeof(scaling)}(spec, weights, scaling, LSTMState(spec, T),
                                HistoryBuffer(spec.hist, T), spinnup_data, zeros(Int, 1), rng,
-                               Float64(gate), stochastic, zeros(T, spec.hist.n_qoi))
+                               Float64(gate), stochastic, zeros(T, spec.hist.n_qoi),
+                               zeros(T, n_input(spec), W), zeros(T, spec.n_latent, W), zeros(Int, 1),
+                               tie_noise, zeros(T, spec.hist.n_qoi))
     end
+end
+
+# Append one step's input and latent draw to the window, dropping the oldest once it is full.
+# A column loop, not `xwin[:, 1:W-1] .= xwin[:, 2:W]`: an aliased broadcast copies (allocates).
+function _push_window!(m::StochLSTM{T}, x, eps) where {T}
+    W = m.spec.window
+    if m.nwin[] == W
+        @inbounds for j in 1:(W - 1), i in axes(m.xwin, 1)
+            m.xwin[i, j] = m.xwin[i, j + 1]
+        end
+        @inbounds for j in 1:(W - 1), i in axes(m.ewin, 1)
+            m.ewin[i, j] = m.ewin[i, j + 1]
+        end
+    else
+        m.nwin[] += 1
+    end
+    j = m.nwin[]
+    @inbounds for i in axes(m.xwin, 1)
+        m.xwin[i, j] = T(x[i])
+    end
+    @inbounds for i in axes(m.ewin, 1)
+        m.ewin[i, j] = eps === nothing ? zero(T) : T(eps[i])
+    end
+    return m
+end
+
+# Reset the recurrence and replay the filled window, oldest first, each step with its OWN stored
+# latent draw. Leaves the last step's output in `m.state`.
+function _replay_window!(m::StochLSTM)
+    reset!(m.state)
+    if is_dense(m.spec)
+        dense_window!(m.state, m.weights, m.spec, view(m.xwin, :, 1:m.nwin[]), view(m.ewin, :, 1:m.nwin[]))
+        return m
+    end
+    if m.spec.prior === :learned
+        # 🔑 ewin holds the stored LATENTS z of the earlier steps, and the fresh standard-normal draw
+        # of the newest one: replay the earlier steps, draw the newest z from the learned prior at the
+        # resulting h_{n-1}, store it (later windows reuse it), then take the last step with it
+        k = m.nwin[]
+        for j in 1:(k - 1)
+            lstm_step!(m.state, m.weights, m.spec, view(m.xwin, :, j); eps = view(m.ewin, :, j))
+        end
+        learned_prior_z!(view(m.ewin, :, k), m.state, m.weights, copy(view(m.ewin, :, k)))
+        lstm_step!(m.state, m.weights, m.spec, view(m.xwin, :, k); eps = view(m.ewin, :, k))
+        return m
+    end
+    for j in 1:m.nwin[]
+        lstm_step!(m.state, m.weights, m.spec, view(m.xwin, :, j); eps = view(m.ewin, :, j))
+    end
+    return m
 end
 
 needs_qstar(::StochLSTM) = true
@@ -125,6 +214,27 @@ in_warmup(m::StochLSTM) = m.counter[] < nwarm(m)
 # Push one completed step onto the lag window, in the scaled units the regressor is built in.
 "What the fit predicts: `:q` (the level; every fit before 2026-09-23) or `:dQ` (the correction)."
 _lstm_target(scaling) = hasproperty(scaling, :target) ? scaling.target : :q
+
+"""
+    _apply_input_map(x, scaling)
+
+Apply the fit's fixed input map, `x -> P x`, when its `scaling` carries one (`input_map`), else
+return `x` unchanged. 🔑 Preprocessing, like the standardisation, and stored with it: a square,
+invertible `P` changes no information, only the conditioning -- e.g. replacing `q*^{n-1}` by the
+standardised increment `(q*^n - q*^{n-1} - m) / s`, which a least-squares map otherwise reaches only
+through coefficients of ~130 that a network does not learn (`results_LSTMS.md` §7f). The training
+driver applies the same `P` to its design, so training and deployment see one input.
+"""
+function _apply_input_map(x::AbstractVector{T}, scaling) where {T}
+    hasproperty(scaling, :input_map) || return x
+    P = scaling.input_map
+    size(P, 2) == length(x) ||
+        error("input_map is $(size(P)) but the regressor has $(length(x)) entries")
+    return T.(P * x)
+end
+
+"The fit's calibrated noise scale (`scaling.noise_scale`), 1 when absent."
+_noise_scale(scaling) = hasproperty(scaling, :noise_scale) ? scaling.noise_scale : 1.0
 
 function _push_scaled!(m::StochLSTM{T}, q, q_star) where {T}
     qs = scale_input(collect(q), m.scaling.in_scaling)
@@ -156,20 +266,69 @@ function get_next_item_timeseries(m::StochLSTM{T}, q_star) where {T}
 
     # the regressor for the step about to be taken
     qs_scaled = T.(vec(scale_input(qs_host, m.scaling.in_scaling)))
-    x = inputvec(m.buf, qs_scaled)
+    x = _apply_input_map(inputvec(m.buf, qs_scaled), m.scaling)
 
+    windowed = m.spec.window > 0
     if in_warmup(m)
-        # 🔴 Charge the recurrence, draw nothing, and return the recorded dQ UNCONVERTED.
-        lstm_step!(m.state, m.weights, m.spec, x; sample_latent = false)
+        # 🔴 Charge the recurrence, draw nothing, and return the recorded dQ UNCONVERTED. In window
+        # mode there is nothing to charge -- the state is reset at every prediction -- so the step
+        # only enters the window, at the posterior mean (`eps = 0`).
+        if windowed
+            _push_window!(m, x, nothing)
+        else
+            lstm_step!(m.state, m.weights, m.spec, x; sample_latent = false)
+        end
         m.counter[] += 1
         dQ = m.spinnup_data[1:nq, m.counter[]]
         _push_scaled!(m, qs_host .+ dQ, qs_host)
         return dQ
     end
 
-    lstm_step!(m.state, m.weights, m.spec, x; rng = m.rng, sample_latent = true)
+    if windowed
+        # 🔴 This step's latent draw is taken ONCE, here, and stored with its input; the W - 1
+        # later windows that replay this step reuse it (see "Window mode" above). Scalar draws in
+        # the order `lstm_step!` makes them, so the rng is consumed identically in both modes.
+        _push_window!(m, x, nothing)
+        if latent_sampled(m.spec)
+            # ⚠️ `tie_noise = false` is a DIAGNOSTIC ablation only: every step of the window is
+            # re-drawn at every prediction, so consecutive corrections share no latent draw. It
+            # measures how much of the correction's persistence the tying produces.
+            jr = m.tie_noise ? (m.nwin[]:m.nwin[]) : (1:m.nwin[])
+            # 🔑 `scaling.noise_scale` (window mode): every latent draw, and the emission noise
+            # below, is multiplied by it -- the spread parameter a closed-loop calibration adjusts
+            ns = T(_noise_scale(m.scaling))
+            @inbounds for j in jr, i in axes(m.ewin, 1)
+                m.ewin[i, j] = ns * T(randn(m.rng))
+            end
+        end
+        _replay_window!(m)
+    else
+        lstm_step!(m.state, m.weights, m.spec, x; rng = m.rng, sample_latent = true)
+    end
     if m.stochastic
         sample_emission!(m.scratch, m.state, m.weights, m.spec, m.rng)
+        # `scaling.emission_scale` (per QoI, window mode) multiplies the EMISSION noise on top of
+        # `noise_scale` -- whiter corrections in chosen bands without touching the shared latent
+        es = hasproperty(m.scaling, :emission_scale) ? m.scaling.emission_scale : nothing
+        if windowed && (_noise_scale(m.scaling) != 1 || es !== nothing)
+            ns = T(_noise_scale(m.scaling))
+            @inbounds for k in eachindex(m.scratch)
+                f = es === nothing ? ns : ns * T(es[k])
+                m.scratch[k] = m.state.y[k] + f * (m.scratch[k] - m.state.y[k])
+            end
+        end
+        # 🔑 COLOURED emission noise (2026-09-27): `scaling.eta_ar = a` (per QoI) turns the white
+        # emission draw e_n into a stationary AR(1), e'_n = a e'_{n-1} + sqrt(1 - a^2) e_n -- same
+        # marginal variance, lag-k autocorrelation a^k. The linear model with it is M0^c (plan L7).
+        if hasproperty(m.scaling, :eta_ar)
+            a = m.scaling.eta_ar
+            @inbounds for k in eachindex(m.scratch)
+                e = m.scratch[k] - m.state.y[k]
+                ec = T(a[k]) * m.eprev[k] + sqrt(one(T) - T(a[k])^2) * e
+                m.eprev[k] = ec
+                m.scratch[k] = m.state.y[k] + ec
+            end
+        end
     else
         copyto!(m.scratch, m.state.y)
     end
@@ -181,6 +340,18 @@ function get_next_item_timeseries(m::StochLSTM{T}, q_star) where {T}
     tgt = _lstm_target(m.scaling)
     # :q -- the level, :dQ -- the additive correction, :logr -- the multiplicative one, r = log1p(dQ/q*)
     dQ = tgt === :dQ ? out : tgt === :logr ? qs_host .* expm1.(out) : out .- qs_host
+    # 🔑 `scaling.dq_offset` (physical units, per QoI): a constant added to every deployed correction
+    # -- the parameter a closed-loop CALIBRATION of the level adjusts (`tools/m4_calibrate.jl`)
+    # `scaling.offset_ref` (per QoI) makes the offset STATE-PROPORTIONAL, `c .* q* ./ q*_ref`: the
+    # same correction at the typical level, shrinking as a band drains (2026-09-27: a constant
+    # offset pushed low excursions into collapse, the clamp firing)
+    if hasproperty(m.scaling, :dq_offset)
+        if hasproperty(m.scaling, :offset_ref)
+            dQ .+= m.scaling.dq_offset .* (qs_host ./ m.scaling.offset_ref)
+        else
+            dQ .+= m.scaling.dq_offset
+        end
+    end
     any(abs.(qs_host) .< m.gate) && (dQ .= 0)
 
     _push_scaled!(m, qs_host .+ dQ, qs_host)

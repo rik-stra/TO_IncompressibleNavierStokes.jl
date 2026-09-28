@@ -275,10 +275,16 @@ then overfitted the rest. More data does not change that (no-skip `:vrnn` on 1�
 a floor of 0.262), so it is structural: the output `V1 tanh(·)` has no linear path from the input.
 
 🔑 **Fix: a linear skip `y += Ws x`** (`LSTMSpec(; skip = true)`, V60), seeded with the
-least-squares map and `V1 = 0`, so update 0 IS the linear model. Joint training at `lr = 1e-2`
-wrecks the seed in two updates (0.284 → 1.14 held out) — the map is a cancellation that a 1e-2
-Adam step on every coefficient destroys — so `Ws` is **frozen** (`freeze = (:Ws,)`) and the
-recurrence models the residual.
+least-squares map and `V1 = V2 = 0`, so update 0 IS the linear model; `Ws` is then **frozen**
+(`freeze = (:Ws,)`) and the recurrence models the residual. Freezing is a convenience, not a
+necessity: joint and frozen `:vrnn` end at the same held-out 0.291 (best checkpoint 0.287). At the
+least-squares optimum the `Ws` gradient is ~0 (norm 9e-3) but Adam normalises it, so every early
+step moves each coefficient by ~`lr` and costs ~+0.03 held out; freezing avoids that.
+⚠️ **Correction (same day):** the round-1 `:vrnn`/`:vaernn` skip fits were seeded with `V1 = 0` only,
+so their decoder skip `V2 z`, `z = Bmu x`, added a random linear map: the seed scored **3.01**, not
+0.284, and the drop "0.284 → 1.14 in two updates" first reported here was training recovering from
+that, not destroying the seed. `:storn`/`:lstm` fits (incl. the lead candidate) were seeded exactly;
+the driver now zeroes `V2` as well. Their end points are unaffected (the table below).
 
 | round 1: residual mean (`:none` emission) | held out (linear floor) |
 |---|---|
@@ -348,6 +354,11 @@ covariance) — M0's structure in the M4 code path.
    persistence falls with λ. The same dial `results.md` §4b found for LinReg1 — and gotcha #63's
    round-off-regularised LinReg1 (h = 5, runs 6–9% low) sits on the other side of zero from the
    exact h = 5 fit here (+1 to +2.3 sd high).
+   🔑 **Joint training does not choose λ for you.** From an exact seed a jointly trained skip stays
+   on the unregularised least-squares map (`:storn` 0.03 output-sd from it, nearest ridge λ = 0;
+   `:lstm` + η returns update 0) — the LS map IS the optimum of the teacher-forced one-step loss,
+   while λ ≈ 1e-5 is set by the closed-loop bias, which no one-step objective contains. Only an
+   objective through the solver (L5) or an online choice of λ (online selection — Rik's call) can.
 6. 🔑 **Deeper lags get the spread right (sd ratio ≈ 1 at h ≥ 3) but not the bias**, which is not
    monotone in h (+1, +0.4, +1.8, +2, +1.5 sd at h = 1, 2, 3, 5, 10): a high-gain cancelling map
    (max |C| 119 → 2527) is sensitive in closed loop to small differences between fits. λ acts on the
@@ -365,6 +376,372 @@ covariance) — M0's structure in the M4 code path.
 
 ⚠️ **All of this is 20 TU, 2–3 replicas, one seed** — a screen. Shared GPU; noise-free timings are
 not quoted.
+
+### 7e. Window mode: short q*-only windows, reset every prediction (2026-09-24, branch `m4-short-lstm`)
+
+The model (Rik): input `x_t = [q*_t; 1]` only (h = 0), `LSTMSpec(; window = W)`; the deployed closure
+resets the state every step and replays the last `W` inputs, each with its OWN latent draw -- `eps_t`
+is drawn once, when step `t` is first predicted, and reused in the `W - 1` later windows that replay it
+(V61). Training: `L = W`, `stride = 1`, `burn = W - 1` (only the deployed prediction is scored), every
+row a window end -- 2 870 windows, 89 updates/epoch. Driver `tools/m4_window_fit.jl`; held-out 50-100
+TU, same unit as §7c (0.5 x SSE per step, standardised `dQ`). One seed, CPU, ~1 min per fit.
+
+| W = 10, 1-10 TU | held out | best at update |
+|---|---|---|
+| linear, `[q*_n; 1]` | 1.752 | — |
+| linear, the whole stacked window `[q*_{n-9..n}; 1]` | **1.460** | — |
+| (§7c: linear with the level lag `q^{n-1}`) | (0.284) | — |
+| `:vrnn` 16/4, no skip | 1.971 | 120 |
+| — `lr = 1e-3` | 1.978 | 620 |
+| — all 10 outputs scored (`burn = 0`) | 2.080 | 120 |
+| — frozen linear skip on `x_n`, `V1 = V2 = 0` seed | 1.749 | 40 |
+
+1. 🔴 **Dropping the level lag costs a factor 5 before any network is involved**: the best linear map
+   on ten `q*` steps scores 1.46 against 0.284 with `q^{n-1}`. `q^{n-1} = q*^{n-1} + dQ^{n-1}`, so what
+   is lost is the previous correction (lag-1 0.74) -- not recoverable from the predictor history.
+2. 🔴 **No fit reaches even the `q*_n` floor without the skip** (1.97 vs 1.75), and none reaches the
+   window floor; with the skip frozen the recurrence adds nothing (1.749). Not undertraining: train
+   loss falls 5.4 -> 1.25 while inner validation and held out both turn up after ~120 updates.
+   Stride 1 multiplies windows, not information -- they overlap in 9 of 10 steps of one 9 TU record.
+3. **The source's KL (`kl_mode = :reference`, V62) changes nothing at the same `lam`**: 1.970 / 2.079
+   / 1.736 against 1.971 / 2.080 / 1.749 (last / all / skip). Its KL is SUMMED over batch x steps,
+   so its weight scales with the geometry: at the source's 32 x 100 and `lam = 1e-4` a `z`-vector's KL
+   weighs 0.32 against one step's SSE; at 32 x 10 with the last step scored the same `lam` gives
+   0.0032. Matched to 0.32 (`lam = 1e-2` last, `1e-3` all) the posterior collapses onto the prior
+   (`sigma_z` 0.99 at `lam = 1e-2`, 0.5 at 1e-4) and held out is slightly worse, 2.07 / 2.11.
+
+### 7f. The q*-only search: increments, the skip, validation, and a conditional-VAE encoder (2026-09-24)
+
+Plan and checklist: [`plan_m4_search.md`](plan_m4_search.md). Driver `tools/m4_window_fit.jl`, W = 10,
+16 hidden / 4 latent, one seed; held out 50-100 TU in dQ units (0.5 x SSE, CRPS over 32 draws,
+spread/skill = ensemble sd / rmse of the ensemble mean). Online 20 TU x 3 on the desktop 3090.
+
+**The linear structure.** Least squares on `[q*_n, q*_{n-1}]` scores 1.458 (on `q*_n` alone 1.752);
+more lags add nothing (W = 10: 1.460, W = 40: 1.565). It needs coefficients of ~130 -- the increment
+of q*, tiny in scaled units -- which no network learned. `FEAT = diff` feeds the standardised
+increment as a fixed invertible `input_map` (V63): the no-skip LSTM then gains (1.97 -> 1.83), but
+still does not reach the linear map. 🔴 **Online, every model with the `[q*, Δq*]` skip diverged,
+0/9 by step 191**, the pure linear + eta included: `q*_n = S(q*_{n-1} + dQ_{n-1})`, so the increment
+carries the model's own last correction and the gain-130 map closes a runaway loop.
+
+**Two review findings, measured.** (i) Validation blocks spread through 1-10 TU (with embargo)
+select WORSE fits than the trailing block -- held out 1.95-2.02 vs 1.736 -- because they share the
+training regime and do not penalise the residual the LSTM grows on the skip; kept as `VAL=blocked`,
+default `tail`. (ii) Held-out inputs beyond the training range explain nothing: 3.6-4.9% of rows,
+and clamping them moves the linear floor 0.5%. Held-out dQ leaves the training range on 0.08-0.8% of
+steps, and the fits track those steps at least as well as the rest (slope 0.35 no skip, 0.54-0.61
+with the skip). 🔑 The linear skip is the unbounded output path (`:storn`/`:lstm` are otherwise capped
+at `cdec +- sum|V1|`), so it is now on by default and frozen (joint training leaves the LS map
+within ~20 updates, 1.96-2.00 held out).
+
+**The latent is not a predictive distribution (the finding of the day).** With the source's encoder
+`q(z | x)`, which never sees the target, spread/skill is **0.05-0.11** at any `beta` (1e-4 or 1e-2,
+sigma_z ~ 1): the decoder ignores `z` because noise only raises the squared error. CRPS 0.500 against
+linear + eta's 0.378. `posterior = :xy` (V65) trains `q(z_t | x_t, dQ_t)` and deploys the prior:
+
+| q*-only, W = 10 | held out | CRPS | spread/skill |
+|---|---|---|---|
+| linear + eta | 1.752 | **0.378** | 0.85-1.08 |
+| `:vrnn` + skip, source encoder | 1.736 | 0.500 | 0.05-0.11 |
+| `:vrnn` + skip, **conditional encoder** | 1.806 | 0.382 | 0.71-0.88 |
+| — state-dependent head / `beta` 0.3 / 3 / nz 2, 8 / W 5, 20 / last-step score | 1.75-1.93 | 0.379-0.392 | 0.64-1.29 |
+
+With level history (h = 1, `q_star_q`) the same holds: CVAE CRPS 0.1287 vs linear + eta 0.1284,
+spread/skill 0.95-0.99; source encoder 0.17-0.18, spread/skill 0.01-0.20.
+
+**Online, q* only (20 TU x 3).**
+
+| | stable | flat | >2900 | Z16 min | sd ratio | KS | `dQ` lag-1 | clamp |
+|---|---|---|---|---|---|---|---|---|
+| **reference** | | 0.2-6.9% | 1.9-12.2% | 721-1080 | 0.86-1.14 | 0.27-0.77 | 0.73-0.75 | 0 |
+| `:storn` + skip, source encoder | 3/3 | 1.7-3.3% | 7.5-10.7% | 511-639 | 1.22-1.33 | **0.55-0.69** | 0.997 | 0 |
+| `:vrnn` + skip, source encoder | 3/3 | 1.3-2.7% | 6.0-8.4% | 521-654 | 1.22-1.27 | 0.42-1.27 | 0.92-0.94 | 0 |
+| — W = 5 / W = 20 | 2/3, 3/3 | | | 207-243 | 1.4-1.8 | 1.2-2.3 | 0.96-0.98 | 18-453 |
+| linear + eta / + LSTM noise scale | 3/3 | | | 160-206 | 1.4-2.0 | 2.3-3.2 | 0.32-0.57 | 242-719 |
+| `:vrnn` + skip, conditional encoder | 3/3 | 1.4-4.4% | 5.0-6.8% | 162-233 | 1.78 | 1.8-2.7 | 0.43-0.62 | 344-532 |
+| no skip (raw / diff) | 2/3, 3/3 | | | 120-178 | 1.8-2.7 | 1.1-1.8 | 0.67-0.79 | 72-304 |
+
+1. 🔴 **Nothing q*-only passes.** The mean is linear-limited, and the noise is either negligible
+   (source encoder: stable, clamp-free, KS in band, but the correction is `q*`'s own persistence,
+   0.93-0.997, and still 1.2-1.3x too wide) or calibrated for one step (linear + eta, the
+   conditional VAE), which the closed loop amplifies to 1.4-2.0x with the clamp firing -- §7d's
+   finding, now for a learned latent too.
+2. 🔑 The window length does not set the persistence (W = 5 / 10 / 20: 0.98 / 0.93 / 0.97), so the
+   0.93 is not the noise tying.
+
+### 7g. With level history: the conditional VAE online (2026-09-24)
+
+Same protocol as §7f, `x_t = [q*_t; q_{t-1}; q*_{t-1}; (q_{t-2}; q*_{t-2};) 1]` (`H`, `HIST_VAR=q_star_q`),
+frozen skip seeded with least squares (`LAMBDA = 0`) or the ridge map. Offline every fit sits on its
+linear floor (0.284 at h = 1, 0.249 at h = 2); the conditional VAE matches linear + eta on CRPS
+(0.1287 vs 0.1284; h = 2 0.1097 vs 0.1095) with spread/skill 0.95-0.99, the source encoder does not
+(0.17-0.18, spread/skill 0.01-0.20). Online, 20 TU x 3, all 27 runs finite:
+
+| | sd ratio | KS | `dQ` lag-1 | clamp | mean offset (sd) | Z16 min | >2900 |
+|---|---|---|---|---|---|---|---|
+| **reference** | **0.86-1.14** | **0.27-0.77** | **0.73-0.75** | 0 | **-0.2..+0.3** | 721-1080 | 1.9-12.2% |
+| CVAE h = 1, lambda 0 | **0.91-1.17** | 2.1-2.4 | 0.79-0.80 | 0 | +0.8..+1.1 | 1076-1530 | 15-25% |
+| CVAE h = 1, lambda 3e-6 / 1e-5 | 1.3-1.7 / 1.6-2.3 | 0.8-1.0 / 0.6-1.2 | 0.77-0.80 | 0-272 | 0..+0.6 / -0.1..+0.2 | 56-590 | 11-20% |
+| linear + eta h = 1, lambda 0 / 1e-5 | 0.96-1.28 / 1.37-1.69 | 0.8-1.2 / 1.1 | 0.74-0.78 | 0 / 0-236 | +0.1..+0.7 / -0.1..-0.5 | 78-978 | 6-20% |
+| **linear + eta h = 2, lambda 0** | **1.11-1.52** | **0.77-1.10** | 0.76-0.78 | **0** | +0.1..+0.5 | 562-745 | 9.6-17% |
+| CVAE h = 2, lambda 0 / 3e-6 | 1.23-1.35 / 1.5-2.0 | 1.6-1.7 / 0.9-1.3 | 0.78-0.81 | 0 / 0-268 | +0.5..+0.9 / +0.1..+0.6 | 48-1010 | 14-19% |
+| `:storn` h = 1, source encoder | 0.83-0.88 | 2.4-3.0 | 0.96 | 0 | +0.8..+1.2 | 1114-1408 | 12-21% |
+
+1. 🔴 **No variant passes the screen.** Nearest: linear + eta at h = 2 -- 2 of 3 replicas inside the band
+   on flat, >2900 and sd ratio (1.11 / 1.12), KS 0.77 / 0.78; misses on the minimum (562-621) and the
+   persistence (0.76-0.78).
+2. 🔑 **One dial governs everything: the linear mean's lambda trades closed-loop bias for spread.**
+   lambda = 0 runs high (+0.5 to +1.1 sd), any ridge removes the bias and over-disperses (1.3-2.3, the
+   clamp firing) -- for the CVAE and for eta alike (§7d found it for eta).
+3. 🔑 **The conditional VAE is the first latent that is a real predictive distribution**, and at
+   h = 1 it has the best spread of any model (0.91-1.17 in all three replicas, clamp 0) with near-right
+   persistence (0.79-0.80). Online it behaves like calibrated eta, not better: its learned temporal
+   structure does not remove the mean's bias, which one-step training cannot see (§7d point 5).
+
+### 7h. Two checks before closed-loop training (2026-09-25)
+
+**(a) A QoI surrogate of the solver is NOT a usable training environment -- no-go.**
+`analysis/m4_surrogate_check.jl` linearises the LF step around the recorded trajectory,
+`q*_n = q*_n^rec + sum_k A_k (q_{n-k} - q_{n-k}^rec)` (A_k by least squares on 1-10 TU), and runs the
+deployed closures through it exactly as online. One step it is near-perfect (R^2 0.998-0.99997), but
+its propagator has spectral radius **1.013 (p = 1) / 1.60 (p = 2)** -- it AMPLIFIES deviations the real
+LES damps -- and in closed loop it gets the bias's sign wrong for 5 of 6 fits (linear + eta h = 1:
+-0.9..-2.3 sd against online -0.5..+0.7; h = 2: -0.3..-1.6 against -0.5..+0.5) and the spread 1.5-5x
+too large; only the h = 1 CVAE's +1.0..+1.6 matched online's +0.7..+1.1. A least-squares Jacobian of a
+near-identity map estimated from natural variability is confounded by the forcing; it is not the
+solver's response. 🔑 A rollout that replays the recorded q* cannot see the bias either (§7), so closed-
+loop training needs either the solver's measured QoI response or the solver itself.
+
+**(b) Resetting the state per prediction (window) beats a persistent state.** Same inputs, CVAE,
+frozen skip; persistent fits by `m4_diag_fit.jl` (`POST=xy`, L 500/200), 20 TU x 3:
+
+| | sd ratio | flat | `dQ` lag-1 | clamp |
+|---|---|---|---|---|
+| reference | 0.86-1.14 | 0.2-6.9% | 0.73-0.75 | 0 |
+| **window W = 10, h = 1** | **0.91-1.17** | 0.2-8.1% | **0.79-0.80** | **0** |
+| persistent h = 1, L = 500 | 2.2-2.6 | 0.4-3.9% | 0.88-0.89 | 700-1180 |
+| persistent h = 1, L = 200 | 0.63-1.15 | 5-8% | 0.86 | 0 |
+| **window W = 10, h = 2** | 1.23-1.35 | 1.4-6.3% | 0.78-0.79 | 0 |
+| persistent h = 2, L = 500 | 0.38-1.28 | **9-19%** (the flat state of §6 returns) | 0.84 | 0-107 |
+
+The persistent state makes the same model over-dispersed or erratic across replicas, and more
+persistent; the reset window is consistent. The +0.5..+1 sd mean bias is common to both.
+⚠️ `elbo` now takes the KL over EVERY step for `posterior = :xy` (a burn-in `z` must not code its target
+for free); window fits scored all steps and are unaffected.
+
+**(c) A rollout with REPLAYED q* is the wrong environment -- tested directly.**
+`analysis/m4_replay_rollout.jl` runs the deployed closure over 50-99.5 TU with the recorded q* supplied
+each step, so the level lags are the model's own `q* + dQhat` and the predictor does not respond:
+
+| fit | teacher-forced 0.5·SSE | replayed-q* rollout (mean / seeds) | online, real solver |
+|---|---|---|---|
+| linear + eta h = 1, lambda 0 | 0.284 | **explodes (~1e50)** | stable 3/3 |
+| CVAE h = 1, lambda 0 | 0.285 | **explodes** | stable 3/3 |
+| linear + eta / CVAE h = 2, lambda 0 | 0.249 / 0.250 | **NaN** | stable 3/3 |
+| linear + eta h = 1, lambda 1e-5 | 0.341 | 2.76 / 3.8 | stable 3/3 |
+| CVAE h = 1, lambda 1e-5 | 0.364 | 3.73 / 4.7-4.8 | stable 3/3 |
+
+🔑 The fits' key feature is the cancellation `a q*_n + b q_{n-1}` (|a|, |b| ~ 119), i.e. the increment
+`q*_n - q_{n-1}`, which is meaningful only because the solver makes `q*_n = S(q_{n-1})`. Replay `q*`
+and the cancellation partner is gone: `q_n = q*_n + dQhat(q_{n-1})` has a loop gain of ~119. The
+earlier "1.00x exposure" (§7) was measured on fits that ignored the lag (§7c) and does not transfer.
+So closed-loop training needs a q* that RESPONDS to the correction: a surrogate of the solver.
+
+**(d) An MLP surrogate on the current step only (Rik's spec) is unstable -- no-go.**
+`analysis/m4_mlp_surrogate.jl`: `q*_{n+1} = q*_n + dQ_n + Delta`, `Delta ~ N(mu(u), sigma(u)^2)`,
+`u = [q*_n; dQ_n]`, an MLP (2 x 64 tanh) and a linear head, Gaussian NLL on 1-10 TU. The MLP overfits
+(best val NLL at epoch 200: -2.33 against -4.81 on training); in closed loop it **diverges in 18 of 18
+runs within 240-1160 steps**, and does so even with the record's own corrections replayed (dmean -55 to
++82 sd): as a dynamical system it has no attractor. The linear head diverges in 14 of 18; its 4
+survivors carry the online bias's sign (h = 1 CVAE +1.3..+1.7 against GPU +0.8..+1.1). 🔑 A map on the
+six QoIs integrates its own step error; what holds the LES on its attractor lives in the unresolved
+field and the forcing. The online bias is an equilibrium shift of exactly that kind.
+
+**(e) The solver's MEASURED response to a correction (38 GPU replay runs).** `12_online_StochLSTM.jl` with
+`RIKFLOW_M4_NWARM` >= the run length only replays the recorded dQ; `RIKFLOW_PERT=j,m,delta` adds a sustained
+step (±0.5 sd(dQ_j) from step m, m = 200 / 1000 / 1800, 400 steps); `analysis/m4_response.jl` reads q* =
+q[:, n+1] − dQ[:, n]. The GPU is deterministic (two identical baselines agree exactly) and the replay
+tracks the record to ≤ 3e-3 q-sd over 2000 steps.
+- 🔑 **The solver passes a correction on ~1:1.** One-step kernel diagonal 0.98 / 1.02 / 0.82 / 1.04 / 0.51 /
+  1.03; the step response grows ~linearly (S_k ≈ k in four bands to k = 10–25): an integrator.
+- Restoring appears only after ~50–100 steps in bands 1, 3, 5; bands 2, 4, 6 still hold 30–115 (per unit
+  step) at k = 200. At k = 200 the spread across start times rivals the signal and the symmetric part is
+  17–27% of the response (not linear).
+- A linear-response surrogate on this kernel truncated at 200 steps has no restoring force and diverges
+  (18/18 at lambda = 0, most at 1e-5). Not a training environment -- but it explains §7d/§7g: a constant bias
+  in the correction is summed over the restoring time into a large LEVEL offset, and white one-step noise is
+  summed into over-dispersion.
+
+### 7i. Closed-loop calibration against the training period, and the dense VAE (2026-09-27)
+
+Rik allowed closed-loop calibration against **training-period statistics only** (the level over 1-10 TU).
+Tools: `scaling.dq_offset` (a per-QoI constant added to the deployed correction), `scaling.noise_scale`
+(scales every latent and emission draw, window mode; V67), `tools/m4_offset_variant.jl`,
+`tools/m4_calibrate.jl` (level Jacobian from +-offset runs, damped Newton step), `analysis/m4_calib_score.jl`.
+
+**Why ridge + a noise scale cannot do it.** On the h = 1 CVAE, lambda removes the bias (|mean error| over
+QoIs: 0.93 at 0, 0.16 at 3e-6, 0.10 at 1e-5) but the level's sd grows (1.0 -> 1.3 -> 1.8 x training), and
+scaling the noise by 0.7 or 0.5 barely changes that at lambda > 0: the over-dispersion is DYNAMICAL -- the
+shrunk map damps the loop less -- not the noise. An offset moves the mean without touching the gain.
+
+**The level Jacobian (+-0.05 sd(dQ) per QoI, replica 1):** entries 5-64 q-sd per dQ-sd, cond 623, signs
+physical (an enstrophy correction in the smallest bands lowers every level); -0.5 sd(dQ) offsets diverged,
+and so did -0.05 in QoI 1. **The Newton step** is <= 0.03 sd(dQ) (bands 5-6), 0.002-0.006 elsewhere.
+
+| h = 1 CVAE (`b_xy_h1`) | mean error vs 1-10 TU per QoI (sd) | sd / training sd |
+|---|---|---|
+| uncalibrated | +0.85..+1.10 | 0.86-1.13 |
+| offset x 0.5 | +0.32..+0.55 | 0.90-1.40 |
+| **offset x 1 (`xy1_N1`)** | **-0.10..+0.13 (all 3 replicas)** | 1.07-1.42 |
+| offset x 1.5 | -0.35..-1.22 | 1.41-1.86 |
+
+Reference-band screen, 20 TU:
+
+| `xy1_N1` | flat | >2900 | Z16 max / min | sd ratio | KS | `dQ` lag-1 | clamp |
+|---|---|---|---|---|---|---|---|
+| **reference** | 0.2-6.9% | 1.9-12.2% | 3100-3790 / 721-1080 | 0.86-1.14 | 0.27-0.77 | 0.73-0.75 | 0 |
+| r1 | 4.1% | 7.1% | 3952 / 191 | 1.35 | **0.69** | 0.790 | 177 |
+| r2 | 5.8% | 10.3% | 3405 / 823 | 1.19 | **0.52** | 0.771 | 0 |
+| r3 | 3.3% | 9.2% | 3585 / 794 | 1.18 | **0.43** | 0.784 | 0 |
+
+🔑 **KS inside the reference band in all three replicas -- a first for any model in this search.** r2/r3 are
+in band on everything but the sd ratio (1.18-1.19 vs <= 1.14) and persistence (0.77-0.78 vs <= 0.75).
+
+**More replicas, and the drain.** Replicas 4-5 of `xy1_N1` (not used in the calibration) sit -0.4..-0.8 sd
+low with the clamp firing; with r1, 3 of 5 replicas fall into a DRAINED state (Z16 min 166-281 vs the
+reference's 721). A constant offset adds dissipation to bands 5-6 at every state, pushing low excursions into
+collapse. **A state-proportional offset** (`scaling.offset_ref`, `c .* q* ./ mean_{1-10 TU}(q*)`, V68) -- the
+same `c`, shrinking as a band drains -- removes it:
+
+| `xy1_R1_s0.8` (state-proportional offset, noise x 0.8), 5 replicas | in band |
+|---|---|
+| flat 3.0-5.5% / >2900 3.1-9.3% / clamp 0 | 5/5 / 5/5 / 5/5 |
+| **KS 0.36-0.66** | **5/5** |
+| sd ratio 0.96-1.18 | 4/5 |
+| Z16 max 3140-3825 / min 434-965 | 4/5 / 3/5 |
+| **`dQ` lag-1 0.79-0.80** (reference 0.73-0.75) | **0/5** |
+
+Training-period score |mean error| 0.09 sd, |log sd ratio| 0.06. The calibrated h = 2 linear + eta is worse
+(full step drains, clamp > 1700; damped step sd 1.14-1.70). Persistence is the remaining gap.
+
+**The fair comparison: calibrate the linear model the same way** (h = 1, state-proportional offset from its
+own Jacobian, noise x 0.8; 20 TU x 5):
+
+| | sd ratio | KS (in band) | Z16 min | `dQ` lag-1 | clamp |
+|---|---|---|---|---|---|
+| **calibrated deep (CVAE)** `xy1_R1_s0.8` | 0.96-1.18 | 0.36-0.66 (**5/5**) | 434-965 | 0.79-0.80 | 0 |
+| calibrated linear + eta `le1_R1_s0.8` | 1.02-1.32 | 0.53-1.54 (3/5) | 256-807 | 0.78-0.80 | 0 |
+| calibrated linear + AR(1) eta | 1.08-1.28 | 0.58-1.50 (2/5) | 257-706 | 0.81-0.83 | 2/5 |
+| LinReg1-equivalent h = 5, one step (+1.2..+2.8 sd before) | 1.09-1.22 | 1.63-2.12 (0/3) | 251-302 | 0.77-0.78 | 2/3 |
+
+🔑 **Calibration closes most of the gap; the deep model stays ahead** (KS in band 5/5 vs 3/5, tighter spread,
+better lower tail). Most of the "improvement over LinReg" is the calibration, a smaller part the model. The
+h = 5 map starts so far off (+1.2..+2.8 sd) that one Newton step overshoots into the drained state; a second
+step is running.
+
+**Over 100 TU the difference is clear** (`analysis/m4_screen_long.jl`, 3 replicas each, both calibrated the
+same way on 1-10 TU):
+
+| 100 TU | whole-run KS | sd ratio | mean offset vs the 100 TU reference (sd) |
+|---|---|---|---|
+| **calibrated deep** `xy1_R1_s0.8` | **0.35-0.49** | 1.12-1.22 | **+0.01..+0.11** |
+| calibrated linear `le1_R1_s0.8` | 0.89-1.34 | 1.13-1.18 | −0.36..−0.64 |
+
+🔑 The linear calibration does not hold beyond the 20 TU it was tuned on (it drifts half an sd low); the deep
+one does. A second Newton step brings the h = 5 LinReg1-equivalent to KS 1.06-1.17, sd 1.09-1.31, >2900
+10.7-18.2%, clamp 0 -- better, still behind.
+
+**Seed robustness -- negative.** The recipe (h = 1 CVAE, its own Jacobian, one Newton step, state-proportional
+offset, noise x 0.8) was repeated on training seeds 2 and 3. Offline the three fits are identical (held out
+0.285-0.286, CRPS 0.128-0.129); online they are not:
+
+| 20 TU x 5 | |mean err| / |log sd err| | behaviour |
+|---|---|---|
+| seed 1, own step (`xy1_R1_s0.8`) | 0.09 / 0.06 | healthy 5/5 |
+| seed 2, own full step | 1.53 / 0.67 | 4/5 lock HIGH (Z16 never below its initial 1887, sd ratio 0.4-0.5) |
+| seed 2, own damped step (mu = 100) | 0.27 / 0.39 | over-dispersed 1.3-1.7, clamp 5/5 |
+| seed 2, seed 1's offset transferred | 0.84 / 0.63 | drains (Z16 min 51-129), clamp |
+| seed 3, seed 1's offset transferred | 0.87 / 0.56 | locks high / drains / diverges |
+| seed 3, own Jacobian | -- | cannot be formed: both +-0.05 runs in QoI 4 diverge; base replica 1 off by 4.4 sd |
+
+🔴 **The closure is multistable** -- a healthy state, a drained one and a high-locked one -- and which basin a
+fit lands in depends on sub-0.05 sd(dQ) differences in the correction and on the training seed; the level
+Jacobian is ill-conditioned (cond ~1000-2800) and strongly nonlinear. **Seed 1's success is one basin, not a
+recipe.** Any claim of the calibrated CVAE over LinReg needs a calibration that finds the healthy basin
+reliably (a line search along the Newton direction is being tried on seed 2), or it rests on one seed.
+
+**Also this round:** integrated regression (the skip fitted on k-step sums, `SUMK`) diverged 9/9 online;
+**the dense VAE** (`arch = :dense`, V66: a 2-layer MLP on the window, no recurrence) matches the LSTM offline
+exactly (floor 0.285, CRPS 0.1287) and online within noise (sd ratio 0.95-1.51, KS 1.7-2.1 uncalibrated) --
+the recurrence neither helps nor hurts.
+
+### 7j. White vs coloured noise -- and a model that LEARNS the colour (2026-09-27)
+
+`analysis/m4_noise_colour.jl`: the closure run teacher-forced (K = 20 noise seeds) over a window; the
+model's NOISE is each draw minus the ensemble mean, the data's RESIDUAL is the recorded dQ minus it. The
+residual ACF is the colour the data asks for, the noise ACF the colour the model makes. Parameters are
+fitted on the training window only (`RIKFLOW_COLOUR_TRAIN=1`); held out 50-100 TU confirms.
+
+**The data's residual is coloured in the middle bands**, white elsewhere (training 1-10 TU, h = 1 mean):
+
+| | Z[0,6] | E[0,6] | Z[7,15] | E[7,15] | Z[16,32] | E[16,32] |
+|---|---|---|---|---|---|---|
+| residual ACF lag 1 / 2 / 10 | 0.11 / 0.12 / −0.02 | 0.04 / 0.04 / 0.00 | **0.73 / 0.40 / 0.00** | **0.82 / 0.66 / −0.23** | 0.02 / −0.11 / 0.05 | 0.18 / 0.02 / 0.05 |
+
+**Every model so far makes WHITE noise** (ACF 0.00 at every lag, one-step spread calibrated 0.90-0.99):
+linear + eta, the window CVAE with a tied latent, the untied CVAE, and the dense CVAE. 🔑 The tied window
+gives the CVAE the MEANS for colour but no INCENTIVE: with an i.i.d. prior the conditional encoder explains
+each step's residual by that step's own z, so past z's are useless to the decoder; and ~all of its noise
+turns out to be the white emission head (colouring only the head reproduces the target colour).
+
+**Imposed colour: AR(1) on eta** (`scaling.eta_ar`, V69), a = the training residual's lag-1 per QoI -- on
+the linear mean this is M0^c (plan L7). It matches lags 1-2 (Z[7,15] 0.73 / 0.53 vs 0.73 / 0.40) but not
+the negative lobe (lag 5: +0.21 vs −0.19).
+
+**Learned colour: the VRNN prior** `p(z_t | h_{t-1})` (`LSTMSpec(; prior = :learned)`, V70), trained with
+KL(q(z_t | x_t, dQ_t) || p(z_t | h_{t-1})). With an emission head the white head still absorbs the residual
+(noise ACF 0); without one, beta = 1 and 0.1 collapse the posterior (spread 5-19% of the residual's). At
+**beta = 0.001, no head (`lp_none_b0.001`)** it learns the colour:
+
+| held out 50-100 TU | Z[7,15] lag 1 / 2 / 5 / 10 | E[7,15] lag 1 / 2 / 5 / 10 | white bands lag 1 | spread vs residual |
+|---|---|---|---|---|
+| data residual | 0.80 / 0.49 / −0.03 / 0.02 | 0.88 / 0.73 / 0.25 / −0.11 | 0.04-0.32 | 1 |
+| **learned prior** | **0.75 / 0.50 / −0.01 / −0.13** | **0.81 / 0.61 / 0.15 / −0.13** | 0.00-0.31 | 0.75-0.91 |
+| same model, standard prior (control) | −0.24 / −0.19 / 0.01 / 0.00 | −0.23 / −0.16 / 0.01 / 0.00 | −0.23..−0.38 | 1.5-3.0 |
+
+🔑 **The learned prior reproduces the colour -- including the negative lobe AR(1) cannot -- and keeps the
+white bands white; the identical model with the i.i.d. prior makes anti-correlated noise 1.5-3x too wide.**
+Offline cost: mean 0.303 vs 0.285, CRPS 0.132 vs 0.128 (one-step metrics cannot see colour). Online: running.
+
+**Online, 20 TU x 5 (uncalibrated unless named):**
+
+| | sd ratio | KS | `dQ` lag-1 | clamp |
+|---|---|---|---|---|
+| **reference** | 0.86-1.14 | 0.27-0.77 | 0.73-0.75 | 0 |
+| linear + white (M0) | 0.96-1.28 | 0.84-1.92 | **0.770-0.781** | 0 |
+| linear + AR(1) (M0^c) | 0.99-1.24 | 1.06-2.07 | 0.804-0.812 | 0 |
+| deep + white | 0.91-1.17 | 2.0-2.4 | 0.774-0.802 | 0 |
+| deep + AR(1) | 0.97-1.28 | 2.1-2.4 | 0.804-0.820 | 0 |
+| **calibrated deep + white** (`xy1_R1_s0.8`) | 0.96-1.18 | **0.36-0.66** | 0.79-0.80 | 0 |
+| calibrated deep + AR(1) | 1.03-1.38 | 0.33-0.78 | 0.811-0.830 | 2/5 |
+| deep + LEARNED colour (`lp_none_b0.001`) | 1.68-2.73 | 1.48-1.79 | 0.77-0.84 | 4/5 |
+
+🔴 **Colour does not help online, imposed or learned.** AR(1) raises the correction's persistence (+0.03)
+without improving KS; the learned-colour model is 1.7-2.7x too wide. 🔑 A reading consistent with §7h(e): the
+solver passes a correction on ~1:1, so a persistent noise is SUMMED into the level -- with lag-1 0.8 its
+summed variance is ~(1+a)/(1-a) ~ 9x a white one's. The residual's colour in the record is the colour of the
+correction the TRACKED run needed, conditional on its state; reproducing it unconditionally over-disperses.
+**Calibrating the learned-colour model does not rescue it**: every variant (full Newton step at noise x 1 /
+0.7 / 0.5, a damped step) drains -- Z16 minimum 19-100, clamp 785-3823, sd ratio 2.2-3.2. It reproduces the
+colour offline and runs away online: its coloured innovations are summed by the solver. A negative result
+for the paper, with a mechanism.
+
+**The factorial** (h = 1, identical inputs):
+
+| mean \ noise | white | coloured, imposed (AR(1)) | coloured, learned |
+|---|---|---|---|
+| linear | `b_lin_eta_h1` (M0) | `colour/lin_h1_ar` (M0^c) | -- |
+| deep (CVAE) | `b_xy_h1` / calibrated `calib/xy1_R1_s0.8` | `colour/xy_h1_ar` / `colour/xy1_R1_s0.8_ar` | `lp_none_b0.001` |
 
 ## 8. Where it stands, and what is open
 

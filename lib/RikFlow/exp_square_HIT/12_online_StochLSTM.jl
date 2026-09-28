@@ -20,6 +20,7 @@
 # file's comments for why each one is the way it is. Only the closure differs.
 
 using Random
+using Statistics
 using JLD2
 using RikFlow
 using IncompressibleNavierStokes
@@ -118,6 +119,18 @@ else
     params_track, u0, dQ_rec = load(ic_file, "params_track", "u0", "dQ")
 end
 
+# `RIKFLOW_ONLINE_DQ` reads the recorded dQ from the ~7 MB QoI cache instead -- the IC extract holds
+# only its first 1000 columns, which a replay (response experiment) longer than that runs past. It
+# must be the SAME record: checked on the columns both hold.
+dq_file = strip(get(ENV, "RIKFLOW_ONLINE_DQ", ""))
+if !isempty(dq_file)
+    dQ_full = load(dq_file, "dQ")
+    nc = min(size(dQ_full, 2), size(dQ_rec, 2))
+    dQ_full[:, 1:nc] == dQ_rec[:, 1:nc] ||
+        error("RIKFLOW_ONLINE_DQ = $dq_file disagrees with the IC's dQ on its first $nc columns")
+    dQ_rec = dQ_full
+end
+
 ustart = u0 isa Tuple ? stack(ArrayType{T}.(u0)) : ArrayType{T}(u0)
 
 # The warm-up window. ⚠️ M4's requirement is its own: the replay has to charge the recurrence, not
@@ -126,6 +139,20 @@ ustart = u0 isa Tuple ? stack(ArrayType{T}.(u0)) : ArrayType{T}(u0)
 # for M4 and this number should be set from that, not assumed.
 nwarm = parse(Int, get(ENV, "RIKFLOW_M4_NWARM", "100"))
 dQ_data = dQ_rec[:, 1:nwarm]
+# 🔑 RESPONSE EXPERIMENTS (2026-09-25): with `RIKFLOW_M4_NWARM` >= the run's step count the closure
+# only REPLAYS `dQ_data`, so the run is the LF solver driven by the recorded corrections.
+# `RIKFLOW_PERT = "j,m,delta"` adds `delta` x sd(dQ_j) to QoI j's correction from step m on -- a
+# sustained step -- to measure how q* responds (`analysis/m4_response.jl`). `RIKFLOW_ONLINE_TAG`
+# names the output so the runs of one experiment do not overwrite each other.
+pert = strip(get(ENV, "RIKFLOW_PERT", ""))
+if !isempty(pert)
+    pj, pm, pd = split(pert, ",")
+    pj, pm, pd = parse(Int, pj), parse(Int, pm), parse(Float64, pd)
+    dQ_data = copy(dQ_data)
+    dQ_data[pj, pm:end] .+= pd * std(dQ_rec[pj, :])
+    @info "response experiment: step perturbation" qoi = pj from_step = pm delta_sd = pd nwarm
+end
+otag = strip(get(ENV, "RIKFLOW_ONLINE_TAG", ""))
 
 params = (;
     params_track...,
@@ -148,12 +175,16 @@ for i in replicas
     # 🔑 The replica index selects the SEED, not a position in a sequence -- task 3 of an array
     # writes exactly the `..._replica3.jld2` the serial loop would have written. The closure is
     # rebuilt per replica so its recurrent state and history buffer start clean.
+    # `RIKFLOW_M4_UNTIED=1`: window mode's noise-tying ablation (`tie_noise = false`) -- a
+    # diagnostic; deploy it from a copy of the fit directory so its replicas cannot mix with the
+    # tied ones
     sampler = RF.StochLSTM(fit.spec, fit.weights, fit.scaling;
                            spinnup_data = dQ_data,
-                           rng = Xoshiro(seeds.to + i + 2))
+                           rng = Xoshiro(seeds.to + i + 2),
+                           tie_noise = get(ENV, "RIKFLOW_M4_UNTIED", "0") != "1")
 
     @info "Running sim $i out of $(cfg.n_replicas)"
     data_online = online_sgs(; params..., ustart = ustart, time_series_method = sampler)
-    jldsave(out_dir * "data_online_tsim$(tsim)_replica$(i)$(devtag).jld2";
+    jldsave(out_dir * "data_online_tsim$(tsim)_replica$(i)$(devtag)$(isempty(otag) ? "" : "_" * otag).jld2";
             data_online, params, model_index, deploy_seed, nwarm, model_file)
 end

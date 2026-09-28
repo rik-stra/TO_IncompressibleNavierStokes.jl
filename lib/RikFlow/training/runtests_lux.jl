@@ -902,4 +902,270 @@ const RF = RikFlow
         @test !all(iszero, psd.Wd)               # positive control: state-dependent does train it
         @test pc.bd != psd.bd || pc.Wx != psd.Wx # and the two are no longer the same fit
     end
+
+    # -----------------------------------------------------------------------------------------
+    # V61 -- window mode: the training segment IS the deployed window
+    # -----------------------------------------------------------------------------------------
+
+    @testset "V61 window: lstm_forward over the stored window == the deployed replay ($arch)" for
+            arch in (:lstm, :storn, :vrnn)
+
+        T = Float32
+        nq, W = 3, 5
+        hist = RF.HistorySpec(; h = 0, n_qoi = nq, hist_var = :q_star)
+        spec = RF.LSTMSpec(; hist, n_hidden = 6, n_latent = 4, n_encoder = 0, arch, window = W,
+                           emission = arch === :lstm ? :constant : :none, skip = true)
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        ps = merge(ps, (; Ws = randn(Xoshiro(4), T, size(ps.Ws)...) ./ 3))
+        w = RF.LSTMWeights(ps, spec)
+        mu, sd = reshape([0.1, 0.2, 0.3], nq, 1), reshape([2.0, 2.5, 3.0], nq, 1)
+        sc = (; in_scaling = (; mu, sigma = sd), out_scaling = (; mu, sigma = sd), target = :dQ)
+        rng = Xoshiro(11)
+        q_star = randn(rng, nq, 20) .+ 1.0
+        dQ = randn(rng, nq, 7) ./ 10
+        m = RF.StochLSTM(spec, w, sc; spinnup_data = dQ, rng = Xoshiro(5), gate = 0.0,
+                         stochastic = false)
+        for k in 1:20
+            RF.get_next_item_timeseries(m, q_star[:, k])
+            k > size(dQ, 2) || continue
+            # the training forward pass, from h = 0, on the closure's own window and draws
+            out = RF.lstm_forward(spec, ps, copy(m.xwin), copy(m.ewin))
+            @test out.Y[:, end] ≈ m.state.y rtol = 1e-5
+        end
+        RF.latent_sampled(spec) && @test any(!iszero, m.ewin)   # the draws are real
+
+        path = joinpath(mktempdir(), "win.jld2")
+        RF.save_stochlstm(path, spec, w, sc)
+        @test RF.load_stochlstm(path).spec.window == W
+    end
+
+    @testset "V61 window: train_stochlstm fits windows and refuses L != window" begin
+        T = Float32
+        nq, W, N = 3, 6, 400
+        rng = Xoshiro(21)
+        q = zeros(nq, N)
+        for t in 2:N
+            q[:, t] = 0.8 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        hist = RF.HistorySpec(; h = 0, n_qoi = nq, hist_var = :q_star)
+        spec = RF.LSTMSpec(; hist, n_hidden = 5, n_latent = 3, n_encoder = 0, arch = :vrnn,
+                           window = W)
+        X, Yb, st = RF.build_history(hist, q[:, 1:(N - 1)], q)
+        Xc, Yc = permutedims(X), permutedims(Yb)
+        @test_throws ErrorException RF.train_stochlstm(spec, Xc, Yc, st; L = W + 1, burn = W,
+                                                       stride = 1, epochs = 1, verbose = false)
+        ps, h = RF.train_stochlstm(spec, Xc, Yc, st; L = W, burn = W - 1, stride = 1, epochs = 2,
+                                   batch = 16, verbose = false, T)
+        # every training row that can end a full window does: ~0.8 N windows, not N / L
+        @test h.nseg == floor(Int, 0.8 * length(st)) - (W - 1)
+        @test all(isfinite, h.val)
+        @test RF.check_shapes(RF.LSTMWeights(ps, spec), spec)
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # V62 -- kl_mode = :reference is the source's `vae_loss_2D`
+    # -----------------------------------------------------------------------------------------
+
+    @testset "V62 kl_mode = :reference reproduces vae_loss_2D ($arch)" for arch in (:storn, :vrnn)
+        T = Float32
+        nq, L, B, lam = 3, 8, 4, 1e-2
+        spec = RF.LSTMSpec(; hist = RF.HistorySpec(; h = 0, n_qoi = nq, hist_var = :q_star),
+                           n_hidden = 5, n_latent = 4, n_encoder = 0, arch, window = L)
+        ps = RF.init_lstm_params(Xoshiro(7), spec; T)
+        ps = merge(ps, (; Bsig = randn(Xoshiro(8), T, size(ps.Bsig)...)))   # sig not all log 2
+        X = randn(Xoshiro(9), T, RF.n_input(spec), L, B)
+        Y = randn(Xoshiro(10), T, nq, L, B)
+        E = randn(Xoshiro(11), T, spec.n_latent, L, B)
+        o = RF.lstm_forward(spec, ps, X, E)
+
+        # the source, written out: yloss per (b, t) summed over features, KL one scalar over
+        # everything, loss = mean over (b, t) of (yloss + lam * kl)
+        for sc in (1:L, L:L)
+            yl = [sum(abs2, Y[:, t, b] .- o.Y[:, t, b]) for t in sc, b in 1:B]
+            kl = 0.5 * sum(o.SIG .^ 2 .+ o.MU .^ 2 .- 1 .- log.(1e-8 .+ o.SIG .^ 2))
+            want = sum(yl .+ lam * kl) / length(yl)
+            got = RF.elbo(spec, ps, X, Y, sc, E; beta = lam, kl_mode = :reference, kl_batch = B)
+            @test got ≈ want rtol = 1e-5
+        end
+
+        # splitting a chunk into smaller batches (validation) gives the same mean loss
+        whole = RF.elbo(spec, ps, X, Y, L:L, E; beta = lam, kl_mode = :reference, kl_batch = B)
+        halves = [RF.elbo(spec, ps, X[:, :, r], Y[:, :, r], L:L, E[:, :, r]; beta = lam,
+                          kl_mode = :reference, kl_batch = B) for r in (1:2, 3:4)]
+        @test sum(halves) / 2 ≈ whole rtol = 1e-5
+        # and the KL really carries weight: the per-step objective is a different number
+        @test RF.elbo(spec, ps, X, Y, L:L, E; beta = lam) != whole
+
+        spec_e = RF.LSTMSpec(; hist = spec.hist, n_hidden = 5, n_latent = 4, n_encoder = 0, arch,
+                             emission = :constant)
+        pe = RF.init_lstm_params(Xoshiro(7), spec_e; T)
+        @test_throws ErrorException RF.elbo(spec_e, pe, X, Y, L:L, E; beta = lam,
+                                            kl_mode = :reference, kl_batch = B)
+        # a short fit runs end to end under it
+        Xc = randn(Xoshiro(12), T, RF.n_input(spec), 200); Yc = randn(Xoshiro(13), T, nq, 200)
+        _, h = RF.train_stochlstm(spec, Xc, Yc, collect(1:200); L, burn = L - 1, stride = 1,
+                                  epochs = 1, batch = 8, verbose = false, kl_mode = :reference, T)
+        @test h.kl_mode === :reference && all(isfinite, h.val)
+    end
+
+    @testset "V64 an explicit split: segments never cross a gap, validation is the given block" begin
+        T = Float32
+        nq, W, N = 3, 6, 300
+        hist = RF.HistorySpec(; h = 0, n_qoi = nq, hist_var = :q_star)
+        spec = RF.LSTMSpec(; hist, n_hidden = 4, n_latent = 2, n_encoder = 0, arch = :vrnn,
+                           window = W)
+        Xc = randn(Xoshiro(1), T, RF.n_input(spec), N); Yc = randn(Xoshiro(2), T, nq, N)
+        steps = collect(1:N)
+        va = collect(121:180)                              # a middle block validates
+        tr = [c for c in 1:N if !(111 <= c <= 190)]         # 10-row embargo on each side
+        _, h = RF.train_stochlstm(spec, Xc, Yc, steps; L = W, burn = W - 1, stride = 1,
+                                  epochs = 1, batch = 8, verbose = false, T,
+                                  split = (; train = tr, val = va))
+        # full windows inside [1, 110] and [191, 300] only: (110 - W + 1) + (110 - W + 1)
+        @test h.nseg == 2 * (110 - W + 1)
+        @test all(isfinite, h.val)
+        @test_throws ErrorException RF.train_stochlstm(spec, Xc, Yc, steps; L = W, burn = W - 1,
+                                                       stride = 1, epochs = 1, verbose = false,
+                                                       split = (; train = tr, val = [100, 101]))
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # V65 -- posterior = :xy, the conditional-VAE encoder: q(z | x, y) in training, prior online
+    # -----------------------------------------------------------------------------------------
+
+    @testset "V65 posterior = :xy ($arch)" for arch in (:storn, :vrnn)
+        T = Float32
+        nq, L, B = 3, 6, 4
+        hist = RF.HistorySpec(; h = 0, n_qoi = nq, hist_var = :q_star)
+        spec = RF.LSTMSpec(; hist, n_hidden = 5, n_latent = 4, n_encoder = 0, arch, window = L,
+                           emission = :constant, posterior = :xy)
+        @test RF.n_encoder_in(spec) == RF.n_input(spec) + nq
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        @test size(ps.Bmu) == (4, RF.n_input(spec) + nq)
+        X = randn(Xoshiro(4), T, RF.n_input(spec), L, B)
+        Y = randn(Xoshiro(5), T, nq, L, B)
+        E = randn(Xoshiro(6), T, 4, L, B)
+
+        # without a target the forward pass IS the prior: z = eps, the encoder weights unused
+        o1 = RF.lstm_forward(spec, ps, X, E)
+        o2 = RF.lstm_forward(spec, merge(ps, (; Bmu = 10 .* ps.Bmu, Bsig = ps.Bsig .+ 1)), X, E)
+        @test o1.Y == o2.Y && all(o1.MU .== 0) && all(o1.SIG .== 1)
+        # with one, the encoder reads it: a different target moves the latent
+        a = RF.lstm_forward(spec, ps, X, E; Y)
+        b = RF.lstm_forward(spec, ps, X, E; Y = Y .+ 1)
+        @test maximum(abs, a.MU .- b.MU) > 1e-3
+        # and elbo trains the encoder on it: nonzero gradient on Bmu
+        g = Zygote.gradient(p -> RF.elbo(spec, p, X, Y, 1:L, E; beta = 1.0), ps)[1]
+        @test sum(abs, g.Bmu) > 0
+
+        # the deployed step draws from the prior and ignores the encoder
+        w = RF.LSTMWeights(ps, spec)
+        st = RF.LSTMState(spec, T)
+        for t in 1:L
+            y, _, z = RF.lstm_step!(st, w, spec, view(X, :, t, 1); eps = view(E, :, t, 1))
+            @test z == E[:, t, 1]
+            @test y ≈ o1.Y[:, t, 1] rtol = 1e-5
+        end
+        path = joinpath(mktempdir(), "xy.jld2")
+        RF.save_stochlstm(path, spec, w, (; in_scaling = nothing, out_scaling = nothing))
+        @test RF.load_stochlstm(path).spec.posterior === :xy
+        @test_throws ErrorException RF.LSTMSpec(; hist, arch = :lstm, emission = :constant,
+                                                posterior = :xy)
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # V66 -- arch = :dense, the no-recurrence window VAE (Phase D)
+    # -----------------------------------------------------------------------------------------
+
+    @testset "V66 arch = :dense: training forward == deployed window map (posterior $post)" for
+            post in (:x, :xy)
+        T = Float32
+        nq, W = 3, 5
+        hist = RF.HistorySpec(; h = 1, n_qoi = nq, hist_var = :q_star_q)
+        spec = RF.LSTMSpec(; hist, n_hidden = 7, n_latent = 2, n_encoder = 0, arch = :dense,
+                           window = W, emission = :constant, skip = true, posterior = post)
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        @test size(ps.Wx) == (7, W * (RF.n_input(spec) + 2)) && length(ps.b) == 14
+        ps = merge(ps, (; Ws = randn(Xoshiro(4), T, size(ps.Ws)...) ./ 3, V1 = randn(Xoshiro(5), T, nq, 7)))
+        w = RF.LSTMWeights(ps, spec)
+        @test RF.check_shapes(w, spec)
+        mu, sd = reshape([0.1, 0.2, 0.3], nq, 1), reshape([2.0, 2.5, 3.0], nq, 1)
+        sc = (; in_scaling = (; mu, sigma = sd), out_scaling = (; mu, sigma = sd), target = :dQ)
+        rng = Xoshiro(11)
+        q_star = randn(rng, nq, 16) .+ 1.0
+        m = RF.StochLSTM(spec, w, sc; spinnup_data = randn(rng, nq, 6) ./ 10, rng = Xoshiro(5),
+                         gate = 0.0, stochastic = false)
+        for k in 1:16
+            RF.get_next_item_timeseries(m, q_star[:, k])
+            k > 6 || continue
+            o = RF.lstm_forward(spec, ps, reshape(copy(m.xwin), :, W, 1), reshape(copy(m.ewin), :, W, 1))
+            @test o.Y[:, end, 1] ≈ m.state.y rtol = 1e-5
+            @test all(iszero, o.Y[:, 1:(end - 1), 1])
+        end
+        path = joinpath(mktempdir(), "dense.jld2")
+        RF.save_stochlstm(path, spec, w, sc)
+        back = RF.load_stochlstm(path)
+        @test back.spec.arch === :dense && back.spec.posterior === post
+        # a short fit (last-step score) runs end to end
+        N = 200
+        Xc = randn(Xoshiro(12), T, RF.n_input(spec), N); Yc = randn(Xoshiro(13), T, nq, N)
+        _, h = RF.train_stochlstm(spec, Xc, Yc, collect(1:N); L = W, burn = W - 1, stride = 1,
+                                  epochs = 1, batch = 8, verbose = false, T)
+        @test all(isfinite, h.val)
+        @test_throws ErrorException RF.LSTMSpec(; hist, arch = :dense, window = 0)
+    end
+
+    # -----------------------------------------------------------------------------------------
+    # V70 -- prior = :learned, the VRNN prior p(z_t | h_{t-1}): learned colour
+    # -----------------------------------------------------------------------------------------
+
+    @testset "V70 prior = :learned ($arch)" for arch in (:storn, :vrnn)
+        T = Float32
+        nq, L, B = 3, 6, 2
+        hist = RF.HistorySpec(; h = 0, n_qoi = nq, hist_var = :q_star)
+        spec = RF.LSTMSpec(; hist, n_hidden = 5, n_latent = 3, n_encoder = 0, arch, window = L,
+                           emission = :constant, posterior = :xy, prior = :learned)
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        @test all(iszero, ps.Pm) && all(RF._softplus.(ps.Pbs) .≈ 1)    # starts at N(0, I)
+        ps = merge(ps, (; Pm = randn(Xoshiro(4), T, 3, 5) ./ 2, Ps = randn(Xoshiro(5), T, 3, 5) ./ 2,
+                        Pbm = randn(Xoshiro(6), T, 3) ./ 3))
+        w = RF.LSTMWeights(ps, spec)
+        @test RF.check_shapes(w, spec)
+        X = randn(Xoshiro(7), T, RF.n_input(spec), L, B)
+        E = randn(Xoshiro(8), T, 3, L, B)
+        o = RF.lstm_forward(spec, ps, X, E)                     # prior mode: z from p(z | h)
+        @test o.MU == o.MUP
+        # replay with the DEPLOYED step: z_t = learned_prior_z!(h_{t-1}, eps_t), then lstm_step!
+        st = RF.LSTMState(spec, T)
+        z = zeros(T, 3)
+        for t in 1:L
+            RF.learned_prior_z!(z, st, w, E[:, t, 1])
+            @test z ≈ o.MU[:, t, 1] .+ o.SIG[:, t, 1] .* E[:, t, 1] rtol = 1e-5
+            y, _, _ = RF.lstm_step!(st, w, spec, view(X, :, t, 1); eps = z)
+            @test y ≈ o.Y[:, t, 1] rtol = 1e-5
+        end
+        # the KL trains the prior
+        Y = randn(Xoshiro(9), T, nq, L, B)
+        g = Zygote.gradient(p -> RF.elbo(spec, p, X, Y, 1:L, E; beta = 1.0), ps)[1]
+        @test sum(abs, g.Pm) > 0 && sum(abs, g.Bmu) > 0
+        # the deployed closure: its output equals a replay of its own stored window of latents
+        mu, sd = reshape([0.1, 0.2, 0.3], nq, 1), reshape([2.0, 2.5, 3.0], nq, 1)
+        sc = (; in_scaling = (; mu, sigma = sd), out_scaling = (; mu, sigma = sd), target = :dQ)
+        q_star = randn(Xoshiro(11), nq, 14) .+ 1.0
+        m = RF.StochLSTM(spec, w, sc; spinnup_data = randn(Xoshiro(12), nq, 7) ./ 10, rng = Xoshiro(5),
+                         gate = 0.0, stochastic = false)
+        for k in 1:14
+            RF.get_next_item_timeseries(m, q_star[:, k])
+        end
+        st2 = RF.LSTMState(spec, T)
+        for j in 1:L
+            RF.lstm_step!(st2, w, spec, view(m.xwin, :, j); eps = view(m.ewin, :, j))
+        end
+        @test st2.y ≈ m.state.y rtol = 1e-6
+        path = joinpath(mktempdir(), "lp.jld2")
+        RF.save_stochlstm(path, spec, w, sc)
+        back = RF.load_stochlstm(path)
+        @test back.spec.prior === :learned && back.weights.P.Wm == w.P.Wm
+        @test_throws ErrorException RF.LSTMSpec(; hist, arch = :vrnn, prior = :learned)   # needs :xy
+    end
 end
