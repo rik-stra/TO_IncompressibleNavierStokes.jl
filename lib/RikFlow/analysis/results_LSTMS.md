@@ -213,9 +213,68 @@ exposure: the fed-back level is `q* + dQ`, so the model's own error barely enter
    - white noise at the output (emission heads): far too white (0.04–0.07), and the widest runs;
    - **cell and decoder (`:vrnn`)**: **0.741, on the reference's 0.743**, and the only `dQ` fit with no
      drain, no clamp and the smallest overshoot.
-4. What remains is **the upward swing — under-damped excursions** (the level target erred the other
+4. 🔴 **The `dQ`/`logr` fits OVERFIT within tens of updates** — they are early-stopped, not converged.
+   Validation bottoms out at update 26–70 and then rises while training keeps falling (`dq_storn`:
+   best 1.70 at update 26, 2.30 at 200 with training at 1.10); the plateau rule then walks the rate
+   to its floor and the stop fires ~200 updates later, so the deployed model is the update-26–70
+   iterate. The level target keeps improving for 10 000 updates. Reason: the correction is mostly
+   unpredictable (~43% of its variance explained) and the learnable part is found in ~30 updates;
+   after that ~2 950 parameters memorise the 8 TU training block's noise. **Regularisation (smaller
+   `n_hidden`, larger `beta`, weight decay, lower `lr`) or more training data is therefore a lever
+   for this target in a way it was not for the level.**
+5. What remains is **the upward swing — under-damped excursions** (the level target erred the other
    way). The multiplicative target `:logr` is the attack: its correction scales with `q*`, and its
    level cannot go negative.
+
+### 7a. Regularisation against the correction target's overfitting (2026-09-24, laptop, branch `m4-regularization`)
+
+⚠️ **Run in parallel with §7b–§7j on the desktop and merged afterwards; read it in that light.** Its
+fits are on the architecture WITHOUT the linear skip, and §7c finds that architecture never learned
+the linear part — which is the deeper reason these fits overfit, and why the ranking below says little
+about the skip models. Its **weight decay is the UNCOUPLED form** (`decay_couple = false`: each update
+shrinks every weight by `wd`, whatever the rate); the desktop fits (`m4_diag_fit.jl`,
+`m4_window_fit.jl`) use the coupled default (`lr * wd`). The same `wd` is not the same decay across the
+two — at `lr = 1e-2`, uncoupled `1e-3` is coupled `0.1`.
+
+Offline only. `dQ` target, `:vrnn`, `L = 500`, seed 1, from scratch; each fit scored by the
+**held-out R² of the correction** (`m4_heldout_skill`: teacher-forced, latent at its mean, per QoI,
+on a window disjoint from training and from the stopping set). New: `train_stochlstm(...;
+weight_decay, decay_couple = false)` (V74); `m4_explore_fit.jl` overrides `NHIDDEN`, `WD`, `TRAINRANGE`.
+Figure: `analysis/plot_m4_reg_loss.jl` → [fig17](figures/fig17_lstm_reg_loss.png).
+
+![loss decay, regularisation sweep](figures/fig17_lstm_reg_loss.png)
+
+| fit | best at update | held-out R², steps 4000–7600 | lower four bands | top two | R², steps 12400–16000 |
+|---|---|---|---|---|---|
+| baseline (`n_hidden` 16) | 70 | 0.127 | −0.40 … −0.07 | 0.93 / 0.92 | 0.176 |
+| `n_hidden` 10 | 70 | 0.172 | −0.40 … −0.03 | 0.93 / 0.91 | |
+| **`n_hidden` 6** | 74 | **0.274** | **−0.06 … +0.01** | 0.89 / 0.83 | |
+| **`n_hidden` 6 + wd 1e-3** | 74 | **0.279** | −0.05 … +0.01 | 0.89 / 0.83 | **0.291** |
+| beta 1e-2 | 70 | 0.119 | −0.40 … −0.07 | 0.93 / 0.91 | |
+| beta 1 | 110 | −0.028 | −0.64 … −0.11 | 0.90 / 0.90 | |
+| wd 1e-4 / 1e-3 / 1e-2 | 70 / 84 / 132 | 0.124 / 0.126 / 0.129 | ≤ −0.03 | 0.93 / 0.92 | |
+| lr 1e-3 | 384 | 0.179 | −0.30 … −0.06 | 0.88 / 0.91 | |
+| lr 1e-3 + wd 1e-3 | **2434** | 0.262 | −0.07 … −0.01 | 0.85 / 0.89 | 0.230 |
+| `:storn` + wd 1e-3 | 26 | 0.237 | −0.13 … −0.04 | 0.88 / 0.86 | |
+| **training range 1–30 TU** (a protocol change) | 92 | — (inside its training range) | | | **0.337** (lower −0.05 … +0.15, top 0.93 / 0.93) |
+| *level target, 10 000 updates (for scale)* | 9998 | *0.475* | *0.45 0.34 −0.04 0.37* | *0.94 / 0.78* | |
+
+- 🔑 **The overfitting is capacity against data.** `n_hidden` 6 roughly doubles held-out skill
+  (0.127 → 0.274; 0.176 → 0.291 on the second window) by taking the four lower bands from clearly
+  negative to about zero, at a small cost in the top two; the train/val gap all but closes.
+  **Three times the data does best** (0.337, lower bands positive, top bands kept at 0.93) — but
+  moves the training range off the project's 1–10 TU partition, so it is Rik's call.
+- **`beta` and weight decay alone do nothing** (beta 1 is worse); the best iterate stays at ~70.
+- ⚠️ **lr 1e-3 + wd 1e-3 does not overfit, but for the wrong reason**: validation falls to update
+  2434 (the sweep's lowest, 1.55) while training loss RISES from ~600 — the per-update decay is not
+  scaled by the learning rate, so once the rate decays the decay dominates and shrinks the network.
+  Regularisation by attrition; wd 1e-2 shows the same, stronger. (The coupled default avoids this.)
+- None reaches the level target's lower-band skill (0.34–0.45): that part of the correction is
+  learnable, the correction target does not learn it from 8 TU of data.
+- **Next candidate, as written on the laptop**: `n_hidden` 6 (+ wd 1e-3) on 1–30 TU, then the online
+  screen. ⚠️ Superseded as a plan by §7c–§8, which put the linear skip in first and found the
+  recurrence then adds no residual mean on 1–10 TU. §7c scores held-out LOSS (0.5 × SSE, lower is
+  better) on 50–100 TU, not this section's R², so the two tables do not compare number for number.
 
 ### 7b. 20 TU × 3 replicas on a GPU (2026-09-24)
 

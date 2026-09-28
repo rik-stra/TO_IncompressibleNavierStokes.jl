@@ -278,3 +278,38 @@ function m4_training_data(rec, cfg, hist; target::Symbol = :q)
     return (; Xc = permutedims(X), Yc = Dn, steps,
             scaling = (in_scaling = in_scaling, out_scaling = out_scaling, target))
 end
+
+"""
+    m4_heldout_skill(spec, ps, rec, cfg, scaling; window, burn = 100) -> (; r2, r2mean, window)
+
+Teacher-forced skill of a fit on a held-out window, as the fraction of the recorded CORRECTION's
+variance it explains, per QoI (R^2 = 1 - SSE/SST over the scored columns). The latent is at its
+mean (`eps = 0`), so this is the predictive mean's skill, not a draw's. Needs the Lux extension
+(`lstm_forward` on the training parameters `ps`).
+
+🔑 **Why the correction, whatever the target**: it is what the closure returns to the solver, so
+`:q`, `:dQ` and `:logr` fits are compared on the same quantity -- `qhat - q*`, the prediction, or
+`q* (exp(r) - 1)` respectively.
+🔴 The inner validation set is also the stopping set, so it cannot show overfitting on its own; this
+window is disjoint from both training and validation.
+"""
+function m4_heldout_skill(spec, ps, rec, cfg, scaling; window::Tuple{Int,Int}, burn::Int = 100)
+    a, b = window
+    ins = scaling.in_scaling
+    qs = RikFlow.scale_input(rec.q[:, a:b], ins)
+    qss = RikFlow.scale_input(rec.q_star[:, a:(b - 1)], ins)
+    X, _, steps = RikFlow.build_history(spec.hist, qss, qs)
+    Xc = permutedims(Float32.(X))
+    N = size(Xc, 2)
+    out = RikFlow.lstm_forward(spec, ps, Xc, zeros(Float32, spec.n_latent, N)).Y
+    y = Float64.(RikFlow.scale_output(out, scaling.out_scaling))
+    cols = (a - 1) .+ steps
+    qstar = rec.q_star[:, cols]
+    tgt = hasproperty(scaling, :target) ? scaling.target : :q
+    pred = tgt === :dQ ? y : tgt === :logr ? qstar .* expm1.(y) : y .- qstar
+    truth = rec.dQ[:, cols]
+    sc = (burn + 1):N
+    r2 = [1 - sum(abs2, pred[k, sc] .- truth[k, sc]) / sum(abs2, truth[k, sc] .- mean(truth[k, sc]))
+          for k in axes(truth, 1)]
+    return (; r2, r2mean = mean(r2), window)
+end

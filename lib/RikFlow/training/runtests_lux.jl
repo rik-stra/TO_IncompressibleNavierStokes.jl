@@ -1233,4 +1233,43 @@ const RF = RikFlow
         @test back.spec.prior === :learned && back.weights.P.Wm == w.P.Wm
         @test_throws ErrorException RF.LSTMSpec(; hist, arch = :vrnn, prior = :learned)   # needs :xy
     end
+
+    # -----------------------------------------------------------------------------------------
+    # V74 -- weight decay with decay_couple = false: (1 - lambda) per update, whatever the rate
+    # -----------------------------------------------------------------------------------------
+    #
+    # At lr = 0 Adam does not move, so an uncoupled decay leaves every weight at exactly
+    # (1 - lambda)^updates of its start, while the coupled default (lr * lambda) leaves it untouched --
+    # so this separates the two. L2 through the gradient (WeightDecay before Adam) would move them by
+    # ~lr per step instead -- zero here as well.
+    @testset "V74 uncoupled weight decay shrinks every weight by (1 - lambda) per update" begin
+        T = Float64
+        nq, N = 3, 500
+        rng = Xoshiro(101)
+        q = zeros(Float64, nq, N)
+        for t in 2:N
+            q[:, t] = 0.8 .* q[:, t - 1] .+ 0.3 .* randn(rng, nq)
+        end
+        sp = mkspec(:vrnn; n_qoi = nq, h = 1, n_hidden = 6, n_latent = 3, n_encoder = 0, emission = :none)
+        X, Yb, st = RF.build_history(sp.hist, q[:, 1:(N - 1)], q)
+        kw = (; L = 60, burn = 15, batch = 4, seed = 3, verbose = false, T, epochs = 3)
+        p0, _ = RF.train_stochlstm(sp, permutedims(X), permutedims(Yb), st; kw..., lr = 5e-3)
+        lam = 1e-2
+        p1, h1 = RF.train_stochlstm(sp, permutedims(X), permutedims(Yb), st; kw..., lr = 0.0,
+                                    init_ps = p0, weight_decay = lam, decay_couple = false)
+        @test h1.weight_decay == lam && h1.decay_couple == false
+        # the returned iterate is the best one, which a pure shrink need not improve on -- so compare
+        # the weights at the iterate it came from: (1 - lam)^best_update
+        f = (1 - lam)^h1.best_update
+        @test p1.Wx ≈ f .* p0.Wx rtol = 1e-10
+        @test p1.V1 ≈ f .* p0.V1 rtol = 1e-10
+        # and with no decay nothing moves at lr = 0
+        p2, _ = RF.train_stochlstm(sp, permutedims(X), permutedims(Yb), st; kw..., lr = 0.0, init_ps = p0)
+        @test p2.Wx == p0.Wx
+        # and the coupled default scales the decay by the rate, so at lr = 0 it does nothing
+        p3, h3 = RF.train_stochlstm(sp, permutedims(X), permutedims(Yb), st; kw..., lr = 0.0,
+                                    init_ps = p0, weight_decay = lam)
+        @test h3.decay_couple == true
+        @test p3.Wx == p0.Wx
+    end
 end

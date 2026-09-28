@@ -8,6 +8,12 @@
 #   RIKFLOW_X_ARCH      :storn | :vrnn | :vaernn        (where the latent noise enters)
 #   RIKFLOW_X_BETA      KL weight
 #   RIKFLOW_X_NLATENT   latent dimension
+#   RIKFLOW_X_NHIDDEN   LSTM width (capacity)
+#   RIKFLOW_X_WD        weight decay, UNCOUPLED: each update shrinks every weight by this fraction
+#                       whatever the rate (`decay_couple = false`, results_LSTMS.md §7a; default 0)
+#   RIKFLOW_X_TRAINRANGE  "a,b" record columns to train on (default the cell's 400,4000 -- a protocol change)
+#   RIKFLOW_X_HELDOUT   "a,b" held-out window for the R^2 score (default 4000,7600, or just past a
+#                       longer training range)
 #   RIKFLOW_X_EMISSION  none | constant | state_dependent  (an output noise channel)
 #   RIKFLOW_X_TARGET    q | dQ | logr   (the level, the additive correction, or log1p(dQ/q*))
 #   RIKFLOW_X_L / _BURN / _STRIDE   segmentation (default 500 / 100 / 100)
@@ -51,6 +57,9 @@ init_fit = warm ? RF.load_stochlstm(joinpath(isdir(init_dir) ? init_dir : joinpa
 ov = (; arch = Symbol(envs("ARCH", string(base.arch))),
       beta = parse(Float64, envs("BETA", string(base.beta))),
       n_latent = parse(Int, envs("NLATENT", string(base.n_latent))),
+      n_hidden = parse(Int, envs("NHIDDEN", string(base.n_hidden))),
+      # ⚠️ a longer training range is a PROTOCOL change (the project's partition is 1-10 TU train)
+      train_range = Tuple(parse.(Int, split(envs("TRAINRANGE", join(base.train_range, ",")), ","))),
       L = parse(Int, envs("L", string(base.L))),
       burn = parse(Int, envs("BURN", string(base.burn))),
       # 🔑 emission noise: :none (latent only), :constant or :state_dependent -- a white noise
@@ -61,6 +70,7 @@ stride = parse(Int, envs("STRIDE", "100"))
 epochs = parse(Int, envs("EPOCHS", "3000"))
 lr = parse(Float64, envs("LR", warm ? "1e-4" : string(base.lr)))
 K = parse(Int, envs("ROLLOUT", "1"))
+wd = parse(Float64, envs("WD", "0"))
 stride <= ov.L - ov.burn || error("stride $stride > L - burn = $(ov.L - ov.burn)")
 cfg = merge(base, ov)                    # keeps the base NAME, so the online cell check passes
 
@@ -88,7 +98,8 @@ lagmap = target !== :dQ ? nothing :
 common = (; cfg.L, cfg.burn, stride, cfg.batch, cfg.beta, cfg.val_frac, seed = 1, lagmap)
 t0 = time()
 ps, h = RF.train_stochlstm(spec, dat.Xc, dat.Yc, dat.steps; common..., epochs, lr, rollout = K,
-                           init_ps = warm ? init_fit.extras.ps : nothing, verbose = false)
+                           init_ps = warm ? init_fit.extras.ps : nothing, verbose = false,
+                           weight_decay = wd, decay_couple = false)
 wall = time() - t0
 # the exposure, measured the same way for every variant: its own output fed back for 100 steps
 score(p, k) = RF.train_stochlstm(spec, dat.Xc, dat.Yc, dat.steps; common..., epochs = 1, lr = 0.0,
@@ -96,6 +107,12 @@ score(p, k) = RF.train_stochlstm(spec, dat.Xc, dat.Yc, dat.steps; common..., epo
 Kx = min(100, cfg.L - cfg.burn)
 # the rollout score needs emission = :none (the feedback would be a draw); NaN for an emission head
 tf = score(ps, 1)
+# held-out skill on the CORRECTION, disjoint from training and from the stopping set
+hw = let e = envs("HELDOUT", "")
+    isempty(e) ? (cfg.train_range[2] <= 4000 ? (4000, 7600) :
+                  (cfg.train_range[2] + 400, cfg.train_range[2] + 4000)) : Tuple(parse.(Int, split(e, ",")))
+end
+hs = m4_heldout_skill(spec, ps, rec, cfg, dat.scaling; window = hw, burn = cfg.burn)
 ro = (RF.emission_noise(spec) || target === :logr) ? NaN : score(ps, Kx)
 
 out_dir = joinpath(TO_folder, "explore", tag)
@@ -103,9 +120,13 @@ path = joinpath(out_dir, "StochLSTM_seed1.jld2")
 RF.save_stochlstm(path, spec, RF.LSTMWeights(ps, spec), dat.scaling;
                   cfg, seed = 1, train_range = cfg.train_range, qoi_source = rec.source, losses = h,
                   ps, stride, batch = cfg.batch, rollout = K, target, overrides = ov, lr,
-                  init_from = warm ? init_dir : "", val = (; tf, ro, Kx))
+                  init_from = warm ? init_dir : "", val = (; tf, ro, Kx), weight_decay = wd, decay_couple = false,
+                  heldout = hs)
 RF.load_stochlstm(path)
 @printf("%s: %s em %s beta %.0e nz %d L %d target %s K %d | %d updates %.1f min (%s) | val TF %.4g, rollout-%d %.4g (%.2fx) | gmax %.3g\n",
         tag, cfg.arch, cfg.emission, cfg.beta, cfg.n_latent, cfg.L, target, K, h.updates, wall / 60, h.stop_reason,
         tf, Kx, ro, ro / tf, maximum(h.gmax))
+@printf("   best at update %d; train at end %.4g; held-out R2 (dQ, window %s): mean %.3f | %s
+",
+        h.best_update, h.train[end], string(hw), hs.r2mean, join((@sprintf("%.3f", r) for r in hs.r2), " "))
 println("wrote $path")

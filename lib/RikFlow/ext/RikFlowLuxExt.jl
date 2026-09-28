@@ -849,6 +849,15 @@ Fit an M4 model to a regressor/target pair.
 - `clip`: clip the gradient's global norm to this before Adam; `0` (default) is off.
   `history.gmax` logs the largest norm seen between validations, so an exploding rollout
   gradient is visible rather than silent.
+- `weight_decay`: AdamW weight decay, applied after the Adam step. `0` (default) is off. Added
+  2026-09-24 against the `:dQ`/`:logr` targets' overfitting (validation best at update 26-70).
+- `decay_couple`: how `weight_decay` is scaled. `true` (default, PyTorch's AdamW) shrinks every
+  weight by `lr * weight_decay` per update, so a learning-rate decay decays it too. `false` (the
+  original paper's form) shrinks by `weight_decay` per update whatever the rate -- which, once the
+  rate has decayed, lets the decay dominate and shrink the network (`results_LSTMS.md` §7a).
+  ⚠️ The same `weight_decay` means different things under the two: at `lr = 1e-2`, coupled `0.1`
+  is uncoupled `1e-3`. Every fit records `decay_couple` in its history.
+- `decay_exclude`: parameter names trained without weight decay, e.g. `(:bd, :Araw)`.
 
 🔴 **Returns the best-validation iterate, not the last one**, and the validation epsilons are drawn
 once and held fixed so the curve is a function of the parameters alone. Both matter more than they
@@ -889,7 +898,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
                             rollout::Int = 1, init_ps = nothing, clip::Real = 0,
                             lagmap = nothing, weight_decay::Real = 0, callback = nothing,
                             freeze = (), kl_mode::Symbol = :per_step, split = nothing,
-                            decay_exclude = ())
+                            decay_exclude = (), decay_couple::Bool = true)
     rollout >= 1 || error("train_stochlstm: rollout must be >= 1 (1 = teacher forcing); got $rollout")
     (rollout == 1 || !RF.emission_noise(spec)) || error(
         "train_stochlstm: rollout > 1 needs emission = :none -- with an emission head the deployed " *
@@ -1015,9 +1024,14 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
     # ⚠️ `clip > 0` clips the gradient's global norm before Adam -- the guard against a free
     # rollout's exploding gradient (Rik, 2026-09-23). Off by default; `history.gmax` shows
     # whether it is needed.
-    # `weight_decay > 0` is decoupled (AdamW-style) decay, applied after Adam's step and scaled by
-    # the current rate, so a learning-rate decay decays it too. Off by default.
-    adam = weight_decay > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(weight_decay)) :
+    # `weight_decay > 0` is AdamW decay, applied after Adam's step (never L2 through the gradient:
+    # `WeightDecay` before Adam goes through Adam's normalisation and moves weights by ~lr per step
+    # whatever lambda is -- measured, not assumed -- so lambda would not be the knob it looks like).
+    # `decay_couple = true` scales it by the current rate, so a learning-rate decay decays it too;
+    # `false` shrinks by `weight_decay` per update, and is exactly the `Adam -> WeightDecay` chain
+    # the 2026-09-24 regularisation sweep used (`results_LSTMS.md` §7a, V74). Off by default.
+    adam = weight_decay > 0 ?
+           Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(weight_decay); couple = decay_couple) :
            Optimisers.Adam(T(lr))
     rule = clip > 0 ? Optimisers.OptimiserChain(Optimisers.ClipNorm(T(clip)), adam) : adam
     opt = Optimisers.setup(rule, ps)
@@ -1258,7 +1272,7 @@ function RF.train_stochlstm(spec::RF.LSTMSpec, X::AbstractMatrix, Y::AbstractMat
            (; history..., best_update = best.update, best_index = best.index,
             best_val = best.val, stopped_early, stop_reason, updates = upd,
             epochs_run = cld(upd, nbatch), nseg, batch_eff, upd_per_epoch = nbatch, val_every,
-            rollout, clip, warm_start = init_ps !== nothing, kl_mode)
+            rollout, clip, weight_decay, decay_couple, warm_start = init_ps !== nothing, kl_mode)
 end
 
 # ---------------------------------------------------------------------------------------------
