@@ -131,6 +131,26 @@ const CELLS = [
     (hist_len =  5, lambda = 10.0),    # LinReg8  -- first contractive cell, rho = 0.9992
     (hist_len =  5, lambda = 100.0),   # LinReg9  -- clearly contractive, RMSE 4.4x
     (hist_len =  5, lambda = 1e4),     # LinReg10 -- ||S|| starts falling; the degraded endpoint
+    # --- appended 2026-09-28: the gap between 1e-2 and 1, for ridge + AR(2) residual -----------
+    #
+    # results_LSTMS §13b: LinReg7 (λ = 1) + an AR(2) residual matches LinReg1's calibration with a
+    # smaller low-energy tail, but loses ~12% CRPS to LinReg1 through the ridge-shrunk MEAN. λ = 1e-2
+    # barely colours the residual (§13c), so the AR has nothing to restore there. These two cells
+    # look for a λ that keeps most of LinReg1's mean and still leaves a colour worth restoring.
+    (hist_len =  5, lambda = 0.1),     # LinReg11
+    (hist_len =  5, lambda = 0.3),     # LinReg12
+    # appended the same evening: + AR(2) scored +2.3 % (λ = 0.1), +3.05 % (0.3), +5.0 % (1) CRPS vs
+    # LinReg1 on the mini-D6 (§13e) -- monotone, so the optimum is at or below 0.1
+    (hist_len =  5, lambda = 0.03),    # LinReg13
+    # --- appended 2026-09-29: paper 3's per-QoI penalty (Rik) ----------------------------------
+    #
+    # Column i of C uses λ_i = λ (σ_i/σ_1)^2, σ_i the sd of the scaled correction; `lambda` is the
+    # base λ. On R1's 1-10 TU rows the multipliers are ≈ 1 / 4.3 / 0.40 / 0.49 / 7.1 / 3.7 -- the
+    # middle bands get the least ridge and E[0,6] much more, which is what the hand-made splices of
+    # results_LSTMS §13f found (the finalist is LinReg1 with a λ = 1 E[0,6] row).
+    (hist_len =  5, lambda = 0.03, lambda_scaling = :paper3),   # LinReg14
+    (hist_len =  5, lambda = 0.1,  lambda_scaling = :paper3),   # LinReg15
+    (hist_len =  5, lambda = 0.3,  lambda_scaling = :paper3),   # LinReg16
 ]
 
 """
@@ -148,7 +168,9 @@ grid(hist_lens, lambdas) = [(; hist_len, lambda) for hist_len in hist_lens, lamb
 function build_inputs(cells, fixed)
     inputs = NamedTuple[]
     for (i, cell) in enumerate(cells)
-        push!(inputs, (name = "LinReg$i", fixed..., cell.hist_len, cell.lambda))
+        # `cell...` rather than (hist_len, lambda): a cell may carry more (e.g. `lambda_scaling`);
+        # for a two-field cell the NamedTuple is the same as before, field for field.
+        push!(inputs, (name = "LinReg$i", fixed..., cell...))
     end
     return inputs
 end

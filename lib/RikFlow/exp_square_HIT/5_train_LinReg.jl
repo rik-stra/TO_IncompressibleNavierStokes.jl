@@ -12,6 +12,7 @@ using Random
 # the fit pipeline.
 using Distributions
 using LinearAlgebra
+using Statistics
 using RegularizedLeastSquares
 
 # parse input ARGS
@@ -65,6 +66,10 @@ inputs = load(TO_folder*inputs_file_name, "inputs")
 # still loads and keeps the behaviour it had (ADMM, intercept penalized -- what paper 2 ran).
 ridge_solver      = get(inputs[model_index], :ridge_solver, :admm)
 penalize_intercept = get(inputs[model_index], :penalize_intercept, true)
+# Added 2026-09-29: `:paper3` scales the penalty per QoI as paper 3 does -- column i of C uses
+# λ_i = λ (σ_i/σ_1)^2, σ_i the sd of the SCALED correction (target minus the predictor row of the
+# design) on the training rows. `lambda` stays the base λ. `:none` (default) is one λ for all.
+lambda_scaling = get(inputs[model_index], :lambda_scaling, :none)
 
 
 out_dir = TO_folder*"/$(name)/"
@@ -74,7 +79,7 @@ out_dir = TO_folder*"/$(name)/"
 # table that is the difference between two experiments.
 save(out_dir*"parameters.jld2", "parameters",
      (; name, hist_len, hist_var, n_replicas, normalization, include_predictor,
-        lambda, ridge_solver, penalize_intercept, train_range, track_file))
+        lambda, lambda_scaling, ridge_solver, penalize_intercept, train_range, track_file))
 
 
 data = load(track_file, "data_track");
@@ -88,13 +93,38 @@ scaling = (in_scaling = in_scaling, out_scaling = in_scaling)
 inputs, outputs = create_history(hist_len, q_star_scaled, q_scaled, dQ_scaled, hist_var; include_predictor)
 
 
+"""
+Per-QoI penalties λ_i = λ (σ_i/σ_1)^2 (paper 3), σ_i the sd of the scaled correction: the target row
+minus the predictor row `q*` (the first rows of the design when `include_predictor`). Returns the
+λ vector and σ over `fitted_qois`.
+"""
+function paper3_lambdas(inputs, outputs, fitted_qois, lambda)
+    corr = outputs[fitted_qois, :] .- inputs[fitted_qois, :]   # predictor rows come first
+    sig = vec(std(corr; dims = 2))
+    return lambda .* (sig ./ sig[1]) .^ 2, sig
+end
+
 function fit_model(inputs, outputs, fitted_qois; indep_normals = false, lambda = 0.0,
-                  regularizer = :l2, ridge_solver = :exact, penalize_intercept = false)
+                  regularizer = :l2, ridge_solver = :exact, penalize_intercept = false,
+                  lambda_per_qoi = nothing)
     n_targets = length(fitted_qois)
     inp = cat(inputs',ones(eltype(inputs), (size(inputs,2),1)),dims=2) # add a bias term
 
     # solve linear regression
-    if lambda > 0.0 && (regularizer == :nuclear || ridge_solver == :admm)
+    if lambda_per_qoi !== nothing
+        # One exact ridge solve per output column, each with its own λ_i -- exact for the same
+        # reason the single-λ solve is column-separable (same design; P differs only in scale).
+        (regularizer == :l2 && ridge_solver == :exact) ||
+            error("per-QoI λ is implemented for the exact :l2 ridge only")
+        T = eltype(inp)
+        m = size(inp, 2)
+        c = zeros(T, m, n_targets)
+        for (j, i) in enumerate(fitted_qois)
+            P = Matrix{T}(I, m, m) * T(sqrt(lambda_per_qoi[j]))
+            penalize_intercept || (P[m, m] = zero(T))   # the bias column is the last one
+            c[:, j] = [inp; P] \ [outputs[i, :]; zeros(T, m)]
+        end
+    elseif lambda > 0.0 && (regularizer == :nuclear || ridge_solver == :admm)
         # 🔴 The historical path, and for `:l2` it does not solve the problem it claims to.
         # Measured on R1's record 2026-09-15 (the parity check `results.md` §7 lists as never
         # run): against the exact ridge minimiser the ADMM iterate differs by a relative 0.97 at
@@ -149,8 +179,24 @@ function run_model(inputs, c, stoch_distr, fitted_qois)
 end
 
 # fit model
+lambda_per_qoi, corr_sigma = if lambda_scaling == :paper3
+    include_predictor || error("lambda_scaling = :paper3 needs include_predictor (correction = target - q*)")
+    paper3_lambdas(inputs, outputs, fitted_qois, lambda)
+elseif lambda_scaling == :none
+    nothing, nothing
+else
+    error("unknown lambda_scaling $(lambda_scaling)")
+end
+lambda_per_qoi === nothing || println("per-QoI λ (paper 3, base $(lambda)): ", lambda_per_qoi,
+                                      "  from σ(scaled correction) = ", corr_sigma)
 c, stoch_distr = fit_model(inputs, outputs, fitted_qois; indep_normals, lambda,
-                          regularizer = :l2, ridge_solver, penalize_intercept)
+                          regularizer = :l2, ridge_solver, penalize_intercept, lambda_per_qoi)
+# the per-QoI λ are only known now; record them next to the base λ
+lambda_per_qoi === nothing ||
+    save(out_dir*"parameters.jld2", "parameters",
+         (; name, hist_len, hist_var, n_replicas, normalization, include_predictor,
+            lambda, lambda_scaling, lambda_per_qoi = Tuple(lambda_per_qoi), corr_sigma = Tuple(corr_sigma),
+            ridge_solver, penalize_intercept, train_range, track_file))
 
 # overwrite the nose distribution
 if model_noise == :tracking_noise

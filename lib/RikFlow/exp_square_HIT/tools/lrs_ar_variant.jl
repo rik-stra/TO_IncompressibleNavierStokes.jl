@@ -2,7 +2,8 @@
 #
 #     julia --startup-file=no --project=training exp_square_HIT/tools/lrs_ar_variant.jl [src] [p ...]
 #
-# default `LinReg7 2 1`: writes `output/TO_LRS/LinReg7_ar2` and `.../LinReg7_ar1`. `--report`
+# default `LinReg7 2 1`: writes `output/TO_LRS/LinReg7_ar2` and `.../LinReg7_ar1`. `2c` writes
+# `LinReg7_ar2c`, the AR(2) with the residual's lag 1 exact (`ar2_ls_lag1`). `--report`
 # re-prints the tables for existing variants (checking the file holds exactly the refit) and writes nothing.
 #
 # The new directory holds a byte copy of `<src>/LinReg.jld2` with three keys ADDED (`ar_phi`,
@@ -55,12 +56,27 @@ function ar_poles(p1, p2)
     return sort(abs.([(p1 + sqrt(d)) / 2, (p1 - sqrt(d)) / 2]); rev = true)
 end
 
-function fit_ar(Z, p)
+"""
+AR(2) whose lag-1 autocorrelation equals the data's exactly (φ1 = r1 (1 − φ2)); φ2 by least squares on
+the ACF at lags 2..L. Removes `ar2_ls`'s one-step over-dispersion in the middle bands (§12b).
+"""
+function ar2_ls_lag1(racf; L = 20)
+    r1 = racf[2]
+    err(p2) = (p1 = r1 * (1 - p2); ar2_stationary(p1, p2) ? sum(abs2, ar2_acf(p1, p2, L)[3:end] .- racf[3:(L + 1)]) : Inf)
+    grid = range(-0.99, 0.99; length = 1981)
+    p2 = grid[argmin(err.(grid))]
+    for s in (1e-4, 1e-5), _ in 1:3
+        p2 = argmin(err, p2 .+ s .* (-5:5))
+    end
+    return r1 * (1 - p2), p2
+end
+
+function fit_ar(Z, p; lag1 = false)
     phi = zeros(p, NQ)
     for i in 1:NQ
         r = acf(Z[:, i], 0:20)
         if p == 2
-            phi[:, i] .= ar2_ls(r; L = 20)
+            phi[:, i] .= lag1 ? ar2_ls_lag1(r; L = 20) : ar2_ls(r; L = 20)
         else
             phi[1, i] = r[2]
         end
@@ -180,13 +196,14 @@ function offline_sanity(file, name, f; io, seed = 1)
     return (; werr, rows)
 end
 
-function build(src, p; io = stdout, report_only = false)
-    dst = "$(src)_ar$(p)"
+function build(src, p; io = stdout, report_only = false, lag1 = false)
+    @assert !lag1 || p == 2
+    dst = "$(src)_ar$(p)" * (lag1 ? "c" : "")
     ddir = joinpath(LRS, dst)
     report_only || !isdir(ddir) || error("$ddir exists; refusing to overwrite (--report re-prints it)")
     fitr = guard(steps_of(1, 10))
     d = scaled_resid(src, fitr)
-    f = fit_ar(d.Z, p)
+    f = fit_ar(d.Z, p; lag1)
     Sw = Matrix(cov(d.m["stoch_distr"]))
     println(io, "\n==== $dst: AR($p) on $(src)'s scaled residual, steps $(first(fitr))-$(last(fitr)) (1-10 TU)")
     @printf(io, "  %-9s %7s %7s %7s | %13s | %9s %9s %11s\n", "QoI", "rho1", "phi1", "phi2", "|poles|",
@@ -211,7 +228,7 @@ function build(src, p; io = stdout, report_only = false)
     mkpath(ddir)
     cp(joinpath(LRS, src, "LinReg.jld2"), joinpath(ddir, "LinReg.jld2"))
     cp(joinpath(LRS, src, "parameters.jld2"), joinpath(ddir, "parameters.jld2"))
-    prov = (; source = src, order = p, method = p == 2 ? "ar2_ls on residual ACF lags 1-20" : "AR(1) at residual lag 1",
+    prov = (; source = src, order = p, method = lag1 ? "ar2_ls_lag1: lag 1 exact, LS on residual ACF lags 2-20" : p == 2 ? "ar2_ls on residual ACF lags 1-20" : "AR(1) at residual lag 1",
             sigma = "innovation lag-0 correlation, marginal variance matched to var(z)",
             fit_steps = (first(fitr), last(fitr)), units = "scaled (out_scaling), minus mean(stoch_distr)",
             record = "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2",
@@ -239,8 +256,8 @@ if abspath(PROGRAM_FILE) == @__FILE__
     report_only = "--report" in ARGS
     args = filter(!=("--report"), ARGS)
     src = isempty(args) ? "LinReg7" : args[1]
-    ps = length(args) > 1 ? parse.(Int, args[2:end]) : [2, 1]
-    for p in ps
-        build(src, p; report_only)
+    ps = length(args) > 1 ? args[2:end] : ["2", "1"]
+    for p in ps   # "2c" = AR(2) with lag 1 exact
+        build(src, parse(Int, rstrip(p, 'c')); report_only, lag1 = endswith(p, "c"))
     end
 end

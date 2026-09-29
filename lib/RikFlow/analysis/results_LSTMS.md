@@ -9,6 +9,20 @@ record — superseded protocols, the GPU investigation, scans run under flawed b
 history (last full version: commit `973e2d9a`). Everything below is either a definition, the
 protocol as it is now, or a result that the current conclusions rest on.
 
+**Status, 2026-09-29 (§10–§13; plan.md *Start here* has the order).**
+- 🏁 **Finalist: `Splice1_E0x7_ar2`** — LinReg1 with LinReg7's (λ = 1) E[0,6] coefficient row and
+  an AR(2) residual. It is linear; no network. At M = 10 on all 46 selection ICs it is **level with
+  LinReg1 on CRPS (−0.02 %, CI ±4.2 %)** and ahead on calibration (30/30 vs 24/30 cells) and
+  stability (tail 13 vs 22, gate 14 vs 26) (§13g). It goes to the confirmation block, scored once.
+- **Nothing beats LinReg1 on skill.** No single λ + AR(2) does (§13e). Paper 3's per-QoI penalty
+  rule is level at best, with worse calibration (§13i). The lever is **per-QoI λ + a coloured
+  residual**: ridge helps only E[0,6], and ridge + white noise is always under-dispersed.
+- **Nonlinear mean (M3ᶠ): closed at this data volume.** The MLP (§11) and the LSTM-memory variant
+  (§13d) both return update 0.
+- **Nonlinear noise (M0ᵛ): the only resolved nonlinear gain**, −8.9 % against its matched M0, but on
+  an h = 2 mean 30 % behind LinReg1 (§13h). Next: the LSTM scale on the finalist's mean.
+- ⚠️ M = 5 mini-D6s are too noisy for cells this close (§13g). Screen finalists at M = 10.
+
 **Status, 2026-09-24.**
 - Offline, the protocol is settled and the best fit (stride 100, `:storn`, 10 000 updates) is the
   best M4 model on held-out data by a wide margin (§5).
@@ -803,6 +817,20 @@ for the paper, with a mechanism.
 | deep (CVAE) | `b_xy_h1` / calibrated `calib/xy1_R1_s0.8` | `colour/xy_h1_ar` / `colour/xy1_R1_s0.8_ar` | `lp_none_b0.001` |
 
 ## 8. Where it stands, and what is open
+
+**2026-09-29 — superseding the list below** (details §13):
+- 🏁 **Finalist `Splice1_E0x7_ar2`** (§13g): level with LinReg1 on CRPS, ahead on calibration and
+  stability. **Open (Rik):** when to spend the confirmation block (76–97 TU) on it, with LinReg1
+  alongside, at full D6 density.
+- **Next cell: M0ᵛ on the finalist's mean**, i.e. the LSTM noise scale (§13h's −8.9 %) on the h = 5
+  LinReg1/splice mean instead of the h = 2 skip. It needs the skip seeded from a `LinReg.jld2`.
+- **Closed:** the nonlinear mean at h = 2 (§11, §13d); single λ + AR (§13e); lag-1-exact AR(2)
+  (§13c); taking Z[0,6] or the small-scale rows from ridge (§13f); AR(1).
+- **Open, cheap:** the paper-3 base-λ scan's last point (LinReg16, §13i); the M = 5 low-priority
+  cells (LinReg2 ± AR, LinReg8 ± AR), which only extend the λ ladder.
+- `r3_lin_sd_h2` below is no longer the lead candidate. Its noise-scale idea survives as M0ᵛ.
+
+**2026-09-24 (superseded):**
 
 - 🏆 **Lead candidate (2026-09-24): `r3_lin_sd_h2`** — linear skip at h = 2 + LSTM-driven noise scale
   (§7c/§7d). Passes the 20 TU screen in 2 of 3 replicas; no earlier variant passed at all. The old
@@ -1701,4 +1729,401 @@ julia --startup-file=no --project=training analysis/m0c_ar_online.jl D6mini_LinR
 ```
 The logs are in the job scratch: `lrs_ar_variant*.log`, `logs/D6mini_*.log`, `score_*.log`, `m0c_ar_online.log`.
 The level-bias and low-tail census is a short ad-hoc script: for runs ending by 74 TU, it computes
-(member − truth)/sd(truth over 1–74 TU) at leads 100/200/400.
+(member − truth)/sd(truth over 1–74 TU) at leads 100/200/400. Since §13 it is `analysis/tail_census.jl`.
+
+## 13. M0ᶜ-ridge to promotion or rejection, and the rest of the ladder (2026-09-28 evening → night)
+
+Order and rationale: `plan.md` → *Start here → 2026-09-28 (evening)*. Rik, 2026-09-28: judge the
+low-energy tail **against both** LinReg7 (the declared, same-family reference) and LinReg1 (the
+target). Branch `overnight-0928` (from `upstream-merge` @ `6de5deea`).
+
+**Where §13 ends (2026-09-29).** All scores are paired fair CRPS at leads ≤ 0.5 TU on the
+selection block, against LinReg1. The rows marked M = 10 are the decisive ones.
+
+| model | what it is | CRPS vs LinReg1 | calibrated cells | tail | § |
+|---|---|---|---|---|---|
+| LinReg1 | λ = 0, white noise (the target) | — | 24/30 | 22 / 430 | g |
+| **Splice1_E0x7_ar2** (M = 10) | LinReg1 + E[0,6] row at λ = 1 + AR(2) | **−0.02 %** (±4.2 %) | **30/30** | **13** / 430 | g |
+| LinReg14_ar2 (M = 10) | paper-3 per-QoI λ, base 0.03, + AR(2) | +0.8 % | 22/30 | 15 / 430 | i |
+| LinReg15_ar2 (M = 10) | paper-3 per-QoI λ, base 0.1, + AR(2) | +2.4 % | 25/30 | 12 / 430 | i |
+| LinReg11_ar2 (M = 5) | single λ = 0.1 + AR(2) | +2.3 % | 30/30 | 6 / 215 | e |
+| LinReg7_ar2 (M = 5) | single λ = 1 + AR(2) | +5.0 %, resolved | 26/30 | 11 / 215 | b′ |
+| LinReg7 (M = 5) | single λ = 1, white | +16 %, resolved | 2/30 | 0 / 215 | b′ |
+| r3_lin_sd_h2 (M = 5) | h = 2 skip + LSTM noise scale | +18.5 %, resolved | 17/30 | 0 / 215 | h |
+
+### 13a. Where the tail lives (check (c)) — the small-scale band
+
+`analysis/tail_census.jl` (new): per QoI and lead, members with q < 0.5× / 0.25× the tracked truth,
+the mean level bias (q − truth)/sd(truth, 1–74 TU), the worst QoI per low member, and whether
+members low at 1 TU are still low at the last lead. The q-to-truth column offset is taken from the
+replayed warm-up and asserted, not assumed. Only members ending by 74 TU are read.
+
+Mini-D6, 1 TU, 215 members / 43 ICs each (count < 0.5× truth at leads 0.25 / 0.5 / 1 TU):
+
+| QoI | LinReg7 | LinReg7_ar2 | LinReg7_ar1 |
+|---|---|---|---|
+| Z[0,6] | 0 / 0 / 0 | 0 / 2 / 2 | 0 / 3 / 2 |
+| E[0,6] | 0 / 0 / 0 | 0 / 0 / 0 | 0 / 2 / 1 |
+| Z[7,15] | 0 / 0 / 0 | 0 / 0 / 4 | 0 / 1 / 5 |
+| E[7,15] | 0 / 0 / 0 | 0 / 1 / 3 | 0 / 1 / 5 |
+| **Z[16,32]** | 0 / 0 / 0 | 0 / 1 / **11** | 0 / 1 / **16** |
+| **E[16,32]** | 0 / 0 / 0 | 0 / 1 / **10** | 0 / 1 / **13** |
+| worst QoI of every low member | — | Z[16,32] in 11/11 | Z[16,32] in 16/16 |
+
+- **The tail is the small-scale band**, Z[16,32] first and E[16,32] with it. It is absent at
+  0.25 TU: the forecast builds it; the IC does not carry it.
+- 🔑 **The target has a tail of its own.** Full D6, all 630 members ending by 74 TU (63 ICs, M = 10,
+  mostly 10–50 TU ICs, which the selection block does not use):
+
+  | lead | LinReg1: Z[16,32] < 0.5× (< 0.25×) | LinReg7 |
+  |---|---|---|
+  | 0.5 TU | 2 (0) | 0 |
+  | 1 TU | 23 (1) | 6 (0) |
+  | 2 TU | 37 (9) | 5 (0) |
+  | 3 TU | 38 (10) | 7 (0) |
+
+  LinReg1 also has 2 divergences and many gate firings (3507 all-zero forecast dQ columns). Its
+  worst QoI is Z[16,32] in 35 of 40 low members. In both LinReg1 and LinReg7, **no member low at
+  1 TU is still low at 3 TU**: they recover, and the 3 TU low members are new ones.
+- So in LinReg1's terms, "LinReg7_ar2 has a low-energy tail" reads "LinReg7_ar2 moved toward
+  LinReg1's small-scale behaviour". The like-for-like comparison is 13b.
+
+### 13b. The 3 TU horizon, same 19 ICs × 10 members as the full D6 (check (a))
+
+`D6sel3_LinReg7_ar2`: odd ordinals 89–125 (t 52.75–70.25 TU, K = 19), M = 10, nlead 1200, the full
+D6's member seeds — so it pairs member-for-member with `D6_LinReg1` and `D6_LinReg7`, restricted to
+the same 19 ICs (`D6_T_MIN=52.5 D6_T_MAX=70.75` at scoring). 190 members, ~26 s each, 0 diverged.
+
+**Primary score** (paired fair CRPS, leads ≤ 0.5 TU, 90 % IC-block CI, block 2 ICs):
+
+| A − B | A | B | A − B | 90 % CI | reading |
+|---|---|---|---|---|---|
+| LinReg7_ar2 − **LinReg7** | 0.2006 | 0.2167 | **−0.0160 (−7.4 %)** | [−0.0273, −0.0051] | A better, resolved (as §12) |
+| LinReg7_ar2 − **LinReg1** | 0.2006 | 0.1789 | **+0.0218 (+12.2 %)** | [−0.0018, +0.0452] | A worse, not resolved (CI just touches 0) |
+
+Per band vs LinReg1: +0.045 (Z[0,6]), +0.012, +0.021, +0.018, +0.017, +0.018 — worse in every band,
+most in Z[0,6].
+
+**Spread–skill on q** (36 cells = 6 bands × leads 25, 50, 100, 200, 400, 1000; S7 band [0.8, 1.25]):
+
+| | cells in band, leads ≤ 1 TU | median ratio, leads ≤ 1 TU |
+|---|---|---|
+| LinReg7 | 2/30 | 0.57 |
+| **LinReg7_ar2** | **25/30** | 1.03 |
+| LinReg1 | 24/30 | 1.12 |
+
+LinReg7_ar2 at 2.5 TU is over-dispersed (1.8–1.9 in five QoIs), where the skill has already
+saturated below the spread. The counts come from `ssband.sh` (job scratch) on the scorer's
+LEVEL-q tables.
+
+**Tail, same 190 members** (count < 0.5× truth, with < 0.25× in brackets; gate = all-zero forecast
+dQ columns, 228 000 forecast steps per run):
+
+| lead | LinReg7 Z[16,32] | **LinReg7_ar2** Z[16,32] | LinReg1 Z[16,32] |
+|---|---|---|---|
+| 0.5 TU | 0 | 3 | 2 |
+| 1 TU | 0 | 7 (1) | 3 |
+| 2 TU | 0 | 5 | 8 (5) |
+| 3 TU | 1 | 9 (1) | 13 (5) |
+| low at 1 TU → still low at 3 TU | — | 1 of 7 | 0 of 4 |
+| gate firings | 0 | 111 | 1842 |
+| any QoI < 0.5× at 3 TU (members) | 1 | 9 | 15 |
+
+**Verdict, judged against both (Rik).**
+- **Against LinReg7** (the declared clause): the AR costs stability. The tail goes 1 → 9 members at
+  3 TU and 0 → 111 gate firings, for −7.4 % CRPS and 2 → 25 calibrated cells. The declared clause
+  "gate census not worse" fails, as in §12.
+- **Against LinReg1** (the target): the tail is **smaller** (9 vs 15 members at 3 TU; 1 vs 5 below
+  0.25×; 111 vs 1842 gate firings) and the calibration equal (25 vs 24 of 30), but the CRPS is
+  **12 % worse** (not resolved at K = 19; the point estimate is the size of LinReg1's lead over
+  LinReg7).
+- 🔑 **So LinReg7_ar2 does not beat the target. It is a new point on S2′'s front, between LinReg1
+  and LinReg7:** LinReg1's calibration, most of LinReg7's stability, and a CRPS 40 % of the way
+  from LinReg7 back to LinReg1. The remaining gap is the **mean**: ridge at λ = 1 shrinks it, and
+  a residual model cannot restore mean skill. The next cells therefore fill the λ gap between
+  1e-2 and 1 with the AR on top (LinReg11 λ = 0.1, LinReg12 λ = 0.3; 13e).
+
+### 13b′. The target on the mini-D6 itself: LinReg1, 46 selection ICs, M = 5, 1 TU
+
+`D6mini_LinReg1` has the same ICs and member seeds as every `D6mini_*` run. Paired primary score
+(90 % IC-block CI, block 3 ICs) and the calibration and tail on the same 215 members that end by 74 TU:
+
+| A vs B = LinReg1 | A − B | 90 % CI | per band A − B (Z0 E0 Z7 E7 Z16 E16) | spread–skill in band / median (leads ≤ 1 TU) | Z[16,32] < 0.5× at 1 TU | gate firings |
+|---|---|---|---|---|---|---|
+| LinReg1 | — | — | — | 25/30, 1.10 | 14 (1 < 0.25×) | 0 |
+| LinReg7 | **+16.1 %** (LinReg1 −13.9 % of LinReg7) | resolved | +.037 **−.012** +.035 +.033 +.037 +.037 | 2/30, 0.59 | 0 | 0 |
+| LinReg7_ar1 | **+9.1 %** | [+0.0068, +0.0249] | +.018 **−.025** +.026 +.026 +.024 +.024 | 21/30, 1.14 | 16 | 19 |
+| **LinReg7_ar2** | **+5.0 %** | [+0.0003, +0.0195] | +.015 **−.028** +.016 +.015 +.016 +.016 | 26/30, 1.13 | 11 (1) | 3 |
+
+- **The target keeps the lead on CRPS by a resolved 5 %.** LinReg7_ar2 matches its calibration
+  (26 vs 25 of 30) and its 1 TU tail (11 vs 14), as on the 3 TU set (§13b). It is a front point,
+  not a win.
+- 🔑 **E[0,6] is the exception, in every ridge cell.** Ridge helps E[0,6] and hurts the other five
+  bands; the AR widens the E[0,6] gain (−0.012 → −0.028). The plan's band table already had "DDN
+  beats LinReg1 on E[0,6]". Multi-output ridge solves each output row independently, so **λ can be
+  chosen per QoI row** at no cost: LinReg1's rows where λ = 0 is best, and a ridge + AR row where
+  ridge is best. The E[0,6] gain alone is worth −0.028/6 ≈ −0.005 on the primary score (≈ −2.7 %).
+  The λ-gap runs (13e) give the per-band optimum.
+- The 1 TU census in 13a said "LinReg7 has no tail"; LinReg1 on the same members has 14. The AR
+  moves LinReg7 toward LinReg1's small-scale behaviour, not past it.
+
+### 13c. Variants built this session
+
+`exp_square_HIT/tools/lrs_ar_variant.jl` gained `2c`: **AR(2) with the residual's lag 1 exact**
+(`ar2_ls_lag1`: φ1 = r1(1 − φ2), φ2 by least squares on the ACF at lags 2–20). The marginal variance
+is matched as before.
+
+| variant | kernel power AR / white Σ (full 6×6, as built) | one-step calibration xi_data/σ_ξ, six QoIs (1 = calibrated) |
+|---|---|---|
+| LinReg7_ar2 (§12) | 1.92–3.34 | 1.01 1.00 **0.62 0.72** 1.04 0.84 |
+| **LinReg7_ar2c** | 1.89–3.29 | 1.04 1.00 **0.75 0.78** 1.06 0.96 |
+| LinReg2_ar2 (λ = 1e-2) | **1.03–1.08** | 1.00 1.00 0.85 1.09 1.00 1.00 |
+| LinReg2_ar2c | 1.03–1.07 | 1.00 1.00 0.93 0.97 1.00 1.00 |
+| LinReg11_ar2 (λ = 0.1, new) | 1.18–1.45 | residual lag 1: 0.40 0.13 0.87 0.93 0.52 0.63 |
+| LinReg12_ar2 (λ = 0.3, new) | 1.44–2.01 | residual lag 1: 0.59 0.26 0.92 0.95 0.67 0.76 |
+| LinReg8_ar2 (λ = 10) | **2.87–6.78** | 0.90 0.95 0.57 0.62 0.80 0.85 |
+| LinReg8_ar2c | 2.87–6.72 | 0.99 0.99 0.69 0.67 0.97 0.94 |
+
+- The lag-1 constraint fixes the outer bands' one-step spread but only halves the middle bands'
+  over-dispersion. The data's lag 2 (0.82 in Z[7,15]) sits below what a smooth AR(2) with lag 1 = 0.95
+  can produce: there is a white "nugget" on top of the persistent part, which an AR(2) cannot carry
+  without an extra (ARMA) term.
+- **λ = 1e-2 barely colours the residual** (middle bands only, lag 1 0.76/0.83). The AR adds 3–8 %
+  power, so LinReg2_ar2 should score as LinReg2. **λ = 10 colours everything** (poles 0.82–0.92), and
+  the AR adds 3–7× the white power: the largest correction and the largest tail risk.
+- Marginal spread is calibrated in every variant (sd model/resid 0.97–1.03).
+
+**Check (b), the lag-1-exact AR(2) on the mini-D6: a null.** `LinReg7_ar2c` against `LinReg7_ar2`:
+CRPS +0.00027 (+0.15 %), CI [−0.00075, +0.00097]. Per band ≤ 0.0006. Spread–skill 25/30 in band,
+median 1.15 (ar2: 26/30, 1.13). The over-dispersed cells do not go away; they move (Z/E[7,15] at
+leads 25 and 100: 1.27–1.33). Tail 12 vs 11 members at 1 TU; gate 7 vs 3. Against LinReg1: +5.1 %,
+CI [+0.0002, +0.0198], as ar2. **The one-step innovation calibration does not drive the ensemble
+score; `ar2_ls` stays the construction.**
+
+### 13c′. Per-QoI λ: splicing coefficient rows (new tool)
+
+`exp_square_HIT/tools/lrs_splice.jl <dst> <src_1> … <src_6>` takes row i of `c` from `src_i` and
+refits the Gaussian noise (MLE mean and covariance) on the spliced residual. Because
+`5_train_LinReg.jl`'s ridge solves one least-squares problem per output column, with the same design,
+penalty and data scaling, this is **exactly** a ridge fit with a per-QoI λ. Only the noise couples
+the rows. The training rows are rebuilt with `create_history`'s construction, and every run checks
+that each source's stored `stoch_distr` is reproduced (LinReg1: 2.1e-16 / 2.3e-16; LinReg7:
+1.5e-17 / 3.4e-16, |Δμ|/sd and |ΔΣ|/|Σ|).
+
+First cell, from §13b′'s per-band read: **`Splice1_E0x7`** = LinReg1 with LinReg7's E[0,6] row, and
+`Splice1_E0x7_ar2`. The AR fitted to the spliced residual is null on LinReg1's five rows (φ ≈ 0,
+white at h = 5 as §10c found) and φ = (0.451, −0.047) on E[0,6], identical to LinReg7_ar2's E[0,6]
+row. The deployed `LinReg` loads the file and warm-starts to 6e-15. Both are queued for the mini-D6.
+
+### 13e. The λ gap with AR(2), mini-D6 (46 selection ICs, M = 5, 1 TU)
+
+All paired with the same member seeds; tail = members with a QoI < 0.5× truth at 1 TU (215 members
+ending by 74 TU); spread–skill = the 30 level cells at leads ≤ 1 TU.
+
+| cell (λ) | vs **LinReg1**: A − B, 90 % CI | per band vs LinReg1 (Z0 E0 Z7 E7 Z16 E16) | vs LinReg7 | spread–skill in band / median | tail | gate |
+|---|---|---|---|---|---|---|
+| LinReg1 (0) | — | — | −13.9 % | 25/30, 1.10 | 14 | 0 |
+| LinReg13_ar2 (0.03) | +1.71 %, [−0.0029, +0.0085], not resolved | +.003 −.016 +.006 +.003 +.011 +.011 | — | 29/30, 1.11 | 7 | 0 |
+| LinReg11 (0.1), white noise | +4.79 %, [+0.0016, +0.0184], resolved | +.008 −.018 +.013 +.010 +.017 +.018 | — | 15/30, 0.80 | 5 | 0 |
+| **LinReg11_ar2 (0.1)** | **+2.3 %**, [−0.0024, +0.0121], not resolved | +.002 **−.020** +.009 +.007 +.013 +.013 | −11.9 % | **30/30**, 1.11 | **6** | **0** |
+| LinReg12_ar2 (0.3) | +3.05 %, [−0.0020, +0.0157], not resolved | +.004 **−.024** +.012 +.010 +.015 +.015 | — | 29/30, 1.09 | 8 | 0 |
+| LinReg7_ar2 (1) | +5.0 %, [+0.0003, +0.0195] | +.015 **−.028** +.016 +.015 +.016 +.016 | −9.6 % | 26/30, 1.13 | 11 | 3 |
+| LinReg7 (1) | +16.1 % | +.037 **−.012** +.035 +.033 +.037 +.037 | — | 2/30, 0.59 | 0 | 0 |
+
+- 🔑 **LinReg11_ar2 is the first cell this project has found that is competitive with the target on
+  every axis at once.** CRPS is not resolvably worse than LinReg1 (+2.3 %, CI contains 0). It has
+  **all 30 cells calibrated** against LinReg1's 25, **less than half LinReg1's low-energy tail**
+  (6 vs 14 members), and 0 gate firings. Against the plan's own test ("better calibration or stability
+  at no loss of skill") it is a candidate. Whether "not resolvably worse" is "no loss" is exactly what
+  the CI bounds: at most +0.012 (+7 %).
+- The per-band column says where the remaining CRPS cost sits: **E[0,6] gains (−0.020), Z[0,6] is
+  level, and the middle and small-scale bands lose 0.007–0.013.** That is the per-QoI λ split
+  §13b′ predicted, now with a λ-dependence: at 0.1 the loss outside E[0,6] is half what it is at 1.
+  A splice taking E[0,6] (and possibly Z[0,6]) from the ridge cell and the rest from LinReg1 is the
+  obvious next cell (§13c′).
+- **The AR residual is a resolved gain at λ = 0.1**, not only at λ = 1: LinReg11 (white) −
+  LinReg11_ar2 = +2.4 %, CI [+0.0013, +0.0090], positive in every band. It also moves calibration
+  from 15/30 (median 0.80, under-dispersed) to 30/30. Ridge + white noise is under-dispersed at
+  every λ ≥ 0.1 measured here; ridge + AR(2) is not.
+- **A single λ never passes LinReg1.** With LinReg13 (λ = 0.03) the curve is +1.7 / +2.3 / +3.05 /
+  +5.0 % at λ = 0.03 / 0.1 / 0.3 / 1. It approaches LinReg1 from above as λ → 0, and every point
+  has better calibration (29–30/30) and half the tail. Only a per-QoI λ (§13f) gets ahead.
+- **The λ trend is monotone** over 0.1 → 0.3 → 1: CRPS against LinReg1 +2.3 → +3.05 → +5.0 %.
+  E[0,6]'s gain grows with λ (−0.020 → −0.024 → −0.028) and the other bands' loss grows faster.
+  LinReg12_ar2 − LinReg11_ar2 = +0.7 % (CI [−0.0014, +0.0049]). So the optimum of a *single* λ is
+  at or below 0.1. **LinReg13 (λ = 0.03)** was appended to `4_setup_search.jl`, fitted and queued with
+  `_ar2`: middle-band residual lag 1 0.82/0.89, AR power ×1.06–1.17.
+- ⚠️ **Selection-block multiplicity.** About ten cells are now being compared on the same 46
+  selection ICs, so whichever cell ends up best has an optimistically biased margin (winner's
+  curse). The protection is plan §7's design: the finalist goes to the **confirmation block**
+  (76–97 TU, untouched), scored once. No cell here is claimed as beating LinReg1 on selection-block
+  evidence alone.
+
+### 13f. Per-QoI λ splices on the mini-D6 (M = 5) — ahead of LinReg1 at M = 5, level at M = 10 (§13g)
+
+| cell | vs **LinReg1**: A − B, 90 % CI | per band vs LinReg1 (Z0 E0 Z7 E7 Z16 E16) | spread–skill in band / median | tail | gate |
+|---|---|---|---|---|---|
+| LinReg1 | — | — | 25/30, 1.10 | 14 | 0 |
+| LinReg11_ar2 (single λ = 0.1) | +2.3 %, [−0.0024, +0.0121] | +.002 −.020 +.009 +.007 +.013 +.013 | 30/30, 1.11 | 6 | 0 |
+| Splice11_S16x1_ar2 (LinReg11, Z/E[16,32] rows from λ = 0) | +2.03 %, [−0.0030, +0.0114] | +.001 −.020 +.009 +.006 +.012 +.012 | 29/30, 1.09 | 6 | 0 |
+| Splice1_E0x11_ar2 (E[0,6] row from λ = 0.1) | −1.56 %, [−0.0088, +0.0042] | −.005 −.018 +.002 +.003 +.001 +.001 | 30/30, 1.09 | 7 | 0 |
+| **Splice1_E0x7_ar2** (LinReg1, E[0,6] row from λ = 1, + AR(2)) | **−2.34 %**, [−0.0110, +0.0030], not resolved | **−.007 −.025** +.002 +.003 +.002 +.001 | **30/30, 1.07** | **7** | **0** |
+| Splice1_E0x7 (the same splice, **white** noise, no AR) | −0.81 %, [−0.0096, +0.0068] | −.008 −.017 +.004 +.004 +.004 +.005 | 23/30, 1.02 (E[0,6] 0.71–0.84) | **3** | 0 |
+| Splice1_E0x8_ar2 (E[0,6] row from λ = 10) | −1.98 %, [−0.0114, +0.0046] | −.006 −.029 +.003 +.004 +.004 +.004 | 30/30, 1.10 | 7 | 0 |
+| Splice1_Z0E0x7_ar2 (Z[0,6] **and** E[0,6] rows from λ = 1) | +2.02 %, [−0.0033, +0.0105]; **+4.5 % vs Splice1_E0x7_ar2, resolved** [+0.0024, +0.0126] | +.001 −.028 +.015 +.013 +.010 +.011 | 24/30, 1.13 | 6 | 0 |
+
+- 🔑 **Splice1_E0x7_ar2 is the first cell ahead of LinReg1 on the point estimate of every axis at
+  once**: CRPS −2.3 %, all 30 cells calibrated (against 25), half the low-energy tail (7 against 14
+  members), no gate firings, no divergences. Against LinReg11_ar2 it is resolved: −4.5 %, CI
+  [−0.0166, −0.0002].
+- The per-band column is the design working: E[0,6] keeps the ridge + AR gain (−0.025), the four
+  middle and small-scale bands are within +0.003 of LinReg1, and **Z[0,6] gains too (−0.007)** — the
+  E[0,6] row changes the large-scale dynamics the Z[0,6] row sees.
+- **The small-scale band's CRPS is not set by its own row.** Giving LinReg11 back LinReg1's
+  Z/E[16,32] rows changes nothing (−0.27 % against LinReg11_ar2, per band ≤ 0.001; the small-scale
+  loss stays +0.012). That loss follows the λ = 0.1 **middle-band** rows: the 16–32 band is slaved
+  to the dynamics below it. So a splice keeps LinReg1's middle rows, and only the large-scale
+  E[0,6] row is a free choice. **The E[0,6]-λ scan: λ = 0.1 → −1.56 %, λ = 1 → −2.34 %, λ = 10 → −1.98 %**
+  against LinReg1. The neighbours differ from λ = 1 by +0.8 % and +0.4 % (neither resolved). At
+  λ = 10 the E[0,6] band itself still improves (−0.029), but its larger AR noise (E[0,6] residual
+  2.3× LinReg7's variance, lag 1 0.71) leaks into the other five bands (+0.003–0.004). **λ = 1 is
+  the E[0,6] optimum on this grid.**
+- **Both parts of the lead cell carry.** The ridge row alone (white noise) gives −0.8 %. The AR
+  gives a further −1.6 % (Splice1_E0x7 − Splice1_E0x7_ar2 = +0.0026, CI [−0.0008, +0.0053]) and
+  **fixes the calibration**: without it the E[0,6] row is under-dispersed (0.71–0.84, LinReg7's
+  signature, §10h), 23/30 in band; with it 30/30. The white splice has the smallest tail measured
+  (3 members); the AR brings it to 7, still half of LinReg1's 14.
+- **Only the E[0,6] row should come from ridge.** Taking Z[0,6] from λ = 1 as well costs a
+  resolved 4.5 %: that row's residual is persistent (AR poles 0.86 / 0.42), and its noise drives
+  the middle bands (+0.010–0.013) and loses Z[0,6]'s own gain. Calibration falls to 24/30. Z[0,6]
+  in the lead cell gains *through* the E[0,6] row, not through its own.
+- The CRPS gain is not resolved at K = 46, M = 5 (CI upper bound +0.003, +1.8 %). Two checks are
+  queued: the 3 TU run on the full D6's 19 selection ICs × 10 members (a second estimate at twice
+  M, with the 3 TU tail), and the plain splice `Splice1_E0x7` (how much is the row, how much is the
+  AR). `Splice1_E0x8_ar2` (E[0,6] from λ = 10; AR power ×4) tests whether E[0,6]'s optimum is
+  higher still.
+
+### 13g. The lead splice at 3 TU on the full D6's 19 ICs × 10 — the lead is not confirmed
+
+`D6sel3_Splice1_E0x7_ar2`, exactly as §13b (odd ordinals 89–125, M = 10, the full D6's seeds),
+paired with `D6_LinReg1` / `D6_LinReg7` on the same members.
+
+| | vs LinReg1 | vs LinReg7 | spread–skill, leads ≤ 1 TU | Z[16,32] < 0.5× at 3 TU (< 0.25×) | gate firings |
+|---|---|---|---|---|---|
+| LinReg1 | — | — | 24/30 | 13 (5) | 1842 |
+| LinReg7_ar2 (§13b) | +12.2 %, [−0.0018, +0.0452] | −7.4 % | 25/30 | 9 (1) | 111 |
+| **Splice1_E0x7_ar2** | **+4.37 %**, [−0.0027, +0.0162], not resolved | **−13.8 %**, resolved | **27/30** | 12 (1) | 192 |
+
+Per band vs LinReg1: +.007 **+.016** +.007 +.009 +.004 +.004 — **E[0,6], the band that gained on the
+mini-D6 (−0.025), is here the band that loses most.**
+
+**Why the two views disagree: sampling, not a defect.**
+- The 19 ICs are the odd-ordinal half of the mini-D6's 46. Scoring the mini-D6 runs (M = 5)
+  on exactly those 19 ICs (`D6_T_MIN=52.5 D6_T_MAX=70.75 D6_STRIDE=2`):
+
+  | splice − LinReg1 | 46 ICs, M = 5 | same 19 ICs, M = 5 | same 19 ICs, M = 10 (3 TU runs) |
+  |---|---|---|---|
+  | Splice1_E0x7_ar2 | −2.3 % | +1.3 % [−0.0100, +0.0113] | +4.4 % |
+  | LinReg7_ar2 | +5.0 % | +8.9 % [−0.0043, +0.0374] | +12.2 % |
+
+  About 3.5 points is the IC subset: those 19 ICs favour LinReg1. About 3 points is members 6–10:
+  adding them moves LinReg1's score 0.1850 → 0.1789, while the two AR cells move by ≤ 0.0007
+  (0.1873 → 0.1867, 0.2013 → 0.2006).
+- It is not hardware. The Snellius `D6_LinReg1` and the desktop `D6mini_LinReg1` make the same draws:
+  dQ agrees to 3.2e-9 over the 95 shared members that end by 74 TU (`m0c_ar_online.jl --vs-full`).
+- 🔑 **Honest reading.** On CRPS, Splice1_E0x7_ar2 is **level with LinReg1 to within about ±4 %**. The
+  three estimates span −2.3 … +4.4 %, and none is resolved. It is ahead on calibration (30/30 vs 25/30
+  mini; 27/30 vs 24/30 at 3 TU) and on stability (1 TU tail 7 vs 14; 3 TU gate firings 192 vs 1842;
+  < 0.25× members 1 vs 5). That is plan §2's "better calibration and stability at no resolvable loss
+  of skill". It is **not** "beats LinReg1 on skill".
+- **The decisive test: M = 10 on all 46 selection ICs** (`D6mini10_*`; members 1–5 hard-linked from
+  the M = 5 runs, 6–10 new, same seed rule):
+
+  | | CRPS | vs LinReg1 (90 % CI) | per band vs LinReg1 | spread–skill in band / median | tail at 1 TU (of 430) | gate |
+  |---|---|---|---|---|---|---|
+  | LinReg1 | 0.17592 | — | — | 24/30, 1.06 | 22 | 26 |
+  | **Splice1_E0x7_ar2** | 0.17588 | **−0.02 %**, [−0.0072, +0.0075] | +.000 −.012 +.004 +.005 +.002 +.001 | **30/30, 1.03** | **13** | **14** |
+
+  🔑 **Verdict on the selection block: level with LinReg1 on skill (a dead heat, CI ±4.2 %), ahead
+  on calibration (30 vs 24 of 30) and stability (tail 13 vs 22, gate 14 vs 26).** That is plan §2's
+  "better calibration and stability at no loss of skill", not "beats LinReg1 on skill". The
+  mini-D6's −2.3 % at M = 5 was member noise. **This is the finalist for the confirmation block.**
+
+### 13h. M0ᵛ: the LSTM noise scale is a resolved gain over its matched linear model — on a weak mean
+
+Mini-D6 (46 ICs, M = 5), `D6_CLOSURE=lstm`, gate parity with LinReg. `r3_lin_sd_h2` = frozen
+least-squares skip at h = 2 + an LSTM-driven state-dependent noise scale; `r2_lin_const_h2` = the
+same skip + constant correlated η (the matched M0). Both are fitted on 1–10 TU (§7d).
+
+| | vs r2_lin_const_h2 | vs LinReg1 | per band vs matched M0 | spread–skill / median | tail | gate |
+|---|---|---|---|---|---|---|
+| r2_lin_const_h2 (M0, h = 2) | — | +30.1 %, resolved | — | 16/30, 0.81 | 0 | 0 |
+| **r3_lin_sd_h2 (M0ᵛ)** | **−8.9 %**, [−0.0292, −0.0129], resolved | +18.5 %, resolved | −.037 −.024 −.015 −.018 −.013 −.012 | 17/30, 0.82 | 0 | 0 |
+
+- 🔑 **First resolved gain from a nonlinear component in this project**: the state-dependent noise
+  scale (lever L2) improves on its matched linear-plus-constant-noise model by 8.9 % in every
+  band, with no stability cost (no tail, no gate firings).
+- **But on the wrong mean**: the h = 2, 1–10 TU skip is 30 % behind LinReg1 (h = 5), and both h = 2
+  cells are under-dispersed (median 0.81–0.82). The gain does not transfer by itself.
+- **Next cell: M0ᵛ on the lead mean** — the LSTM scale on LinReg1's h = 5 mean (or the splice's),
+  fitted on the same 1–10 TU, deployed through `D6_CLOSURE=lstm`. It needs a skip seeded from a
+  `LinReg.jld2` rather than refitted, or an h = 5 refit that reproduces LinReg1 (λ = 0 least squares,
+  same rows: the same map up to round-off).
+
+### 13i. Paper 3's per-QoI penalty (Rik, 2026-09-29)
+
+Paper 3 rescales the ridge penalty per QoI: column i of C uses **λ_i = λ (σ_i/σ_1)²**, with σ_i the
+sd of the scaled correction, and quotes the base λ. It is now `lambda_scaling = :paper3` in
+`5_train_LinReg.jl` (default `:none`). There σ_i is taken on the fit's own rows as the target row
+minus the predictor row `q*`, and each column gets one exact ridge solve with its λ_i.
+`4_setup_search.jl` builds cells by splatting the cell NamedTuple, which is identical field for
+field for the old two-field cells; cells 1–13 were re-checked equal.
+
+On R1's 1–10 TU rows: σ = 0.0173 0.0248 0.0084 0.0104 0.0518 0.0369, so the multipliers are
+**1 / 2.06 / 0.23 / 0.36 / 9.0 / 4.6**. The middle bands get the least ridge, E[0,6] about twice
+Z[0,6]'s, and the small scales the most. That is the direction §13f found by hand. The Z[0,6] row
+of each paper-3 cell equals the single-λ fit at the same base λ to 3e-15 (LinReg14/15/16 against
+LinReg13/11/12), which checks the per-column solve.
+
+| cell | base λ | λ_i (Z0 E0 Z7 E7 Z16 E16) | AR power ×, as built |
+|---|---|---|---|
+| LinReg14 | 0.03 | 0.030 0.062 0.007 0.011 0.270 0.137 | 1.15–1.23 |
+| LinReg15 | 0.1 | 0.100 0.206 0.023 0.036 0.899 0.456 | 1.38–1.61 |
+| LinReg16 | 0.3 | 0.300 0.618 0.070 0.108 2.70 1.37 | 1.80–2.27 |
+
+⚠️ Paper 3's rule gives Z[0,6] the base λ. §13f found Z[0,6] best at λ = 0, so the rule may cost
+there at the larger base λ. Each `_ar2` cell is run at **M = 10 on all 46 selection ICs**, against
+`D6mini10_LinReg1` and the finalist `D6mini10_Splice1_E0x7_ar2`.
+
+| cell (M = 10, 46 ICs) | vs LinReg1 | vs finalist | per band vs LinReg1 (Z0 E0 Z7 E7 Z16 E16) | spread–skill / median | tail (of 430) | gate |
+|---|---|---|---|---|---|---|
+| LinReg1 | — | +0.02 % | — | 24/30, 1.06 | 22 | 26 |
+| Splice1_E0x7_ar2 (finalist) | −0.02 %, [−0.0072, +0.0075] | — | +.000 −.012 +.004 +.005 +.002 +.001 | **30/30**, 1.03 | 13 | 14 |
+| LinReg14_ar2 (paper 3, base 0.03) | +0.79 %, [−0.0054, +0.0100] | +0.81 %, [−0.0077, +0.0113] | −.000 **−.010** +.003 +.001 +.008 +.007 | 22/30, 1.12 | 15 | 23 |
+| LinReg15_ar2 (paper 3, base 0.1) | +2.39 %, [−0.0035, +0.0150] | +2.41 %, [−0.0054, +0.0155] | +.004 **−.011** +.007 +.005 +.010 +.010 | 25/30, 1.08 | 12 | 9 |
+
+- At base 0.1 the rule gets E[0,6] right (−0.011, as the finalist's −0.012), but it puts
+  λ = 0.1 on Z[0,6] and 0.02–0.04 on the middle rows. Those rows cost 0.004–0.007 each, and the
+  small-scale bands follow them (+0.010; §13f). Not resolved against either reference.
+- At base 0.03 the rule is level with LinReg1 on skill (+0.8 %; Z[0,6] and the middle bands level,
+  E[0,6] −0.010), but calibration and stability fall back toward LinReg1's (22/30, tail 15, gate 23).
+  The small-scale bands still lose (+0.007) at λ_i 0.27 / 0.14 on their own rows. **Neither base λ
+  reproduces the finalist's combination** of LinReg1's skill *and* 30/30 calibration. That needs
+  E[0,6] alone at λ ≈ 1 with its AR, and λ = 0 everywhere else, i.e. a multiplier profile paper 3's
+  σ-rule does not produce (it ranks Z[16,32] above E[0,6]). *(LinReg16, base 0.3, pending.)*
+
+### 13d. M3ᶠ with memory — a null (the open item of §11e)
+
+An `:lstm` recurrence over a W = 10 window of the same h = 2 regressor, on the frozen λ = 0 skip, with
+the constant seeded head; 1–50 TU, held out 52–74 TU (`m4_window_fit.jl`, `p4/m3fmem_lstm_l0_*`):
+
+| fit | updates | best iterate | held loss | CRPS | ‖g‖/‖resid‖ |
+|---|---|---|---|---|---|
+| LR 1e-2, WD 1e-2, seed 1 | 17 300 | **update 0** | 0.2098 (= M0) | 0.10117 (+0.00 %) | 0.000 |
+| LR 3e-3, WD 0, seed 1 | 10 700 | **update 0** | 0.2098 (= M0) | 0.10117 (+0.00 %) | 0.000 |
+
+The held-out loss never goes below the linear floor at any checkpoint (best held-out iterate 0.210).
+Together with §11a's feed-forward null and §7c (the old +3.4 % was h = 1 against an h = 1 floor, and
+one extra lag gives the same), **L1 is closed at this data volume: neither nonlinearity nor recurrent
+memory improves on least squares at h = 2.** The only mean gain on record is linear, from stacking
+10 lags (0.2074, −1.1 %).
