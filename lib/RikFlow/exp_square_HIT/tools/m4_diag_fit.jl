@@ -15,6 +15,8 @@
 #   RIKFLOW_D_EVAL_EVERY updates between held-out scorings (default 10)
 #   RIKFLOW_D_SKIP       1 = linear skip `y += Ws x`, seeded with the least-squares map and `V1 = V2 = 0`,
 #                        so update 0 IS the linear model and the recurrence learns its residual
+#   RIKFLOW_D_SKIP_FROM  <TO_LRS model>: seed the skip with that deployed LinReg's mean instead
+#                        (translated exactly into this fit's scaled dQ; asserted), e.g. Splice1_E0x7
 #   RIKFLOW_D_SEEDHEAD   1 = (with SKIP and an emission head) seed the head at the linear map's
 #                        training-residual covariance -- `bd = log sd`, `A'A = R^{-1}` -- so update 0
 #                        is the linear mean with M0's eta; otherwise it starts at Sigma = I
@@ -124,6 +126,43 @@ end
 # fit has seen exactly what the network trains on and nothing of its early-stopping block.
 ntr = floor(Int, (1 - cfg.val_frac) * size(dat.Xc, 2))
 Clin = Float64.(dat.Xc[:, 1:ntr])' \ Float64.(dat.Yc[:, 1:ntr])'     # (n_in x N_Q)
+
+# `RIKFLOW_D_SKIP_FROM=<TO_LRS model>` (2026-09-29): take the linear mean from a deployed
+# `LinReg.jld2` (e.g. the per-QoI-λ finalist `Splice1_E0x7`) instead of refitting it here, so the
+# network adds only what the deployed model lacks. The LRS predicts the scaled LEVEL q^{n+1} from the
+# same regressor ([q*_n; q_{n-1}, q*_{n-1}; ...; 1], same order as `build_history`); its prediction is
+# evaluated on this fit's training rows in raw units, turned into the scaled `dQ` target, and `Ws`
+# is the least-squares map onto it -- EXACT when the two regressors agree up to an affine map, which
+# is asserted (the fit residual must be round-off) rather than assumed.
+skip_from = envs("SKIP_FROM", "")
+if !isempty(skip_from)
+    (skip && target === :dQ) || error("RIKFLOW_D_SKIP_FROM needs SKIP=1 and TARGET=dQ")
+    lrs = load(joinpath(TO_folder, "..", "TO_LRS", skip_from, "LinReg.jld2"))
+    (lrs["hist_var"] == cfg.hist_var && lrs["hist_len"] == cfg.h && lrs["include_predictor"] == cfg.include_predictor) ||
+        error("$skip_from: hist ($(lrs["hist_var"]), h = $(lrs["hist_len"])) differs from this fit's ($(cfg.hist_var), h = $(cfg.h))")
+    nq = size(rec.q, 1)
+    mi, si = vec(dat.scaling.in_scaling.mu), vec(dat.scaling.in_scaling.sigma)
+    ml, sl = vec(lrs["scaling"].in_scaling.mu), vec(lrs["scaling"].in_scaling.sigma)
+    mo, so = vec(lrs["scaling"].out_scaling.mu), vec(lrs["scaling"].out_scaling.sigma)
+    # this fit's scaled regressor -> raw -> the LRS's scaling (feature j carries QoI mod1(j, nq))
+    Xr = Float64.(dat.Xc)
+    for j in 1:(size(Xr, 1) - 1)
+        i = mod1(j, nq)
+        Xr[j, :] .= ((Xr[j, :] .* si[i] .+ mi[i]) .- ml[i]) ./ sl[i]
+    end
+    qpred = (Matrix(lrs["c"]) * Xr) .* so .+ mo                  # raw q^{n+1}, nq x N
+    cols = (cfg.train_range[1] - 1) .+ dat.steps
+    dqpred = qpred .- rec.q_star[:, cols]                        # raw predicted correction
+    Yfin = (dqpred .- vec(dat.scaling.out_scaling.mu)) ./ vec(dat.scaling.out_scaling.sigma)
+    Cfin = Float64.(dat.Xc)' \ Yfin'                             # (n_in x N_Q), all rows
+    fres = maximum(abs.(Cfin' * Float64.(dat.Xc) .- Yfin)) / maximum(abs.(Yfin))
+    fres < 1e-8 || error("$skip_from's map is not affine in this fit's regressor (rel residual $fres)")
+    # how the deployed map compares with this fit's own least squares, on the training rows' target
+    rdep = Float64.(dat.Yc[:, 1:ntr]) .- Cfin' * Float64.(dat.Xc[:, 1:ntr])
+    rown = Float64.(dat.Yc[:, 1:ntr]) .- Clin' * Float64.(dat.Xc[:, 1:ntr])
+    @info "skip from $skip_from" exact_fit_residual = fres train_sse_deployed = 0.5 * sum(abs2, rdep) / ntr train_sse_own_ls = 0.5 * sum(abs2, rown) / ntr
+    Clin = Cfin
+end
 rl = Yh[:, (WARM + 1):end] .- (Clin' * Xh)[:, (WARM + 1):end]
 lin = 0.5 * sum(abs2, rl) / size(rl, 2)
 # the linear map's Gaussian NLL with the training residual's full covariance -- M0's eta, in this unit

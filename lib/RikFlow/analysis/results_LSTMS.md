@@ -2101,6 +2101,7 @@ there at the larger base λ. Each `_ar2` cell is run at **M = 10 on all 46 selec
 | Splice1_E0x7_ar2 (finalist) | −0.02 %, [−0.0072, +0.0075] | — | +.000 −.012 +.004 +.005 +.002 +.001 | **30/30**, 1.03 | 13 | 14 |
 | LinReg14_ar2 (paper 3, base 0.03) | +0.79 %, [−0.0054, +0.0100] | +0.81 %, [−0.0077, +0.0113] | −.000 **−.010** +.003 +.001 +.008 +.007 | 22/30, 1.12 | 15 | 23 |
 | LinReg15_ar2 (paper 3, base 0.1) | +2.39 %, [−0.0035, +0.0150] | +2.41 %, [−0.0054, +0.0155] | +.004 **−.011** +.007 +.005 +.010 +.010 | 25/30, 1.08 | 12 | 9 |
+| LinReg16_ar2 (paper 3, base 0.3) | +4.02 %, [−0.0004, +0.0180] | +4.04 %, [−0.0011, +0.0170] | +.011 **−.014** +.012 +.010 +.012 +.012 | 28/30, 1.09 | 11 | 3 |
 
 - At base 0.1 the rule gets E[0,6] right (−0.011, as the finalist's −0.012), but it puts
   λ = 0.1 on Z[0,6] and 0.02–0.04 on the middle rows. Those rows cost 0.004–0.007 each, and the
@@ -2110,7 +2111,56 @@ there at the larger base λ. Each `_ar2` cell is run at **M = 10 on all 46 selec
   The small-scale bands still lose (+0.007) at λ_i 0.27 / 0.14 on their own rows. **Neither base λ
   reproduces the finalist's combination** of LinReg1's skill *and* 30/30 calibration. That needs
   E[0,6] alone at λ ≈ 1 with its AR, and λ = 0 everywhere else, i.e. a multiplier profile paper 3's
-  σ-rule does not produce (it ranks Z[16,32] above E[0,6]). *(LinReg16, base 0.3, pending.)*
+  σ-rule does not produce (it ranks Z[16,32] above E[0,6]).
+- **The base-λ scan is a clean one-parameter trade-off**: base 0.03 / 0.1 / 0.3 gives CRPS +0.8 /
+  +2.4 / +4.0 % against calibration 22 / 25 / 28 of 30, tail 15 / 12 / 11 and gate 23 / 9 / 3. Every
+  point is dominated by the finalist (−0.02 %, 30/30, 13, 14). **Verdict on paper 3's rule: it is
+  the right idea (per-QoI λ) with the wrong profile for this testbed.** The profile that works is
+  "ridge on E[0,6] only".
+
+### 13j. M0ᵛ on the finalist's mean — worse, stopped early (2026-09-29)
+
+**Setup.** `m4_diag_fit.jl` gained `RIKFLOW_D_SKIP_FROM=<TO_LRS model>`. It seeds the frozen skip
+from a deployed LinReg's mean, translated into the fit's scaled-dQ coordinates by least squares on
+that model's own predictions over the training rows. This is exact: residual 4e-13 for
+`Splice1_E0x7`, 6e-13 for LinReg1. Fits (h = 5, 1–10 TU, held out 52–74 TU, `:lstm` +
+`EMISSION=state_dependent`, `SEEDHEAD=1`), in `TO_LSTM/diag/`:
+
+| fit | mean | trained | held-out NLL / step (linear + constant η) |
+|---|---|---|---|
+| `m0v_fin_sd` | Splice1_E0x7 | LSTM + head | −7.546 (−6.934) |
+| `m0v_fin_const` | Splice1_E0x7 | head only; LSTM frozen at its random init | −7.556 (−6.934) |
+| `m0v_lr1_sd` | LinReg1 | LSTM + head | −8.233 (−7.580) |
+
+All three early-stop at update 24–30 (the known fast overfit). The state-dependent head gains
+≈ +0.6 nats/step over a constant η. **Training the LSTM adds nothing over its random
+initialisation** (sd vs const). The "const" fit is therefore not a constant-noise control: a frozen
+random LSTM still feeds the head.
+
+**Online, partial** (`m0v_fin_sd`, M = 10, the first 12 of 46 selection ICs, t 52.25–57.5 TU; the
+run was stopped at Rik's decision after this read):
+
+| vs | A − B | 90 % CI | per band (Z0 E0 Z7 E7 Z16 E16) |
+|---|---|---|---|
+| finalist Splice1_E0x7_ar2 | **+12.7 %** | [+0.0048, +0.0353] | +.025 **+.044** +.011 +.015 +.009 +.003 |
+| LinReg1 | **+12.2 %** | [+0.0048, +0.0386] | +.024 +.022 +.016 +.021 +.014 +.007 |
+
+Spread–skill 19/30 in band, median 0.88: **under-dispersed**, worst in E[0,6] (0.57–0.98) and in
+the small-scale bands at short leads (0.56–0.67).
+
+**Reading.** The one-step NLL gain did not carry online, again (plan §25: the best one-step
+likelihood has repeatedly been the wrong online selector). Two causes are visible:
+- a head fitted by early-stopped one-step likelihood under-states the multi-step spread;
+- the white head drops the AR(2) colour the E[0,6] ridge row needs (§13f: the white splice's E[0,6]
+  was also under-dispersed, 0.71–0.84).
+
+`m0v_lr1_sd` was not run online (the same head, the same training). **If M0ᵛ is pursued**, the
+head must change, not the number of runs:
+- (a) keep the AR(2) and let the LSTM scale only its innovation; or
+- (b) train the head on a multi-step / ensemble (CRPS) objective.
+
+§13h's −8.9 % was against an h = 2 constant-η model whose own spread was too small (0.81). The
+state-dependent scale helps a badly calibrated base; it does not help a calibrated one.
 
 ### 13d. M3ᶠ with memory — a null (the open item of §11e)
 
