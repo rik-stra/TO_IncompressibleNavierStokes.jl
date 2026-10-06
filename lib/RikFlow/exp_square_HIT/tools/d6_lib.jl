@@ -32,6 +32,26 @@ function parse_closure(s::AbstractString)
 end
 
 """
+    deploy_seed_for(dir; spec = get(ENV, "RIKFLOW_DEPLOY_SEED", "1")) -> Int
+
+Which fitted seed of the M4 fit directory `dir` goes online. **Seed 1 by default**: the paper fixes
+"the coupled runs use the first seed" in advance (Rik, 2026-10-06; paper review D). `spec` may name
+another seed, or be `median` for the old S6 rule (`seed_summary.jld2`'s `median_seed`, which must
+then exist). `12_online_StochLSTM.jl` and `analysis/postrun_lstm.jl` apply the same rule.
+"""
+function deploy_seed_for(dir::AbstractString; spec::AbstractString = get(ENV, "RIKFLOW_DEPLOY_SEED", "1"))
+    s = lowercase(strip(spec))
+    if s == "median"
+        summary = joinpath(dir, "seed_summary.jld2")
+        isfile(summary) || error("RIKFLOW_DEPLOY_SEED=median, but $dir has no seed_summary.jld2")
+        return Int(load(summary, "median_seed"))
+    end
+    seed = tryparse(Int, s)
+    (seed === nothing || seed < 1) && error("RIKFLOW_DEPLOY_SEED must be a seed >= 1 or `median`; got $(repr(spec))")
+    return seed
+end
+
+"""
     resolve_lstm_model(spec; root) -> (; file, dir, deploy_seed, name)
 
 Where the M4 fit named by `spec` (`D6_MODEL`) lives, resolved the way `12_online_StochLSTM.jl`
@@ -39,8 +59,9 @@ does it:
 
   * a **directory** (absolute, relative to the working directory, or relative to `root` =
     `exp_square_HIT/output/TO_LSTM`, e.g. `diag/r3_lin_sd_h2`): the fit is
-    `StochLSTM_seed<s>.jld2` with `s` the directory's `seed_summary.jld2` `median_seed` when that
-    file exists, else 1 (S6: the MEDIAN-seed fit goes online, not seed 1);
+    `StochLSTM_seed<s>.jld2` with `s = deploy_seed_for(dir)`: **seed 1** by default, the paper's
+    rule fixed in advance (2026-10-06; it was the `seed_summary.jld2` `median_seed`, S6), another
+    seed with `RIKFLOW_DEPLOY_SEED=<s>`, or the median with `RIKFLOW_DEPLOY_SEED=median`;
   * a **file**: deployed as is; the seed is read off a `StochLSTM_seed<s>.jld2` name, else 0.
 
 `name` is the directory relative to `root` when it is under it (`diag/r3_lin_sd_h2`), else its
@@ -56,8 +77,7 @@ function resolve_lstm_model(spec::AbstractString; root::AbstractString)
     ispath(p) || error("D6_MODEL = $(repr(s)) is neither a path nor a directory under $root")
     if isdir(p)
         dir = rstrip(p, ['/', '\\'])
-        summary = joinpath(dir, "seed_summary.jld2")
-        deploy_seed = isfile(summary) ? Int(load(summary, "median_seed")) : 1
+        deploy_seed = deploy_seed_for(dir)
         file = joinpath(dir, "StochLSTM_seed$(deploy_seed).jld2")
         isfile(file) || error("no fitted model at $file; $dir holds " *
                               join(filter(f -> endswith(f, ".jld2"), readdir(dir)), ", "))

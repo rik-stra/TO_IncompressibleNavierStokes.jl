@@ -109,12 +109,23 @@ end
         @test r.file == p1 && r.deploy_seed == 1 && r.name == "diag/fitA"
         @test X.resolve_lstm_model(joinpath(root, "diag", "fitA"); root).name == "diag/fitA"
         @test X.resolve_lstm_model(p1; root).deploy_seed == 1        # a file, deployed as is
-        # 🔑 S6: the median-seed fit goes online when the directory names one
+        # 🔑 Seed 1 goes online by default, even when the directory names a median seed (the
+        # paper's rule, 2026-10-06); RIKFLOW_DEPLOY_SEED=median restores S6, =<s> picks a seed
         d = dirname(p1)
         cp(p1, joinpath(d, "StochLSTM_seed3.jld2"))
         jldsave(joinpath(d, "seed_summary.jld2"); median_seed = 3)
-        r3 = X.resolve_lstm_model("diag/fitA"; root)
-        @test r3.deploy_seed == 3 && endswith(r3.file, "StochLSTM_seed3.jld2")
+        withenv("RIKFLOW_DEPLOY_SEED" => nothing) do
+            r1 = X.resolve_lstm_model("diag/fitA"; root)
+            @test r1.deploy_seed == 1 && r1.file == p1
+        end
+        withenv("RIKFLOW_DEPLOY_SEED" => "median") do
+            r3 = X.resolve_lstm_model("diag/fitA"; root)
+            @test r3.deploy_seed == 3 && endswith(r3.file, "StochLSTM_seed3.jld2")
+        end
+        @test X.deploy_seed_for(d; spec = "3") == 3
+        @test_throws ErrorException X.deploy_seed_for(d; spec = "0")
+        @test_throws ErrorException X.deploy_seed_for(d; spec = "best")
+        @test_throws ErrorException X.deploy_seed_for(joinpath(root, "empty_dir_x"); spec = "median")
         @test_throws ErrorException X.resolve_lstm_model(""; root)
         @test_throws ErrorException X.resolve_lstm_model("diag/nope"; root)
         mkpath(joinpath(root, "empty"))

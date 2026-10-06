@@ -65,6 +65,14 @@ inputs = load(TO_folder*inputs_file_name, "inputs")
 # Added 2026-09-15; read with a fallback so an `inputs_example.jld2` written before they existed
 # still loads and keeps the behaviour it had (ADMM, intercept penalized -- what paper 2 ran).
 ridge_solver      = get(inputs[model_index], :ridge_solver, :admm)
+# 🔴 But the ADMM fallback does not solve ridge (#64), and it only bites at λ > 0 (`fit_model`).
+# A table without the key and with λ > 0 is refused rather than silently fitted by ADMM
+# (2026-10-06, paper review D): regenerate the table with `4_setup_search.jl` (which writes
+# `:exact`), or set `ridge_solver = :admm` in it explicitly to reproduce an archived paper-2 fit.
+haskey(inputs[model_index], :ridge_solver) || inputs[model_index].lambda == 0 || error(
+    "$(inputs[model_index].name): lambda = $(inputs[model_index].lambda) > 0 but the inputs table " *
+    "has no :ridge_solver, so it would fall back to ADMM, which does not solve ridge (#64). " *
+    "Regenerate the table with 4_setup_search.jl, or set :ridge_solver explicitly.")
 penalize_intercept = get(inputs[model_index], :penalize_intercept, true)
 # Added 2026-09-29: `:paper3` scales the penalty per QoI as paper 3 does -- column i of C uses
 # λ_i = λ (σ_i/σ_1)^2, σ_i the sd of the SCALED correction (target minus the predictor row of the

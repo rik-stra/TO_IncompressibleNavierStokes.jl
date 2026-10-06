@@ -34,8 +34,9 @@
 # 🔴 The saved model is the one the PROTOCOL picks -- best inner validation, the library's return
 # value. The held-out curve only diagnoses; the update it would have picked is recorded, not used.
 #
-# Writes `output/TO_LSTM/diag/<tag>/StochLSTM_seed1.jld2` (deployable like an explore fit, with
-# `RIKFLOW_M4_MODEL_DIR`) and `curve.jld2` (inner val, held-out and linear-baseline numbers).
+# Writes `output/TO_LSTM/diag/<tag>/StochLSTM_seed<s>.jld2`, s = RIKFLOW_D_SEED (deployable like an
+# explore fit, with `RIKFLOW_M4_MODEL_DIR`), and `curve.jld2` (`curve_seed<s>.jld2` for s > 1:
+# inner val, held-out and linear-baseline numbers).
 
 using RikFlow
 using Lux, Optimisers, Zygote
@@ -208,12 +209,17 @@ ib = argmin(curve.held)
 
 out_dir = joinpath(TO_folder, "diag", tag)
 mkpath(out_dir)
-RF.save_stochlstm(joinpath(out_dir, "StochLSTM_seed1.jld2"), spec, RF.LSTMWeights(ps, spec), dat.scaling;
+# 🔴 Named by `seed` (2026-10-06, paper review D). It was always `StochLSTM_seed1.jld2`, so seeds
+# 2 and 3 of one tag silently overwrote seed 1. Seed 1 keeps its old names, so existing fits and
+# every reader of `curve.jld2` are unchanged.
+model_name = "StochLSTM_seed$(seed).jld2"
+curve_name = seed == 1 ? "curve.jld2" : "curve_seed$(seed).jld2"
+RF.save_stochlstm(joinpath(out_dir, model_name), spec, RF.LSTMWeights(ps, spec), dat.scaling;
                   cfg, seed, train_range = cfg.train_range, qoi_source = rec.source, losses = h, ps, stride,
                   batch = cfg.batch, rollout = 1, target, overrides = ov, lr = cfg.lr,
                   init_from = "", val = (; tf = h.best_val, ro = NaN, Kx = 0),
                   diag = (; held = hbest, r2, linear_floor = lin, held_nll = hnll, linear_nll = linnll, wd, skip, freeze))
-jldsave(joinpath(out_dir, "curve.jld2"); curve, lin, linnll, hnll, hbest, r2, best_update = h.best_update, ov, target, stride, wd, skip, freeze)
+jldsave(joinpath(out_dir, curve_name); curve, lin, linnll, hnll, hbest, r2, best_update = h.best_update, ov, target, stride, wd, skip, freeze)
 @printf("%-26s %-6s %-5s sk %d%s nh %2d nz %d h %d L %4d str %3d wd %.0e TU %3.0f | %4d upd, best@%4d (%s) %.1f min | val %.3f | held %.3f (lin %.3f) held-best %.3f@%d | NLL %.3f (lin %.3f) | R2 %s\n",
         tag, cfg.arch, string(cfg.emission)[1:min(5, end)], skip, isempty(freeze) ? " " : "f", cfg.n_hidden, cfg.n_latent, cfg.h, cfg.L, stride, wd, train_tu, h.updates, h.best_update,
         h.stop_reason, wall / 60, h.best_val, hbest, lin, curve.held[ib], curve.update[ib], hnll, linnll,

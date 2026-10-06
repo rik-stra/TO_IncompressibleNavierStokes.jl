@@ -14,6 +14,7 @@
 #
 # Usage (submit from exp_square_HIT or lib/RikFlow):
 #     sbatch batch_scripts/run_online.sh lrs 1     # train LinReg<n>, then 5 online replicas
+#     sbatch batch_scripts/run_online.sh lrsdeploy Splice1_E0x7_ar2   # prebuilt model, no training
 #     sbatch batch_scripts/run_online.sh ddn       # 5 DDN replicas
 #     sbatch batch_scripts/run_online.sh smag      # Smagorinsky, c_s = 0.07
 #     sbatch batch_scripts/run_online.sh nomodel   # no SGS model
@@ -48,12 +49,12 @@ set -u
 
 CASE=${1:-}
 INDEX=${2:-1}
-REPLICA=${3:-}      # lstm only: one replica instead of all n_replicas
+REPLICA=${3:-}      # lstm and lrsdeploy only: one replica instead of all n_replicas
 
 case "$CASE" in
-    lrs|ddn|smag|nomodel|lstm) ;;
+    lrs|lrsdeploy|ddn|smag|nomodel|lstm) ;;
     *)
-        echo "run_online.sh: first argument must be one of lrs | ddn | smag | nomodel | lstm" >&2
+        echo "run_online.sh: first argument must be one of lrs | lrsdeploy | ddn | smag | nomodel | lstm" >&2
         echo "  e.g. sbatch batch_scripts/run_online.sh lrs 1" >&2
         exit 1
         ;;
@@ -89,6 +90,14 @@ case "$CASE" in
         julia --project "$EXP/5_train_LinReg.jl" "$INDEX" || exit 1
         echo "== running LinReg$INDEX online, 5 replicas x 100 TU"
         julia --project "$EXP/6_online_TO_LRS.jl" "$INDEX"
+        ;;
+    lrsdeploy)
+        # Deploy a PREBUILT model by name, no training: the `_ar2` variants and the splices
+        # (2026-10-06, paper review D). The second argument is the directory under
+        # output/TO_LRS, e.g. `sbatch batch_scripts/run_online.sh lrsdeploy Splice1_E0x7_ar2`;
+        # an optional third runs one replica.
+        echo "== running prebuilt $INDEX online, replica(s) ${REPLICA:-all} x 100 TU (no training)"
+        julia --project "$EXP/6_online_TO_LRS.jl" "$INDEX" $REPLICA
         ;;
     ddn)
         # 🔴 New measurement, not reproduction: the DDN online runs have never existed in either

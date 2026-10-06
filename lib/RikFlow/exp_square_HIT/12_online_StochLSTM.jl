@@ -76,10 +76,21 @@ if replica_arg !== nothing
 end
 replicas = replica_arg === nothing ? (1:cfg.n_replicas) : (replica_arg:replica_arg)
 
-# 🔑 S6 asks for the MEDIAN-seed fit to go online, not seed 1. `11_train_StochLSTM.jl` writes the
-# summary that names it; without the summary there is only one seed and it is seed 1.
+# 🔑 **Seed 1 goes online by default**: the paper fixes "the coupled runs use the first seed" in
+# advance (Rik, 2026-10-06; paper review D). It used to be S6's MEDIAN seed from the
+# `seed_summary.jld2` that `11_train_StochLSTM.jl` writes; `RIKFLOW_DEPLOY_SEED=median` restores
+# that, and `RIKFLOW_DEPLOY_SEED=<s>` picks a seed. Same rule as `tools/d6_lib.jl`
+# `deploy_seed_for`, so the hindcast and the long runs deploy the same fit.
+deploy_spec = lowercase(strip(get(ENV, "RIKFLOW_DEPLOY_SEED", "1")))
 summary_file = out_dir * "seed_summary.jld2"
-deploy_seed = isfile(summary_file) ? load(summary_file, "median_seed") : 1
+deploy_seed = if deploy_spec == "median"
+    isfile(summary_file) || error("RIKFLOW_DEPLOY_SEED=median, but $out_dir has no seed_summary.jld2")
+    load(summary_file, "median_seed")
+else
+    s = tryparse(Int, deploy_spec)
+    (s === nothing || s < 1) && error("RIKFLOW_DEPLOY_SEED must be a seed >= 1 or `median`; got $(repr(deploy_spec))")
+    s
+end
 model_file = out_dir * "StochLSTM_seed$(deploy_seed).jld2"
 if !isfile(model_file)
     # 🔑 Most often this is an exported stride-scan point deployed WITHOUT `RIKFLOW_M4_MODEL_DIR`

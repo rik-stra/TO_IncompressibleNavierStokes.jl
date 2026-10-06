@@ -85,8 +85,12 @@ end
 inputs = load(TO_folder * "/inputs_lstm.jld2", "inputs")
 cfg = inputs[model_index]
 out_dir = TO_folder * "/$(cfg.name)/"
+# Seed 1 by default, as the online deploy (2026-10-06, paper review D); `RIKFLOW_DEPLOY_SEED=median`
+# restores the old S6 rule. An explicit seed argument still wins.
+deploy_spec = lowercase(strip(get(ENV, "RIKFLOW_DEPLOY_SEED", "1")))
 seed = seed_arg !== nothing ? seed_arg :
-       (isfile(out_dir * "seed_summary.jld2") ? load(out_dir * "seed_summary.jld2", "median_seed") : 1)
+       deploy_spec == "median" ? load(out_dir * "seed_summary.jld2", "median_seed") :
+       parse(Int, deploy_spec)
 fit = RF.load_stochlstm(out_dir * "StochLSTM_seed$(seed).jld2")
 spec, w, scaling = fit.spec, fit.weights, fit.scaling
 

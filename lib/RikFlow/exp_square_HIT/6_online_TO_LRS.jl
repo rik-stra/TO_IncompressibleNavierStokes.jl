@@ -16,8 +16,14 @@ using CUDA
 # the batch array told it — silently, and with `5_train_LinReg.jl` (whose manual line *is*
 # commented) happily training something else. Train and deploy could disagree about which model was
 # being run, with no error anywhere. Fixed 2026-09-14; see claude_memory.md #55.
-length(ARGS) >= 1 || error("usage: julia 6_online_TO_LRS.jl <model_index> [replica]")
-model_index = parse(Int, ARGS[1])
+length(ARGS) >= 1 || error("usage: julia 6_online_TO_LRS.jl <model_index | model_name> [replica]")
+# 🔑 A NAME instead of an index deploys a prebuilt model under `output/TO_LRS/<name>/` -- the
+# `_ar2` variants (`tools/lrs_ar_variant.jl`) and the splices (`tools/lrs_splice.jl`), which have
+# no row in `inputs_example.jld2` and so had no long-run path (2026-10-06, paper review D). Like
+# `tools/run_d6.jl`, it reads `hist_len`/`hist_var` from the model's own `LinReg.jld2`, and
+# `n_replicas` from its `parameters.jld2`. An integer takes the table path, unchanged.
+model_index = tryparse(Int, ARGS[1])
+model_name_arg = model_index === nothing ? String(strip(ARGS[1])) : nothing
 
 # Optional second argument: run ONE replica instead of all `n_replicas`, so a SLURM array can put
 # the ensemble members on separate GPUs.
@@ -77,8 +83,20 @@ seeds = (;
 
 
 ## Load data
-inputs = load(TO_folder*inputs_file_name, "inputs")
-(; name, hist_len, n_replicas, hist_var,tracking_noise) = inputs[model_index]
+if model_index !== nothing
+    inputs = load(TO_folder*inputs_file_name, "inputs")
+    (; name, hist_len, n_replicas, hist_var,tracking_noise) = inputs[model_index]
+    lambda_info = get(inputs[model_index], :lambda, missing)
+else
+    name = model_name_arg
+    model_dir = TO_folder*"/$(name)/"
+    isfile(model_dir*"LinReg.jld2") || error("no prebuilt model at $(model_dir)LinReg.jld2")
+    isfile(model_dir*"parameters.jld2") || error("no parameters.jld2 in $model_dir")
+    hist_len, hist_var = load(model_dir*"LinReg.jld2", "hist_len", "hist_var")
+    model_params = load(model_dir*"parameters.jld2", "parameters")
+    n_replicas = model_params.n_replicas
+    lambda_info = get(model_params, :lambda, missing)
+end
 
 # Resolve which replicas this process owns, and refuse a bad index HERE -- immediately after the
 # 12 kB inputs table and *before* the 2.7 GB track file, the CuArray initial condition and the
@@ -89,7 +107,7 @@ if replica_arg !== nothing
         "replica $replica_arg is out of range: $name declares n_replicas = $n_replicas")
 end
 replicas = replica_arg === nothing ? (1:n_replicas) : (replica_arg:replica_arg)
-@info "Deploying $name" model_index lambda=get(inputs[model_index], :lambda, missing) replicas=collect(replicas) n_replicas
+@info "Deploying $name" model_index lambda=lambda_info replicas=collect(replicas) n_replicas
 
 out_dir = TO_folder*"/$(name)/"
 
