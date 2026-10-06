@@ -1,7 +1,9 @@
 #!/bin/bash
 #SBATCH -J online
 #SBATCH -t 06:00:00
-#SBATCH --partition=gpu_h100
+# gpu_a100 (Rik, 2026-10-06): 128 SBU/h vs gpu_h100's 192; ~1.4x slower per step (D6 smoke
+# 27660921 vs 27660628), so a 100 TU replica costs about the same (~23-25 SBU) on either.
+#SBATCH --partition=gpu_a100
 #SBATCH --gpus=1
 # Explicit, though it is SLURM's default: the job inherits the SUBMITTING environment, which is
 # how `RIKFLOW_M4_MODEL_DIR=... sbatch ...` reaches the driver. ⚠️ The variable must be on the

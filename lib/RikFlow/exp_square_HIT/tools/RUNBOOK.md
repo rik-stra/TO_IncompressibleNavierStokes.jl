@@ -93,9 +93,14 @@ export JULIA_DEPOT_PATH=$HOME/julia/julia_h100:      # trailing colon, as every 
 julia --project -e 'using Pkg; Pkg.instantiate()'
 ```
 
-✅ **Every GPU batch script in this directory is now on `gpu_h100` + `julia_h100` with the same
-`JULIA_CPU_TARGET`** (`run_d6.sh` was moved there 2026-09-16; it had been the only one on `gpu_a100`/`julia_a1003`, and its `--partition` line had been missed when the depot was switched). The three production scripts
-`run_d6_linreg1.sh`, `run_d6_linreg7.sh`, `run_d6_ddn.sh` were written to match. `JULIA_CPU_TARGET` multiversioning means one depot serves both
+🔑 **Partition (Rik, 2026-10-06): paper production runs on `gpu_a100`** — `run_d6_packed.sh`
+(hindcasts, 10 tasks × 9 ICs) and `run_online.sh` (long runs). Measured on the same packed smoke:
+A100 18 s/member at 128 SBU/h (job 27660921), H100 12–13 s/member at 192 SBU/h (27660628), so a
+packed hindcast is ~650 SBU on the A100 vs ~730 on the H100 and a long run costs the same on
+either. The Sept baselines (`run_d6_linreg1.sh`, `run_d6_linreg7.sh`, `run_d6_ddn.sh`) and
+`run_track_ref.sh` are on `gpu_a100` too; the training, probe and p4grid scripts stay on
+`gpu_h100`. Every script uses the `julia_h100` depot with the same `JULIA_CPU_TARGET`
+(`run_d6.sh` was moved off `julia_a1003` on 2026-09-16). `JULIA_CPU_TARGET` multiversioning means one depot serves both
 partitions, so warm this one and every script benefits. ⚠️ Keep the target string identical across
 `run_d6.sh`, the three `run_d6_*.sh`, `run_online_array.sh` and `run_train_lrs.sh` — Julia validates a compile cache against
 the target it was built for, so a mismatch silently recompiles inside the walltime.

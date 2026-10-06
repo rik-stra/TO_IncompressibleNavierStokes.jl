@@ -5,7 +5,7 @@
 #         sbatch batch_scripts/run_d6_packed.sh                     # from exp_square_HIT/
 #
 # 🔑 Why: one IC per task (`run_d6_linreg1.sh`, `--array=1-179:2`) pays Julia's start-up and the
-# solver's compile ~90 times per hindcast, ~1-2 min each, at 192 SBU per job-hour on gpu_h100. Here
+# solver's compile ~90 times per hindcast, ~1-2 min each, billed per job-hour. Here
 # each task runs D6_PACK ICs in one process (`run_d6.jl o1,o2,...`), so the hindcast pays it ~10
 # times. Members, seeds, warm-up check and output are exactly those of the one-IC tasks: the same
 # `run_ic`, called per ordinal.
@@ -22,12 +22,19 @@
 # into another's directory. `run_d6.jl` also refuses a directory holding another model's members.
 # For lstm, D6_MODEL must be the seed-1 FILE (`.../StochLSTM_seed1.jld2`), as WORKFLOW.md §4 says.
 #
-# Wall time: 9 ICs x 10 members x ~15-21 s (q99 ~95 s on the A100, divergences included) + start-up
-# ~ 25-45 min; 1:30 h is the margin. SLURM bills elapsed time, not the limit.
+# 🔑 gpu_a100, not gpu_h100 (Rik, 2026-10-06): the same packed smoke (LinReg1, 2 ICs x 2 members)
+# measured 18 s per member at 128 SBU/h on the A100 (job 27660921) against 12-13 s at 192 SBU/h on
+# the H100 (27660628) -- a packed hindcast ~5.1 h / ~650 SBU vs ~3.8 h / ~730 SBU. The reused
+# baselines (`D6_LinReg1`, `D6_LinReg7`, `D6_DDN`) also ran on the A100. `-p gpu_h100` on the
+# sbatch line overrides this when speed matters more than SBU. One depot serves both partitions
+# (`JULIA_CPU_TARGET` below).
+#
+# Wall time: 9 ICs x 10 members x ~19 s (A100; diverging members take up to ~5x) + ~2 min start-up
+# ~ 30-45 min; 1:30 h is the margin. SLURM bills elapsed time, not the limit.
 
 #SBATCH -J d6-packed
 #SBATCH -t 01:30:00
-#SBATCH --partition=gpu_h100
+#SBATCH --partition=gpu_a100
 #SBATCH --gpus=1
 #SBATCH --array=1-10
 #SBATCH --export=ALL
