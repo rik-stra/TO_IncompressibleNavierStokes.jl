@@ -831,6 +831,7 @@ The warm-up columns are excluded: there `dQ` is replayed from the record, not pr
 """
 function clamp_report(ens)
     fired = Int[]
+    ic_of = Int[]
     total = 0
     for k in ens.ks, (_, path) in ens.files[k]
         dQ = load(path, "dQ")
@@ -840,10 +841,16 @@ function clamp_report(ens)
             all(iszero, @view dQ[:, c]) && (n += 1)
         end
         push!(fired, n)
+        push!(ic_of, k)
         total += size(dQ, 2) - nwarm
     end
+    # `members_fired` / `ics_fired` (2026-10-06): the paper discloses, besides the share of steps,
+    # how many members and initial conditions saw at least one firing (Sec. 3.5, "Gate firings").
+    # Counted from the files, so it works on runs that predate the `gate_nfired` field.
     return (; nfired = sum(fired), nsteps = total, per_run = fired,
-            rate = total == 0 ? NaN : sum(fired) / total)
+            rate = total == 0 ? NaN : sum(fired) / total,
+            members_fired = count(>(0), fired), ics_fired = length(unique(ic_of[fired .> 0])),
+            nruns = length(fired))
 end
 
 """
@@ -1101,6 +1108,271 @@ function paired_primary(dir_a, dir_b; truth = load_truth(), max_lead::Integer = 
 end
 
 # ---------------------------------------------------------------------------------------------
+# calibrated and flat counts with their reference, the normalized error -- paired
+# ---------------------------------------------------------------------------------------------
+#
+# 🔒 Paper Sec. 3.5-3.7 (Rik, 2026-10-06, review A2 and A4). The calibration score is the COUNT of
+# calibrated cells, 0.8 <= r <= 1.25, over all 36 (QoI, lead) cells, given with
+#   (i)  its reference: the count the same ensemble reaches when, in each IC, a member drawn at
+#        random stands in for the truth and the other M - 1 members are scored against it,
+#        averaged over 1000 draws (the flat count gets the same reference), and
+#   (ii) for a pair of closures, the paired IC-block bootstrap interval of the count difference,
+#        with r recomputed in every cell for every resample (the same resampled ICs on both sides).
+# Every AR-vs-white pair also reports the paired change in the normalized error of the ensemble
+# mean (36-cell mean), with the same kind of interval.
+
+"Calibrated band of the corrected spread-skill ratio (paper Sec. 3.5)."
+const CAL_BAND = (0.8, 1.25)
+
+"""
+    cell_moments(fc, tr) -> (; V, E, M)
+
+Per (IC, QoI, lead): the members' unbiased variance `V` and the squared error of their mean `E`,
+each `K x N_Q x L` (`assemble`'s layout). Every cell statistic below is a sum of these over ICs,
+so a bootstrap resample only re-sums them.
+"""
+function cell_moments(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3})
+    K, nq, M, L = size(fc)
+    size(tr) == (K, nq, L) ||
+        throw(DimensionMismatch("truth is $(size(tr)), expected $((K, nq, L))"))
+    M >= 2 || error("cell moments need M >= 2 members, got $M")
+    V = Array{Float64}(undef, K, nq, L)
+    E = Array{Float64}(undef, K, nq, L)
+    for k in 1:K, i in 1:nq, j in 1:L
+        m = view(fc, k, i, :, j)
+        mb = sum(m) / M
+        V[k, i, j] = sum(abs2, m .- mb) / (M - 1)
+        E[k, i, j] = (mb - tr[k, i, j])^2
+    end
+    return (; V, E, M)
+end
+
+"""
+    cell_ratios(mom, idx = 1:K) -> N_Q x L
+
+Corrected spread-skill ratio `r = sqrt((M+1)/M) spread / RMSE` per cell (Eq. spread skill) over the
+ICs `idx`, repeats allowed (a bootstrap resample). On `idx = 1:K` it equals
+`spread_skill_by_lead`'s per-cell `ratio` (tested).
+"""
+function cell_ratios(mom, idx = axes(mom.V, 1))
+    _, nq, L = size(mom.V)
+    f = sqrt((mom.M + 1) / mom.M)
+    r = Matrix{Float64}(undef, nq, L)
+    for i in 1:nq, j in 1:L
+        sp = 0.0
+        sk = 0.0
+        for k in idx
+            sp += mom.V[k, i, j]
+            sk += mom.E[k, i, j]
+        end
+        r[i, j] = sk > 0 ? f * sqrt(sp / sk) : NaN
+    end
+    return r
+end
+
+"Number of cells with `CAL_BAND[1] <= r <= CAL_BAND[2]`."
+calibrated_count(r::AbstractMatrix) = count(x -> CAL_BAND[1] <= x <= CAL_BAND[2], r)
+
+"""
+    normalized_error(mom, scale, idx = 1:K) -> N_Q x L
+
+RMSE of the ensemble mean over the ICs `idx`, divided by `scale[i] * sqrt(1 + 1/M)`, the RMSE an
+ensemble drawn from the climatology reaches (paper Sec. 3.5; `climatological_skill`). `scale` is
+the reference sd over the whole record (`primary_band_scale`). Lower is better; 1 = climatology.
+"""
+function normalized_error(mom, scale::AbstractVector{<:Real}, idx = axes(mom.V, 1))
+    _, nq, L = size(mom.V)
+    length(scale) == nq || throw(DimensionMismatch("scale has $(length(scale)) bands, expected $nq"))
+    c = sqrt(1 + 1 / mom.M)
+    ne = Matrix{Float64}(undef, nq, L)
+    for i in 1:nq, j in 1:L
+        s = 0.0
+        for k in idx
+            s += mom.E[k, i, j]
+        end
+        ne[i, j] = sqrt(s / length(idx)) / (scale[i] * c)
+    end
+    return ne
+end
+
+"Flat = both Jolliffe-Primo 95 % intervals contain 0 (paper Sec. 3.5)."
+is_flat(h) = h.slope_ci[1] <= 0 <= h.slope_ci[2] && h.convexity_ci[1] <= 0 <= h.convexity_ci[2]
+
+"""
+    flat_count(fc, tr, grid; rng = Xoshiro(SEED), nboot = 1000)
+
+Flat cells out of N_Q x L, through `rank_histogram_by_lead` with the same rng and `nboot` as
+`main`'s level table, so on the same ICs it reproduces that table's flat cells.
+"""
+function flat_count(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3},
+                    grid::AbstractVector{<:Integer}; rng = Xoshiro(SEED), nboot::Integer = 1000)
+    rh = rank_histogram_by_lead(fc, tr; grid, rng, nboot)
+    return count(is_flat, Iterators.flatten(rh.hist))
+end
+
+"""
+    member_as_truth_reference(fc, grid; ndraw = 1000, flat = true, rng = Xoshiro(SEED),
+                              nboot_rh = 1000)
+
+The counts this very ensemble reaches when it is calibrated by construction (paper Sec. 3.5): in
+each of `ndraw` draws, every IC's truth is one of its own members drawn at random (the same member
+for all QoIs and leads of that IC), and the other `M - 1` members are scored against it, so the
+finite-M factor uses `M - 1`. Returns the mean calibrated count over draws and its 5-95 %
+range, and the same for the flat count when `flat = true`. Needs `M >= 3`.
+"""
+function member_as_truth_reference(fc::AbstractArray{<:Real,4}, grid::AbstractVector{<:Integer};
+                                   ndraw::Integer = 1000, flat::Bool = true,
+                                   rng = Xoshiro(SEED), nboot_rh::Integer = 1000)
+    K, nq, M, L = size(fc)
+    M >= 3 || error("the member-as-truth reference needs M >= 3, got $M")
+    length(grid) == L || throw(DimensionMismatch("grid has $(length(grid)) leads, fc has $L"))
+    fcd = Array{Float64}(undef, K, nq, M - 1, L)
+    trd = Array{Float64}(undef, K, nq, L)
+    cal = Vector{Float64}(undef, ndraw)
+    fl = Vector{Float64}(undef, flat ? ndraw : 0)
+    for d in 1:ndraw
+        for k in 1:K
+            m0 = rand(rng, 1:M)
+            for i in 1:nq, j in 1:L
+                trd[k, i, j] = fc[k, i, m0, j]
+                c = 0
+                for m in 1:M
+                    m == m0 && continue
+                    c += 1
+                    fcd[k, i, c, j] = fc[k, i, m, j]
+                end
+            end
+        end
+        cal[d] = calibrated_count(cell_ratios(cell_moments(fcd, trd)))
+        flat && (fl[d] = flat_count(fcd, trd, grid; rng, nboot = nboot_rh))
+    end
+    q(v, p) = quantile(v, p)
+    return (; calibrated = mean(cal), calibrated_range = (q(cal, 0.05), q(cal, 0.95)),
+            flat = flat ? mean(fl) : NaN, flat_range = flat ? (q(fl, 0.05), q(fl, 0.95)) : (NaN, NaN),
+            ndraw = Int(ndraw), M_ref = M - 1)
+end
+
+"""
+    ic_blocklen(t_ic; blocklen = nothing, block_tu = PRIMARY_BLOCK_TU)
+
+The IC-block length of `ic_block_bootstrap_ci`: `floor(block_tu / median spacing) + 1`, clamped
+to `1:K`, unless `blocklen` is given.
+"""
+function ic_blocklen(t_ic::AbstractVector{<:Real}; blocklen = nothing,
+                     block_tu::Real = PRIMARY_BLOCK_TU)
+    K = length(t_ic)
+    sp = sort(diff(sort(Float64.(t_ic))))
+    b = blocklen === nothing ? floor(Int, block_tu / max(sp[cld(length(sp), 2)], eps())) + 1 :
+        Int(blocklen)
+    return clamp(b, 1, K)
+end
+
+"""
+    paired_cell_bootstrap(stat, ma, mb, t_ic; blocklen, block_tu, nboot, level, rng)
+
+Moving-block bootstrap over the paired ICs, in time order, of `stat(ma, idx) - stat(mb, idx)`,
+with the SAME resampled `idx` on both sides (Sec. 3.6: blocks of consecutive ICs, 10 000
+resamples, 90 % percentile interval). Returns `(; a, b, diff, lo, hi, blocklen, nboot, level, K)`.
+"""
+function paired_cell_bootstrap(stat, ma, mb, t_ic::AbstractVector{<:Real}; blocklen = nothing,
+                               block_tu::Real = PRIMARY_BLOCK_TU, nboot::Integer = 10_000,
+                               level::Real = 0.90, rng = Xoshiro(SEED))
+    K = size(ma.V, 1)
+    size(mb.V, 1) == K || throw(DimensionMismatch("A has $K ICs, B has $(size(mb.V, 1))"))
+    length(t_ic) == K || throw(DimensionMismatch("t_ic has $(length(t_ic)) entries, expected $K"))
+    K >= 2 || error("a bootstrap over ICs needs at least 2 ICs, got $K")
+    o = sortperm(t_ic)
+    b = ic_blocklen(t_ic; blocklen, block_tu)
+    allk = axes(ma.V, 1)
+    sa, sb = stat(ma, allk), stat(mb, allk)
+    boots = Vector{Float64}(undef, nboot)
+    for r in 1:nboot
+        idx = o[block_bootstrap_indices(K, b, rng)]
+        boots[r] = stat(ma, idx) - stat(mb, idx)
+    end
+    sort!(boots)
+    a = (1 - level) / 2
+    q(p) = boots[clamp(round(Int, p * nboot), 1, nboot)]
+    return (; a = sa, b = sb, diff = sa - sb, lo = q(a), hi = q(1 - a), blocklen = b,
+            nboot = Int(nboot), level = Float64(level), K)
+end
+
+"Paired calibrated-count difference A - B (Sec. 3.5): r recomputed in every cell per resample."
+paired_calibration(ma, mb, t_ic; kw...) =
+    paired_cell_bootstrap((m, idx) -> calibrated_count(cell_ratios(m, idx)), ma, mb, t_ic; kw...)
+
+"Paired change A - B of the 36-cell mean normalized error (Sec. 3.5; review A4)."
+paired_normalized_error(ma, mb, scale, t_ic; kw...) =
+    paired_cell_bootstrap((m, idx) -> mean(normalized_error(m, scale, idx)), ma, mb, t_ic; kw...)
+
+"""
+    paired_compare(dir_a, dir_b; truth = load_truth(), nboot = 10_000, ndraw = 1000,
+                   level = 0.90, margin = 10.0, io = stdout)
+
+Everything the paper reports for a pair (Secs. 3.5-3.7), B being the comparator (LinReg1, the
+control run, or the matched partner): CRPS_0.5 and CRPS_all with their paired intervals
+(`paired_primary`), the calibrated count of each side with its member-as-truth reference and the
+paired interval of the difference, the flat count of each side with its reference, and the paired
+change in the normalized error. Then the criterion's two hindcast clauses against B:
+  S: the CRPS_0.5 interval lies below 0;
+  C: the count interval lies above 0 AND the upper end of the CRPS_0.5 interval is below
+     `margin` % of B's CRPS_0.5.
+The KS guard is a long-run statistic (`score_m0_ddn.jl`) and is not evaluated here.
+Pairing, exclusion policy and thinning are `paired_primary`'s / `load_members`'s.
+"""
+function paired_compare(dir_a, dir_b; truth = load_truth(), nboot::Integer = 10_000,
+                        ndraw::Integer = 1000, level::Real = 0.90, margin::Real = 10.0,
+                        io = stdout)
+    p05 = paired_primary(dir_a, dir_b; truth, nboot, level, io)
+    pall = paired_primary(dir_a, dir_b; truth, max_lead = maximum(LEADS), nboot, level, io)
+    ea, eb = load_members(dir_a), load_members(dir_b)
+    ks = sort(intersect(ea.ks, eb.ks))
+    grid = filter(<=(min(ea.nlead, eb.nlead)), LEADS)
+    a, b = restrict(ea, ks), restrict(eb, ks)
+    fa, tra = assemble(a, truth, grid)
+    fb, trb = assemble(b, truth, grid)
+    tra == trb || error("the two runs verify against different truth at the same ICs")
+    ma, mb = cell_moments(fa, tra), cell_moments(fb, trb)
+    cal = paired_calibration(ma, mb, a.t; nboot, level)
+    sc = primary_band_scale(truth.q)
+    ne = paired_normalized_error(ma, mb, sc, a.t; nboot, level)
+    fla, flb = flat_count(fa, tra, grid), flat_count(fb, trb, grid)
+    ra = ea.M >= 3 ? member_as_truth_reference(fa, grid; ndraw) : nothing
+    rb = eb.M >= 3 ? member_as_truth_reference(fb, grid; ndraw) : nothing
+    ncell = length(grid) * size(fa, 2)
+    function rf(r, f)
+        r === nothing && return "(M < 3: no reference)"
+        rg = getproperty(r, Symbol(f, :_range))
+        return @sprintf("reference %.1f (5-95 %%: %.0f-%.0f)", getproperty(r, f), rg[1], rg[2])
+    end
+
+    @printf(io, "\nCALIBRATION, %d cells (r in [%.2f, %.2f]), K = %d paired ICs, leads %s\n",
+            ncell, CAL_BAND[1], CAL_BAND[2], length(ks), join(grid, ","))
+    @printf(io, "  calibrated  A %2d of %d   %s\n", cal.a, ncell, rf(ra, :calibrated))
+    @printf(io, "              B %2d of %d   %s\n", cal.b, ncell, rf(rb, :calibrated))
+    @printf(io, "  A - B %+d, %.0f%% paired IC-block CI [%+.0f, %+.0f] (block %d, %d resamples) -> %s\n",
+            cal.diff, 100 * level, cal.lo, cal.hi, cal.blocklen, cal.nboot,
+            cal.lo > 0 ? "A higher, CI excludes 0" : cal.hi < 0 ? "B higher, CI excludes 0" :
+            "not resolved")
+    @printf(io, "  flat        A %2d of %d   %s\n", fla, ncell, rf(ra, :flat))
+    @printf(io, "              B %2d of %d   %s\n", flb, ncell, rf(rb, :flat))
+    @printf(io, "NORMALIZED ERROR of the ensemble mean, %d-cell mean: A %.4f  B %.4f  A - B %+.4f (%+.2f%% of B), %.0f%% CI [%+.4f, %+.4f] -> %s\n",
+            ncell, ne.a, ne.b, ne.diff, 100 * ne.diff / ne.b, 100 * level, ne.lo, ne.hi,
+            ne.hi < 0 ? "A lower" : ne.lo > 0 ? "B lower" : "not resolved")
+    S = p05.hi < 0
+    hi_pct = 100 * p05.hi / p05.score_b
+    C = cal.lo > 0 && hi_pct < margin
+    @printf(io, "CRITERION vs B (Sec. 3.7; KS guard G from the long runs, not evaluated here)\n")
+    @printf(io, "  S  CRPS_0.5 CI upper end %+.2f%% of B < 0            : %s\n", hi_pct, S ? "PASS" : "fail")
+    @printf(io, "  C  count CI lower end %+.0f > 0, CRPS_0.5 upper %+.2f%% < %+.0f%% : %s\n",
+            cal.lo, hi_pct, margin, C ? "PASS" : "fail")
+    @printf(io, "  -> improves on B iff G and (S or C): S or C = %s\n", S || C ? "yes" : "no")
+    return (; crps05 = p05, crps_all = pall, calibration = cal, normalized_error = ne,
+            flat_a = fla, flat_b = flb, reference_a = ra, reference_b = rb, ks, grid,
+            S, C, crps05_hi_pct = hi_pct, margin = Float64(margin))
+end
+
+# ---------------------------------------------------------------------------------------------
 # driver
 # ---------------------------------------------------------------------------------------------
 
@@ -1219,14 +1491,16 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
     compare_validation(; dir, io)
 
     cl = clamp_report(ens)
-    @printf(io, "clamp: fired on %d of %d forecast steps (%.3g%%)%s\n",
-            cl.nfired, cl.nsteps, 100 * cl.rate,
+    @printf(io, "clamp: fired on %d of %d forecast steps (%.3g%%), in %d of %d members and %d of %d ICs%s\n",
+            cl.nfired, cl.nsteps, 100 * cl.rate, cl.members_fired, cl.nruns, cl.ics_fired,
+            length(ens.ks),
             cl.nfired == 0 ? " -- as measured everywhere else on HIT, it never fires" :
             " ⚠️ every number below is then partly the stabiliser's, not the model's")
 
     rng = Xoshiro(SEED)
     pos = lead_positions(grid, leads)
     out = Dict{Symbol,Any}()
+    counts = (;)     # the level's calibrated and flat counts (set below; saved, not returned)
     for (label, level) in (("LEVEL q  -- primary (gotcha #27)", true),
                            ("CORRECTION dQ -- secondary (gotcha #28)", false))
         fc, tr = assemble(ens, truth, grid; level)
@@ -1254,6 +1528,29 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
                 nties, ss.K * sum(length, leads),
                 nties == 0 ? " As expected -- the clamp never fires on HIT." :
                 " ⚠️ Unexpected; metrics.md #4's duplicate-by-construction case was ruled out.")
+        if level
+            # 🔑 Paper Sec. 3.5 (Rik, 2026-10-06): both counts over all cells, each with its
+            # member-as-truth reference. `D6_REF_NDRAW` (default 1000; 0 skips) sets the draws.
+            ncal = count(x -> CAL_BAND[1] <= x <= CAL_BAND[2], Iterators.flatten(ss.ratio))
+            nflat = count(is_flat, Iterators.flatten(rh.hist))
+            ncell = sum(length, ss.ratio)
+            nd = parse(Int, get(ENV, "D6_REF_NDRAW", "1000"))
+            ref = (ens.M >= 3 && nd > 0 && all(l -> l == grid, leads)) ?
+                  member_as_truth_reference(fc, grid; ndraw = nd) : nothing
+            refcal = ref === nothing ?
+                     "  (no reference: M < 3, D6_REF_NDRAW = 0 or per-QoI grids)" :
+                     @sprintf("  -- reference %.1f (5-95 %%: %.0f-%.0f, %d draws, M - 1 = %d)",
+                              ref.calibrated, ref.calibrated_range[1], ref.calibrated_range[2],
+                              ref.ndraw, ref.M_ref)
+            refflat = ref === nothing ? "" :
+                      @sprintf("  -- reference %.1f (5-95 %%: %.0f-%.0f)", ref.flat,
+                               ref.flat_range[1], ref.flat_range[2])
+            @printf(io, "\n  calibrated cells (r in [%.2f, %.2f]): %d of %d%s\n", CAL_BAND[1],
+                    CAL_BAND[2], ncal, ncell, refcal)
+            @printf(io, "  flat cells: %d of %d%s\n", nflat, ncell, refflat)
+            counts = (; calibrated = ncal, flat = nflat, ncell,
+                            reference = ref === nothing ? (;) : ref)
+        end
         nsat = count(s -> s !== nothing, sat)
         @printf(io, "\n  %d of %d QoIs saturate inside the grid.%s\n", nsat, length(sat),
                 nsat == length(sat) ? "" :
@@ -1277,6 +1574,7 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
     jldsave(p; level = out[:level], correction = out[:correction],
             labels = LABELS, T_int = T_INT, dt = DT, truth = truth.source,
             ics = ens.ks, clamp_nfired = cl.nfired, clamp_nsteps = cl.nsteps,
+            clamp_members = cl.members_fired, clamp_ics = cl.ics_fired, counts,
             policy = !THINNING ? "ic_level" :
                      isempty(EXCLUDE_ICS) ? "member_level" : "isolation_control",
             excluded_ics = sort(collect(EXCLUDE_ICS)),
@@ -1296,6 +1594,10 @@ if abspath(PROGRAM_FILE) == @__FILE__
     if !isempty(ARGS) && ARGS[1] == "--paired"
         length(ARGS) == 3 || error("usage: score_d6.jl --paired <dir A> <dir B>")
         paired_primary(ARGS[2], ARGS[3])
+    elseif !isempty(ARGS) && ARGS[1] == "--compare"
+        # Everything the paper reports for a pair, B the comparator (2026-10-06).
+        length(ARGS) == 3 || error("usage: score_d6.jl --compare <dir A> <dir B>")
+        paired_compare(ARGS[2], ARGS[3])
     else
         main(; preview_only = ("--preview" in ARGS))
     end

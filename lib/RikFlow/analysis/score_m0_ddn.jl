@@ -809,16 +809,25 @@ function main()
             (@printf("    %-10s deterministic -- no q*, stabilizer does not apply\n", nm); continue)
         rates = Float64[]
         mins = Float64[]
-        for qs in e.q_star
+        # 🔑 The gate's ACTUAL firings (2026-10-06, paper Sec. 3.5 "Gate firings"): a fired step
+        # zeroes the whole `dQ` column, so it is counted exactly from `dQ`, past the 100-step
+        # warm-up (replayed from the record). `rate` above it stays the would-fire rate of `q*`.
+        fired = Int[]
+        npred = Int[]
+        for (r, qs) in enumerate(e.q_star)
             c = clamp_census(Float64.(qs))
             push!(rates, c.rate)
             push!(mins, minimum(abs, qs))
+            dq = e.dQ[r]
+            push!(fired, count(j -> all(iszero, view(dq, :, j)), 101:size(dq, 2)))
+            push!(npred, size(dq, 2) - 100)
         end
-        census["online_$nm"] = (; rate = maximum(rates), nfired = 0,
+        census["online_$nm"] = (; rate = maximum(rates), nfired = sum(fired),
                                 nsteps = size(e.q_star[1], 2), per_qoi_rate = rates,
-                                threshold = 1e-2)
-        @printf("    %-10s max rate over %d replicas = %.3e   global min |q*| = %.4e\n", nm,
-                length(rates), maximum(rates), minimum(mins))
+                                threshold = 1e-2, fired_rate = fired ./ npred)
+        @printf("    %-10s max rate over %d replicas = %.3e   global min |q*| = %.4e   fired on %s %% of predicted steps\n",
+                nm, length(rates), maximum(rates), minimum(mins),
+                join((@sprintf("%.2f", 100 * f / n) for (f, n) in zip(fired, npred)), " / "))
         flush(stdout)
     end
 
@@ -831,7 +840,8 @@ function main()
             tint_q = [(; t.rho1, t.T_exp, t.T_int, t.truncated) for t in tint_q],
             tint_q_tracked = [(; t.rho1, t.T_exp, t.T_int, t.truncated) for t in tint_qtrack],
             t_int_q_med = median([t.T_int for t in tint_q]),
-            census = Dict(k => (; v.rate, v.nfired, v.nsteps, v.per_qoi_rate, v.threshold)
+            census = Dict(k => (; v.rate, v.nfired, v.nsteps, v.per_qoi_rate, v.threshold,
+                                fired_rate = get(v, :fired_rate, Float64[]))
                           for (k, v) in census),
             m0 = (; m0.h, m0.lambda, m0.normalization, m0.penalize_intercept, m0.C,
                   m0.Sigma_scaled, sigma = collect(m0.scaling.sigma),

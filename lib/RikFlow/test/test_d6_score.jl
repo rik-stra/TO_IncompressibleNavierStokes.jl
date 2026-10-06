@@ -741,3 +741,88 @@ end
         @test_throws ErrorException D6Score.paired_primary(a, c; truth, io = devnull)
     end
 end
+
+# ---------------------------------------------------------------------------------------------
+# V80 -- the paper's calibration and normalized-error statistics (2026-10-06, Sec. 3.5-3.7)
+# ---------------------------------------------------------------------------------------------
+
+@testitem "V80 cell ratios and the normalized error equal the existing per-cell statistics" default_imports = false setup = [D6Score] begin
+    using Test
+    using Random
+    using Statistics
+    grid = [25, 50, 100, 200, 400, 1000]
+    fc, tr = D6Score.exchangeable(90, 6, 10, length(grid); rng = Xoshiro(11))
+    mom = D6Score.cell_moments(fc, tr)
+    ss = D6Score.spread_skill_by_lead(fc, tr; grid)
+    r = D6Score.cell_ratios(mom)
+    @test all(isapprox(r[i, j], ss.ratio[i][j]; rtol = 1e-12) for i in 1:6, j in eachindex(grid))
+    scale = [1.0, 2.0, 0.5, 1.0, 3.0, 1.0]
+    ne = D6Score.normalized_error(mom, scale)
+    @test all(isapprox(ne[i, j], ss.skill[i][j] / (scale[i] * sqrt(1 + 1 / 10)); rtol = 1e-12)
+              for i in 1:6, j in eachindex(grid))
+    @test D6Score.calibrated_count(r) == count(x -> 0.8 <= x <= 1.25, Iterators.flatten(ss.ratio))
+end
+
+@testitem "V80 paired counts: zero against itself, resolved against an under-dispersed twin" default_imports = false setup = [D6Score] begin
+    using Test
+    using Random
+    K, nq, M, L = 90, 6, 10, 6
+    rng = Xoshiro(12)
+    signal = 3 .* randn(rng, K, nq, L)
+    tr = signal .+ randn(rng, K, nq, L)
+    fa = Array{Float64}(undef, K, nq, M, L)
+    fb = similar(fa)
+    for k in 1:K, i in 1:nq, m in 1:M, j in 1:L
+        fa[k, i, m, j] = signal[k, i, j] + randn(rng)        # calibrated
+        fb[k, i, m, j] = signal[k, i, j] + 0.4 * randn(rng)  # under-dispersed, r ~ 0.4
+    end
+    t = 0.97 .* (1:K)
+    ma, mb = D6Score.cell_moments(fa, tr), D6Score.cell_moments(fb, tr)
+    self = D6Score.paired_calibration(ma, ma, t; nboot = 500)
+    @test self.diff == 0 && self.lo == 0 && self.hi == 0
+    @test self.blocklen == 2                                # 1 TU / 0.97 TU spacing + 1
+    p = D6Score.paired_calibration(ma, mb, t; nboot = 2000)
+    @test p.a >= 30 && p.b == 0 && p.lo > 0
+    sc = ones(nq)
+    ne0 = D6Score.paired_normalized_error(ma, ma, sc, t; nboot = 500)
+    @test ne0.diff == 0 && ne0.lo == 0 && ne0.hi == 0
+end
+
+@testitem "V80 the member-as-truth reference matches a calibrated ensemble's own count" default_imports = false setup = [D6Score] begin
+    using Test
+    using Random
+    using Statistics
+    grid = [25, 50, 100, 200, 400, 1000]
+    rng = Xoshiro(13)
+    real, refs = Float64[], Float64[]
+    for rep in 1:12
+        fc, tr = D6Score.exchangeable(90, 6, 10, length(grid); rng)
+        push!(real, D6Score.calibrated_count(D6Score.cell_ratios(D6Score.cell_moments(fc, tr))))
+        push!(refs, D6Score.member_as_truth_reference(fc, grid; ndraw = 50, flat = false, rng).calibrated)
+    end
+    # Same law for truth and members, so the expected counts agree up to M vs M - 1 members.
+    @test abs(mean(real) - mean(refs)) < 3
+    fc, tr = D6Score.exchangeable(90, 6, 10, length(grid); rng)
+    ref = D6Score.member_as_truth_reference(fc, grid; ndraw = 3, flat = true, rng, nboot_rh = 200)
+    @test 0 <= ref.flat <= 36 && ref.M_ref == 9 && ref.ndraw == 3
+    fc2, _ = D6Score.exchangeable(10, 6, 2, length(grid); rng)
+    @test_throws ErrorException D6Score.member_as_truth_reference(fc2, grid; ndraw = 2)
+end
+
+@testitem "V80 the gate is counted per member and per IC" default_imports = false setup = [D6Score] begin
+    using Test
+    using JLD2
+    mktempdir() do dir
+        nwarm, nt, nq = 100, 400, 6
+        for (k, m, fire) in ((42, 1, true), (42, 2, false), (46, 1, false), (46, 2, false))
+            q = Float32[c - 1 for _ in 1:nq, c in 1:(nt + 1)]
+            dQ = Float32[c for _ in 1:nq, c in 1:nt]
+            fire && (dQ[:, 200] .= 0; dQ[:, 300] .= 0)
+            jldsave(joinpath(dir, "d6_online_ic$(k)_m$(m).jld2"); q, dQ, tau = dQ, k, n_k = 100 * k,
+                    t_k = 0.25 * k, ordinal = 1, member = m, seed = UInt64(m), ou_advance = 100 * k,
+                    nwarm, nlead = nt - nwarm, M = 2)
+        end
+        cl = D6Score.clamp_report(D6Score.load_members(dir))
+        @test cl.nfired == 2 && cl.members_fired == 1 && cl.ics_fired == 1 && cl.nruns == 4
+    end
+end
