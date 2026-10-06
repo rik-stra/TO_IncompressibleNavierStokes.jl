@@ -7,6 +7,7 @@
 #
 # Usage (from exp_square_HIT/, i.e. `--project` = lib/RikFlow -- for EVERY closure, M4 included):
 #   julia --project tools/run_d6.jl <ordinal>     # one IC (an array task); 0 = the validation IC
+#   julia --project tools/run_d6.jl 1,3,5         # several ICs, one process (run_d6_packed.sh)
 #   julia --project tools/run_d6.jl --all         # every IC the filter below selects, one process
 #   julia --project tools/run_d6.jl --list        # print the selected ordinals and stop
 #
@@ -650,7 +651,7 @@ every selected ordinal in this process, so the solver compiles once (the desktop
 `--list` prints the selection and stops.
 """
 function main(args = ARGS)
-    isempty(args) && error("usage: run_d6.jl <ordinal> | --all | --list   (ordinal 1..K is the " *
+    isempty(args) && error("usage: run_d6.jl <ordinal>[,<ordinal>...] | --all | --list   (ordinal 1..K is the " *
                            "array task id; 0 = the validation IC, fields[1] of the record)")
     filt = ic_filter_from_env()
     if args[1] in ("--all", "--list")
@@ -669,18 +670,27 @@ function main(args = ARGS)
         end
         return ords
     end
-    ordinal = parse(Int, args[1])
-    if ordinal != 0 && filt.active
-        ords, man = selected_ordinals(filt)
-        if !(ordinal in ords)
-            @printf("ordinal %d (k = %d, t = %.2f TU) is outside the IC filter %s -- skipped\n",
-                    ordinal, man["k"][ordinal], man["t"][ordinal], filt.label)
-            flush(stdout)
-            return Int[]
+    # 🔑 `<o1>,<o2>,...` (2026-10-06, Rik: several ICs per Snellius task): the listed ordinals in
+    # this process, one after another, each exactly as its own single-ordinal task would run it --
+    # same filter check, seeds, warm-up check and skip of existing members -- so the solver compiles
+    # once per task instead of once per IC (~1-2 min of start-up each, billed at 192 SBU per
+    # job-hour on gpu_h100). `batch_scripts/run_d6_packed.sh` hands each array task its slice. A
+    # single ordinal is the one-element list, so the old call is unchanged.
+    done = Int[]
+    for ordinal in parse.(Int, split(args[1], ","))
+        if ordinal != 0 && filt.active
+            ords, man = selected_ordinals(filt)
+            if !(ordinal in ords)
+                @printf("ordinal %d (k = %d, t = %.2f TU) is outside the IC filter %s -- skipped\n",
+                        ordinal, man["k"][ordinal], man["t"][ordinal], filt.label)
+                flush(stdout)
+                continue
+            end
         end
+        run_ic(ordinal; filt)
+        push!(done, ordinal)
     end
-    run_ic(ordinal; filt)
-    return [ordinal]
+    return done
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__

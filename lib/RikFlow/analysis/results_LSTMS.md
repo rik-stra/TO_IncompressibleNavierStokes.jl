@@ -2177,3 +2177,80 @@ Together with §11a's feed-forward null and §7c (the old +3.4 % was h = 1 again
 one extra lag gives the same), **L1 is closed at this data volume: neither nonlinearity nor recurrent
 memory improves on least squares at h = 2.** The only mean gain on record is linear, from stacking
 10 lags (0.2074, −1.1 %).
+
+## 14. R2: one linear model, two code paths — the premise was wrong, the control is built (2026-10-06, laptop)
+
+Implementation testing (`paper/todo.md` R2), not a result (restart, 2026-10-06). **Question:** the
+"same" h = 5, λ = 0 linear model ran −6 to −9 % low in the LinReg path and +1.0 to +2.3 sd high in
+the network path (§7d point 5). Which is the implementation's fault?
+
+**R2-0, one metric** (`analysis/r2_bias.jl`): mean offset of the level in HF-reference sd (vs its
+100 TU mean, as `m4_online_moments.jl`). LinReg1's five R2 long runs: **−0.18 to −0.54 sd over
+0–20 TU** (the §7d window), −0.16 to −0.53 over 0–100 TU, every replica and QoI. Against §7d's
++1.0 to +2.3 sd the gap is real: ~1.5–2.5 sd, opposite sign. (Tracked record vs HF reference:
+< 0.7 % of an sd apart, so the reference choice is immaterial.)
+
+**R2-1:** the deployed `TO_LRS/LinReg1` IS the exact Float64 λ = 0 fit — refit coefficients 4.9e-11
+relative (below cond·eps), training SSE equal to 4e-15 (`analysis/r2_offline.jl`; as #63 already
+found on 2026-09-16; todo.md's "round-off-regularised" premise misread #63, which is about the
+pre-R2 archive).
+
+🔴 **The two paths never ran the same model.** `m4_linear_eta.jl` (the §7d `rdg_h5_l0`) refits on
+the first 80 % of the rows, **1–8.2 TU**, not 1–10 TU. Offline, one step, teacher-forced, in
+sd(dQ) (`r2_offline.jl`):
+
+| change from the deployed LinReg1 | mean shift | rms |
+|---|---|---|
+| refit on 1–8.2 TU (Float64) | 2e-5 to 6e-3 | 5e-3 to 5e-2 |
+| Float32 evaluation, network-path style (x, coefficients, product) | ~1e-6 | 2e-5 to 2e-4 |
+
+The two windows' coefficients differ by **83 % (Frobenius)** while their one-step predictions agree
+to 0.5–5 %: cond(X) = 1.9e6, and the λ = 0 map's near-null directions are set by which rows are in
+the fit. A closed-loop bias that depends on those directions can differ between the two fits; the
+one-step numbers cannot say whether it does.
+
+⚠️ **The LinReg path is not pure Float64 either.** In `get_next_item_timeseries(::LinReg, …)`,
+`pred = draw_eta(…) .|> Float32`, so `pred[…] += c * data` stores the scaled level in Float32 before
+`scale_output` (~1e-5 sd(dQ) per step). `closures.tex`'s "differs … in its floating-point
+precision" needs that qualification.
+
+**The control (`tools/m4_control.jl`, `TO_LSTM/diag/control_LinReg1/StochLSTM_seed1.jld2`).**
+LinReg1's map translated in closed form into the network path's scaled-dQ regression (no refit;
+residual **3.1e-12 sd(dQ)** over all 39 995 rows), `arch = :lstm` with `V1 = 0` (LSTM off), a
+`:constant` head equal to LinReg1's own MVG Σ (checked to 1e-16 against the MLE covariance of its
+training residuals; MVG mean 1.5e-15), weights Float32, cell `StochLSTM2` (index 2). **GATE 2 on the
+file as deployed:** Σ to 1.3e-6; the real `StochLSTM` closure (`stochastic = false`), replayed 100
+recorded steps from 400 starts per window, against LinReg1's mean on the same history: rms
+**2e-5 to 1.4e-4 sd(dQ)**, max 7e-4, mean ≤ 1e-5, on 1–10 and 10–100 TU — Float32 round-off. PASS.
+
+**Card (declared before the runs, Rik 2026-10-06):** one arm settles R2 — the Float32 control,
+5 × 100 TU on Snellius, against LinReg1's five R2 long runs (same IC, same forcing). **Pass:** in
+0–20 and 0–100 TU and in every QoI, the 5-replica mean offset has LinReg1's sign and the replica
+ranges overlap (`r2_bias.jl` evaluates it). Pass → the implementation is cleared and §7d's
+discrepancy belongs to the 1–8.2 TU refit (by elimination; pilot, not quoted). Fail → add the
+Float64 control (needs a precision switch in `12_online_StochLSTM.jl`). ⚠️ The rule is coarse:
+LinReg7 (−0.25 sd mean) passes it against LinReg1 (−0.37 sd). It catches R2's sign flip, not a
+0.1 sd shift; R2-5 (the control's full hindcast) is the fine check.
+
+**Runs (Snellius, checkout `conditional-density_time-series` @ `1b3fb354`).** Smoke 27655353 (1 TU,
+replica 1): completed; warm-up dQ bit-identical to the record, finite, gate 0/300, and the level over
+the warm-up bit-identical to LinReg1's replica 1 (same IC, forcing, solver). Production: 5 × 100 TU,
+jobs 27655506–09, 27655511 (`run_online.sh lstm 2 <r>`, `RIKFLOW_M4_MODEL_DIR=…/control_LinReg1`,
+IC from the tracked record, as LinReg1's R2 runs). ~0.01 s/step.
+
+**Result (2026-10-06): ✅ PASS — R2 is resolved; the second implementation is cleared.** `r2_bias.jl`, 5 replicas each, mean offset in reference sd:
+
+| | 0–20 TU | 0–100 TU |
+|---|---|---|
+| LinReg1, LinReg path | −0.34 to −0.41 | −0.31 to −0.41 |
+| control, network path (Float32) | −0.26 to −0.34 | −0.29 to −0.39 |
+
+Same sign and overlapping replica ranges in every QoI and both windows; over 100 TU the means agree to ~0.02 sd (ratio of means −4 to −12 % per replica, as LinReg1's). All 10 runs complete (40 000 steps) and finite; gate fired on 0.80–1.45 % of steps (control) vs 0.40–1.84 % (LinReg1). So §7d's +1 to +2.3 sd belonged to the 1–8.2 TU refit, not to the code path (by elimination; pilot, not quoted). Network closures deploy at Float32 as they are. Still open: R2-5, the control's full hindcast (= C0), when the network path is run. Cost: 5 × 7:40 on H100 = ~125 SBU.
+
+**Reproduce**
+```bash
+# from lib/RikFlow
+julia --startup-file=no --project=. analysis/r2_offline.jl                    # R2-1 + the offline table
+julia --startup-file=no --project=training exp_square_HIT/tools/m4_control.jl  # build + GATE 2 (~1 min)
+julia --project=analysis analysis/r2_bias.jl TO_LRS/LinReg1 TO_LSTM/diag/control_LinReg1   # R2-0 / the pass rule
+```
