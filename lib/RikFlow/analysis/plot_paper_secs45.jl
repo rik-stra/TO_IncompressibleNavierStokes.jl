@@ -30,6 +30,7 @@ get!(ENV, "D6_EXCLUDE_ICS", "170,197,313")            # policy A: the 87 ICs all
 include(joinpath(@__DIR__, "score_d6.jl"))            # load_members, restrict, assemble, load_truth, ...
 include(joinpath(SRC, "ts_history.jl"))               # HistorySpec, build_history
 include(joinpath(SRC, "ts_scaling.jl"))               # scale_input
+include(joinpath(SRC, "ts_scale.jl"))                 # fit_powerlaw_scale (step 4p's fit)
 using CairoMakie
 
 const OUTD = normpath(joinpath(@__DIR__, "..", "exp_square_HIT", "output"))
@@ -276,13 +277,18 @@ function fig_step()
         @printf("step: %-8s S_k at k = 1, 10, 25, 50, 100, 200: %s\n", LABELS[i],
                 join((@sprintf("%.2f", sm[kk]) for kk in (1, 10, 25, 50, 100, 200) if kk <= K), " "))
         ax = axs[i]
+        lo, hi = vec(minimum(s; dims = 2)), vec(maximum(s; dims = 2))
         lines!(ax, [0, K], [0, K]; color = :gray55, linestyle = :dash, linewidth = 0.6)
-        band!(ax, k, vec(minimum(s; dims = 2)), vec(maximum(s; dims = 2)); color = (C_REF, 0.15))
+        band!(ax, k, lo, hi; color = (C_REF, 0.15))
         lines!(ax, k, sm; color = C_REF)
+        hlines!(ax, [0.0]; color = :gray70, linewidth = 0.5)
         r, cc = pos(i)
         r == 2 && (ax.xlabel = "steps after the step")
         cc == 1 && (ax.ylabel = "response per unit step")
-        xlims!(ax, 0, K)
+        # each panel on its own range: the integrator line leaves the panel where it must, and the
+        # Z[7,15] / Z[16,32] responses (peaks of ~5) are not flattened by a shared 0-200 axis
+        span = maximum(hi) - min(minimum(lo), 0)
+        xlims!(ax, 0, K); ylims!(ax, min(minimum(lo), 0) - 0.06span, maximum(hi) + 0.1span)
     end
     rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
     savefig("baseline_step_response.pdf", fig)
@@ -293,37 +299,24 @@ end
 # --------------------------------------------------------------------------------------------------
 const LAGAX = (; xscale = log10, xticks = [1, 2, 5, 10, 20, 50, 100, 200])
 
-# AR(2) fitted to an ACF, verbatim from m0c_checks.jl (`ar2_acf`, `ar2_stationary`, `ar2_ls`), which
-# lrs_ar_variant.jl's `fit_ar` calls on lags 1-20; copied because that file needs RikFlow.
-function ar2_acf(p1, p2, L)
-    r = zeros(L + 1)
-    r[1] = 1
-    r[2] = p1 / (1 - p2)
-    for k in 2:L
-        r[k + 1] = p1 * r[k] + p2 * r[k - 1]
-    end
-    return r
+# The AR(2) fit to an ACF: `ar2_acf`, `ar2_stationary` and `ar2_ls` (with its `nonneg` restriction)
+# evaluated from m0c_checks.jl's own source, which lrs_ar_variant.jl's `fit_ar` calls on lags 1-20.
+# That file loads RikFlow and the record at top level, so it cannot be included here; extracting the
+# named definitions (as test/test_round1.jl does) keeps the figure on exactly the deployed fit.
+function _defname(e)
+    e isa Expr || return nothing
+    e.head === :macrocall && return _defname(e.args[end])           # a docstring wraps the definition
+    e.head in (:function, :(=)) && e.args[1] isa Expr && e.args[1].head === :call && return e.args[1].args[1]
+    return nothing
 end
-ar2_stationary(p1, p2) = abs(p2) < 1 && p2 + p1 < 1 && p2 - p1 < 1
-function ar2_ls(racf; L = 20)
-    best = (Inf, 0.0, 0.0)
-    for p1 in range(-1.99, 1.99; length = 399), p2 in range(-0.99, 0.99; length = 199)
-        ar2_stationary(p1, p2) || continue
-        r = ar2_acf(p1, p2, L)
-        e = sum(abs2, r[2:end] .- racf[2:(L + 1)])
-        e < best[1] && (best = (e, p1, p2))
+let src = joinpath(@__DIR__, "m0c_checks.jl"), want = Set([:ar2_acf, :ar2_stationary, :ar2_ls]), got = Set{Symbol}()
+    for e in Meta.parseall(read(src, String); filename = src).args
+        n = _defname(e)
+        n in want || continue
+        Core.eval(@__MODULE__, e)
+        push!(got, n)
     end
-    _, p1, p2 = best
-    for s in (0.005, 0.001, 0.0002), _ in 1:3
-        for d1 in (-2s, -s, 0, s, 2s), d2 in (-2s, -s, 0, s, 2s)
-            a, b = p1 + d1, p2 + d2
-            ar2_stationary(a, b) || continue
-            e = sum(abs2, ar2_acf(a, b, L)[2:end] .- racf[2:(L + 1)])
-            e < best[1] && (best = (e, a, b))
-        end
-        _, p1, p2 = best
-    end
-    return p1, p2
+    got == want || error("m0c_checks.jl no longer defines $(setdiff(want, got)) at top level")
 end
 
 "The deployed model's residual on the training rows (steps 400-4000), as colour_tables.jl builds it."
@@ -346,16 +339,19 @@ function fig_resacf(; L = 200)
         hlines!(ax, [0.0]; color = :gray70, linewidth = 0.5)
         a1 = autocorr(R["LinReg1"][:, i], L)
         a7 = autocorr(R["LinReg7"][:, i], L)
-        p1, p2 = ar2_ls(a7; L = 20)
+        p1, p2 = ar2_ls(a7; L = 20, nonneg = true)          # the fit the closures use (Sec. 6.1)
+        u1, u2 = ar2_ls(a7; L = 20)                         # unconstrained, for comparison
         f2 = ar2_acf(p1, p2, L)
+        fu = ar2_acf(u1, u2, L)
         f1 = a7[2] .^ (0:L)
-        q1, q2 = ar2_ls(a1; L = 20)
-        @printf("resacf: %-8s rho1 LinReg1 %.2f, LinReg7 %.2f | LinReg7 AR(2) phi = (%.3f, %.3f), fitted rho1 %.2f, max |fit - data| lags 1-20 %.3f; min ACF lags 1-40 data %+.3f, AR(2) %+.3f; LRV data %.1f AR2 %.1f AR1 %.1f | LinReg1 AR(2) phi = (%.3f, %.3f)\n",
-                LABELS[i], a1[2], a7[2], p1, p2, f2[2], maximum(abs, f2[2:21] .- a7[2:21]),
-                minimum(a7[2:41]), minimum(f2[2:41]), 1 + 2sum(a7[2:end]), 1 + 2sum(f2[2:end]),
-                1 + 2sum(f1[2:end]), q1, q2)
+        q1, q2 = ar2_ls(a1; L = 20, nonneg = true)
+        @printf("resacf: %-8s rho1 LinReg1 %.2f, LinReg7 %.2f | LinReg7 AR(2) constrained phi = (%.3f, %.3f), fitted rho1 %.2f, max |fit - data| lags 1-20 %.3f; unconstrained (%.3f, %.3f), rho1 %.2f, max %.3f; min ACF lags 1-40 data %+.3f, AR(2) %+.3f; LRV data %.1f AR2 %.1f (unconstr. %.1f) AR1 %.1f | LinReg1 AR(2) phi = (%.3f, %.3f)\n",
+                LABELS[i], a1[2], a7[2], p1, p2, f2[2], maximum(abs, f2[2:21] .- a7[2:21]), u1, u2, fu[2],
+                maximum(abs, fu[2:21] .- a7[2:21]), minimum(a7[2:41]), minimum(f2[2:41]),
+                1 + 2sum(a7[2:end]), 1 + 2sum(f2[2:end]), 1 + 2sum(fu[2:end]), 1 + 2sum(f1[2:end]), q1, q2)
         lines!(ax, lags, a1[2:end]; color = COL["LinReg1"], linewidth = 1.1)
         lines!(ax, lags, a7[2:end]; color = COL["LinReg7"], linewidth = 1.1)
+        lines!(ax, lags, fu[2:end]; color = :gray55, linewidth = 0.6, linestyle = :dashdot)
         lines!(ax, lags, f2[2:end]; color = C_REF, linewidth = 0.8, linestyle = :dash)
         lines!(ax, lags, f1[2:end]; color = C_REF, linewidth = 0.8, linestyle = :dot)
         r, cc = pos(i)
@@ -364,8 +360,11 @@ function fig_resacf(; L = 200)
         xlims!(ax, 1, L); ylims!(ax, -0.3, 1.02)
     end
     Legend(fig[3, 1:3], [LineElement(color = COL["LinReg1"]), LineElement(color = COL["LinReg7"]),
-                         LineElement(color = C_REF, linestyle = :dash), LineElement(color = C_REF, linestyle = :dot)],
-           ["LinReg1", "LinReg7", "AR(2) fit to LinReg7", "AR(1) fit to LinReg7"]; orientation = :horizontal)
+                         LineElement(color = C_REF, linestyle = :dash),
+                         LineElement(color = :gray55, linestyle = :dashdot),
+                         LineElement(color = C_REF, linestyle = :dot)],
+           ["LinReg1", "LinReg7", "AR(2), constrained", "AR(2), unconstrained", "AR(1)"];
+           orientation = :horizontal)
     rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
     savefig("colour_residual_acf.pdf", fig)
 end
@@ -417,8 +416,70 @@ function fig_dqacf(; L = 200)
 end
 
 # --------------------------------------------------------------------------------------------------
+# Sec. 5.6: the scale of the residual against the level (step 4p)
+# --------------------------------------------------------------------------------------------------
+"A deployed LinReg's residual on the whole record, with q*^n in physical units, and the 1-10 / 10-100 TU rows."
+function full_residual(name)
+    m = load(joinpath(OUTD, "TO_LRS", name, "LinReg.jld2"))
+    C = permutedims(Matrix{Float64}(m["c"]))
+    s = m["scaling"].in_scaling
+    hist = HistorySpec(; h = m["hist_len"], n_qoi = NQ, hist_var = :q_star_q, include_predictor = true)
+    X, Y, st = build_history(hist, scale_input(REC["q_star"], s), scale_input(REC["q"], s))
+    tr = findall(n -> 400 <= n <= 4000, st)
+    ho = findall(n -> 10 < n * DT <= 100, st)
+    return (; R = Y .- X * C, qs = X[:, 1:NQ] .* vec(s.sigma)' .+ vec(s.mu)', tr, ho)
+end
+
+"""
+LinReg1's residual, standardised by its 1-10 TU sd, binned in deciles of q*/q_ref (edges from 1-10 TU):
+rms per bin on 1-10 TU (filled) and 10-100 TU (open), the power law of step 4p fitted on 1-10 TU and
+clipped as deployed, and the constant scale of LinReg + MVG. Reprints β and the held-out gain.
+"""
+function fig_scale(; nbin = 10)
+    r = full_residual("LinReg1")
+    sd = vec(std(r.R[r.tr, :]; dims = 1))
+    E = r.R ./ sd'
+    fig = Figure(size = (W, 240), figure_padding = (2, 6, 2, 2))
+    axs = qoi_axes(fig; xscale = log10, yscale = log10, xticks = [0.5, 1, 1.5],
+                   yticks = [0.3, 0.5, 0.7, 1, 1.4, 2], xtickformat = vs -> [@sprintf("%g", v) for v in vs],
+                   ytickformat = vs -> [@sprintf("%g", v) for v in vs])
+    for i in 1:NQ
+        ax = axs[i]
+        p = fit_powerlaw_scale(E[r.tr, i], r.qs[r.tr, i])
+        x = r.qs[:, i] ./ p.qref
+        edges = quantile(x[r.tr], range(0, 1; length = nbin + 1)[2:(end - 1)])
+        hlines!(ax, [1.0]; color = :gray55, linestyle = :dash, linewidth = 0.6)
+        lo, hi = p.qclip ./ p.qref
+        xx = exp.(range(log(0.3), log(2.1); length = 200))
+        lines!(ax, xx, exp(p.logvar / 2) .* clamp.(xx, lo, hi) .^ p.beta; color = COL["LinReg1"], linewidth = 1.1)
+        for (rows, filled) in ((r.tr, true), (r.ho, false))
+            b = searchsortedfirst.(Ref(edges), x[rows])
+            xm = [exp(mean(log.(x[rows][b .== k]))) for k in 1:nbin]
+            ym = [sqrt(mean(abs2, E[rows[b .== k], i])) for k in 1:nbin]
+            scatter!(ax, xm, ym; color = filled ? C_REF : :white, strokecolor = C_REF, strokewidth = 0.6,
+                     markersize = 4)
+        end
+        nllc(rows) = mean(0.5 .* (log(2pi) .+ log(mean(abs2, E[r.tr, i])) .+ E[rows, i] .^ 2 ./ mean(abs2, E[r.tr, i])))
+        lv(rows) = p.logvar .+ 2p.beta .* log.(clamp.(r.qs[rows, i], p.qclip...) ./ p.qref)
+        nllp(rows) = mean(0.5 .* (log(2pi) .+ lv(rows) .+ E[rows, i] .^ 2 .* exp.(-lv(rows))))
+        @printf("scale: %-8s beta %.2f, clip/q_ref %.2f-%.2f, held-out NLL gain %.3f nats/step\n", LABELS[i],
+                p.beta, lo, hi, nllc(r.ho) - nllp(r.ho))
+        rr, cc = pos(i)
+        rr == 2 ? (ax.xlabel = L"q^{n*}_i / q_{\mathrm{ref},i}") : (ax.xticklabelsvisible = false)
+        cc == 1 ? (ax.ylabel = "rms / constant scale") : (ax.yticklabelsvisible = false)
+        xlims!(ax, 0.3, 2.1); ylims!(ax, 0.25, 2.1)
+    end
+    Legend(fig[3, 1:3], [MarkerElement(color = C_REF, marker = :circle, markersize = 4),
+                         MarkerElement(color = :white, strokecolor = C_REF, strokewidth = 0.6, marker = :circle, markersize = 4),
+                         LineElement(color = COL["LinReg1"]), LineElement(color = :gray55, linestyle = :dash)],
+           ["1–10 TU", "10–100 TU", "power law (fitted on 1–10 TU)", "constant scale"]; orientation = :horizontal)
+    rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
+    savefig("colour_scale.pdf", fig)
+end
+
+# --------------------------------------------------------------------------------------------------
 if abspath(PROGRAM_FILE) == @__FILE__
-    want = isempty(ARGS) ? ["fans", "spread", "ranks", "step", "resacf", "dqacf"] : ARGS
+    want = isempty(ARGS) ? ["fans", "spread", "ranks", "step", "resacf", "dqacf", "scale"] : ARGS
     if any(in(want), ("fans", "spread", "ranks"))
         H = hindcast()
         "fans" in want && fig_fans(H)
@@ -428,4 +489,5 @@ if abspath(PROGRAM_FILE) == @__FILE__
     "step" in want && fig_step()
     "resacf" in want && fig_resacf()
     "dqacf" in want && fig_dqacf()
+    "scale" in want && fig_scale()
 end

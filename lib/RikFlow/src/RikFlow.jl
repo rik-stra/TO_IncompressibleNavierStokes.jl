@@ -292,6 +292,9 @@ export HistorySpec, build_history, HistoryBuffer, inputvec
 include("ts_models.jl")
 export JointModel, pacf_to_ar, ar_roots, decorrelation_time
 
+# step 4p's power-law scale of the residual (used by `LinReg`'s `draw_eta`; 2026-10-07)
+include("ts_scale.jl")
+
 # M4's inference core. Stdlib-only on purpose -- training lives in `ext/RikFlowLuxExt.jl` and
 # nothing here loads Lux. See the header of ts_lstm.jl for why the split runs this way round.
 include("ts_lstm.jl")

@@ -19,17 +19,17 @@ draws (Sec. 3.4).
 
 | run | closure | the one change | matched partner (secondary) | artefact (`TO_LRS/`) | expected, and why (Sec. 6.1) |
 |---|---|---|---|---|---|
-| S1.1 | LinReg7 + AR(2) | AR(2) residual on LinReg7 (λ = 1 on every QoI) | LinReg7 | `LinReg7_ar2` | vs LinReg7: more calibrated cells (ridge coloured the residual; the white draw lost its low-frequency power, hence LinReg7's 5/36) and a lower CRPS_0.5 at short leads (AR state starts from the realized residuals). vs LinReg1: **no improvement** — LinReg7 is 18 % behind on CRPS_0.5, and ridge on every QoI removed the dynamics the AR(2) restores only in part |
+| S1.1 | LinReg7 + AR(2) | AR(2) residual on LinReg7 (λ = 1 on every QoI) | LinReg7 | `LinReg7_ar2n` | vs LinReg7: more calibrated cells (ridge coloured the residual; the white draw lost its low-frequency power, hence LinReg7's 5/36) and a lower CRPS_0.5 at short leads (AR state starts from the realized residuals). vs LinReg1: **no improvement** — LinReg7 is 18 % behind on CRPS_0.5, and ridge on every QoI removed the dynamics the AR(2) restores only in part |
 | S1.2a | LinReg^E, white, λ = 0.1 | ridge on E[0,6] only (T_int < h rule) | LinReg1 | `Splice1_E0x11` (row from LinReg11) | ≈ LinReg1: the E[0,6] correction decorrelates in ~4 steps, so its lags carry little; its residual becomes slightly coloured and is drawn white. **No improvement** expected (partner for S1.3a) |
 | S1.2b | LinReg^E, white, λ = 1 | as S1.2a | LinReg1 | `Splice1_E0x7` | as S1.2a; E[0,6]'s residual lag-1 0.44 (colour table) is lost by the white draw → its cells under-dispersed |
 | S1.2c | LinReg^E, white, λ = 10 | as S1.2a | LinReg1 | `Splice1_E0x8` | as S1.2b, more so |
-| S1.3a | LinReg^E + AR(2), λ = 0.1 | AR(2) on S1.2a | S1.2a | `Splice1_E0x11_ar2` | vs S1.2a: little to gain (little colour at λ = 0.1). vs LinReg1: level |
-| S1.3b | LinReg^E + AR(2), λ = 1 | AR(2) on S1.2b | S1.2b | `Splice1_E0x7_ar2` | vs S1.2b: more calibrated cells, lower CRPS_0.5 (colour restored in E[0,6]). vs LinReg1: **the round's candidate** — CRPS_0.5 level with LinReg1, calibrated count higher → clause C |
-| S1.3c | LinReg^E + AR(2), λ = 10 | AR(2) on S1.2c | S1.2c | `Splice1_E0x8_ar2` | vs S1.2c: as S1.3b. vs LinReg1: calibration up, but more skill lost in E[0,6]'s mean than at λ = 1 → C possible, S not |
-| S1.4 | paper 3's rule + AR(2), base λ = 0.03 | ridge also on the other five QoIs (λ_i = λ(σ_i/σ_1)², most on the small scales) | S1.3a (λ = 0.1; E[0,6] gets 0.06) | `LinReg14_ar2` | vs S1.3a: CRPS_0.5 higher (ridge on the persistent small-scale corrections, where the lags carry the skill); calibration up in the bands it colours. vs LinReg1: **no improvement** on S; C uncertain |
-| S1.5 | paper 3's rule + AR(2), base λ = 0.3 | as S1.4 | S1.3b (λ = 1; E[0,6] gets 0.62) | `LinReg16_ar2` | as S1.4, more skill lost |
+| S1.3a | LinReg^E + AR(2), λ = 0.1 | AR(2) on S1.2a | S1.2a | `Splice1_E0x11_ar2n` | vs S1.2a: little to gain (little colour at λ = 0.1). vs LinReg1: level |
+| S1.3b | LinReg^E + AR(2), λ = 1 | AR(2) on S1.2b | S1.2b | `Splice1_E0x7_ar2n` | vs S1.2b: more calibrated cells, lower CRPS_0.5 (colour restored in E[0,6]). vs LinReg1: **the round's candidate** — CRPS_0.5 level with LinReg1, calibrated count higher → clause C |
+| S1.3c | LinReg^E + AR(2), λ = 10 | AR(2) on S1.2c | S1.2c | `Splice1_E0x8_ar2n` | vs S1.2c: as S1.3b. vs LinReg1: calibration up, but more skill lost in E[0,6]'s mean than at λ = 1 → C possible, S not |
+| S1.4 | paper 3's rule + AR(2), base λ = 0.03 | ridge also on the other five QoIs (λ_i = λ(σ_i/σ_1)², most on the small scales) | S1.3a (λ = 0.1; E[0,6] gets 0.06) | `LinReg14_ar2n` | vs S1.3a: CRPS_0.5 higher (ridge on the persistent small-scale corrections, where the lags carry the skill); calibration up in the bands it colours. vs LinReg1: **no improvement** on S; C uncertain |
+| S1.5 | paper 3's rule + AR(2), base λ = 0.3 | as S1.4 | S1.3b (λ = 1; E[0,6] gets 0.62) | `LinReg16_ar2n` | as S1.4, more skill lost |
 
-Artefacts checked on the desktop 2026-10-06 (`meta_files/handoff_desktop_round1_2026-10-06.md`, Task A): all `:exact` or λ = 0, (400, 4000), h = 5; every AR(2) re-fitted by `lrs_ar_variant.jl --report` and equal to the file. They live on the desktop; copy them to Snellius before the runs.
+Artefacts checked on the desktop 2026-10-06 (`meta_files/handoff_desktop_round1_2026-10-06.md`, Task A): all `:exact` or λ = 0, (400, 4000), h = 5; every AR(2) re-fitted by `lrs_ar_variant.jl --report` and equal to the file. 2026-10-07: the `*_ar2n` artefacts (constrained fit) replace the `*_ar2` ones; `LinReg7_ar2n` built on the laptop, the other five to build on the desktop (`<src> 2n`, then `--report`). Copy them to Snellius before the runs.
 
 ## Clauses (fixed; paper Sec. 3.7, Rik 2026-10-06)
 
@@ -58,7 +58,16 @@ Tool: `julia --project=analysis analysis/score_d6.jl --compare <closure dir> <pa
 
 - No offset and no noise scale fitted against coupled runs (D-10: none in round 1).
 - Fixed by rule: E[0,6] alone (T_int < h on 1–10 TU, `analysis/tint_rule.jl`); AR(2) fitted to the
-  residual ACF at lags 1–20 on 1–10 TU, Σ_ξ = DRD; the λ ladder 0.1 / 1 / 10, all reported.
+  residual ACF at lags 1–20 on 1–10 TU, **constrained to φ1 ≥ 0, φ2 ≤ 0** (poles with non-negative
+  real part), Σ_ξ = DRD; the λ ladder 0.1 / 1 / 10, all reported.
+- 🔒 **2026-10-07, before any round-1 hindcast (Rik: "make it the rule"):** the AR(2) constraint
+  replaces the unconstrained fit in every AR(2) closure, on offline evidence only (training-window
+  residual, tracked dQ, the replay response kernel; `results_LSTMS.md` §16). It binds materially in
+  Z[0,6] and Z[16,32] of S1.1, S1.4, S1.5 (negative real pole removed); in S1.3a–c only the white
+  LinReg1 rows move (|φ| ≤ 0.017 → 0). Artefacts renamed `*_ar2n`; the `*_ar2` ones are not run.
+  ⚠️ Cost found after the decision: one-step under-dispersion where it binds (data innovation sd /
+  σ_ξ 1.17 and 1.11 in LinReg7's Z[0,6] and Z[16,32], vs 1.01 and 1.04 unconstrained); disclosed in
+  closures.tex Step 1. [ ] Rik to confirm the rule stands.
 - Pilot-chosen, disclosed (Sec. 3.8): LinReg7's λ = 1; paper 3's base 0.03 / 0.3; the AR order 2;
   the E[0,6] rule itself was formulated after a pilot scan.
 

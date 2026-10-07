@@ -188,6 +188,15 @@ The linear-regression closure (M0): a level prediction `q^n = scale_output(c [x;
     with `μ_η = mean(stoch_distr)`. The innovation `ξ`, not `η`, is what is drawn (plan §5 D2): the
     closure knows its own past draws. `η` enters exactly where the white draw does.
 
+  * **Power-law scale (optional, step 4p, 2026-10-07; `ts_scale.jl`):** when the file carries
+    `"scale_beta"`, `"scale_qref"`, `"scale_qclip"` (`n_qoi × 2`) and `"scale_sigma_eps"`,
+
+        η_n = μ_η + f(q*_n) ⊙ ε_n,   ε_n ~ N(0, Σ_ε),   f_i = (clamp(q*_i, lo_i, hi_i) / q_ref,i)^β_i,
+
+    with `q*` the predictor in physical units. One `rand(rng, MvNormal(0, Σ_ε))` replaces the white
+    call, so the stream is LinReg1's; with `β = 0` and `Σ_ε = Σ` the draws equal the white ones bit
+    for bit. Not combined with AR (refused).
+
 🔴 **Without the AR keys the behaviour is bit-identical to the pre-AR code, RNG stream included**:
 the white branch is the same `rand(rng, stoch_distr)` call at the same point, and nothing else
 touches `rng` (`test/test_linreg_ar.jl` pins this against a verbatim copy of the old code).
@@ -230,6 +239,7 @@ struct LinReg
     rng
     ArrayType
     ar          # nothing (white η), or the AR(p) residual state -- see `load_ar_residual`
+    scale       # nothing, or step 4p's power-law scale -- see `load_powerlaw_scale`
 
     function LinReg(file_name, rng, ArrayType; q_hist = nothing, spinnup_data = nothing)
 
@@ -238,6 +248,8 @@ struct LinReg
         scaling = adapt(ArrayType, scaling)
         c= adapt(ArrayType, c)
         ar = load_ar_residual(file_name, stoch_distr)
+        scale = load_powerlaw_scale(file_name, stoch_distr)
+        !isnothing(ar) && !isnothing(scale) && error("$file_name: AR residual and power-law scale together are not implemented")
 
         counter = zeros(Int)
         if !isnothing(q_hist)
@@ -246,8 +258,32 @@ struct LinReg
         if !isnothing(spinnup_data) && isnothing(q_hist)
             @error "Spinnup not implemented without history"
         end
-        new(c, stoch_distr, scaling, q_hist, spinnup_data, counter, hist_var, include_predictor, fitted_qois, target, rng, ArrayType, ar)
+        new(c, stoch_distr, scaling, q_hist, spinnup_data, counter, hist_var, include_predictor, fitted_qois, target, rng, ArrayType, ar, scale)
     end
+end
+
+"""
+    load_powerlaw_scale(file_name, stoch_distr)
+
+Step 4p's optional scale of a `LinReg` file: `nothing` without the `"scale_*"` keys (every file
+before 2026-10-07), else `(; beta, qref, qclip, eps_distr, mu_eta)`. Refuses a partial key set, a
+size mismatch, a non-positive reference or clip range, or a missing `stoch_distr`.
+"""
+function load_powerlaw_scale(file_name, stoch_distr)
+    keys_ = ("scale_beta", "scale_qref", "scale_qclip", "scale_sigma_eps")
+    has = jldopen(f -> [haskey(f, k) for k in keys_], file_name, "r")
+    any(has) || return nothing
+    all(has) || error("$file_name has only some of the power-law scale keys $(keys_[has])")
+    isnothing(stoch_distr) && error("$file_name: a power-law scale needs stoch_distr (its mean is μ_η)")
+    beta, qref, qclip, S = load(file_name, keys_...)
+    n = length(stoch_distr)
+    length(beta) == n && length(qref) == n && size(qclip) == (n, 2) && size(S) == (n, n) ||
+        error("$file_name: power-law scale sizes do not match $n QoIs")
+    all(>(0), qref) && all(>(0), qclip) && all(qclip[:, 1] .<= qclip[:, 2]) ||
+        error("$file_name: q_ref and the clip range must be positive and ordered")
+    eps_distr = MvNormal(zeros(n), Matrix{Float64}(Symmetric(Matrix{Float64}(S))))
+    return (; beta = Vector{Float64}(beta), qref = Vector{Float64}(qref), qclip = Matrix{Float64}(qclip),
+            eps_distr, mu_eta = Vector{Float64}(mean(stoch_distr)))
 end
 
 "Steps of the AR recursion from zero used as the stationary-draw fallback (see `LinReg`)."
@@ -311,12 +347,19 @@ function ar_step!(ar, rng)
 end
 
 """
-    draw_eta(m::LinReg)
+    draw_eta(m::LinReg, q_star = nothing)
 
 The residual draw in scaled units: `rand(rng, stoch_distr)` for a white `LinReg` (the pre-AR call,
-unchanged), `μ_η + z_n` for an AR one.
+unchanged), `μ_η + z_n` for an AR one, `μ_η + f(q*) ⊙ ε` with step 4p's scale (`q_star` in physical
+units, required then).
 """
-function draw_eta(m::LinReg)
+function draw_eta(m::LinReg, q_star = nothing)
+    sc = m.scale
+    if !isnothing(sc)
+        isnothing(q_star) && error("a power-law scale needs q_star")
+        eps = rand(m.rng, sc.eps_distr)
+        return sc.mu_eta .+ powerlaw_factor(vec(Array(q_star)), sc.beta, sc.qref, sc.qclip) .* eps
+    end
     ar = m.ar
     isnothing(ar) && return rand(m.rng, m.stoch_distr)
     p = size(ar.z, 2)
@@ -386,7 +429,7 @@ function get_next_item_timeseries(time_series_method::LinReg, q_star)
         else    # after that, predict dQ  (we now have enough history)
             data = linreg_data(time_series_method, q_star)
             if !isnothing(time_series_method.stoch_distr)
-                pred = draw_eta(time_series_method).|> Float32 |> adapt(time_series_method.ArrayType)
+                pred = draw_eta(time_series_method, q_star).|> Float32 |> adapt(time_series_method.ArrayType)
             else
                 pred = zeros(eltype(data), (n_qoi,1)) |> adapt(time_series_method.ArrayType)
             end
@@ -417,7 +460,7 @@ function get_next_item_timeseries(time_series_method::LinReg, q_star)
         q_star_sc = scale_input(q_star, time_series_method.scaling.in_scaling)
         data = vcat(q_star_sc, ones(eltype(q_star_sc), (1,1)))
         if !isnothing(time_series_method.stoch_distr)
-            pred = draw_eta(time_series_method) |> adapt(time_series_method.ArrayType)
+            pred = draw_eta(time_series_method, q_star) |> adapt(time_series_method.ArrayType)
         else
             pred = zeros(eltype(q_star_sc), n_qoi)
         end

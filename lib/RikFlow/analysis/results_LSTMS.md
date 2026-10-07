@@ -640,6 +640,11 @@ tracks the record to ≤ 3e-3 q-sd over 2000 steps.
 - Restoring appears only after ~50–100 steps in bands 1, 3, 5; bands 2, 4, 6 still hold 30–115 (per unit
   step) at k = 200. At k = 200 the spread across start times rivals the signal and the symmetric part is
   17–27% of the response (not linear).
+  ⚠️ **Corrected 2026-10-07** (re-read from `response_kernel.jld2`, `plot_paper_secs45.jl step`): the
+  restoring line above holds for band 1 only. Peaks of the mean S_k[j, j]: Z[0,6] k = 75 (52/65/152 per
+  start time), **Z[7,15] k = 15 (5.0), then negative (−13…−29 at k = 200)**, **Z[16,32] k = 34 (4.6)**,
+  E[16,32] k = 106 (34, falling to 28–32 at 200 in every start time); E[0,6], E[7,15] do not restore.
+  S_k ≥ 0.8 k up to k = 15 / 124 / 1 / 45 / 0 / 17 (bands 1–6): bands 3 and 5 are not integrators.
 - A linear-response surrogate on this kernel truncated at 200 steps has no restoring force and diverges
   (18/18 at lambda = 0, most at 1e-5). Not a training environment -- but it explains §7d/§7g: a constant bias
   in the correction is summed over the restoring time into a large LEVEL offset, and white one-step noise is
@@ -2337,3 +2342,102 @@ LinReg7 31, DDN 35, LinReg1 0; LinReg1 flat cells by lead 25…1000 = 4, 6, 4, 4
 6 of 6 at 1000; resolved positive slope 11 / 20 / 25 cells (LinReg1 / LinReg7 / DDN), negative 2 / 4
 / 0; DDN normalized error Z/E[16,32] by lead 0.89/0.70, 1.36/1.08, 1.89/1.50, 1.67/1.35, 1.91/1.63,
 1.57/1.33 (worse than climatology from lead 50 on, not at lead 25).
+
+## 16. The AR(2) fit constrained to poles with a non-negative real part (2026-10-07, laptop)
+
+🔒 **Rik, 2026-10-07: the rule for every AR(2) closure** ("make it the rule"; decided before any
+round-1 hindcast, on the offline evidence below). Fit: `ar2_ls(racf; L = 20, nonneg = true)` in
+`m0c_checks.jl` = Eq. (ACF fit) restricted to φ1 ≥ 0, φ2 ≤ 0 (⇔ both poles with real part ≥ 0: no
+step-to-step alternating component, no oscillation faster than 4 steps), plus a 1e-4 line search on
+φ2 = 0 (the refinement stalled short of the edge on a persistent synthetic ACF). Builder:
+`lrs_ar_variant.jl <src> 2n` → `<src>_ar2n`. Tests V82 (`test_round1.jl`). Default `nonneg = false`
+leaves every earlier fit bit-identical.
+
+**Why.** The unconstrained fit (§12b) has a **negative real pole** where φ2 > 0: LinReg7 Z[0,6]
+0.862 / −0.416 and Z[16,32] 0.876 / −0.487 (§12b listed moduli only); also paper 3's rule, Z[0,6] and
+Z[16,32] at both bases. Evidence on the training window (1–10 TU), all offline:
+- the residual does not alternate: LinReg7's ACF at lags 1–6 is 0.77 0.59 0.49 0.42 0.36 0.32 (Z[0,6])
+  and 0.81 0.58 0.45 0.37 0.33 0.30 (Z[16,32]);
+- the tracked correction dQ has lag-1 ACF 0.96 0.75 0.98 0.99 1.00 1.00 and a variance share above
+  f = 1/4 of 0.013 0.090 0.0007 0.0003 0.0013 0.0014; two steps = 0.005 TU;
+- variance share above f = 1/4 (AR spectrum vs residual periodogram), where the constraint binds:
+
+| closure, QoI | residual | unconstrained | constrained |
+|---|---|---|---|
+| LinReg7 Z[0,6] | 0.085 | 0.141 | 0.056 |
+| LinReg7 Z[16,32] | 0.053 | 0.150 | 0.051 |
+| paper 3, 0.03, Z[0,6] | 0.384 | 0.377 | 0.357 |
+| paper 3, 0.03, Z[16,32] | 0.113 | 0.163 | 0.136 |
+| paper 3, 0.3, Z[0,6] | 0.171 | 0.181 | 0.126 |
+| paper 3, 0.3, Z[16,32] | 0.028 | 0.103 | 0.033 |
+
+  (unconstrained up to 3.7× the residual's share, constrained ≤ 1.2×);
+- the power the solver passes on, Σ g_a g_b ρ_{|a−b|} with the measured diagonal kernel G (K = 200,
+  `response_kernel.jld2`), relative to white, data / unconstrained / constrained: LinReg7 Z[0,6]
+  11.36 / 8.44 / 8.49, Z[16,32] 6.38 / 7.22 / 7.45; paper 3 0.03: 1.87 / 1.71 / 1.57, 3.99 / 3.79 /
+  3.72; paper 3 0.3: 5.98 / 4.45 / 4.43, 7.92 / 9.17 / 9.50 (constrained vs unconstrained ≤ 8 %);
+- LinReg7, constrained: Z[0,6] φ = (0.837, 0), Z[16,32] (0.850, 0) — AR(1)s on the edge; lag-1 0.84 /
+  0.85 vs data 0.77 / 0.81 (unconstrained 0.69 / 0.68); max |fit − data| at lags 1–20 0.157 / 0.163
+  (unconstrained 0.141 / 0.138); LRV 11.3 / 12.4 (unconstrained 11.7 / 13.0, data 10.2 / 27.2). The
+  other four QoIs: unconstrained fit feasible, unchanged. LinReg^E splices: only the white LinReg1
+  rows move (|φ| ≤ 0.017 → 0); E[0,6] is feasible at every λ.
+- On every real residual above, the constrained `ar2_ls` is at or below a 0.001-grid minimum over the
+  restricted set (gap in the AR's ACF ≤ 0.0011).
+- ⚠️ **The cost, found after the decision (built `LinReg7_ar2n`, offline sanity):** one-step
+  under-dispersion where the constraint binds. Data innovation sd / σ_ξ under the fitted φ: Z[0,6]
+  **1.170** constrained vs 1.007 unconstrained; Z[16,32] **1.114** vs 1.043 (σ_ξ/sd(z) 0.547 / 0.526 vs
+  0.673 / 0.664): the AR(1) on the edge has lag 1 0.84 / 0.85 > the data's 0.77 / 0.81, so it predicts the
+  next residual too confidently. Builder's own numbers (out_scaling residual): φ (0.838, 0), (0.850, 0);
+  xi_d/σξ 1.169 / 1.118; warm start 1.3e-15; model-noise ACF = fitted ACF. Reported to Rik 2026-10-07.
+
+**Artefacts:** `LinReg7_ar2n` built on the laptop (see `data_locations.md`); `Splice1_E0x11_ar2n`,
+`Splice1_E0x7_ar2n`, `Splice1_E0x8_ar2n`, `LinReg14_ar2n`, `LinReg16_ar2n` to build on the desktop
+(`julia --project=training exp_square_HIT/tools/lrs_ar_variant.jl <src> 2n`, then `--report`), and copy
+to Snellius. The round-1 card and `paper/round1_gate01.md` name the `_ar2n` artefacts.
+
+## 17. Offline: does the residual's scale depend on the state? (2026-10-07, laptop; Rik asked)
+
+`analysis/state_dependence.jl`. Deployed LinReg1 / LinReg7 teacher-forced on R1's tracked record,
+residual standardised by its 1–10 TU sd (the constant MVG scale); fits on 1–10 TU, evaluated there
+and on 10–100 TU (held out). State = the predicted level q*^n, as step 4p deploys it (first run with
+q^{n−1}: the same to ±0.005 nats/step). Offline only; no setting chosen.
+
+**Yes, strongly, and it is multiplicative.** LinReg1, sd ratio in the lowest .. highest quintile of
+the QoI's own level (1–10 TU | 10–100 TU): middle and small scales **0.50–0.55 .. 1.34–1.40 | 0.60–
+0.62 .. 1.53–1.57**; large scales 0.82–0.84 .. 1.12–1.18 | 0.91–0.96 .. 1.22–1.23. The same pattern by
+the Z[16,32] level (the bands move together). LinReg7 weaker: 0.52–0.84 .. 1.14–1.32 | 0.69–0.92 ..
+1.23–1.46. Squared residuals cluster beyond what the residual's own ACF implies (ACF(e²)_k − ρ_k² at
+k = 1, 10, 50: LinReg1 0.04–0.17, LinReg7 −0.01–0.11) — the slowly varying level.
+
+**Held-out NLL gain over the constant variance, nats/step, summed over the six QoIs** (Gaussian ML,
+log-variance linear in the features):
+
+| head | LinReg1 train / held | LinReg7 train / held |
+|---|---|---|
+| six current levels (7 parameters per QoI) | 0.536 / **0.513** | 0.342 / **0.294** |
+| full regressor, 66 + 1 (ridge 1e-3) | 0.579 / 0.475 | 0.422 / 0.215 |
+| **own-level power law σ ∝ (q*)^β (2 per QoI)**, `fit_powerlaw_scale`, clipped as deployed | 0.489 / **0.477** | 0.273 / **0.283** |
+
+Per QoI (LinReg1, held out): 0.010 / 0.006 (large scales), 0.124 / 0.118 (middle), 0.109 / 0.110
+(small). Exponents β, LinReg1: Z/E[0,6] 0.51 / 0.55, Z/E[7,15] **1.85 / 1.82**, Z/E[16,32] 1.28 / 1.36;
+LinReg7: 1.03 / 0.51, 1.36 / 0.96, 0.72 / 1.06. The fit-window gain 0.489 equals the builder's
+(`LinReg1_pl`, below): the paper's number, the artefact and the deployment use one fit (`ts_scale.jl`).
+
+**Reading.** There is state dependence to learn, almost all of it in a fixed physical form: the
+residual's scale grows with the QoI's own level, faster than proportionally in the middle and small
+scales. In the middle and small scales the constant Σ's sd is therefore 1.6–2.0 times the residual's
+in the lowest-level quintile (1/0.50–1/0.62), and 0.64–0.75 times it in the highest. ⚠️ Hypothesis only: relatively too much noise at
+low levels could feed the deep downward excursions where the baselines' bias sits (Sec. 4.2). ⚠️ An
+offline gain is necessary, not sufficient: the pilot LSTM head gained +0.6 nats/step offline and was
+worse online (§13j, memory #75).
+
+🔒 **Rik, 2026-10-07: added as closure 4p** ("add the power-law scale as a closure and a Sec. 5
+subsection"): LinReg1's mean, η = μ_η + f(q*) ⊙ ε, ε ~ N(0, Σ_ε), f_i = (clip(q*_i)/q_ref,i)^β_i
+(paper Sec. 6.4 Eq. power law, Sec. 5.6). Partner: LinReg1 (β = 0 is LinReg1 bit for bit, shared
+random numbers). Code: `src/ts_scale.jl` (`powerlaw_factor`, `fit_powerlaw_scale`), `LinReg` keys
+`scale_*` (`load_powerlaw_scale`, `draw_eta(m, q_star)`), builder `exp_square_HIT/tools/
+lrs_scale_variant.jl` → `TO_LRS/LinReg1_pl`, tests V83 (`test/test_linreg_scale.jl`; V73 unchanged).
+`LinReg1_pl` (laptop, 2026-10-07): β 0.514 / 0.554 / 1.849 / 1.823 / 1.276 / 1.365; clip/q_ref
+0.36–1.56 (Z[16,32]) to 0.56–1.36 (Z[0,6]); fit-window gain 0.4892 nats/step; deployed draws ÷ f have
+covariance Σ_ε to 0.003 (3601 draws) and reproduce the data's quintile pattern (e.g. Z[7,15] model
+0.52 .. 1.33 vs data 0.50 .. 1.40).

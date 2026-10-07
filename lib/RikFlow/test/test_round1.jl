@@ -5,6 +5,8 @@
 #
 #   * `ar2_ls` (analysis/m0c_checks.jl) recovers (φ1, φ2) from the exact ACF of known stationary
 #     AR(2)s, and returns a pair its own stationarity test accepts for ACFs no stationary AR(2) fits;
+#     V82 (2026-10-07): its `nonneg = true` restriction (φ1 ≥ 0, φ2 ≤ 0) is feasible, leaves a fit
+#     it does not bind unchanged, and is a minimum over the restricted set, also inside `fit_ar`;
 #   * Σ_ξ (exp_square_HIT/tools/lrs_ar_variant.jl): the innovation variance gives the AR(2) the
 #     residual's marginal variance -- in closed form, and by a long simulation with the builder's own
 #     simulator -- and `fit_ar` assembles Σ_ξ = D R D from it;
@@ -202,6 +204,51 @@ end
     @info "V81 ar2_ls on 200 off-grid AR(2)s: $nmiss miss (phi) by > 5e-4, worst $(round(maximum(errs); sigdigits = 3)); " *
           "worst ACF misfit $(round(maximum(misfit); sigdigits = 3))"
     @test_broken nmiss == 0
+end
+
+@testitem "V82 ar2_ls nonneg: feasible, unchanged when the free fit is feasible, a minimum otherwise" default_imports = false setup = [Round1] begin
+    using Test
+    using .Round1: ar2_acf, ar2_ls, ar2_stationary
+    feas(a, b) = ar2_stationary(a, b) && a >= 0 && b <= 0
+    sse(a, b, r) = sum(abs2, ar2_acf(a, b, 20)[2:end] .- r[2:21])
+    # (i) targets inside the restricted set (decay, damped oscillation, AR(1), white): the restriction
+    # does not bind, so the restricted fit is the free fit, bit for bit
+    for (p1, p2) in ((1.2, -0.5), (0.5, -0.3), (1.83, -0.85), (0.99, 0.0), (0.0, 0.0), (0.83, -0.05))
+        r = ar2_acf(p1, p2, 20)
+        @test ar2_ls(r; L = 20, nonneg = true) == ar2_ls(r; L = 20)
+    end
+    # (ii) targets with a negative real pole (phi2 > 0; LinReg7's Z[0,6] and Z[16,32] are of this kind)
+    # or phi1 < 0: the result is feasible, fits no better than the free fit, and no worse than the best
+    # point of a fine grid over the restricted set
+    for (p1, p2) in ((0.44, 0.36), (0.39, 0.43), (0.6, 0.2), (-0.4, 0.3), (-0.6, -0.2), (0.3, 0.6))
+        r = ar2_acf(p1, p2, 20)
+        a, b = ar2_ls(r; L = 20, nonneg = true)
+        @test feas(a, b)
+        @test sse(a, b, r) >= sse(ar2_ls(r; L = 20)..., r) - 1e-12
+        gridbest = minimum(sse(x, y, r) for x in 0:0.0025:1.99, y in -0.99:0.0025:0 if feas(x, y))
+        @test sse(a, b, r) <= gridbest + 1e-6
+    end
+    # (iii) the default is the free fit (keyword off = the old function)
+    r = ar2_acf(0.44, 0.36, 20)
+    @test ar2_ls(r; L = 20, nonneg = false) == ar2_ls(r; L = 20)
+end
+
+@testitem "V82 fit_ar(nonneg = true) gives every QoI a pair with phi1 >= 0, phi2 <= 0" default_imports = false setup = [Round1] begin
+    using Test
+    using Random
+    using .Round1: sim_ar_S, fit_ar, ar2_stationary, NQ
+    # two columns with a negative real pole, four well inside the restricted set (not on its edge:
+    # a sampled white or AR(1) column fits φ2 = ±1e-3, and the restriction then binds, correctly)
+    p1 = [0.44, 0.39, 1.2, 0.6, 0.9, 0.3]
+    p2 = [0.36, 0.43, -0.5, -0.1, -0.1, -0.2]
+    Z = permutedims(sim_ar_S(p1, p2, [i == j ? 1.0 : 0.2 for i in 1:6, j in 1:6], 100_000, Xoshiro(7)))
+    f = fit_ar(Z, 2; nonneg = true)
+    g = fit_ar(Z, 2)
+    @test all(i -> ar2_stationary(f.p1[i], f.p2[i]) && f.p1[i] >= 0 && f.p2[i] <= 0, 1:NQ)
+    @test g.p2[1] > 0 && g.p2[2] > 0                   # the free fit keeps the negative pole ...
+    @test f.p2[1] <= 0 && f.p2[2] <= 0                 # ... the restricted one does not
+    @test f.phi[:, 3:6] == g.phi[:, 3:6]               # where it does not bind, nothing changes
+    @test_throws AssertionError fit_ar(Z, 2; lag1 = true, nonneg = true)
 end
 
 # ---------------------------------------------------------------------------------------------

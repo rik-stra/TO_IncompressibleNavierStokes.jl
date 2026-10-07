@@ -26,6 +26,7 @@
     adapt(::Any, x) = x
     adapt(::Any) = identity
     include(joinpath(SRC, "ts_scaling.jl"))
+    include(joinpath(SRC, "ts_scale.jl"))            # step 4p's scale, used by draw_eta (V83)
     include(joinpath(SRC, "time_series_methods.jl"))
     include(joinpath(@__DIR__, "legacy_linreg.jl"))
 

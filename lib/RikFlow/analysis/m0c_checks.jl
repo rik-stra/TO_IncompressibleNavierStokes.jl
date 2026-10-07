@@ -118,11 +118,20 @@ function ar2_yw(r1, r2)
     return p1, p2
 end
 
-"AR(2) whose ACF best matches the empirical one at lags 1..L (grid + local refine, stationary)."
-function ar2_ls(racf; L = 20)
+"""
+    ar2_ls(racf; L = 20, nonneg = false)
+
+AR(2) whose ACF best matches the empirical one at lags 1..L (grid + local refine, stationary).
+
+`nonneg = true` restricts the fit to φ1 ≥ 0, φ2 ≤ 0 (2026-10-07): no negative real pole, and complex
+poles only with a positive real part (period > 4 steps), i.e. no component that alternates in sign
+from step to step. Off by default, so every existing fit is bit-identical.
+"""
+function ar2_ls(racf; L = 20, nonneg = false)
+    ok(a, b) = ar2_stationary(a, b) && (!nonneg || (a >= 0 && b <= 0))
     best = (Inf, 0.0, 0.0)
     for p1 in range(-1.99, 1.99; length = 399), p2 in range(-0.99, 0.99; length = 199)
-        ar2_stationary(p1, p2) || continue
+        ok(p1, p2) || continue
         r = ar2_acf(p1, p2, L)
         e = sum(abs2, r[2:end] .- racf[2:(L + 1)])
         e < best[1] && (best = (e, p1, p2))
@@ -131,9 +140,18 @@ function ar2_ls(racf; L = 20)
     for s in (0.005, 0.001, 0.0002), _ in 1:3
         for d1 in (-2s, -s, 0, s, 2s), d2 in (-2s, -s, 0, s, 2s)
             a, b = p1 + d1, p2 + d2
-            ar2_stationary(a, b) || continue
+            ok(a, b) || continue
             e = sum(abs2, ar2_acf(a, b, L)[2:end] .- racf[2:(L + 1)])
             e < best[1] && (best = (e, a, b))
+        end
+        _, p1, p2 = best
+    end
+    # The restricted minimum often lies on the edge φ2 = 0 (an AR(1)), where the local refinement can
+    # stall short of it on persistent ACFs (V82). Search that edge directly at 1e-4.
+    if nonneg
+        for a in 0:1e-4:(1 - 1e-4)
+            e = sum(abs2, ar2_acf(a, 0.0, L)[2:end] .- racf[2:(L + 1)])
+            e < best[1] && (best = (e, a, 0.0))
         end
         _, p1, p2 = best
     end
