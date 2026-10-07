@@ -29,7 +29,7 @@ draws (Sec. 3.4).
 | S1.4 | paper 3's rule + AR(2), base λ = 0.03 | ridge also on the other five QoIs (λ_i = λ(σ_i/σ_1)², most on the small scales) | S1.3a (λ = 0.1; E[0,6] gets 0.06) | `LinReg14_ar2n` | vs S1.3a: CRPS_0.5 higher (ridge on the persistent small-scale corrections, where the lags carry the skill); calibration up in the bands it colours. vs LinReg1: **no improvement** on S; C uncertain |
 | S1.5 | paper 3's rule + AR(2), base λ = 0.3 | as S1.4 | S1.3b (λ = 1; E[0,6] gets 0.62) | `LinReg16_ar2n` | as S1.4, more skill lost |
 
-Artefacts checked on the desktop 2026-10-06 (`meta_files/handoff_desktop_round1_2026-10-06.md`, Task A): all `:exact` or λ = 0, (400, 4000), h = 5; every AR(2) re-fitted by `lrs_ar_variant.jl --report` and equal to the file. 2026-10-07: the `*_ar2n` artefacts (constrained fit) replace the `*_ar2` ones; `LinReg7_ar2n` built on the laptop, the other five to build on the desktop (`<src> 2n`, then `--report`). Copy them to Snellius before the runs.
+Artefacts checked on the desktop 2026-10-06 (`meta_files/handoff_desktop_round1_2026-10-06.md`, Task A): all `:exact` or λ = 0, (400, 4000), h = 5; every AR(2) re-fitted by `lrs_ar_variant.jl --report` and equal to the file. 2026-10-07: the `*_ar2n` artefacts (constrained fit) replace the `*_ar2` ones; all six built and `--report`-checked on the desktop 2026-10-07 @ `09099363` (results_LSTMS.md §16). Copy the desktop's six to Snellius before the runs.
 
 ## Clauses (fixed; paper Sec. 3.7, Rik 2026-10-06)
 
@@ -67,7 +67,8 @@ Tool: `julia --project=analysis analysis/score_d6.jl --compare <closure dir> <pa
   LinReg1 rows move (|φ| ≤ 0.017 → 0). Artefacts renamed `*_ar2n`; the `*_ar2` ones are not run.
   ⚠️ Cost found after the decision: one-step under-dispersion where it binds (data innovation sd /
   σ_ξ 1.17 and 1.11 in LinReg7's Z[0,6] and Z[16,32], vs 1.01 and 1.04 unconstrained); disclosed in
-  closures.tex Step 1. [ ] Rik to confirm the rule stands.
+  closures.tex Step 1. [x] Rik confirmed the rule 2026-10-07, after the offline comparison with AR(1) + white
+  and two AR(1)s (results_LSTMS.md §18): "keep the constrained AR(2)".
 - Pilot-chosen, disclosed (Sec. 3.8): LinReg7's λ = 1; paper 3's base 0.03 / 0.3; the AR order 2;
   the E[0,6] rule itself was formulated after a pilot scan.
 

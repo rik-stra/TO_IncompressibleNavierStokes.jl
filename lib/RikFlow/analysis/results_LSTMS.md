@@ -2390,10 +2390,13 @@ Z[16,32] at both bases. Evidence on the training window (1–10 TU), all offline
   next residual too confidently. Builder's own numbers (out_scaling residual): φ (0.838, 0), (0.850, 0);
   xi_d/σξ 1.169 / 1.118; warm start 1.3e-15; model-noise ACF = fitted ACF. Reported to Rik 2026-10-07.
 
-**Artefacts:** `LinReg7_ar2n` built on the laptop (see `data_locations.md`); `Splice1_E0x11_ar2n`,
-`Splice1_E0x7_ar2n`, `Splice1_E0x8_ar2n`, `LinReg14_ar2n`, `LinReg16_ar2n` to build on the desktop
-(`julia --project=training exp_square_HIT/tools/lrs_ar_variant.jl <src> 2n`, then `--report`), and copy
-to Snellius. The round-1 card and `paper/round1_gate01.md` name the `_ar2n` artefacts.
+**Artefacts:** all six `*_ar2n` (`LinReg7`, `Splice1_E0x11`, `Splice1_E0x7`, `Splice1_E0x8`, `LinReg14`,
+`LinReg16`) built and `--report`-checked on the desktop 2026-10-07 @ `09099363` (log
+`/export/scratch2/rik/tmp/build_ar2n_2026-10-07.log`; warm starts ≤ 5.6e-15). Where the constraint binds
+(φ2 = 0): LinReg7 Z[0,6] / Z[16,32] (0.838, 0) / (0.850, 0); LinReg14 (0.233, 0) / (0.642, 0); LinReg16
+(0.667, 0) / (0.901, 0). E[0,6] of the splices is free: (0.126, −0.011), (0.451, −0.047), (0.767, −0.130).
+`LinReg7_ar2n` was also built on the laptop: φ and c identical, Σ_ξ within 8e-21 (Julia 1.12 vs 1.13) —
+the desktop's six are the ones to copy to Snellius. The round-1 card and `paper/round1_gate01.md` name them.
 
 ## 17. Offline: does the residual's scale depend on the state? (2026-10-07, laptop; Rik asked)
 
@@ -2441,3 +2444,50 @@ lrs_scale_variant.jl` → `TO_LRS/LinReg1_pl`, tests V83 (`test/test_linreg_scal
 0.36–1.56 (Z[16,32]) to 0.56–1.36 (Z[0,6]); fit-window gain 0.4892 nats/step; deployed draws ÷ f have
 covariance Σ_ε to 0.003 (3601 draws) and reproduce the data's quintile pattern (e.g. Z[7,15] model
 0.52 .. 1.33 vs data 0.50 .. 1.40).
+
+## 18. Which residual model for step 1? AR(2) vs AR(1)+white vs two AR(1)s (2026-10-07, laptop; Rik asked)
+
+`analysis/ar_family_compare.jl`, after the literature check (`meta_files/lit_ar2_restriction_2026-10-07.md`:
+an AR(2) with two non-negative poles has a rounded ACF at the origin, so the fast-drop + slow-tail ACF of
+Z[0,6] / Z[16,32] needs a negative pole; two AR(1)s with poles ≥ 0 can make it). Four models, all fitted
+by Eq. (ACF fit) on 1–10 TU, marginal variance = the residual's: **AR2u** (unconstrained), **AR2c**
+(φ1 ≥ 0, φ2 ≤ 0, the round-1 rule), **A1W** (AR(1) + white = ARMA(1,1)), **A1A1** (two AR(1)s, poles
+in [0, 1) = ARMA(2,1); both sampled continuous-time processes). One-step = each model's exact best linear
+predictor from its ACF (Durbin–Levinson, 50 lags); var ratio = realized / predicted one-step variance
+(1 = calibrated, > 1 under-dispersed). Offline only; no setting chosen.
+
+**Where the constraint binds** (train | 10–100 TU; kernel = power the measured diagonal kernel passes on,
+K = 200, rel. white; data value first):
+
+| QoI | model | ACF SSE 1–20 | LRV (data) | kernel (data) | share f ≥ ¼ (data) | var ratio | NLL gain |
+|---|---|---|---|---|---|---|---|
+| LinReg7 Z[0,6] | AR2u | 0.095 \| 0.104 | 11.7 (10.5) | 8.44 (11.38) | 0.139 (0.084) | 1.00 \| 1.06 | 0.392 \| 0.415 |
+| | AR2c | 0.131 \| 0.154 | 11.3 | 8.50 | 0.056 | **1.34 \| 1.43** | 0.424 \| 0.441 |
+| | A1W | 0.073 \| 0.074 | 12.3 | 8.48 | 0.152 | 0.85 \| 0.90 | 0.404 \| 0.433 |
+| | A1A1 | **0.009 \| 0.020** | **52.4** | 6.72 | **0.080** | 1.02 \| 1.08 | **0.457 \| 0.482** |
+| LinReg7 Z[16,32] | AR2u | 0.142 \| 0.186 | 13.0 (27.2) | 7.22 (6.37) | 0.150 (0.053) | 1.07 \| 1.11 | 0.369 \| 0.385 |
+| | AR2c | 0.201 \| 0.269 | 12.4 | 7.45 | **0.051** | 1.22 \| 1.28 | 0.525 \| 0.532 |
+| | A1W | 0.084 \| 0.108 | 14.2 | 6.97 | 0.180 | 0.82 \| 0.84 | 0.381 \| 0.407 |
+| | A1A1 | **0.006 \| 0.034** | **22.8** | **6.70** | 0.095 | 0.79 \| 0.82 | 0.517 \| **0.538** |
+
+Paper 3's rule, same pattern: A1A1 fits the ACF 5–40× better (Z[16,32] at 0.3: 0.002 vs 0.058–0.086) and
+gets Z[16,32]'s LRV right (37.4 vs data 42.9; AR2 19–20; at 0.03: 15.3 vs 11.3, AR2 4.6–4.8), but
+overshoots Z[0,6]'s (19.4 vs 3.1 train, 13.5 held) and passes less kernel power there (3.89 vs 5.99; AR2
+4.5); one-step, AR2c is best calibrated in Z[16,32] (1.07 / 0.94), A1W in Z[0,6] at 0.3 (0.97). **Summed
+one-step NLL gain over the six binding cells, train | held: AR2u 1.88 | 1.97, AR2c 2.26 | 2.32, A1W 1.88 |
+2.00, A1A1 2.26 | 2.37.** Where the constraint does not bind, A1W/A1A1 collapse to one AR(1) and lose to
+the AR(2) in the middle band (it needs the complex pair: e.g. LinReg7 E[7,15] SSE 0.001 vs 0.194).
+
+🔒 **Rik, 2026-10-07: keep the constrained AR(2)** for every AR(2) closure; A1A1 stays a recorded candidate.
+
+**Reading.** No model dominates. A1A1 matches the shape (ACF, high-frequency share) far better and has
+the best summed held-out NLL, but its slow pole is extrapolated beyond lag 20 (Z[0,6]'s LRV 52 vs 10.5)
+and it passes less solver power in Z[0,6] than the data (and than the AR(2)s). AR2c is within 0.05
+nats/step of it summed, passes the same power as AR2u, and its cost is one-step under-dispersion in
+LinReg7's Z[0,6] (var ratio 1.34 | 1.43). 🔴 **Found in passing, all four models: in the middle band the
+ACF-fitted residual model is strongly one-step OVER-dispersed** (LinReg7 var ratio 0.38 / 0.51 for AR2,
+0.27–0.36 for A1W/A1A1, Z/E[7,15]; also E[16,32] 0.69): the residual is smoother at one step than an
+ACF fit over 20 lags implies. It is in the deployed `*_ar2(n)` too (builder `xi_d/σξ` 0.62 / 0.72 = sd
+ratios). It is the price of fitting the ACF, not the one-step error (closures.tex says so); the coupled
+runs respond to the kernel power, which the AR(2) matches within 7–21 % there (6.72 vs 8.49, 9.87 vs
+10.66).
