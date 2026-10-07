@@ -71,6 +71,16 @@ function ar2_ls_lag1(racf; L = 20)
     return r1 * (1 - p2), p2
 end
 
+"""
+    ar_innovation_var(s2, p1, p2)
+
+σ_ξ² of the AR(2) `η_t = φ1 η_{t−1} + φ2 η_{t−2} + ξ_t` whose stationary MARGINAL variance is `s2`:
+`s2 (1 − φ1 ρ1 − φ2 ρ2)`, ρ the AR's own ACF (`p2 = 0` is the AR(1), `s2 (1 − φ1²)`). The `D` of
+`Σ_ξ = D R D` in `fit_ar`; pure, so `test/test_round1.jl` checks it against the closed-form AR(2)
+variance and a long simulation.
+"""
+ar_innovation_var(s2, p1, p2) = (rho = ar_acf(p1, p2, 2); s2 * (1 - p1 * rho[2] - p2 * rho[3]))
+
 function fit_ar(Z, p; lag1 = false)
     phi = zeros(p, NQ)
     for i in 1:NQ
@@ -86,10 +96,7 @@ function fit_ar(Z, p; lag1 = false)
     Xi = Z[3:end, :] .- p1' .* Z[2:(end - 1), :] .- p2' .* Z[1:(end - 2), :]
     R = cor(Xi)
     s2 = vec(var(Z; dims = 1))
-    sxi2 = [begin
-                rho = ar_acf(p1[i], p2[i], 2)
-                s2[i] * (1 - p1[i] * rho[2] - p2[i] * rho[3])
-            end for i in 1:NQ]
+    sxi2 = [ar_innovation_var(s2[i], p1[i], p2[i]) for i in 1:NQ]
     D = Diagonal(sqrt.(sxi2))
     S = Matrix(Symmetric(D * R * D))
     return (; phi, p1, p2, S, R, Xi, s2, sxi2)

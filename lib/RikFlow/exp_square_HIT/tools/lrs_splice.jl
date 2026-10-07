@@ -66,6 +66,21 @@ end
 "MLE Gaussian of the residual, as `fit(MvNormal, R)` (R: NQ x N)."
 mle(R) = (vec(mean(R; dims = 2)), Matrix(Symmetric(cov(R; dims = 2, corrected = false))))
 
+"""
+    splice_rows(cs, srcs, X, Y) -> (; c, mu, S)
+
+The pure core of `splice`, no files: row `i` of the spliced `c` is row `i` of `cs[srcs[i]]` (each
+source's QoI x regressor coefficient matrix, `c [x; 1]` layout), and the noise is `mle` of the
+spliced residual `Y - c X` on the training rows -- `X` regressors x N with the bias row last, `Y`
+QoI x N, as `train_rows` returns them. Tested on a synthetic design in `test/test_round1.jl`.
+"""
+function splice_rows(cs, srcs, X, Y)
+    length(srcs) == size(Y, 1) || error("need $(size(Y, 1)) sources, one per QoI; got $(length(srcs))")
+    c = vcat((Matrix(cs[s])[i:i, :] for (i, s) in enumerate(srcs))...)
+    mu, S = mle(Y .- c * X)
+    return (; c, mu, S)
+end
+
 function splice(dst, srcs; io = stdout)
     length(srcs) == NQ || error("need $NQ sources, one per QoI; got $(length(srcs))")
     ddir = joinpath(LRS, dst)
@@ -91,8 +106,7 @@ function splice(dst, srcs; io = stdout)
         @printf(io, "  no-op check %-9s: |Δμ|/sd %.1e, |ΔΣ|/|Σ| %.1e\n", s, e1, e2)
         (e1 < 1e-8 && e2 < 1e-8) || error("$s: the rebuilt training rows do not reproduce its stoch_distr")
     end
-    c = vcat((Matrix(ms[s]["c"])[i:i, :] for (i, s) in enumerate(srcs))...)
-    mu, S = mle(Y .- c * X)
+    (; c, mu, S) = splice_rows(Dict(s => ms[s]["c"] for s in unique(srcs)), srcs, X, Y)
     sd1 = m1["stoch_distr"]
     Dmod = parentmodule(typeof(sd1))
     stoch = Dmod.MvNormal(mu, S)

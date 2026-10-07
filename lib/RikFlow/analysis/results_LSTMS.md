@@ -2254,3 +2254,86 @@ julia --startup-file=no --project=. analysis/r2_offline.jl                    # 
 julia --startup-file=no --project=training exp_square_HIT/tools/m4_control.jl  # build + GATE 2 (~1 min)
 julia --project=analysis analysis/r2_bias.jl TO_LRS/LinReg1 TO_LSTM/diag/control_LinReg1   # R2-0 / the pass rule
 ```
+
+## 15. Paper Secs. 4 and 5: the baselines and the residual colour (2026-10-06, laptop)
+
+Paper numbers (the baselines are reused, Rik 2026-10-06; Sec. 5 is offline). Scripts:
+`analysis/score_d6.jl --compare`, `analysis/baseline_extras.jl`, `analysis/colour_tables.jl`,
+`analysis/tint_rule.jl`; figures (2026-10-07) `analysis/plot_paper_secs45.jl` -> `paper/figs/`, which
+reprints the quoted numbers (all match). Hindcast: policy A, the 87 ICs all three baselines keep
+(`D6_EXCLUDE_ICS=170,197,313`), M = 10.
+
+**Table 4.1** (`--compare`; LinReg1 = B in every pair):
+
+| | CRPS_0.5 | CRPS_all | norm. error | calibrated (reference) | flat (reference) |
+|---|---|---|---|---|---|
+| LinReg1 | 0.198 | 0.276 | 0.496 | 27 (35.6) | 23 (32.3) |
+| LinReg7 | 0.235 | 0.309 | 0.510 | 5 (35.7) | 1 (32.5) |
+| DDN | 0.526 | 0.577 | 0.846 | 4 (35.1) | 0 (32.2) |
+
+Paired against LinReg1: LinReg7 CRPS_0.5 +18.4 % [+11.3, +25.9 %], count −22 [−27, −14],
+normalized error +0.014 [−0.003, +0.033] (not resolved); DDN CRPS_0.5 +165 % [+149, +185 %], count
+−23 [−27, −15], normalized error +0.350 [+0.314, +0.388].
+
+**Hindcast bias of the ensemble mean by lead**, reference sd, mean over QoIs (range):
+LinReg1 0.00 at 25 steps, −0.02 at 50, −0.10 at 100, −0.13 at 200, −0.21 at 400, −0.29 at 1000
+(−0.27 to −0.32); LinReg7 −0.00 / −0.03 / −0.12 / −0.18 / −0.20 / −0.26; DDN −0.04 / −0.06 / −0.14 /
+−0.33 / −0.31 / −0.50 (small scales −0.8 at 1000). Long-run level for comparison: LinReg1 −0.37 sd
+(§14, 0–100 TU).
+
+**Long-run bias per 10 TU block** (vs the reference over the same block, % of its mean, mean over 5
+runs, range over QoIs): LinReg1 low in every block, from [−3.7, +0.1] to [−15.2, −9.2] %, already
+[−6.8, −4.8] % in 0–10 TU, no trend; LinReg7 from [−0.6, +0.5] to [−12.3, −7.6] %; DDN [−30, +1.8] %.
+The offset is reached within the first block and then varies with the block, not with time.
+
+**LinReg1's residual, teacher-forced on the tracked record:** training 1–10 TU mean 0, sd = fitted
+(by construction); held out 10–100 TU mean −0.016 to +0.024 fitted sd, sd 1.03–1.07 × fitted.
+
+**Correction ACF in the long runs vs the tracked record (lags 1–200, dQ from step 101).**
+⚠️ Corrected 2026-10-07 (`plot_paper_secs45.jl dqacf`, per run): the first version said "LinReg1
+within 0.17 (E[0,6]), ≤ 0.11 in the other five", which is wrong in Z[7,15] and hid one run.
+- LinReg1, max |run − record| over lags, per run: Z[0,6] 0.07–0.11, E[0,6] 0.06–0.09, Z[7,15]
+  0.17–0.20, E[7,15] 0.10–0.16, Z[16,32] 0.07–0.18, E[16,32] 0.06–0.16 (runs 1, 2, 3, 5). For the mean
+  of the 5 runs: 0.06 / 0.17 / 0.17 / 0.11 / 0.10 / 0.08. In Z[7,15] every run is more persistent
+  than the record at lags 20–100 (gap +0.05 to +0.20).
+- 🔑 **Replica 4's E[0,6] is one event**: dQ alternates in sign for ~12 steps at 36.26–36.30 TU, up to
+  156 sd of the rest of the run, while Z[16,32] = 270 (reference minimum 721) and the guard fires at
+  36.2275, 36.255, 36.26 and 36.30 TU. It alone sets that run's lag-1 to −0.18 (and the 5-run mean
+  to 0.57); without ±1 TU around it the run gives 0.76, the other four 0.76, the record 0.74. The
+  sign flips are not the guard's zero steps (lag-1 over ungated pairs in 30–40 TU: −0.62).
+- LinReg7's lag 1 in the middle band is 0.06–0.11 per run against 0.98 (gap 0.88–0.90): a white
+  component carries most of the variance.
+(The pilot's "≤ 0.07 at every lag" of §10g was the hindcast at lags 1/2/5/20 on 63 ICs.)
+
+**Colour tables** (`colour_tables.jl`; refits equal the deployed LinReg1/2/6/7/8 to ≤ 5e-11; paper
+3's multipliers 1 / 2.060 / 0.234 / 0.359 / 8.993 / 4.558, = the desktop's stored values). ρ1 Z / E
+per band, training || 10–100 TU; LRV = 1 + 2 Σ_{k≤200} ρ_k:
+
+| mean model | [0,6] | [7,15] | [16,32] | LRV training (range) | LRV 10–100 TU (range) |
+|---|---|---|---|---|---|
+| q*^n (residual = dQ) | 0.96/0.75 ‖ 0.96/0.74 | 0.98/0.99 ‖ same | 1.00/1.00 ‖ same | 10.5–220 | 6.2–217 |
+| h = 1, λ = 0 | 0.09/0.03 ‖ 0.13/0.05 | 0.76/0.86 ‖ same | 0.01/0.21 ‖ 0.02/0.20 | 0.5–3.4 | 2.1–4.3 |
+| h = 2, λ = 0 | ≈0 ‖ 0.03/0.02 | 0.30/0.18 ‖ 0.29/0.18 | ≈0/0.06 ‖ ≈0/0.04 | 0.6–3.6 | 1.9–3.9 |
+| h = 5, λ = 0 (LinReg1) | ≈0 ‖ 0.04/0.02 | ≈0 ‖ ≈0 | ≈0 ‖ ≈0 | 0.6–1.2 | 1.2–1.9 |
+| h = 7, λ = 0 | ≈0 ‖ 0.04/0.02 | ≈0 ‖ ≈0 | ≈0 ‖ ≈0 | 0.6–1.3 | 1.4–1.9 |
+| λ = 1e-4 | ≈0 ‖ 0.04/0.02 | 0.20/0.21 ‖ 0.19/0.21 | 0.01/0.03 ‖ ≈0/0.02 | 0.5–1.5 | 1.5–3.1 |
+| λ = 1e-2 | 0.10/0.02 ‖ 0.13/0.04 | 0.76/0.84 ‖ 0.75/0.84 | 0.19/0.30 ‖ 0.19/0.28 | 0.5–3.4 | 1.9–9.2 |
+| λ = 0.1 | 0.39/0.12 ‖ 0.41/0.15 | 0.87/0.93 ‖ same | 0.52/0.63 ‖ 0.52/0.62 | 1.0–7.6 | 2.5–17.5 |
+| λ = 1 (LinReg7) | 0.77/0.44 ‖ 0.78/0.45 | 0.95/0.97 ‖ same | 0.81/0.85 ‖ same | 2.2–27 | 3.6–30 |
+| λ = 10 | 0.94/0.70 ‖ 0.94/0.71 | 0.98/0.98 ‖ 0.98/0.99 | 0.94/0.95 ‖ 0.95/0.95 | 4.1–55 | 5.0–47 |
+| paper 3, 0.03 | 0.20/0.08 ‖ 0.23/0.11 | 0.74/0.84 ‖ 0.73/0.84 | 0.66/0.67 ‖ 0.66/0.66 | 0.5–11.2 | 2.3–13.6 |
+| paper 3, 0.3 | 0.59/0.37 ‖ 0.61/0.38 | 0.86/0.93 ‖ same | 0.89/0.87 ‖ same | 1.8–42.8 | 3.3–34.9 |
+| LinReg^E 0.1 / 1 / 10 (E[0,6]) | E: 0.12 / 0.44 / 0.70 ‖ 0.15 / 0.45 / 0.71; other five = LinReg1 | | | E: 1.0 / 2.2 / 4.1 | E: 2.5 / 3.6 / 5.0 |
+
+LRV per band (training): paper 3 at 0.03 gives 0.5/0.9 | 2.8/3.5 | **11.2**/2.7 — by ρ1 the middle
+band is the most coloured, by LRV Z[16,32]. Residual sd, LinReg7 / LinReg1 (training): 1.85 / 1.16 /
+7.93 / 11.49 / 1.99 / 2.84. **h = 7 vs h = 5**, one-step RMSE / sd(dQ) on 8.2–10 TU (fits on
+1–8.2 TU): within 1 % in every QoI (E[0,6] 0.5818 vs 0.5819, Z[7,15] 0.1015 vs 0.1005 the largest change).
+
+**Recheck of the Sec. 4 hindcast claims on the 87 paired ICs** (2026-10-06, score_d6.jl functions,
+`rank_histogram_by_lead` with `Xoshiro(SEED)`): median spread–skill ratio LinReg1 0.98, LinReg7
+**0.58** (the draft's 0.56 was an earlier IC set), DDN 0.40; U-shaped cells (convexity CI > 0)
+LinReg7 31, DDN 35, LinReg1 0; LinReg1 flat cells by lead 25…1000 = 4, 6, 4, 4, 5, 0 and cap-shaped
+6 of 6 at 1000; resolved positive slope 11 / 20 / 25 cells (LinReg1 / LinReg7 / DDN), negative 2 / 4
+/ 0; DDN normalized error Z/E[16,32] by lead 0.89/0.70, 1.36/1.08, 1.89/1.50, 1.67/1.35, 1.91/1.63,
+1.57/1.33 (worse than climatology from lead 50 on, not at lead 25).

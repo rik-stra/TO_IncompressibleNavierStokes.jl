@@ -1306,6 +1306,43 @@ paired_normalized_error(ma, mb, scale, t_ic; kw...) =
     paired_cell_bootstrap((m, idx) -> mean(normalized_error(m, scale, idx)), ma, mb, t_ic; kw...)
 
 """
+    criterion_clauses(p05_hi, score_b, cal_lo; margin = 10.0) -> (; S, C, hi_pct)
+
+The criterion's two hindcast clauses against the comparator B (paper Sec. 3.7), from the ends of
+the paired intervals `paired_compare` computes:
+  S = `p05_hi < 0`, the upper end of the CRPS_0.5 interval of A - B below 0;
+  C = `cal_lo > 0 && hi_pct < margin`, the lower end of the calibrated-count interval above 0 AND
+      that same CRPS_0.5 upper end below `margin` % of B's CRPS_0.5,
+with `hi_pct = 100 p05_hi / score_b`. 🔑 Every inequality is strict: an interval end AT 0, or at
+exactly the margin, does not pass. Pulled out of `paired_compare` so the rule is tested on its own.
+"""
+function criterion_clauses(p05_hi::Real, score_b::Real, cal_lo::Real; margin::Real = 10.0)
+    S = p05_hi < 0
+    hi_pct = 100 * p05_hi / score_b
+    C = cal_lo > 0 && hi_pct < margin
+    return (; S, C, hi_pct)
+end
+
+"""
+    ks_guard(ks_closure, ks_ref) -> (; pass, min_closure, max_ref)
+
+The criterion's KS guard G (paper Sec. 3.7), on the single-run summed KS values of the closure and
+of the comparator (5 long runs each): G FAILS iff every closure value lies above every reference
+value, i.e. `minimum(ks_closure) > maximum(ks_ref)`. Overlapping ranges, a better closure, and a tie
+at the boundary (`min == max`) all pass.
+
+For 5 against 5 exchangeable runs the chance of a fail is `1 / binomial(10, 5) = 1/252`: the guard
+catches a closure whose long runs are separated from the comparator's, not one that is marginally
+worse. Not evaluated by `paired_compare` -- KS is a long-run statistic (`score_m0_ddn.jl`).
+"""
+function ks_guard(ks_closure::AbstractVector, ks_ref::AbstractVector)
+    isempty(ks_closure) && throw(ArgumentError("ks_guard: no closure KS values"))
+    isempty(ks_ref) && throw(ArgumentError("ks_guard: no reference KS values"))
+    min_closure, max_ref = minimum(ks_closure), maximum(ks_ref)
+    return (; pass = !(min_closure > max_ref), min_closure, max_ref)
+end
+
+"""
     paired_compare(dir_a, dir_b; truth = load_truth(), nboot = 10_000, ndraw = 1000,
                    level = 0.90, margin = 10.0, io = stdout)
 
@@ -1317,7 +1354,8 @@ change in the normalized error. Then the criterion's two hindcast clauses agains
   S: the CRPS_0.5 interval lies below 0;
   C: the count interval lies above 0 AND the upper end of the CRPS_0.5 interval is below
      `margin` % of B's CRPS_0.5.
-The KS guard is a long-run statistic (`score_m0_ddn.jl`) and is not evaluated here.
+(both from [`criterion_clauses`](@ref)). The KS guard is a long-run statistic (`score_m0_ddn.jl`)
+and is not evaluated here; its rule is [`ks_guard`](@ref).
 Pairing, exclusion policy and thinning are `paired_primary`'s / `load_members`'s.
 """
 function paired_compare(dir_a, dir_b; truth = load_truth(), nboot::Integer = 10_000,
@@ -1359,9 +1397,7 @@ function paired_compare(dir_a, dir_b; truth = load_truth(), nboot::Integer = 10_
     @printf(io, "NORMALIZED ERROR of the ensemble mean, %d-cell mean: A %.4f  B %.4f  A - B %+.4f (%+.2f%% of B), %.0f%% CI [%+.4f, %+.4f] -> %s\n",
             ncell, ne.a, ne.b, ne.diff, 100 * ne.diff / ne.b, 100 * level, ne.lo, ne.hi,
             ne.hi < 0 ? "A lower" : ne.lo > 0 ? "B lower" : "not resolved")
-    S = p05.hi < 0
-    hi_pct = 100 * p05.hi / p05.score_b
-    C = cal.lo > 0 && hi_pct < margin
+    (; S, C, hi_pct) = criterion_clauses(p05.hi, p05.score_b, cal.lo; margin)
     @printf(io, "CRITERION vs B (Sec. 3.7; KS guard G from the long runs, not evaluated here)\n")
     @printf(io, "  S  CRPS_0.5 CI upper end %+.2f%% of B < 0            : %s\n", hi_pct, S ? "PASS" : "fail")
     @printf(io, "  C  count CI lower end %+.0f > 0, CRPS_0.5 upper %+.2f%% < %+.0f%% : %s\n",
