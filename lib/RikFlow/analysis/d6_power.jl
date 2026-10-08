@@ -49,7 +49,11 @@ const NQ = 6
 const LABELS = ["Z[0,6]", "E[0,6]", "Z[7,15]", "E[7,15]", "Z[16,32]", "E[16,32]"]
 const GRID = [25, 50, 100, 200, 400, 1000]          # score_d6.jl LEADS
 const PRIMARY_GRID = [25, 50, 100, 200]             # <= 0.5 TU
-const DENSE = collect(5:5:200)
+# 🔒 2026-10-08 (Rik): the paper's CRPS_0.5 is the average over EVERY step 1..200 (score_d6.jl
+# `paired_primary`), so "dense" is every step now (was every 5th; the two agree to a per-IC A - B
+# correlation of 0.99993). ⚠️ This script still loads under policy A (`load_pair`); the paper's
+# lead-wise numbers (half-width, noCRN, ACF, block length) come from `window_scores.jl`.
+const DENSE = collect(1:200)
 const STORE_LEADS = sort(unique(vcat(DENSE, GRID)))  # what the cache holds
 const INBAND = (0.8, 1.25)
 const TAU_BLOCK = parse(Float64, get(ENV, "D6_POWER_TAU", "1.0"))   # TU
@@ -449,7 +453,10 @@ function main_real(; io = stdout)
     cache = joinpath(get(ENV, "D6_POWER_OUT", joinpath(HERE, "output")), "d6_power_cache_$(basename(dA))_$(basename(dB)).jld2")
     qref = load(hf, "q_ref")
     sd = vec(std(qref; dims = 2))
-    P = if isfile(cache) && get(ENV, "D6_POWER_REBUILD", "0") != "1"
+    # a cache built on another lead set (DENSE was every 5th step before 2026-10-08) is rebuilt
+    stale = isfile(cache) && load(cache, "leads") != STORE_LEADS
+    stale && println(io, "cache $cache holds other leads; rebuilding")
+    P = if isfile(cache) && !stale && get(ENV, "D6_POWER_REBUILD", "0") != "1"
         c = load(cache)
         (; fcA = c["fcA"], fcB = c["fcB"], tr = c["tr"], ks = c["ks"], tk = c["tk"], M = c["M"])
     else

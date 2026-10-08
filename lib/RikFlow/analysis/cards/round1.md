@@ -54,6 +54,36 @@ calibrated count's reference, mean bias by lead, long-run bias and spread–skil
 Tool: `julia --project=analysis analysis/score_d6.jl --compare <closure dir> <partner dir>`
 (`D6_EXCLUDE_ICS` = the union of both closures' diverged ICs for policy A).
 
+### Amendment 2026-10-08 (Rik), before any round-1 closure was scored
+
+Only the reused baselines had been scored when these were changed.
+
+1. **Divergences: lead-wise rule** replaces policy A/B. A diverged member is scored at every step
+   before its stop and left out of both closures from there (`score_d6.jl` `LEADWISE`, the
+   default). No `D6_EXCLUDE_ICS`. Reason: Rik, diverged runs "should be included as much as
+   possible"; policy A dropped whole ICs, conditioning the closure that diverged in its own favour.
+2. **CRPS_0.5 and CRPS_all are window averages over every forecast step**: steps 1–200 and 1–1200
+   (step 1 = the first closure step after the 100-step replay), over the ICs and the six QoIs. The
+   normalized error likewise: δ₀.₅ (1–200) and δ_all (1–1200); the mean/spread reading of an
+   AR-vs-white pair uses δ₀.₅. Reason: the fair CRPS is ≥ 0 and proper per step, and the squared
+   error cannot cancel, so a window average hides nothing; the grid weighted each doubling of lead
+   equally and made CRPS_all mostly a short-lead score.
+3. **Unchanged, per lead (36 cells):** r and the calibrated count (clause C), the rank histograms
+   and flat count, the bias by lead. Reason: r is two-sided, so too narrow early and too wide late
+   would cancel in a window, and pooled sums of squares are dominated by the long leads.
+4. **Margin stays 10 %** (the half-width moves 7.0 → 7.3 % of LinReg1's CRPS_0.5 on the baseline
+   pair, so a closure as good as LinReg1 passes the margin about 0.73 of the time, was 0.76).
+
+Clause S and the CRPS part of clause C now read the window CRPS_0.5. Plan and measurements:
+`meta_files/handoff_window_scores_2026-10-08.md`; paper Sec. 3.4.
+
+5. **Later the same day (Rik):** no δ_all (past 0.5 TU the mean error approaches climatology for
+   every closure; it does not resolve LinReg1 vs LinReg7 and has no attribution role); no flat count
+   as a reported number (it overlaps the calibrated count; the rank histograms stay as a figure, for
+   their slope, which r does not show). So "Reported for every closure" above now reads: CRPS_all,
+   δ₀.₅, calibrated count's reference, rank-histogram figure (slopes), mean bias by lead, long-run
+   bias and spread–skill (per run), divergences, gate firings.
+
 ## Settings and where they come from
 
 - No offset and no noise scale fitted against coupled runs (D-10: none in round 1).

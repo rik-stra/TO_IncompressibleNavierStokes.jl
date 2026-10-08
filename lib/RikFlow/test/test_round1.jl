@@ -112,20 +112,24 @@ end
 # INCLUDED, so each policy needs its own copy of the file. `withenv` sets exactly the four policy
 # variables for the include and restores the caller's environment afterwards, so neither module
 # leaks into `D6Score` (test_d6_score.jl) or into the other, whatever order they are built in.
+# Both are IC-level-policy modules: `D6_POLICY = "ic"` since lead-wise became the default
+# (2026-10-08), and the member-level settings are refused under lead-wise.
 @testmodule D6PolicyA begin
     const ENV_BEFORE = Dict(k => get(ENV, k, nothing) for k in
-                            ("D6_EXCLUDE_ICS", "D6_THIN_MEMBERS", "D6_THIN_TO", "D6_POLICY_CONTROL"))
+                            ("D6_EXCLUDE_ICS", "D6_THIN_MEMBERS", "D6_THIN_TO", "D6_POLICY_CONTROL",
+                             "D6_POLICY"))
     withenv("D6_EXCLUDE_ICS" => "46", "D6_THIN_MEMBERS" => nothing, "D6_THIN_TO" => nothing,
-            "D6_POLICY_CONTROL" => nothing) do
+            "D6_POLICY_CONTROL" => nothing, "D6_POLICY" => "ic") do
         include(normpath(joinpath(@__DIR__, "..", "analysis", "score_d6.jl")))
     end
 end
 
 @testmodule D6PolicyB begin
     const ENV_BEFORE = Dict(k => get(ENV, k, nothing) for k in
-                            ("D6_EXCLUDE_ICS", "D6_THIN_MEMBERS", "D6_THIN_TO", "D6_POLICY_CONTROL"))
+                            ("D6_EXCLUDE_ICS", "D6_THIN_MEMBERS", "D6_THIN_TO", "D6_POLICY_CONTROL",
+                             "D6_POLICY"))
     withenv("D6_EXCLUDE_ICS" => nothing, "D6_THIN_MEMBERS" => "44:2", "D6_THIN_TO" => "2",
-            "D6_POLICY_CONTROL" => nothing) do
+            "D6_POLICY_CONTROL" => nothing, "D6_POLICY" => "ic") do
         include(normpath(joinpath(@__DIR__, "..", "analysis", "score_d6.jl")))
     end
 end

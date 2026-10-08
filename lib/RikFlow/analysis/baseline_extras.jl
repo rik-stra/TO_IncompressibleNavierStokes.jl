@@ -1,11 +1,11 @@
 # Paper Sec. 4 (baseline.tex) and Sec. 5's last paragraph: the numbers not in score_d6.jl's tables
 # (results_LSTMS.md §15). Reads the reused baselines (D6_LinReg1/7/DDN, the R2 long runs).
 #
-#     D6_EXCLUDE_ICS=170,197,313 julia --startup-file=no --project=lib/RikFlow/analysis \
-#         lib/RikFlow/analysis/baseline_extras.jl
+#     julia --startup-file=no --project=lib/RikFlow/analysis lib/RikFlow/analysis/baseline_extras.jl
 #
-# 1. bias of the ensemble mean by lead in the hindcast (policy A: the ICs all three closures keep),
-#    in reference sd, per QoI;
+# 1. bias of the ensemble mean by lead in the hindcast (lead-wise policy, the default since
+#    2026-10-08: all 90 ICs, a diverged member left out of all three closures from its stop on;
+#    `D6_POLICY=ic D6_EXCLUDE_ICS=170,197,313` gives the old policy A), in reference sd, per QoI;
 # 2. long-run bias per 10 TU block, against the reference over the SAME block (shared forcing), in %
 #    of that block's reference mean;
 # 3. LinReg1's residual on the held-out 10-100 TU of the tracked record (teacher-forced): mean and sd
@@ -24,15 +24,18 @@ truth = load_truth()
 sdref = vec(std(truth.q; dims = 2))
 
 # --- 1. hindcast bias by lead ---------------------------------------------------------------------
-println("1. Hindcast bias of the ensemble mean by lead, reference sd (policy A; D6_EXCLUDE_ICS = ",
-        join(sort(collect(EXCLUDE_ICS)), ","), ")")
-ens = Dict(c => load_members(joinpath(OUTD, "D6_$c")) for c in ("LinReg1", "LinReg7", "DDN"))
+println("1. Hindcast bias of the ensemble mean by lead, reference sd (policy ", POLICY,
+        isempty(EXCLUDE_ICS) ? "" : "; D6_EXCLUDE_ICS = " * join(sort(collect(EXCLUDE_ICS)), ","), ")")
+const CL3 = ("LinReg1", "LinReg7", "DDN")
+ens = Dict(c => load_members(joinpath(OUTD, "D6_$c")) for c in CL3)
 ks = sort(intersect((e.ks for e in values(ens))...))
 grid = filter(<=(minimum(e.nlead for e in values(ens))), LEADS)
 @printf("   K = %d ICs, leads %s\n   %-8s %-6s %s   mean\n", length(ks), join(grid, ","), "closure", "lead", join((lpad(l, 7) for l in LABS), ""))
-for c in ("LinReg1", "LinReg7", "DDN")
-    fc, tr = assemble(restrict(ens[c], ks), truth, grid)
-    b = dropdims(mean(dropdims(mean(fc; dims = 3); dims = 3) .- tr; dims = 1); dims = 1) ./ sdref  # nq x L
+asm = Dict(c => assemble(restrict(ens[c], ks), truth, grid) for c in CL3)
+mask_joint!([asm[c][1] for c in CL3])          # a member missing in one closure is missing in all
+for c in CL3
+    fc, tr = asm[c]
+    b = dropdims(mean(ensemble_mean(fc) .- tr; dims = 1); dims = 1) ./ sdref  # nq x L
     for (j, l) in pairs(grid)
         @printf("   %-8s %-6d %s %7.2f\n", c, l, fmt6(b[:, j]), mean(b[:, j]))
     end

@@ -14,8 +14,8 @@
 #   colour_dq_acf.pdf             ACF of dQ in the long runs against the tracked record (Sec. 5)
 #
 # Every number a figure shows comes from the code that made the paper's tables: the hindcast through
-# score_d6.jl (assemble, cell_moments, cell_ratios, rank_histogram_by_lead; policy A, the 87 ICs all
-# three baselines keep), the long runs and the dQ ACF as in baseline_extras.jl, the residual as in
+# score_d6.jl (assemble, cell_moments, cell_ratios, rank_histogram_by_lead_lw; the lead-wise policy,
+# all 90 ICs, a diverged member left out of all three baselines from its stop on, 2026-10-08), the long runs and the dQ ACF as in baseline_extras.jl, the residual as in
 # colour_tables.jl (deployed C, training rows 400-4000), the AR fits as lrs_ar_variant.jl's
 # (`ar2_ls` on lags 1-20; AR(1) phi = lag-1 ACF). Each figure prints the numbers the text quotes, so
 # a mismatch shows here and not in the PDF.
@@ -26,7 +26,7 @@
 # Later rounds: PAPER45_DQ_EXTRA="Label=TO_LRS/<dir>,..." adds closures to the dQ ACF figure
 # (e.g. the AR(2) closures once their long runs exist).
 
-get!(ENV, "D6_EXCLUDE_ICS", "170,197,313")            # policy A: the 87 ICs all three keep
+# 2026-10-08: the lead-wise policy (score_d6.jl LEADWISE, the default) replaces policy A here.
 include(joinpath(@__DIR__, "score_d6.jl"))            # load_members, restrict, assemble, load_truth, ...
 include(joinpath(SRC, "ts_history.jl"))               # HistorySpec, build_history
 include(joinpath(SRC, "ts_scaling.jl"))               # scale_input
@@ -72,7 +72,8 @@ end
 const TRUTH = load_truth()
 const REC = load(joinpath(@__DIR__, "data", "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2"))
 
-"The three baselines on the ICs all three keep, assembled on the paper's lead grid."
+"The three baselines on the ICs all three keep, assembled on the paper's lead grid, with a member
+missing in one closure (lead-wise policy) left out of all three."
 function hindcast()
     ens = Dict(c => load_members(joinpath(OUTD, "D6_$c")) for c in CLOSURES)
     ks = sort(intersect((e.ks for e in values(ens))...))
@@ -80,11 +81,14 @@ function hindcast()
     @printf("hindcast: K = %d ICs (excluded %s), leads %s\n", length(ks),
             join(sort(collect(EXCLUDE_ICS)), ","), join(grid, ","))
     out = Dict{String,Any}()
+    asm = Dict(c => (restrict(ens[c], ks), assemble(restrict(ens[c], ks), TRUTH, grid)...) for c in CLOSURES)
+    mask_joint!([asm[c][2] for c in CLOSURES])
     for c in CLOSURES
-        e = restrict(ens[c], ks)
-        fc, tr = assemble(e, TRUTH, grid)
+        e, fc, tr = asm[c]
         out[c] = (; ens = e, fc, tr, mom = cell_moments(fc, tr))
     end
+    @printf("          missing (member, lead) entries after the joint mask: %d\n",
+            count(isnan, out[first(CLOSURES)].fc[:, 1, :, :]))
     return (; d = out, ks, grid, t = out["LinReg1"].ens.t)
 end
 
@@ -221,10 +225,9 @@ end
 # Sec. 4.1: rank histograms
 # --------------------------------------------------------------------------------------------------
 function fig_ranks(H)
-    rh = Dict(c => rank_histogram_by_lead(H.d[c].fc, H.d[c].tr; grid = H.grid, rng = Xoshiro(SEED),
-                                          nboot = 1000) for c in ("LinReg1", "LinReg7"))
-    K, M = length(H.ks), size(H.d["LinReg1"].fc, 3)
-    expd = K / (M + 1)
+    rh = Dict(c => rank_histogram_by_lead_lw(H.d[c].fc, H.d[c].tr; grid = H.grid, rng = Xoshiro(SEED),
+                                             nboot = 1000) for c in ("LinReg1", "LinReg7"))
+    M = size(H.d["LinReg1"].fc, 3)
     for c in ("LinReg1", "LinReg7")
         hs = collect(Iterators.flatten(rh[c].hist))
         @printf("ranks: %-8s flat %2d, U %2d, cap %2d, slope+ %2d, slope- %2d of 36\n", c,
@@ -240,8 +243,9 @@ function fig_ranks(H)
                   yticks = [0, 2, 4], yticklabelsvisible = j == 1, yticksvisible = j == 1,
                   title = i == 1 ? @sprintf("%g TU", H.grid[j] * DT) : "",
                   ylabel = j == 1 ? QLAB[i] : "")
-        c1 = rh["LinReg1"].hist[i][j].counts ./ expd
-        c7 = rh["LinReg7"].hist[i][j].counts ./ expd
+        # per cell: a lead where a member is missing ranks only the complete ICs (lead-wise policy)
+        c1 = rh["LinReg1"].hist[i][j].counts ./ (rh["LinReg1"].hist[i][j].n / (M + 1))
+        c7 = rh["LinReg7"].hist[i][j].counts ./ (rh["LinReg7"].hist[i][j].n / (M + 1))
         any(>(ymax), c7) && @printf("ranks: %s lead %d LinReg7 bin max %.2f clipped at %.1f\n",
                                     LABELS[i], H.grid[j], maximum(c7), ymax)
         barplot!(ax, 1:(M + 1), c1; color = (COL["LinReg1"], 0.55), gap = 0.12, strokewidth = 0)

@@ -2491,3 +2491,81 @@ ACF fit over 20 lags implies. It is in the deployed `*_ar2(n)` too (builder `xi_
 ratios). It is the price of fitting the ACF, not the one-step error (closures.tex says so); the coupled
 runs respond to the kernel power, which the AR(2) matches within 7–21 % there (6.72 vs 8.49, 9.87 vs
 10.66).
+
+## 19. The lead-wise divergence policy, and the baselines rescored under it (2026-10-08, laptop; Rik decided)
+
+**Decision (Rik, 2026-10-08, "use your recommendation"):** diverged hindcast members are included as
+much as possible. A member is scored at every lead before its stop and left out of **both** closures
+of a comparison (of all three in a table) from its stop on. Fair CRPS on the members that remain;
+the finite-M factors of r and of the normalized error per IC (`W = 1 + 1/n_k`:
+`r = sqrt(Σ W V / Σ E)`, `NE = sqrt(Σ E / Σ W) / σ`); rank histograms (M + 1 bins) use the ICs whose
+ensemble is complete at that lead. Replaces policy A (drop the IC) as the paper's rule.
+
+**Code:** `score_d6.jl` `LEADWISE` (default; `D6_POLICY=ic` restores policy A and is the only setting
+for `D6_THIN_*`), `assemble` writes NaN from a diverged member's last column (the one that crossed
+`nan_limit`) on, `crps_by_ic`/`cell_moments`/`cell_ratios`/`normalized_error` skip NaN with per-IC
+factors (complete runs bit for bit as before), `mask_union!` in `paired_primary`/`paired_compare`,
+`mask_joint!` and `ensemble_mean` for tables and figures, `rank_histogram_by_lead_lw`,
+`spread_skill_by_lead_lw`. Score files get the tag `_lw`. Tests V84 (3 items); V81's policy modules
+now set `D6_POLICY=ic`; the d6/round1 items pass (572 + 5 broken, as before).
+`baseline_extras.jl` §1 and `plot_paper_secs45.jl` switched to lead-wise (no `D6_EXCLUDE_ICS`).
+Not switched: `d6_delta.jl`, `plot_d6_rh.jl` (pilot-era readers of the bare policy-A files).
+
+**The baselines (90 ICs, M = 10; LinReg1's three members stop 331, 612, 638 steps into the forecast,
+so leads ≤ 200 lose nothing, lead 400 one member, lead 1000 three):**
+
+| | CRPS_0.5 | CRPS_all | NE (36-cell mean) | calibrated | flat | median r | slope+ / slope− |
+|---|---|---|---|---|---|---|---|
+| LinReg1 | 0.2006 | 0.2777 | 0.498 | 28 | 21 | 0.95 | 13 / 2 |
+| LinReg7 | 0.2386 | 0.3102 | 0.513 | 5 | 1 | 0.56 | 19 / 5 |
+| DDN | 0.5316 | 0.5807 | 0.850 | 4 | 0 | 0.39 | 28 / 0 |
+
+LinReg7 − LinReg1 on CRPS_0.5 +0.0380 (+18.95 %), 90 % CI [+0.0246, +0.0525], half-width 0.0140
+(7.0 % of LinReg1's); calibrated count LinReg1 − LinReg7 = +23, CI [12, 27]; NE difference not
+resolved (CI [−0.0006, +0.0328]). References: calibrated 35.5 / 35.7 / 35.2, flat 32.3 / 32.2 /
+32.2. LinReg1's flat cells: 21 of 30 up to 1 TU, cap in all six at 2.5 TU. Bias of LinReg1's
+ensemble mean (ref sd): −0.10 at 0.25 TU, −0.22 at 1 TU, −0.30 at 2.5 TU.
+
+**Check:** the same scripts with `D6_POLICY=ic D6_EXCLUDE_ICS=170,197,313` reproduce every 87-IC
+number of §15 exactly (CRPS_0.5 0.198 / 0.235 / 0.526, NE 0.496 / 0.510 / 0.846, calibrated
+27 / 5 / 4, flat 23 / 1 / 0, slopes 11 / 20 / 25, medians 0.98 / 0.58 / 0.40), so every change above
+is the policy (3 more ICs; the 4 masked entries), not the code. Scratch outputs:
+`lw_cmp_L7_L1.txt`, `lw_cmp_DDN_L1.txt`, `lw_extras.txt` (session scratchpad, not kept).
+
+## 20. Window scores: CRPS and the normalized error over every step (2026-10-08, laptop; Rik decided)
+
+**Decision (Rik, 2026-10-08; plan and pre-implementation measurements in
+`meta_files/handoff_window_scores_2026-10-08.md`):** CRPS_0.5 = the fair CRPS averaged over the ICs,
+the six standardised QoIs and **every step 1–200**; CRPS_all = every step 1–1200 (the whole
+forecast); the normalized error δ₀.₅ over steps 1–200 (per QoI `sqrt(ΣΣE / ΣΣW)/σ`, mean over QoIs).
+r, the calibrated count (clause C), the rank histograms and the bias stay per lead (36 cells).
+**Later the same day (Rik):** no δ_all (mean error near climatology past 0.5 TU for every closure;
+does not resolve LinReg1 vs LinReg7; no attribution role); no flat count as a reported number
+(overlaps the calibrated count; rank histograms stay as a figure, for the slope). Margin stays 10 %.
+
+**Code (`score_d6.jl`):** `paired_load` (assemble every step once, `mask_union!`), `paired_primary`
+on the window `1:max_lead` (`PRIMARY_MAX_LEAD = 200`, `WINDOW_ALL = 1200`), `window_delta_parts` /
+`window_delta` / `paired_window_delta`, `paired_compare` (CRPS_0.5, CRPS_all, δ₀.₅, calibrated count
+with reference; the reference no longer draws the flat count), `main` prints and saves the window
+scores per closure. `d6_power.jl`: DENSE = every step (still policy A; the paper numbers come from
+`window_scores.jl`). Tests: V71 updated (window grid), V84 (stop inside the window), V85 (one-step
+window = cell; complete = RMSE/(σ√(1+1/M)); per-IC/step factor; paired_primary = mean over steps;
+paired_compare has δ₀.₅ and no δ_all/flat). d6 + round1 items: 589 pass + 5 broken.
+
+**The baselines (lead-wise, 90 ICs; `--compare` against LinReg1):**
+
+| | CRPS_0.5 | CRPS_all | δ₀.₅ | calibrated (ref.) |
+|---|---|---|---|---|
+| LinReg1 | 0.2208 | 0.3903 | 0.4505 | 28 (35.6) |
+| LinReg7 | 0.2630 | 0.4081 | 0.4812 | 5 (35.8) |
+| DDN | 0.5553 | 0.6357 | 0.8329 | 4 (35.1) |
+
+LinReg7 − LinReg1: CRPS_0.5 +0.0422, CI [+0.0268, +0.0589], half-width 0.0161 = 7.3 % of LinReg1;
+CRPS_all +0.0178, CI [+0.0053, +0.0314]; δ₀.₅ +0.0306, CI [+0.0025, +0.0591] (resolved, just);
+count −23, CI [−27, −12]. noCRN M = 5 (steps 1–200): half-width 0.0251 = 11.5 %. Per-IC CRPS_0.5
+difference ACF lags 1–3: −0.01, 0.03, 0.20 (±0.21); blocks of 1/2/4: 0.0160/0.0161/0.0170.
+These reproduce the handoff's pre-implementation measurements (`window_scores.jl`) exactly.
+On the 87 ICs (`D6_POLICY=ic D6_EXCLUDE_ICS=170,197,313`): CRPS_0.5 0.2175 / 0.2576 / 0.5498,
+CRPS_all 0.3893 / 0.4084 / 0.6340, δ₀.₅ 0.4450 / 0.4703 / 0.8247, calibrated 27 / 5 / 4 — the
+lead-wise rule moves every CRPS and δ by < 2.5 % and the count by ≤ 1.
+§15/§19's CRPS and NE values are the grid versions and are superseded for the paper.

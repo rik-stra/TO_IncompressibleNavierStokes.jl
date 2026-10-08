@@ -418,7 +418,8 @@ end
                 out = D6Score.main(; dir, outdir = od, io = devnull)
                 @test out !== nothing
                 @test Set(keys(out)) == Set([:level, :correction])
-                p = joinpath(od, "d6_scores_$(basename(dir)).jld2")   # named after the run dir
+                # named after the run dir, with the policy's tag ("_lw" by default since 2026-10-08)
+                p = joinpath(od, "d6_scores_$(basename(dir))$(D6Score.POLICY_TAG).jld2")
                 @test isfile(p)
                 d = load(p)
                 @test d["labels"] == D6Score.LABELS
@@ -728,7 +729,7 @@ end
         run!(b, 60.0; seed = 2, skip = [247])                  # biased, and one IC short
         r = D6Score.paired_primary(a, b; truth, nboot = 2000, io = devnull)
         @test r.K == 19 && r.dropped_a == [247] && isempty(r.dropped_b)
-        @test r.grid == [25, 50, 100, 200]
+        @test r.grid == collect(1:200)                          # every step of 0.5 TU (2026-10-08)
         @test r.diff < 0 && r.hi < 0                           # A (unbiased) is better, resolved
         @test r.diff ≈ r.score_a - r.score_b
         @test length(r.per_band) == 6 && all(<(0), r.per_band)
@@ -824,5 +825,232 @@ end
         end
         cl = D6Score.clamp_report(D6Score.load_members(dir))
         @test cl.nfired == 2 && cl.members_fired == 1 && cl.ics_fired == 1 && cl.nruns == 4
+    end
+end
+
+# ---------------------------------------------------------------------------------------------
+# V84 -- the lead-wise divergence policy (paper Sec. 3.4, Rik 2026-10-08)
+# ---------------------------------------------------------------------------------------------
+
+@testitem "V84 lead-wise: a diverged member is scored up to its stop and NaN from there" default_imports = false setup = [D6Score] begin
+    using Test
+    using JLD2
+    @test D6Score.LEADWISE && D6Score.POLICY_TAG == "_lw"     # the default
+    nq, nwarm, nt = 6, 100, 1300
+    ref = D6Score.planted_truth(nq, 30000)
+    grid = [25, 50, 100, 200, 400, 1000]                       # q columns 126 ... 1101
+    mktempdir() do dir
+        for m in 1:3
+            D6Score.write_run(dir, 42, 4100, m; nwarm, nt, nq)
+        end
+        # member 3 stops 300 steps into the forecast: q holds the IC and 400 steps, and its last
+        # column is the step that crossed the limit
+        nstep = nwarm + 300
+        q = Float32[c - 1 for _ in 1:nq, c in 1:(nstep + 1)]
+        q[:, end] .= 1f9
+        dQ = Float32[c for _ in 1:nq, c in 1:nstep]
+        jldsave(joinpath(dir, "d6_online_ic42_m3.jld2"); q, dQ, tau = dQ, k = 42, n_k = 4100,
+                t_k = 0.25 * 41, ordinal = 1, member = 3, seed = UInt64(3), ou_advance = 4100,
+                nwarm, nlead = nt - nwarm, M = 2, diverged = true, nstep)
+        ens = D6Score.load_members(dir)
+        @test ens.ks == [42] && ens.M == 3                   # the member is kept ...
+        @test ens.divergences == Dict(42 => [3])             # ... and counted
+        fc, tr = D6Score.assemble(ens, ref, grid)
+        @test all(isfinite, fc[:, :, 1:2, :])
+        @test all(isfinite, fc[:, :, 3, 1:4])                # leads 25-200: columns <= 301 < 401
+        @test all(isnan, fc[:, :, 3, 5:6])                   # leads 400, 1000: past the stop
+        @test fc[1, 1, 3, 4] == D6Score.forecast_column(200; nwarm) - 1   # planted step value
+        # the same rule on the correction
+        fd, _ = D6Score.assemble(ens, ref, grid; level = false)
+        @test all(isfinite, fd[:, :, 3, 1:4]) && all(isnan, fd[:, :, 3, 5:6])
+    end
+end
+
+@testitem "V84 lead-wise: the scores skip missing members, with the factor per IC" default_imports = false setup = [D6Score] begin
+    using Test
+    using Random
+    using Statistics
+    grid = [25, 50, 100, 200, 400, 1000]
+    fc, tr = D6Score.exchangeable(40, 6, 10, length(grid); rng = Xoshiro(3))
+    # complete runs: unchanged, bit for bit
+    mom0 = D6Score.cell_moments(fc, tr)
+    @test !mom0.ragged
+    ss = D6Score.spread_skill_by_lead(fc, tr; grid)
+    @test D6Score.spread_skill_by_lead_lw(fc, tr; grid) == ss
+    # one member missing at the last two leads of IC 5
+    fm = copy(fc)
+    fm[5, :, 7, 5:6] .= NaN
+    sc = ones(6)
+    c = D6Score.crps_by_ic(fm, tr, sc)
+    keep = [1:6; 8:10]
+    @test c[5, 2, 6] ≈ D6Score.crps_ensemble(fc[5, 2, keep, 6], tr[5, 2, 6]; fair = true)
+    @test c[5, 2, 4] == D6Score.crps_by_ic(fc, tr, sc)[5, 2, 4]     # earlier leads untouched
+    mom = D6Score.cell_moments(fm, tr)
+    @test mom.ragged && mom.W[5, 1, 6] == 10 / 9 && mom.W[4, 1, 6] == 11 / 10
+    x = fc[5, 3, keep, 6]
+    @test mom.V[5, 3, 6] ≈ var(x) && mom.E[5, 3, 6] ≈ (mean(x) - tr[5, 3, 6])^2
+    r = D6Score.cell_ratios(mom)
+    @test r[3, 6] ≈ sqrt(sum(mom.W[:, 3, 6] .* mom.V[:, 3, 6]) / sum(mom.E[:, 3, 6]))
+    @test r[3, 2] ≈ D6Score.cell_ratios(mom0)[3, 2]                 # complete column: same value
+    ne = D6Score.normalized_error(mom, sc)
+    @test ne[3, 6] ≈ sqrt(sum(mom.E[:, 3, 6]) / sum(mom.W[:, 3, 6]))
+    @test ne[3, 2] ≈ D6Score.normalized_error(mom0, sc)[3, 2]
+    # a ragged null still reads about 1, as the complete one does
+    @test 0.8 < mean(r) < 1.25
+    sl = D6Score.spread_skill_by_lead_lw(fm, tr; grid)
+    @test sl.ratio[3][6] ≈ r[3, 6] && sl.ratio[3][1] ≈ ss.ratio[3][1]
+    # rank histograms: the incomplete IC leaves only the cells where it is incomplete
+    rh = D6Score.rank_histogram_by_lead_lw(fm, tr; grid, rng = Xoshiro(1), nboot = 50)
+    @test rh.hist[1][6].n == 39 && rh.hist[1][4].n == 40
+    # the member-as-truth reference draws its stand-in from complete members and runs through
+    ref = D6Score.member_as_truth_reference(fm, grid; ndraw = 3, nboot_rh = 20)
+    @test ref.M_ref == 9 && 0 <= ref.calibrated <= 36
+end
+
+@testitem "V84 lead-wise pairing drops a missing member from both closures" default_imports = false setup = [D6Score] begin
+    using Test
+    using JLD2
+    using Random
+    fa = randn(Xoshiro(1), 3, 2, 4, 2)
+    fb = randn(Xoshiro(2), 3, 2, 4, 2)
+    fa[2, :, 3, 2] .= NaN
+    a0, b0 = copy(fa), copy(fb)
+    D6Score.mask_union!(fa, fb)
+    @test all(isnan, fb[2, :, 3, 2])                         # dropped from B too
+    @test fb[2, :, 3, 1] == b0[2, :, 3, 1]                   # only at that lead
+    @test count(isnan, fa) == count(isnan, fb) == 2
+    # complete arrays of different M pair as before; with a missing member they cannot
+    @test D6Score.mask_union!(randn(3, 2, 4, 2), randn(3, 2, 5, 2)) isa Tuple
+    @test_throws ErrorException D6Score.mask_union!(a0, randn(3, 2, 5, 2))
+
+    # end to end: A's member 2 of one IC stops between leads 200 and 400; no IC is dropped
+    truth = D6Score.planted_truth(6, 30000)
+    ks = collect(209:2:247)
+    nwarm, nlead, nq, M = 100, 400, 6, 5
+    nt = nwarm + nlead
+    function run!(dir, bias; seed, stop = nothing)
+        rng = Xoshiro(seed)
+        for k in ks
+            n_k = 100 * (k - 1)
+            for m in 1:M
+                q = [Float64(n_k + c - 1) + 30 * randn(rng) + bias for _ in 1:nq, c in 1:(nt + 1)]
+                kw = (;)
+                if stop !== nothing && (k, m) == stop
+                    ns = nwarm + 300
+                    q = q[:, 1:(ns + 1)]
+                    kw = (; diverged = true, nstep = ns)
+                end
+                jldsave(joinpath(dir, "d6_online_ic$(k)_m$(m).jld2"); q,
+                        dQ = zeros(nq, size(q, 2) - 1), tau = zeros(nq, size(q, 2) - 1), k, n_k,
+                        t_k = 0.25 * (k - 1), ordinal = 1, member = m, seed = UInt64(m), nwarm,
+                        nlead, M, closure = "lstm", model_name = "m$(bias)", block = "selection",
+                        kw...)
+            end
+        end
+    end
+    mktempdir() do root
+        a, b = mkpath(joinpath(root, "a")), mkpath(joinpath(root, "b"))
+        run!(a, 0.0; seed = 1, stop = (215, 2))
+        run!(b, 60.0; seed = 2)
+        # the window 1..200 (2026-10-08): the member stops at step 300, so nothing is missing
+        r = D6Score.paired_primary(a, b; truth, nboot = 500, io = devnull)
+        @test r.K == 20 && isempty(r.dropped_a) && r.grid == collect(1:200)
+        @test isfinite(r.diff) && r.hi < 0
+        # the window 1..400 reaches past the stop: steps 300..400 lose member 2 of IC 215
+        rl = D6Score.paired_primary(a, b; truth, max_lead = 400, nboot = 500, io = devnull)
+        @test rl.K == 20 && rl.grid == collect(1:400) && isfinite(rl.diff)
+        # ... in B too: B scored without its member 2 there, unlike B on its own
+        @test rl.per_ic_b[findfirst(==(215), rl.ks)] != D6Score.primary_score_by_ic(
+            D6Score.assemble(D6Score.restrict(D6Score.load_members(b), [215]), truth,
+                             collect(1:400))..., collect(1:400),
+            D6Score.primary_band_scale(truth.q); max_lead = 400)[1]
+        # and B's ICs without a stop score as B on its own
+        k1 = findfirst(==(209), rl.ks)
+        @test rl.per_ic_b[k1] ≈ D6Score.primary_score_by_ic(
+            D6Score.assemble(D6Score.restrict(D6Score.load_members(b), [209]), truth,
+                             collect(1:400))..., collect(1:400),
+            D6Score.primary_band_scale(truth.q); max_lead = 400)[1]
+    end
+end
+
+# ---------------------------------------------------------------------------------------------
+# V85 -- window scores: CRPS_0.5 / CRPS_all and delta_0.5 over every step (Rik, 2026-10-08)
+# ---------------------------------------------------------------------------------------------
+
+@testitem "V85 the window normalized error: one step is the cell, complete is RMSE over sd sqrt(1+1/M)" default_imports = false setup = [D6Score] begin
+    using Test
+    using Random
+    using Statistics
+    K, nq, M, L = 30, 6, 10, 12
+    fc, tr = D6Score.exchangeable(K, nq, M, L; rng = Xoshiro(5))
+    sc = [1.0, 2.0, 0.5, 1.0, 3.0, 1.0]
+    mom = D6Score.cell_moments(fc, tr)
+    ne = D6Score.normalized_error(mom, sc)
+    # a one-step window is the per-cell normalized error, averaged over the QoIs
+    for j in (1, 7, L)
+        P = D6Score.window_delta_parts(fc, tr, [j])
+        @test D6Score.window_delta(P, sc) ≈ mean(ne[:, j])
+    end
+    # complete ensembles: the window RMSE of the ensemble mean over sigma sqrt(1 + 1/M)
+    cols = 3:9
+    mu = dropdims(mean(fc; dims = 3); dims = 3)
+    want = mean(sqrt(mean(abs2, mu[:, i, cols] .- tr[:, i, cols])) / (sc[i] * sqrt(1 + 1 / M)) for i in 1:nq)
+    P = D6Score.window_delta_parts(fc, tr, cols)
+    @test D6Score.window_delta(P, sc) ≈ want
+    @test size(P.S) == (K, nq) && size(P.W) == (K, nq)
+    # a resample re-sums the parts
+    idx = [1, 1, 2, 5, 30]
+    @test D6Score.window_delta(P, sc, idx) ≈
+          mean(sqrt(sum(abs2, mu[idx, i, cols] .- tr[idx, i, cols]) / (length(idx) * length(cols) * (1 + 1 / M))) / sc[i] for i in 1:nq)
+    # with a member missing the factor is per IC and step
+    fm = copy(fc)
+    fm[4, :, 2, 8:9] .= NaN
+    Pm = D6Score.window_delta_parts(fm, tr, cols)
+    @test Pm.W[4, 1] ≈ 5 * (11 / 10) + 2 * (10 / 9) && Pm.W[3, 1] ≈ 7 * (11 / 10)
+    @test isfinite(D6Score.window_delta(Pm, sc))
+end
+
+@testitem "V85 paired_primary and paired_compare average every step of the window" default_imports = false setup = [D6Score] begin
+    using Test
+    using JLD2
+    using Random
+    using Statistics
+    truth = D6Score.planted_truth(6, 30000)
+    ks = collect(209:2:227)                                    # 10 ICs
+    nwarm, nlead, nq, M = 100, 400, 6, 4
+    nt = nwarm + nlead
+    function run!(dir, bias; seed)
+        rng = Xoshiro(seed)
+        for k in ks, m in 1:M
+            n_k = 100 * (k - 1)
+            q = [Float64(n_k + c - 1) + 30 * randn(rng) + bias for _ in 1:nq, c in 1:(nt + 1)]
+            jldsave(joinpath(dir, "d6_online_ic$(k)_m$(m).jld2"); q, dQ = zeros(nq, nt),
+                    tau = zeros(nq, nt), k, n_k, t_k = 0.25 * (k - 1), ordinal = 1, member = m,
+                    seed = UInt64(m), nwarm, nlead, M, closure = "lstm", model_name = "m$(bias)",
+                    block = "selection")
+        end
+    end
+    mktempdir() do root
+        a, b = mkpath(joinpath(root, "a")), mkpath(joinpath(root, "b"))
+        run!(a, 0.0; seed = 1)
+        run!(b, 20.0; seed = 2)
+        sc = D6Score.primary_band_scale(truth.q)
+        fa, tr = D6Score.assemble(D6Score.load_members(a), truth, collect(1:400))
+        # CRPS_0.5: the mean of the fair CRPS over ICs, bands and steps 1..200
+        r = D6Score.paired_primary(a, b; truth, nboot = 200, io = devnull)
+        @test r.score_a ≈ mean(D6Score.crps_by_ic(fa[:, :, :, 1:200], tr[:, :, 1:200], sc))
+        # CRPS_all: the whole forecast this run has (nlead = 400 < WINDOW_ALL)
+        rall = D6Score.paired_primary(a, b; truth, max_lead = D6Score.WINDOW_ALL, nboot = 200, io = devnull)
+        @test rall.grid == collect(1:400)
+        @test rall.score_a ≈ mean(D6Score.crps_by_ic(fa, tr, sc))
+        # one load serves every window, with the same numbers
+        pl = D6Score.paired_load(a, b; truth)
+        @test D6Score.paired_primary(a, b; truth, nboot = 200, io = devnull, pl).diff == r.diff
+        # paired_compare: delta_0.5 on the window, no delta_all, no flat count
+        c = D6Score.paired_compare(a, b; truth, nboot = 200, ndraw = 5, io = devnull)
+        @test c.delta05.a ≈ D6Score.window_delta(D6Score.window_delta_parts(fa, tr, 1:200), sc)
+        @test c.crps05.score_a ≈ r.score_a && c.crps_all.score_a ≈ rall.score_a
+        @test !haskey(c, :delta_all) && !haskey(c, :flat_a)
+        @test c.grid == [25, 50, 100, 200, 400]                 # the cells stay on the lead grid
     end
 end

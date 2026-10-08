@@ -113,6 +113,11 @@ The lead grid, in **steps**, and it is **the same for every band** (Rik, 2026-09
 
     25, 50, 100, 200, 400, 1000  =  0.0625, 0.125, 0.25, 0.5, 1.0, 2.5 TU
 
+🔒 **Since 2026-10-08 (Rik) the grid is the CELL grid only**: the spread-skill ratio, the calibrated
+count, the rank histograms and the bias by lead (36 cells). CRPS_0.5 / CRPS_all and the normalized
+error are averages over EVERY step of a window (`PRIMARY_MAX_LEAD`, `WINDOW_ALL`), because they are
+non-negative per step and cannot cancel; `r` is two-sided and would.
+
 🔴 **Why one grid replaced the per-QoI one.** The per-QoI grid came from gotcha #30 -- `T_int` spans
 a factor **36.8** across the six QoIs -- but that was measured on the **correction**, and D6 scores
 the **level**. On the level the spread is 2.18x on `T_int`, 1.40x on the `rho = 0.1` crossing and
@@ -319,15 +324,41 @@ isempty(EXCLUDE_ICS) || !THINNING || BOTH_POLICIES ||
           "D6_POLICY_CONTROL=1 if you want the isolation control.")
 
 """
+    LEADWISE
+
+The paper's divergence policy since 2026-10-08 (Rik: diverged runs "should be included as much as
+possible"), and the default: **every member is scored at every lead it reached.** A diverged
+member stays in its ensemble up to the last step before its stop and is `NaN` from there on
+(`assemble`); at those leads its IC is scored with the members that remain, with the finite-`M`
+factors taken per IC (`cell_moments`). In a pair, a member missing in either closure is dropped
+from both at that lead (`mask_union!`), so the comparison stays matched member for member. Nothing
+is dropped at a lead before any member stopped, so on the baselines CRPS_0.5 keeps all 90 ICs at
+`M = 10` (LinReg1's three divergences stop 331, 612 and 638 steps into the forecast).
+
+`D6_POLICY=ic` restores the IC-level policy (policy A: an IC short of a member is dropped), and is
+the only setting under which the member-level alternatives (`D6_THIN_*`) can be used.
+
+⚠️ The rank histograms cannot mix ensembles of different size (`M + 1` bins), so a cell's histogram
+uses the ICs whose ensemble is complete at that lead (`rank_histogram_by_lead_lw`).
+"""
+const POLICY = get(ENV, "D6_POLICY", "leadwise")
+POLICY in ("leadwise", "ic") ||
+    error("D6_POLICY must be \"leadwise\" (the default) or \"ic\", got $(repr(POLICY))")
+const LEADWISE = POLICY == "leadwise"
+LEADWISE && THINNING &&
+    error("D6_THIN_MEMBERS / D6_THIN_TO are the member-level alternative to the IC-level policy; " *
+          "under D6_POLICY=leadwise every member is already kept up to its stop. Set D6_POLICY=ic.")
+
+"""
     POLICY_TAG
 
 Suffix distinguishing the score file one exclusion policy writes from another's.
 
 🔴 Without it the two policies collide on `d6_scores_<dir>.jld2` and the second run silently
 replaces the first -- the same defect a fixed filename already caused once when three closures were
-scored in a row (2026-09-16).
+scored in a row (2026-09-16). The IC-level policy keeps the bare name its files have always had.
 """
-const POLICY_TAG = !THINNING ? "" : isempty(EXCLUDE_ICS) ? "_thin" : "_thin_k87"
+const POLICY_TAG = LEADWISE ? "_lw" : !THINNING ? "" : isempty(EXCLUDE_ICS) ? "_thin" : "_thin_k87"
 
 """
     load_members(dir = D6_DIR)
@@ -404,12 +435,15 @@ function load_members(dir = D6_DIR; filt = ic_filter_from_env())
     #
     # ⚠️ Files written before 2026-09-16 have no `diverged` key. They were complete or the run would
     # have raised, so a missing key reads as `false`.
+    #
+    # 🔑 Under `LEADWISE` (the default since 2026-10-08) the diverged member is counted here but
+    # KEPT: `assemble` scores it at every lead before its stop and writes `NaN` from there on.
     divergences = Dict{Int,Vector{Int}}()
     for (k, entries) in byic
         bad = [mid for (mid, path) in entries if info[path].diverged]
         isempty(bad) && continue
         divergences[k] = sort(bad)
-        filter!(e -> !(first(e) in bad), entries)
+        LEADWISE || filter!(e -> !(first(e) in bad), entries)
     end
     filter!(p -> !isempty(p.second), byic)
     isempty(byic) && return nothing
@@ -740,6 +774,9 @@ different column offsets and that is the point of them being separate functions 
 
 Every column index is bounds-checked against the record. A lead that runs past the reference throws
 rather than being clipped, because a clipped lead reads as a saturated one.
+
+Under `LEADWISE` a diverged member is `NaN` at every lead at or past its stop column (all QoIs at
+once); every scorer below skips `NaN` members cell by cell.
 """
 function assemble(ens, truth, grid::AbstractVector{<:Integer}; level::Bool = true)
     K = length(ens.ks)
@@ -767,8 +804,19 @@ function assemble(ens, truth, grid::AbstractVector{<:Integer}; level::Bool = tru
             d["k"] == k || error("$path says k = $(d["k"])")
             x = level ? d["q"] : d["dQ"]
             nwarm = d["nwarm"]
+            dv = get(d, "diverged", false) === true
             for (j, ℓ) in pairs(grid)
                 c = fcol(ℓ; nwarm)
+                # 🔴 LEAD-WISE (see `LEADWISE`): a diverged member's LAST column is the step that
+                # crossed `nan_limit` (`qoisaver` pushes it before `solve_unsteady` stops), so it
+                # counts as gone from that column on. Every earlier column is a value the closure
+                # produced while still running, and is scored.
+                if dv && c >= size(x, 2)
+                    LEADWISE || error("diverged member $mid of IC $k reached `assemble` under " *
+                                      "D6_POLICY=ic; load_members should have dropped it")
+                    fc[ik, :, im, j] .= NaN
+                    continue
+                end
                 c <= size(x, 2) || error("lead $ℓ needs column $c of a $(size(x, 2))-column run")
                 fc[ik, :, im, j] = @view x[:, c]
             end
@@ -925,14 +973,24 @@ end
 # over leads <= 0.5 TU and all six bands, each band standardised by the truth's own climatological
 # sd, with an IC-block bootstrap. The in-band count is reported, never tested.
 #
+# 🔒 2026-10-08 (Rik, before any round-1 closure was scored): the leads of the average are EVERY
+# STEP of the window, 1..PRIMARY_MAX_LEAD, not the grid's leads <= 0.5 TU; CRPS_all is every step
+# 1..WINDOW_ALL (the whole forecast). `meta_files/handoff_window_scores_2026-10-08.md` holds the
+# measurements that settled it (every 5th step agreed with every step to a per-IC A - B correlation
+# of 0.99993; every step is the exact definition and costs nothing extra).
+#
 # ⚠️ Pairing is by IC only. The same member seed does NOT give common random numbers across an MVG
 # and an LSTM sampler (plan §7), so the pairing removes the IC-to-IC variance and nothing else.
 #
 # These functions take plain arrays so that `analysis/d6_power.jl` can subsample K and M from
 # existing runs through the same code path the verdict uses.
 
-"Longest lead (steps) entering the primary score: 0.5 TU."
+"Last step of the primary score's window, steps 1..200 = the first 0.5 TU of the forecast."
 const PRIMARY_MAX_LEAD = 200
+
+"Last step of CRPS_all's window: the whole forecast, steps 1..1200 (3 TU). (No delta_all: Rik,
+2026-10-08 -- the mean error is near climatology past 0.5 TU for every closure.)"
+const WINDOW_ALL = 1200
 
 """
 Default IC-block length of the primary score's bootstrap, in TU.
@@ -957,6 +1015,10 @@ primary_band_scale(ref::AbstractMatrix) = vec(std(Float64.(ref); dims = 2))
 
 Fair ensemble CRPS per (IC, band, lead), divided by `scale[band]`. `fc` is `K x N_Q x M x L`, `tr`
 is `K x N_Q x L` (`assemble`'s layout). `M >= 2`: the fair form is undefined for one member.
+
+`NaN` members (a diverged member past its stop, `LEADWISE`) are skipped: the cell is scored with
+the members that remain, which the fair form allows because its expectation does not depend on
+the ensemble size.
 """
 function crps_by_ic(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3},
                     scale::AbstractVector{<:Real})
@@ -968,7 +1030,13 @@ function crps_by_ic(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3},
     M >= 2 || error("the fair ensemble CRPS needs M >= 2, got $M")
     out = Array{Float64}(undef, K, nq, L)
     for k in 1:K, i in 1:nq, j in 1:L
-        out[k, i, j] = crps_ensemble(view(fc, k, i, :, j), tr[k, i, j]; fair = true) / scale[i]
+        x = view(fc, k, i, :, j)
+        if any(isnan, x)
+            x = filter(!isnan, x)
+            length(x) >= 2 || error("IC $k, QoI $i, lead column $j keeps $(length(x)) member(s); " *
+                                    "the fair CRPS needs 2")
+        end
+        out[k, i, j] = crps_ensemble(x, tr[k, i, j]; fair = true) / scale[i]
     end
     return out
 end
@@ -1036,24 +1104,62 @@ function restrict(ens, ks::AbstractVector{<:Integer})
 end
 
 """
-    paired_primary(dir_a, dir_b; truth = load_truth(), max_lead = PRIMARY_MAX_LEAD,
-                   blocklen = nothing, nboot = 10_000, level = 0.90, io = stdout)
+    mask_union!(fa, fb) -> (fa, fb)
 
-The plan's **declared primary score**: `A - B` of `primary_score_by_ic`, IC by IC, over the ICs
-both directories scored, with an IC-block bootstrap interval. **Negative means A is better.**
+The pairing half of `LEADWISE`: a member that is missing (`NaN`) at a lead in either closure is set
+missing in both, so a paired difference compares the same members at every lead. Members pair by
+index because their draws are seeded by `(k, member)` alone (`member_seed`). Arrays of different
+`M` can only be paired when neither has a missing member.
+"""
+function mask_union!(fa::AbstractArray{<:Real,4}, fb::AbstractArray{<:Real,4})
+    anya, anyb = any(isnan, fa), any(isnan, fb)
+    (anya || anyb) || return fa, fb
+    size(fa) == size(fb) ||
+        error("lead-wise pairing drops missing members by index, which needs equal sizes; got " *
+              "$(size(fa)) and $(size(fb))")
+    K, _, M, L = size(fa)
+    for k in 1:K, m in 1:M, j in 1:L
+        if any(isnan, view(fa, k, :, m, j)) || any(isnan, view(fb, k, :, m, j))
+            fa[k, :, m, j] .= NaN
+            fb[k, :, m, j] .= NaN
+        end
+    end
+    return fa, fb
+end
+
+"""
+    mask_joint!(fcs) -> fcs
+
+`mask_union!` over any number of closures scored side by side (a paper table or figure): a member
+missing in one is missing in all, so every closure is scored on the same members at every lead.
+"""
+function mask_joint!(fcs::AbstractVector{<:AbstractArray{<:Real,4}})
+    for f in fcs[2:end]
+        mask_union!(fcs[1], f)
+    end
+    for f in fcs[2:end]
+        mask_union!(fcs[1], f)          # the first now carries the union; hand it to every other
+    end
+    return fcs
+end
+
+"Ensemble mean per (IC, QoI, lead) over the members present (`NaN` = missing, `LEADWISE`)."
+ensemble_mean(fc::AbstractArray{<:Real,4}) =
+    [mean(filter(!isnan, view(fc, k, i, :, j))) for k in axes(fc, 1), i in axes(fc, 2), j in axes(fc, 4)]
+
+"""
+    paired_load(dir_a, dir_b; truth = load_truth(), nsteps = nothing)
+
+Both runs, restricted to the ICs both scored, assembled on EVERY forecast step `1:nsteps` (default:
+the shorter run's whole forecast) and masked member for member (`mask_union!`). Step `n` is column
+`n` of the result, so every window (`PRIMARY_MAX_LEAD`, `WINDOW_ALL`) and the cell grid (`LEADS`)
+are slices of one array: each member file is read once per side.
 
 🔴 Refuses to pair two runs from different partition blocks, and reports (never hides) ICs that one
-side lacks -- an IC dropped for a divergence on one side is dropped from both, which is policy A
-(`results.md` §4c); each side's divergence count is printed for that reason. Each side's
-`load_members` honours the same environment (`D6_EXCLUDE_ICS`, `D6_THIN_*`, the IC filter).
-
-Returns `(; diff, lo, hi, se, blocklen, K, ks, t, score_a, score_b, per_ic_a, per_ic_b,
-per_band, grid, M_a, M_b, id_a, id_b, dropped_a, dropped_b, level)`; `per_band` is the `A - B`
-difference per band, averaged over ICs and the primary leads.
+side lacks. Each side's `load_members` honours the same environment (`D6_POLICY`,
+`D6_EXCLUDE_ICS`, `D6_THIN_*`, the IC filter).
 """
-function paired_primary(dir_a, dir_b; truth = load_truth(), max_lead::Integer = PRIMARY_MAX_LEAD,
-                        blocklen = nothing, nboot::Integer = 10_000, level::Real = 0.90,
-                        rng = Xoshiro(SEED), io = stdout)
+function paired_load(dir_a, dir_b; truth = load_truth(), nsteps = nothing)
     ea = load_members(dir_a)
     eb = load_members(dir_b)
     ea === nothing && error("no D6 members in $dir_a")
@@ -1065,33 +1171,59 @@ function paired_primary(dir_a, dir_b; truth = load_truth(), max_lead::Integer = 
     length(ks) >= 2 || error("the two runs share $(length(ks)) scored ICs; nothing to pair")
     dropped_a, dropped_b = setdiff(ea.ks, ks), setdiff(eb.ks, ks)
     nl = min(ea.nlead, eb.nlead)
-    grid = filter(l -> l <= min(max_lead, nl), LEADS)
-    isempty(grid) && error("no lead <= $(min(max_lead, nl)) on the grid $LEADS")
+    steps = collect(1:(nsteps === nothing ? nl : min(nsteps, nl)))
     a, b = restrict(ea, ks), restrict(eb, ks)
-    fa, tra = assemble(a, truth, grid)
-    fb, trb = assemble(b, truth, grid)
+    fa, tra = assemble(a, truth, steps)
+    fb, trb = assemble(b, truth, steps)
     tra == trb || error("the two runs verify against different truth at the same ICs -- " *
                         "their n_k or nwarm disagree")
+    mask_union!(fa, fb)
+    return (; ea, eb, a, b, ks, t = a.t, dropped_a, dropped_b, nl, steps, fa, fb, tr = tra)
+end
+
+"""
+    paired_primary(dir_a, dir_b; truth = load_truth(), max_lead = PRIMARY_MAX_LEAD,
+                   blocklen = nothing, nboot = 10_000, level = 0.90, io = stdout, pl = nothing)
+
+The plan's **declared primary score**: `A - B` of the window CRPS per IC -- the fair CRPS averaged
+over the six standardised bands and EVERY step `1..max_lead` (2026-10-08; the grid's leads before)
+-- over the ICs both directories scored, with an IC-block bootstrap interval. **Negative means A is
+better.** `max_lead = WINDOW_ALL` gives CRPS_all. `pl`, a `paired_load` result covering the window,
+saves reading the runs again.
+
+Returns `(; diff, lo, hi, se, blocklen, K, ks, t, score_a, score_b, per_ic_a, per_ic_b,
+per_band, grid, M_a, M_b, id_a, id_b, dropped_a, dropped_b, level)`; `grid` is the window's steps,
+`per_band` the `A - B` difference per band, averaged over ICs and the window.
+"""
+function paired_primary(dir_a, dir_b; truth = load_truth(), max_lead::Integer = PRIMARY_MAX_LEAD,
+                        blocklen = nothing, nboot::Integer = 10_000, level::Real = 0.90,
+                        rng = Xoshiro(SEED), io = stdout, pl = nothing)
+    pl === nothing && (pl = paired_load(dir_a, dir_b; truth, nsteps = max_lead))
+    w = min(max_lead, pl.nl)
+    length(pl.steps) >= w || error("the loaded pair covers steps 1..$(length(pl.steps)), the window 1..$w")
+    grid = collect(1:w)
     sc = primary_band_scale(truth.q)
-    sa = primary_score_by_ic(fa, tra, grid, sc; max_lead)
-    sb = primary_score_by_ic(fb, trb, grid, sc; max_lead)
-    ci = ic_block_bootstrap_ci(sa .- sb, a.t; blocklen, nboot, level, rng)
-    per_band = vec(mean(crps_by_ic(fa, tra, sc) .- crps_by_ic(fb, trb, sc); dims = (1, 3)))
+    ca = crps_by_ic(view(pl.fa, :, :, :, grid), view(pl.tr, :, :, grid), sc)
+    cb = crps_by_ic(view(pl.fb, :, :, :, grid), view(pl.tr, :, :, grid), sc)
+    sa = vec(mean(ca; dims = (2, 3)))
+    sb = vec(mean(cb; dims = (2, 3)))
+    ci = ic_block_bootstrap_ci(sa .- sb, pl.t; blocklen, nboot, level, rng)
+    per_band = vec(mean(ca .- cb; dims = (1, 3)))
+    ea, eb, ks = pl.ea, pl.eb, pl.ks
 
     lab(e) = "$(e.identity.closure):$(e.identity.model_name)"
-    @printf(io, "\nPRIMARY SCORE (plan §7): paired fair ensemble CRPS, leads <= %d steps (%.3g TU), 6 bands standardised\n",
-            max_lead, max_lead * DT)
+    @printf(io, "\nPRIMARY SCORE (plan §7): paired fair ensemble CRPS, every step 1..%d (%.3g TU), 6 bands standardised\n",
+            w, w * DT)
     @printf(io, "  A = %s  (%s, M = %d, %d diverged member(s))\n", lab(ea), dir_a, ea.M,
             sum(length, values(ea.divergences); init = 0))
     @printf(io, "  B = %s  (%s, M = %d, %d diverged member(s))\n", lab(eb), dir_b, eb.M,
             sum(length, values(eb.divergences); init = 0))
-    @printf(io, "  K = %d paired ICs, t = %.2f..%.2f TU, block %s; leads %s\n", length(ks),
-            first(a.t), last(a.t), isempty(ea.identity.block) ? "(none)" : ea.identity.block,
-            join(grid, ","))
-    if !(isempty(dropped_a) && isempty(dropped_b))
+    @printf(io, "  K = %d paired ICs, t = %.2f..%.2f TU, block %s; window steps 1..%d\n", length(ks),
+            first(pl.t), last(pl.t), isempty(ea.identity.block) ? "(none)" : ea.identity.block, w)
+    if !(isempty(pl.dropped_a) && isempty(pl.dropped_b))
         @printf(io, "  ⚠️ unpaired ICs dropped: from A %s, from B %s\n",
-                isempty(dropped_a) ? "none" : join(dropped_a, ","),
-                isempty(dropped_b) ? "none" : join(dropped_b, ","))
+                isempty(pl.dropped_a) ? "none" : join(pl.dropped_a, ","),
+                isempty(pl.dropped_b) ? "none" : join(pl.dropped_b, ","))
     end
     @printf(io, "  score A %.5f   B %.5f   A - B %+.5f  (%+.2f%% of B)\n", mean(sa), mean(sb),
             ci.mean, 100 * ci.mean / mean(sb))
@@ -1101,10 +1233,10 @@ function paired_primary(dir_a, dir_b; truth = load_truth(), max_lead::Integer = 
             "not resolved (CI contains 0)")
     @printf(io, "  per band A - B: %s\n",
             join((@sprintf("%s %+.4f", LABELS[i], per_band[i]) for i in eachindex(per_band)), "  "))
-    return (; diff = ci.mean, ci.lo, ci.hi, ci.se, ci.blocklen, K = length(ks), ks, t = a.t,
+    return (; diff = ci.mean, ci.lo, ci.hi, ci.se, ci.blocklen, K = length(ks), ks, t = pl.t,
             score_a = mean(sa), score_b = mean(sb), per_ic_a = sa, per_ic_b = sb, per_band, grid,
-            M_a = ea.M, M_b = eb.M, id_a = ea.identity, id_b = eb.identity, dropped_a, dropped_b,
-            level = Float64(level))
+            M_a = ea.M, M_b = eb.M, id_a = ea.identity, id_b = eb.identity,
+            dropped_a = pl.dropped_a, dropped_b = pl.dropped_b, level = Float64(level))
 end
 
 # ---------------------------------------------------------------------------------------------
@@ -1125,11 +1257,17 @@ end
 const CAL_BAND = (0.8, 1.25)
 
 """
-    cell_moments(fc, tr) -> (; V, E, M)
+    cell_moments(fc, tr) -> (; V, E, W, M, ragged)
 
 Per (IC, QoI, lead): the members' unbiased variance `V` and the squared error of their mean `E`,
 each `K x N_Q x L` (`assemble`'s layout). Every cell statistic below is a sum of these over ICs,
 so a bootstrap resample only re-sums them.
+
+`NaN` members (`LEADWISE`) are skipped. `W = 1 + 1/n` is the finite-ensemble factor of each entry,
+with `n` the members it kept: a reliable ensemble of `n` members has `E[E] = W E[V]`, so with
+different `n` across ICs the ratio is `sqrt(sum W V / sum E)`. `ragged` says whether any entry lost a
+member; when none did, `cell_ratios` and `normalized_error` take their original single-`M` form,
+so complete runs score bit for bit as before.
 """
 function cell_moments(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3})
     K, nq, M, L = size(fc)
@@ -1138,13 +1276,23 @@ function cell_moments(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3})
     M >= 2 || error("cell moments need M >= 2 members, got $M")
     V = Array{Float64}(undef, K, nq, L)
     E = Array{Float64}(undef, K, nq, L)
+    W = fill((M + 1) / M, K, nq, L)
+    ragged = false
     for k in 1:K, i in 1:nq, j in 1:L
         m = view(fc, k, i, :, j)
-        mb = sum(m) / M
-        V[k, i, j] = sum(abs2, m .- mb) / (M - 1)
+        n = M
+        if any(isnan, m)
+            m = filter(!isnan, m)
+            n = length(m)
+            n >= 2 || error("IC $k, QoI $i, lead column $j keeps $n member(s); need 2")
+            W[k, i, j] = (n + 1) / n
+            ragged = true
+        end
+        mb = sum(m) / n
+        V[k, i, j] = sum(abs2, m .- mb) / (n - 1)
         E[k, i, j] = (mb - tr[k, i, j])^2
     end
-    return (; V, E, M)
+    return (; V, E, W, M, ragged)
 end
 
 """
@@ -1152,20 +1300,22 @@ end
 
 Corrected spread-skill ratio `r = sqrt((M+1)/M) spread / RMSE` per cell (Eq. spread skill) over the
 ICs `idx`, repeats allowed (a bootstrap resample). On `idx = 1:K` it equals
-`spread_skill_by_lead`'s per-cell `ratio` (tested).
+`spread_skill_by_lead`'s per-cell `ratio` (tested). With members missing (`mom.ragged`) the
+factor is taken per IC: `r = sqrt(sum W V / sum E)`.
 """
 function cell_ratios(mom, idx = axes(mom.V, 1))
     _, nq, L = size(mom.V)
     f = sqrt((mom.M + 1) / mom.M)
+    rag = get(mom, :ragged, false)
     r = Matrix{Float64}(undef, nq, L)
     for i in 1:nq, j in 1:L
         sp = 0.0
         sk = 0.0
         for k in idx
-            sp += mom.V[k, i, j]
+            sp += rag ? mom.W[k, i, j] * mom.V[k, i, j] : mom.V[k, i, j]
             sk += mom.E[k, i, j]
         end
-        r[i, j] = sk > 0 ? f * sqrt(sp / sk) : NaN
+        r[i, j] = sk > 0 ? (rag ? sqrt(sp / sk) : f * sqrt(sp / sk)) : NaN
     end
     return r
 end
@@ -1184,13 +1334,17 @@ function normalized_error(mom, scale::AbstractVector{<:Real}, idx = axes(mom.V, 
     _, nq, L = size(mom.V)
     length(scale) == nq || throw(DimensionMismatch("scale has $(length(scale)) bands, expected $nq"))
     c = sqrt(1 + 1 / mom.M)
+    rag = get(mom, :ragged, false)
     ne = Matrix{Float64}(undef, nq, L)
     for i in 1:nq, j in 1:L
         s = 0.0
+        w = 0.0
         for k in idx
             s += mom.E[k, i, j]
+            rag && (w += mom.W[k, i, j])
         end
-        ne[i, j] = sqrt(s / length(idx)) / (scale[i] * c)
+        # With members missing, the climatological RMSE is taken per IC: sigma^2 (1 + 1/n_k).
+        ne[i, j] = rag ? sqrt(s / w) / scale[i] : sqrt(s / length(idx)) / (scale[i] * c)
     end
     return ne
 end
@@ -1206,8 +1360,53 @@ Flat cells out of N_Q x L, through `rank_histogram_by_lead` with the same rng an
 """
 function flat_count(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3},
                     grid::AbstractVector{<:Integer}; rng = Xoshiro(SEED), nboot::Integer = 1000)
-    rh = rank_histogram_by_lead(fc, tr; grid, rng, nboot)
+    rh = rank_histogram_by_lead_lw(fc, tr; grid, rng, nboot)
     return count(is_flat, Iterators.flatten(rh.hist))
+end
+
+"""
+    rank_histogram_by_lead_lw(fc, tr; grid, leads = nothing, rng, nboot = 1000)
+
+`rank_histogram_by_lead` under `LEADWISE`. A rank histogram has `M + 1` bins, so it cannot mix
+ensembles of different size: where a member is missing (`NaN`), the cell's histogram uses only the
+ICs whose ensemble is complete at that lead. Without missing members it IS the library function,
+with the same rng stream.
+"""
+function rank_histogram_by_lead_lw(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3};
+                                   grid::AbstractVector{<:Integer}, leads = nothing,
+                                   rng = Random.default_rng(), nboot::Integer = 1000)
+    any(isnan, fc) || return rank_histogram_by_lead(fc, tr; grid, leads, rng, nboot)
+    K, nq, _, _ = size(fc)
+    ll = leads === nothing ? [collect(grid) for _ in 1:nq] : leads
+    idx = lead_positions(grid, ll)
+    hist = [[begin
+                 ok = [k for k in 1:K if !any(isnan, view(fc, k, i, :, j))]
+                 rank_histogram(Array(view(fc, ok, i, :, j)), Array(view(tr, ok, i, j)); rng, nboot)
+             end for j in idx[i]] for i in 1:nq]
+    return (; grid = collect(grid), leads = ll, hist)
+end
+
+"""
+    spread_skill_by_lead_lw(fc, tr; grid, leads = nothing)
+
+`spread_skill_by_lead` under `LEADWISE`: with members missing, every per-cell quantity comes from
+`cell_moments`, with the finite-ensemble factor per IC. Without missing members it IS the library
+function.
+"""
+function spread_skill_by_lead_lw(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3};
+                                 grid::AbstractVector{<:Integer}, leads = nothing)
+    any(isnan, fc) || return spread_skill_by_lead(fc, tr; grid, leads)
+    K, nq, M, L = size(fc)
+    ll = leads === nothing ? [collect(grid) for _ in 1:nq] : leads
+    idx = lead_positions(grid, ll)
+    mom = cell_moments(fc, tr)
+    r = cell_ratios(mom)
+    ratio = [[r[i, j] for j in idx[i]] for i in 1:nq]
+    spread = [[sqrt(mean(view(mom.V, :, i, j))) for j in idx[i]] for i in 1:nq]
+    skill = [[sqrt(mean(view(mom.E, :, i, j))) for j in idx[i]] for i in 1:nq]
+    pooled_ratio = [sqrt(sum(mom.W[:, :, j] .* mom.V[:, :, j]) / sum(mom.E[:, :, j])) for j in 1:L]
+    return (; grid = collect(grid), leads = ll, ratio, spread, skill, pooled_ratio, K, M,
+            correction = sqrt((M + 1) / M))
 end
 
 """
@@ -1230,9 +1429,14 @@ function member_as_truth_reference(fc::AbstractArray{<:Real,4}, grid::AbstractVe
     trd = Array{Float64}(undef, K, nq, L)
     cal = Vector{Float64}(undef, ndraw)
     fl = Vector{Float64}(undef, flat ? ndraw : 0)
+    # Under `LEADWISE` the stand-in truth is drawn from the members complete at every lead of the
+    # grid (a diverged member has no value to stand in with past its stop); it still scores the
+    # others, missing values included. Complete ICs draw exactly as before.
+    surv = [[m for m in 1:M if !any(isnan, view(fc, k, :, m, :))] for k in 1:K]
+    any(isempty, surv) && error("an IC has no member complete at every lead")
     for d in 1:ndraw
         for k in 1:K
-            m0 = rand(rng, 1:M)
+            m0 = length(surv[k]) == M ? rand(rng, 1:M) : rand(rng, surv[k])
             for i in 1:nq, j in 1:L
                 trd[k, i, j] = fc[k, i, m0, j]
                 c = 0
@@ -1277,13 +1481,13 @@ resamples, 90 % percentile interval). Returns `(; a, b, diff, lo, hi, blocklen, 
 function paired_cell_bootstrap(stat, ma, mb, t_ic::AbstractVector{<:Real}; blocklen = nothing,
                                block_tu::Real = PRIMARY_BLOCK_TU, nboot::Integer = 10_000,
                                level::Real = 0.90, rng = Xoshiro(SEED))
-    K = size(ma.V, 1)
-    size(mb.V, 1) == K || throw(DimensionMismatch("A has $K ICs, B has $(size(mb.V, 1))"))
+    K = n_ics(ma)
+    n_ics(mb) == K || throw(DimensionMismatch("A has $K ICs, B has $(n_ics(mb))"))
     length(t_ic) == K || throw(DimensionMismatch("t_ic has $(length(t_ic)) entries, expected $K"))
     K >= 2 || error("a bootstrap over ICs needs at least 2 ICs, got $K")
     o = sortperm(t_ic)
     b = ic_blocklen(t_ic; blocklen, block_tu)
-    allk = axes(ma.V, 1)
+    allk = 1:K
     sa, sb = stat(ma, allk), stat(mb, allk)
     boots = Vector{Float64}(undef, nboot)
     for r in 1:nboot
@@ -1301,9 +1505,42 @@ end
 paired_calibration(ma, mb, t_ic; kw...) =
     paired_cell_bootstrap((m, idx) -> calibrated_count(cell_ratios(m, idx)), ma, mb, t_ic; kw...)
 
-"Paired change A - B of the 36-cell mean normalized error (Sec. 3.5; review A4)."
+"Number of ICs in a set of per-IC parts: `cell_moments` (`V`) or `window_delta_parts` (`S`)."
+n_ics(m) = hasproperty(m, :V) ? size(m.V, 1) : size(m.S, 1)
+
+"Paired change A - B of the 36-cell mean normalized error (Sec. 3.5; review A4). Superseded in the
+paper by the window form, `paired_window_delta` (2026-10-08); kept for the cell tables."
 paired_normalized_error(ma, mb, scale, t_ic; kw...) =
     paired_cell_bootstrap((m, idx) -> mean(normalized_error(m, scale, idx)), ma, mb, t_ic; kw...)
+
+"""
+    window_delta_parts(fc, tr, cols) -> (; S, W)
+
+Per IC and QoI (`K x N_Q`), the sums over the window's steps `cols` of the squared error of the
+ensemble mean (`S`) and of its finite-ensemble factor `1 + 1/n` (`W`; per IC and step, with `n` the
+members present there under `LEADWISE`). Every window statistic below re-sums these, so a bootstrap
+resample is cheap.
+"""
+function window_delta_parts(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3}, cols)
+    m = cell_moments(view(fc, :, :, :, cols), view(tr, :, :, cols))
+    return (; S = dropdims(sum(m.E; dims = 3); dims = 3), W = dropdims(sum(m.W; dims = 3); dims = 3))
+end
+
+"""
+    window_delta(P, scale, idx = 1:K) -> Float64
+
+The normalized error over a window (paper Eq. `normalized error`, 2026-10-08): per QoI
+`sqrt(sum_k sum_n E / sum_k sum_n W) / sigma_i`, averaged over the QoIs, over the ICs `idx`
+(repeats allowed: a bootstrap resample). With complete ensembles `W = 1 + 1/M` everywhere and this is
+the window RMSE of the ensemble mean over `sigma_i sqrt(1 + 1/M)`; a one-step window is the
+per-cell `normalized_error` (tested).
+"""
+window_delta(P, scale::AbstractVector{<:Real}, idx = axes(P.S, 1)) =
+    mean(sqrt(sum(view(P.S, idx, i)) / sum(view(P.W, idx, i))) / scale[i] for i in axes(P.S, 2))
+
+"Paired change A - B of the window normalized error (delta_0.5), IC-block bootstrap."
+paired_window_delta(pa, pb, scale, t_ic; kw...) =
+    paired_cell_bootstrap((m, idx) -> window_delta(m, scale, idx), pa, pb, t_ic; kw...)
 
 """
     criterion_clauses(p05_hi, score_b, cal_lo; margin = 10.0) -> (; S, C, hi_pct)
@@ -1346,44 +1583,53 @@ end
     paired_compare(dir_a, dir_b; truth = load_truth(), nboot = 10_000, ndraw = 1000,
                    level = 0.90, margin = 10.0, io = stdout)
 
-Everything the paper reports for a pair (Secs. 3.5-3.7), B being the comparator (LinReg1, the
+Everything the paper reports for a pair (Secs. 3.4-3.6), B being the comparator (LinReg1, the
 control run, or the matched partner): CRPS_0.5 and CRPS_all with their paired intervals
-(`paired_primary`), the calibrated count of each side with its member-as-truth reference and the
-paired interval of the difference, the flat count of each side with its reference, and the paired
-change in the normalized error. Then the criterion's two hindcast clauses against B:
+(`paired_primary`, window averages over every step since 2026-10-08), the paired change in the
+window normalized error delta_0.5, and the calibrated count of each side with its member-as-truth
+reference and the paired interval of the difference (on the 36-cell grid, `LEADS`). Then the
+criterion's two hindcast clauses against B:
   S: the CRPS_0.5 interval lies below 0;
   C: the count interval lies above 0 AND the upper end of the CRPS_0.5 interval is below
      `margin` % of B's CRPS_0.5.
 (both from [`criterion_clauses`](@ref)). The KS guard is a long-run statistic (`score_m0_ddn.jl`)
 and is not evaluated here; its rule is [`ks_guard`](@ref).
-Pairing, exclusion policy and thinning are `paired_primary`'s / `load_members`'s.
+Pairing and the divergence policy are `paired_load`'s / `load_members`'s. The runs are read once.
+
+🔒 Rik, 2026-10-08 (later the same day): **no delta_all** -- past 0.5 TU the mean error approaches
+climatology for every closure, it does not resolve LinReg1 vs LinReg7 and has no attribution role;
+**no flat count** as a headline number -- it overlaps the calibrated count (the rank histograms stay
+a figure, for their slope). `main` still prints the per-cell rank-histogram statistics.
 """
 function paired_compare(dir_a, dir_b; truth = load_truth(), nboot::Integer = 10_000,
                         ndraw::Integer = 1000, level::Real = 0.90, margin::Real = 10.0,
                         io = stdout)
-    p05 = paired_primary(dir_a, dir_b; truth, nboot, level, io)
-    pall = paired_primary(dir_a, dir_b; truth, max_lead = maximum(LEADS), nboot, level, io)
-    ea, eb = load_members(dir_a), load_members(dir_b)
-    ks = sort(intersect(ea.ks, eb.ks))
-    grid = filter(<=(min(ea.nlead, eb.nlead)), LEADS)
-    a, b = restrict(ea, ks), restrict(eb, ks)
-    fa, tra = assemble(a, truth, grid)
-    fb, trb = assemble(b, truth, grid)
-    tra == trb || error("the two runs verify against different truth at the same ICs")
-    ma, mb = cell_moments(fa, tra), cell_moments(fb, trb)
-    cal = paired_calibration(ma, mb, a.t; nboot, level)
+    pl = paired_load(dir_a, dir_b; truth)             # every step of the shorter forecast
+    p05 = paired_primary(dir_a, dir_b; truth, nboot, level, io, pl)
+    pall = paired_primary(dir_a, dir_b; truth, max_lead = WINDOW_ALL, nboot, level, io, pl)
+    ea, eb, ks = pl.ea, pl.eb, pl.ks
     sc = primary_band_scale(truth.q)
-    ne = paired_normalized_error(ma, mb, sc, a.t; nboot, level)
-    fla, flb = flat_count(fa, tra, grid), flat_count(fb, trb, grid)
-    ra = ea.M >= 3 ? member_as_truth_reference(fa, grid; ndraw) : nothing
-    rb = eb.M >= 3 ? member_as_truth_reference(fb, grid; ndraw) : nothing
+    w05 = 1:min(PRIMARY_MAX_LEAD, pl.nl)
+    d05 = paired_window_delta(window_delta_parts(pl.fa, pl.tr, w05),
+                              window_delta_parts(pl.fb, pl.tr, w05), sc, pl.t; nboot, level)
+    # the cell grid: step n is column n of the paired arrays
+    grid = filter(<=(pl.nl), LEADS)
+    fa, fb, tr = pl.fa[:, :, :, grid], pl.fb[:, :, :, grid], pl.tr[:, :, grid]
+    ma, mb = cell_moments(fa, tr), cell_moments(fb, tr)
+    cal = paired_calibration(ma, mb, pl.t; nboot, level)
+    ra = ea.M >= 3 ? member_as_truth_reference(fa, grid; ndraw, flat = false) : nothing
+    rb = eb.M >= 3 ? member_as_truth_reference(fb, grid; ndraw, flat = false) : nothing
     ncell = length(grid) * size(fa, 2)
     function rf(r, f)
         r === nothing && return "(M < 3: no reference)"
         rg = getproperty(r, Symbol(f, :_range))
         return @sprintf("reference %.1f (5-95 %%: %.0f-%.0f)", getproperty(r, f), rg[1], rg[2])
     end
+    verdict(x) = x.hi < 0 ? "A lower" : x.lo > 0 ? "B lower" : "not resolved"
 
+    @printf(io, "NORMALIZED ERROR delta_0.5 of the ensemble mean, every step 1..%d: A %.4f  B %.4f  A - B %+.4f (%+.2f%% of B), %.0f%% CI [%+.4f, %+.4f] -> %s\n",
+            last(w05), d05.a, d05.b, d05.diff, 100 * d05.diff / d05.b, 100 * level, d05.lo, d05.hi,
+            verdict(d05))
     @printf(io, "\nCALIBRATION, %d cells (r in [%.2f, %.2f]), K = %d paired ICs, leads %s\n",
             ncell, CAL_BAND[1], CAL_BAND[2], length(ks), join(grid, ","))
     @printf(io, "  calibrated  A %2d of %d   %s\n", cal.a, ncell, rf(ra, :calibrated))
@@ -1392,19 +1638,14 @@ function paired_compare(dir_a, dir_b; truth = load_truth(), nboot::Integer = 10_
             cal.diff, 100 * level, cal.lo, cal.hi, cal.blocklen, cal.nboot,
             cal.lo > 0 ? "A higher, CI excludes 0" : cal.hi < 0 ? "B higher, CI excludes 0" :
             "not resolved")
-    @printf(io, "  flat        A %2d of %d   %s\n", fla, ncell, rf(ra, :flat))
-    @printf(io, "              B %2d of %d   %s\n", flb, ncell, rf(rb, :flat))
-    @printf(io, "NORMALIZED ERROR of the ensemble mean, %d-cell mean: A %.4f  B %.4f  A - B %+.4f (%+.2f%% of B), %.0f%% CI [%+.4f, %+.4f] -> %s\n",
-            ncell, ne.a, ne.b, ne.diff, 100 * ne.diff / ne.b, 100 * level, ne.lo, ne.hi,
-            ne.hi < 0 ? "A lower" : ne.lo > 0 ? "B lower" : "not resolved")
     (; S, C, hi_pct) = criterion_clauses(p05.hi, p05.score_b, cal.lo; margin)
-    @printf(io, "CRITERION vs B (Sec. 3.7; KS guard G from the long runs, not evaluated here)\n")
+    @printf(io, "CRITERION vs B (Sec. 3.6; KS guard G from the long runs, not evaluated here)\n")
     @printf(io, "  S  CRPS_0.5 CI upper end %+.2f%% of B < 0            : %s\n", hi_pct, S ? "PASS" : "fail")
     @printf(io, "  C  count CI lower end %+.0f > 0, CRPS_0.5 upper %+.2f%% < %+.0f%% : %s\n",
             cal.lo, hi_pct, margin, C ? "PASS" : "fail")
     @printf(io, "  -> improves on B iff G and (S or C): S or C = %s\n", S || C ? "yes" : "no")
-    return (; crps05 = p05, crps_all = pall, calibration = cal, normalized_error = ne,
-            flat_a = fla, flat_b = flb, reference_a = ra, reference_b = rb, ks, grid,
+    return (; crps05 = p05, crps_all = pall, delta05 = d05, calibration = cal,
+            reference_a = ra, reference_b = rb, ks, grid,
             S, C, crps05_hi_pct = hi_pct, margin = Float64(margin))
 end
 
@@ -1493,14 +1734,20 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
             ndiv == 0 && println(io, "     (no `diverged` flag on disk -- pre-2026-09-16 runs ",
                                  "aborted the task, so the failing member was never written)")
         end
-        if isempty(THIN_MEMBERS)
+        if isempty(THIN_MEMBERS) && !LEADWISE
             @printf(io, "   ⚠️ the tables below are conditioned on the ICs this closure SURVIVED\n")
         end
     end
     # 🔴 The exclusion policy, printed whether or not it is in force. A skill table means a
     # different thing under each one, and the two are a factor 1/9 apart in `M` and 3 ICs apart in
     # `K` -- neither visible in the numbers themselves.
-    if !THINNING
+    if LEADWISE
+        @printf(io, "policy: LEAD-wise (D6_POLICY=leadwise) -- every member scored at each lead before its stop%s\n",
+                isempty(EXCLUDE_ICS) ? "" :
+                "; D6_EXCLUDE_ICS = " * join(sort(collect(EXCLUDE_ICS)), ",") * " kept out")
+        ndiv > 0 && println(io, "     ⚠️ past a stop the IC scores the members that remain; its rank ",
+                            "histogram then uses only the ICs complete at that lead")
+    elseif !THINNING
         @printf(io, "policy: IC-level%s -- whole ICs kept out of the scored set\n",
                 isempty(EXCLUDE_ICS) ? " (none named)" :
                 " (D6_EXCLUDE_ICS = " * join(sort(collect(EXCLUDE_ICS)), ",") * ")")
@@ -1540,8 +1787,8 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
     for (label, level) in (("LEVEL q  -- primary (gotcha #27)", true),
                            ("CORRECTION dQ -- secondary (gotcha #28)", false))
         fc, tr = assemble(ens, truth, grid; level)
-        ss = spread_skill_by_lead(fc, tr; grid, leads)
-        rh = rank_histogram_by_lead(fc, tr; grid, leads, rng)
+        ss = spread_skill_by_lead_lw(fc, tr; grid, leads)
+        rh = rank_histogram_by_lead_lw(fc, tr; grid, leads, rng)
         ref = level ? truth.q : truth.dQ
         sat, lev = saturation(ss, ref, ens.M)
         report_scores(ss, rh, sat; label, io)
@@ -1565,25 +1812,24 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
                 nties == 0 ? " As expected -- the clamp never fires on HIT." :
                 " ⚠️ Unexpected; metrics.md #4's duplicate-by-construction case was ruled out.")
         if level
-            # 🔑 Paper Sec. 3.5 (Rik, 2026-10-06): both counts over all cells, each with its
+            # 🔑 Paper Sec. 3.4 (Rik, 2026-10-06): the calibrated count over all cells, with its
             # member-as-truth reference. `D6_REF_NDRAW` (default 1000; 0 skips) sets the draws.
+            # 🔒 2026-10-08 (Rik): the flat count is no longer a paper score (it overlaps the
+            # calibrated count); it is printed as a diagnostic, without the costly reference.
             ncal = count(x -> CAL_BAND[1] <= x <= CAL_BAND[2], Iterators.flatten(ss.ratio))
             nflat = count(is_flat, Iterators.flatten(rh.hist))
             ncell = sum(length, ss.ratio)
             nd = parse(Int, get(ENV, "D6_REF_NDRAW", "1000"))
             ref = (ens.M >= 3 && nd > 0 && all(l -> l == grid, leads)) ?
-                  member_as_truth_reference(fc, grid; ndraw = nd) : nothing
+                  member_as_truth_reference(fc, grid; ndraw = nd, flat = false) : nothing
             refcal = ref === nothing ?
                      "  (no reference: M < 3, D6_REF_NDRAW = 0 or per-QoI grids)" :
                      @sprintf("  -- reference %.1f (5-95 %%: %.0f-%.0f, %d draws, M - 1 = %d)",
                               ref.calibrated, ref.calibrated_range[1], ref.calibrated_range[2],
                               ref.ndraw, ref.M_ref)
-            refflat = ref === nothing ? "" :
-                      @sprintf("  -- reference %.1f (5-95 %%: %.0f-%.0f)", ref.flat,
-                               ref.flat_range[1], ref.flat_range[2])
             @printf(io, "\n  calibrated cells (r in [%.2f, %.2f]): %d of %d%s\n", CAL_BAND[1],
                     CAL_BAND[2], ncal, ncell, refcal)
-            @printf(io, "  flat cells: %d of %d%s\n", nflat, ncell, refflat)
+            @printf(io, "  flat cells: %d of %d (diagnostic, not a paper score)\n", nflat, ncell)
             counts = (; calibrated = ncal, flat = nflat, ncell,
                             reference = ref === nothing ? (;) : ref)
         end
@@ -1592,6 +1838,20 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
                 nsat == length(sat) ? "" :
                 " ⚠️ The rest are reported as not reached; do not extrapolate.")
     end
+
+    # 🔒 2026-10-08 (Rik): CRPS_0.5, CRPS_all and delta_0.5 are averages over EVERY step of their
+    # window (`PRIMARY_MAX_LEAD`, `WINDOW_ALL`), not over the cell grid above. Unpaired here: this
+    # closure's own members (its own missing ones only); the paired values come from --compare.
+    steps = collect(1:min(WINDOW_ALL, ens.nlead))
+    fcw, trw = assemble(ens, truth, steps)
+    scw = primary_band_scale(truth.q)
+    cw = crps_by_ic(fcw, trw, scw)
+    w05 = 1:min(PRIMARY_MAX_LEAD, length(steps))
+    window = (; crps05 = mean(view(cw, :, :, w05)), crps_all = mean(cw),
+              delta05 = window_delta(window_delta_parts(fcw, trw, w05), scw),
+              last_step_05 = last(w05), last_step_all = last(steps))
+    @printf(io, "\nWINDOW SCORES (every step): CRPS_0.5 (steps 1..%d) %.5f   CRPS_all (steps 1..%d) %.5f   delta_0.5 %.4f\n",
+            window.last_step_05, window.crps05, window.last_step_all, window.crps_all, window.delta05)
 
     mkpath(outdir)
     # 🔴 Named after the run directory. A fixed name meant scoring three closures in a row left
@@ -1610,8 +1870,8 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
     jldsave(p; level = out[:level], correction = out[:correction],
             labels = LABELS, T_int = T_INT, dt = DT, truth = truth.source,
             ics = ens.ks, clamp_nfired = cl.nfired, clamp_nsteps = cl.nsteps,
-            clamp_members = cl.members_fired, clamp_ics = cl.ics_fired, counts,
-            policy = !THINNING ? "ic_level" :
+            clamp_members = cl.members_fired, clamp_ics = cl.ics_fired, counts, window,
+            policy = LEADWISE ? "lead_wise" : !THINNING ? "ic_level" :
                      isempty(EXCLUDE_ICS) ? "member_level" : "isolation_control",
             excluded_ics = sort(collect(EXCLUDE_ICS)),
             thinned_members = ens.thinned, member_ids = ens.member_ids,
