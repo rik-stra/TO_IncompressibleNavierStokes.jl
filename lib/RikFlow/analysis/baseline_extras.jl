@@ -40,6 +40,18 @@ for c in CL3
         @printf("   %-8s %-6d %s %7.2f\n", c, l, fmt6(b[:, j]), mean(b[:, j]))
     end
 end
+# The same bias in the unit of the long-run mean bias b (paper Eq. mean bias; Rik 2026-10-12: one
+# unit, so that forecast and long run compare): the mean over the ICs of the ensemble mean against
+# that of the reference, minus one, in %, per QoI and its mean over the QoIs.
+println("   the same, % of the reference mean over the ICs (Eq. mean bias)")
+for c in CL3
+    fc, tr = asm[c]
+    b = (dropdims(mean(ensemble_mean(fc); dims = 1); dims = 1) ./
+         dropdims(mean(tr; dims = 1); dims = 1) .- 1) .* 100                    # nq x L
+    for (j, l) in pairs(grid)
+        @printf("   %-8s %-6d %s %7.1f\n", c, l, fmt6(b[:, j]; d = 1), mean(b[:, j]))
+    end
+end
 
 # --- 2. long-run bias per 10 TU block -----------------------------------------------------------------
 println("\n2. Long-run bias per 10 TU block, % of the reference mean over the same block (mean over replicas; range over QoIs)")

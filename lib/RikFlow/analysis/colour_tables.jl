@@ -157,3 +157,15 @@ for h in (5, 7)
             join((@sprintf("%s %.4f", LAB[i], sqrt(mean(abs2, E[:, i])) / sdq[i]) for i in 1:NQ), "  "),
             n + 1, size(X, 1), size(X, 1))
 end
+
+# Paper Fig. colour-sweep (2026-10-12, Rik: "can table 5 be replaced by plots of the auto-correlation
+# function?"): the residual ACF of every row, lags 0-KMAX, on the training rows and on 10-100 TU, for
+# plot_paper_secs45.jl (`sweep`).
+let out = joinpath(@__DIR__, "output", "colour_acf.jld2")
+    labels = String[first(r) for r in rows]
+    acf_train = [reduce(hcat, [acfv(view(Rt, :, i), KMAX) for i in 1:NQ]) for (_, (Rt, _)) in rows]
+    acf_held = [reduce(hcat, [acfv(view(Rh, :, i), KMAX) for i in 1:NQ]) for (_, (_, Rh)) in rows]
+    mkpath(dirname(out))
+    jldsave(out; labels, acf_train, acf_held, kmax = KMAX)
+    println("\nwrote $out")
+end

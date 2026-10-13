@@ -2569,3 +2569,24 @@ On the 87 ICs (`D6_POLICY=ic D6_EXCLUDE_ICS=170,197,313`): CRPS_0.5 0.2175 / 0.2
 CRPS_all 0.3893 / 0.4084 / 0.6340, δ₀.₅ 0.4450 / 0.4703 / 0.8247, calibrated 27 / 5 / 4 — the
 lead-wise rule moves every CRPS and δ by < 2.5 % and the count by ≤ 1.
 §15/§19's CRPS and NE values are the grid versions and are superseded for the paper.
+
+## 21. Combining the QoIs; the bias in one unit (2026-10-12, laptop; Rik decided)
+
+Rik: every measure is computed per QoI and then combined over the six (paper Sec. 3.4, Table
+`tab: measures`), and the bias of the long runs and of the hindcast is given in one unit (%).
+
+- **Long runs** (`longrun_stats.jl`, new): mean bias b = mean over the QoIs of b_i, per run and pooled;
+  in every run of every baseline the six b_i have the same sign. Pooled b: LinReg1 −7.3 %, LinReg7
+  −4.9 %, DDN −9.0 %. Long-run spread–skill with each QoI ÷σ_i before pooling (now also
+  `score_m0_ddn.jl` `ss_of`): 1.525 / 0.988 / 0.977 (raw pooling gave 1.507 / 0.982 / 0.979).
+- **Hindcast** (`baseline_extras.jl` §1, added): bias of the ensemble mean in % of the reference mean
+  over the ICs (Eq. mean bias), mean over the QoIs, lead-wise, 90 ICs:
+
+  | lead (steps) | 25 | 50 | 100 | 200 | 400 | 1000 |
+  |---|---|---|---|---|---|---|
+  | LinReg1 | 0.0 | −0.4 | −1.8 | −2.9 | −4.2 | −5.9 |
+  | LinReg7 | 0.0 | −0.5 | −2.3 | −4.0 | −4.1 | −5.1 |
+  | DDN | −0.8 | −1.2 | −2.7 | −7.3 | −7.2 | −10.9 |
+
+  The σ-unit values of §15 reproduce exactly. At 0.5 and 2.5 TU the sign is the same in every QoI;
+  at 25–50 steps the [16,32] bands of the LinRegs are slightly positive.

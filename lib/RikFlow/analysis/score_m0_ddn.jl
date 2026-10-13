@@ -317,15 +317,20 @@ function score_regime_c(name, ens, q_ref, ref_dQ; dt = DT, lag_int = nothing)
     drt_dQ    = has_dQ ? [delta_rho(t, ref_dQ; lag = li) for t in dtrajs] : nothing
     # #18: the climatological spread-skill of the **level**, from replicas that have fully
     # decorrelated from their common start. Reported and labelled, never quoted as a lead.
+    # Every QoI is divided by the standard deviation of the reference over its whole record before
+    # the sums are pooled over the QoIs (paper Sec. 3.4, Rik 2026-10-12); pooled raw, the Z bands
+    # (~1e3, against ~0.07 for E[16,32]) set the ratio. `per_qoi` is unchanged by the scaling;
+    # `spread` and `skill` are in units of that standard deviation.
     M = length(trajs)
     nq = size(trajs[1], 1)
     function ss_of(ts, ref)
         K = min(minimum(size(t, 2) for t in ts), size(ref, 2))
+        sig = vec(std(ref; dims = 2))
         arr = Array{Float64}(undef, K, nq, length(ts))
         for (j, t) in enumerate(ts)
-            arr[:, :, j] .= transpose(view(t, :, 1:K))
+            arr[:, :, j] .= transpose(view(t, :, 1:K)) ./ sig'
         end
-        return length(ts) > 1 ? spread_skill(arr, transpose(view(ref, :, 1:K))) : nothing
+        return length(ts) > 1 ? spread_skill(arr, transpose(view(ref, :, 1:K)) ./ sig') : nothing
     end
     ss = ss_of(trajs, qref)
     ss_dQ = has_dQ ? ss_of(dtrajs, ref_dQ) : nothing

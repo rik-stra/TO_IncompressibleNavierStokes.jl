@@ -552,6 +552,10 @@ point where the standalone operator becomes **contractive** (ρ crosses 1 betwee
 | ensemble KS, `dQ` | 0.435 | 0.426 | **0.402** | 0.665 | 1.188 | 2.243 |
 | Δρ₁(dQ) | **0.028** | **0.037** | 2.740 | 4.922 | 6.666 | 8.602 |
 
+⚠️ **2026-10-12:** the spread–skill row above pools the raw sums over the QoIs, so the Z bands set it.
+`score_m0_ddn.jl` now divides every QoI by σ of the reference first (paper Sec. 3.4): **1.525 / 1.448 /
+0.988 / 0.761 / 0.489 / 0.210**, DDN 0.977 (`longrun_stats.jl`). Only λ = 1e4 moves by more than 0.02.
+
 🔑 **λ = 1 is the best cell this project has run, and it is best on the correction too.** Summed KS
 **0.648** against 0.836 at λ = 0 — the lowest in the report — on per-band KS of 0.087–0.118, the
 lowest of any closure in five of the six bands. ⚠️ The exception is `E[0,6]`, where it ties the DDN

@@ -287,8 +287,8 @@ function fig_step()
         lines!(ax, k, sm; color = C_REF)
         hlines!(ax, [0.0]; color = :gray70, linewidth = 0.5)
         r, cc = pos(i)
-        r == 2 && (ax.xlabel = "steps after the step")
-        cc == 1 && (ax.ylabel = "response per unit step")
+        r == 2 && (ax.xlabel = "steps since the error began")
+        cc == 1 && (ax.ylabel = "response per unit error")
         # each panel on its own range: the integrator line leaves the panel where it must, and the
         # Z[7,15] / Z[16,32] responses (peaks of ~5) are not flattened by a shared 0-200 axis
         span = maximum(hi) - min(minimum(lo), 0)
@@ -323,6 +323,61 @@ let src = joinpath(@__DIR__, "m0c_checks.jl"), want = Set([:ar2_acf, :ar2_statio
     got == want || error("m0c_checks.jl no longer defines $(setdiff(want, got)) at top level")
 end
 
+"""
+The residual ACF of the mean models of Sec. 5 on 10-100 TU (colour_tables.jl writes
+`output/colour_acf.jld2`), in two blocks: the history length at λ = 0, and the ridge at h = 5. Each
+sweep is one sequential hue, light to dark with the parameter (dataviz: magnitude = one hue); LinReg1
+and LinReg7 keep their colours of the other figures; the correction dQ is the black reference. Replaces
+Table 5 (Rik, 2026-10-12).
+"""
+function fig_sweep()
+    d = load(joinpath(@__DIR__, "output", "colour_acf.jld2"))
+    A = Dict(l => a for (l, a) in zip(d["labels"], d["acf_held"]))
+    L = d["kmax"]; lags = 1:L
+    blocks = [(L"\text{history length, } \lambda = 0",
+               [("dQ (prediction q*^n)", L"dQ", C_REF, :dash),
+                ("h = 1, λ = 0", L"h = 1", to_color("#9ECAE1"), :solid),
+                ("h = 2, λ = 0", L"h = 2", to_color("#4A98C9"), :solid),
+                ("h = 5, λ = 0 (LinReg1)", L"h = 5 \; \mathrm{(LinReg1)}", COL["LinReg1"], :solid),
+                ("h = 7, λ = 0", L"h = 7", to_color("#08306B"), :dot)]),
+              (L"\text{ridge, } h = 5",
+               [("dQ (prediction q*^n)", L"dQ", C_REF, :dash),
+                ("h = 5, λ = 0 (LinReg1)", L"\lambda = 0 \; \mathrm{(LinReg1)}", COL["LinReg1"], :solid),
+                ("h = 5, λ = 1e-4", L"\lambda = 10^{-4}", to_color("#F3BB86"), :solid),
+                ("h = 5, λ = 1e-2", L"\lambda = 10^{-2}", to_color("#EC9A57"), :solid),
+                ("h = 5, λ = 0.1", L"\lambda = 0.1", to_color("#E27A2E"), :solid),
+                ("h = 5, λ = 1 (LinReg7)", L"\lambda = 1 \; \mathrm{(LinReg7)}", COL["LinReg7"], :solid),
+                ("h = 5, λ = 10", L"\lambda = 10", to_color("#7A2E00"), :solid)])]
+    fig = Figure(size = (W, 470), figure_padding = (2, 6, 2, 2))
+    for (b, (title, curves)) in enumerate(blocks)
+        g = fig[2b - 1, 1] = GridLayout()
+        Label(g[0, 1:3], title; fontsize = 8, halign = :left, tellwidth = false)
+        axs = [Axis(g[pos(i)...]; title = QLAB[i], LAGAX...) for i in 1:NQ]
+        for i in 1:NQ
+            ax = axs[i]
+            hlines!(ax, [0.0]; color = :gray70, linewidth = 0.5)
+            for (key, _, col, ls) in curves
+                lines!(ax, lags, A[key][2:end, i]; color = col, linewidth = 1.0, linestyle = ls)
+            end
+            r, cc = pos(i)
+            r == 2 ? (ax.xlabel = "lag (steps)") : (ax.xticklabelsvisible = false)
+            cc == 1 ? (ax.ylabel = "autocorrelation") : (ax.yticklabelsvisible = false)
+            xlims!(ax, 1, L); ylims!(ax, -0.3, 1.02)
+        end
+        Legend(fig[2b, 1], [LineElement(color = c, linestyle = ls) for (_, _, c, ls) in curves],
+               [lab for (_, lab, _, _) in curves]; orientation = :horizontal, nbanks = 1)
+        rowgap!(g, 3); colgap!(g, 10)
+        for (key, _, _, _) in curves
+            a = A[key]
+            @printf("sweep: %-24s rho1 %s | ratio (1 + 2 sum, lags 1-%d) %s\n", key,
+                    join((@sprintf("%.2f", a[2, i]) for i in 1:NQ), " "), L,
+                    join((@sprintf("%.1f", 1 + 2sum(a[2:end, i])) for i in 1:NQ), " "))
+        end
+    end
+    rowgap!(fig.layout, 4)
+    savefig("colour_sweep_acf.pdf", fig)
+end
+
 "The deployed model's residual on the training rows (steps 400-4000), as colour_tables.jl builds it."
 function train_residual(name)
     m = load(joinpath(OUTD, "TO_LRS", name, "LinReg.jld2"))
@@ -336,6 +391,7 @@ end
 function fig_resacf(; L = 200)
     lags = 1:L                                   # log lag axis: lag 0 (= 1) is not drawn
     R = Dict(c => train_residual(c) for c in ("LinReg1", "LinReg7"))
+    F7 = full_residual("LinReg7")                # its residual on 10-100 TU: the tail beyond the fit
     fig = Figure(size = (W, 240), figure_padding = (2, 6, 2, 2))
     axs = qoi_axes(fig; LAGAX...)
     for i in 1:NQ
@@ -355,6 +411,10 @@ function fig_resacf(; L = 200)
                 1 + 2sum(a7[2:end]), 1 + 2sum(f2[2:end]), 1 + 2sum(fu[2:end]), 1 + 2sum(f1[2:end]), q1, q2)
         lines!(ax, lags, a1[2:end]; color = COL["LinReg1"], linewidth = 1.1)
         lines!(ax, lags, a7[2:end]; color = COL["LinReg7"], linewidth = 1.1)
+        a7h = autocorr(F7.R[F7.ho, i], L)
+        @printf("resacf: %-8s LinReg7 on 10-100 TU: rho1 %.2f, ACF at lags 20 / 50 / 100: %.2f / %.2f / %.2f (training %.2f / %.2f / %.2f; AR(2) %.2f / %.2f / %.2f)\n",
+                LABELS[i], a7h[2], a7h[21], a7h[51], a7h[101], a7[21], a7[51], a7[101], f2[21], f2[51], f2[101])
+        lines!(ax, lags, a7h[2:end]; color = (COL["LinReg7"], 0.45), linewidth = 1.1)
         lines!(ax, lags, fu[2:end]; color = :gray55, linewidth = 0.6, linestyle = :dashdot)
         lines!(ax, lags, f2[2:end]; color = C_REF, linewidth = 0.8, linestyle = :dash)
         lines!(ax, lags, f1[2:end]; color = C_REF, linewidth = 0.8, linestyle = :dot)
@@ -364,11 +424,12 @@ function fig_resacf(; L = 200)
         xlims!(ax, 1, L); ylims!(ax, -0.3, 1.02)
     end
     Legend(fig[3, 1:3], [LineElement(color = COL["LinReg1"]), LineElement(color = COL["LinReg7"]),
+                         LineElement(color = (COL["LinReg7"], 0.45)),
                          LineElement(color = C_REF, linestyle = :dash),
                          LineElement(color = :gray55, linestyle = :dashdot),
                          LineElement(color = C_REF, linestyle = :dot)],
-           ["LinReg1", "LinReg7", "AR(2), constrained", "AR(2), unconstrained", "AR(1)"];
-           orientation = :horizontal)
+           ["LinReg1", "LinReg7", "LinReg7, 10–100 TU", "AR(2), constrained", "AR(2), unconstrained", "AR(1)"];
+           orientation = :horizontal, nbanks = 2)
     rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
     savefig("colour_residual_acf.pdf", fig)
 end
@@ -492,6 +553,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
     end
     "step" in want && fig_step()
     "resacf" in want && fig_resacf()
+    "sweep" in want && fig_sweep()
     "dqacf" in want && fig_dqacf()
     "scale" in want && fig_scale()
 end
