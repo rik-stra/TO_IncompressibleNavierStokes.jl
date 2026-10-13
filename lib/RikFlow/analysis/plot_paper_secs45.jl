@@ -479,7 +479,11 @@ function fig_dqacf(; L = 200)
                     maximum(abs, am[2:end] .- ar[2:end]),
                     join((@sprintf("%.2f", maximum(abs, A[2:end, j] .- ar[2:end])) for j in axes(A, 2)), " "))
             for j in axes(A, 2)
-                lines!(ax, lags, A[2:end, j]; color = (col, 0.7), linewidth = 0.6)
+                # Rik, 2026-10-13: the run with the alternating burst at 36.3 TU (LinReg1 replica 4; Sec. 5.4) is drawn
+                # dotted, so its sawtooth in E[0,6] is identified in the legend, not left unexplained.
+                ev = lab == "LinReg1" && j == 4
+                lines!(ax, lags, A[2:end, j]; color = (col, ev ? 1.0 : 0.7), linewidth = ev ? 0.9 : 0.6,
+                       linestyle = ev ? :dot : :solid)
             end
         end
         lines!(ax, lags, ar[2:end]; color = C_REF, linewidth = 1.1, linestyle = :dash)
@@ -489,8 +493,10 @@ function fig_dqacf(; L = 200)
         xlims!(ax, 1, L); ylims!(ax, -0.3, 1.02)
     end
     Legend(fig[3, 1:3], [[LineElement(color = C_REF, linestyle = :dash)];
-                         [LineElement(color = col) for (_, _, col) in sets]],
-           ["tracked record"; [lab * ", long runs" for (lab, _, _) in sets]]; orientation = :horizontal)
+                         [LineElement(color = col) for (_, _, col) in sets];
+                         [LineElement(color = COL["LinReg1"], linestyle = :dot, linewidth = 0.9)]],
+           ["tracked record"; [lab * ", long runs" for (lab, _, _) in sets]; "LinReg1, run with the alternating burst"];
+           orientation = :horizontal)
     rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
     savefig("colour_dq_acf.pdf", fig)
 end
