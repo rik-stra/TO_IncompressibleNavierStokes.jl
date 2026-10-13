@@ -10,6 +10,7 @@
 #   julia --project tools/run_d6.jl 1,3,5         # several ICs, one process (run_d6_packed.sh)
 #   julia --project tools/run_d6.jl --all         # every IC the filter below selects, one process
 #   julia --project tools/run_d6.jl --list        # print the selected ordinals and stop
+#   julia --project tools/run_d6.jl --only        # the ICs named in D6_ONLY (a member subset)
 #
 # Environment overrides, all optional:
 #   D6_IC_DIR    where the `d6_ic_<k>.jld2` packages live
@@ -29,6 +30,19 @@
 #   D6_STRIDE    take every n-th IC of the window (default 1)
 #     An ordinal outside the filter is SKIPPED (exit 0), so `--array=1-180` with D6_BLOCK set runs
 #     the block and idles the rest. Ordinal 0 (validation) ignores the filter.
+#   RIKFLOW_GATE on (default) | off -- the LinReg turbulence gate (`RikFlow.gate_from_env`). `off`
+#                writes only into a D6_OUT ending in `_nogate` (and `on` never into one); lrs only.
+#   D6_ONLY      run only these members, `k:member` pairs, e.g. `42:3,42:10,46:2` (field index k,
+#                not ordinal). With `--only` as the argument, the ordinals are those of the listed k.
+#   D6_PAIR_WITH a directory of the same closure's earlier members (same k, member): each member's
+#                seed must equal the earlier file's, and the output records the first `dQ` column
+#                where the two runs differ (`pair_first_diff`, 0 = identical) -- the gate-off
+#                rerun's check that it reproduces the gated original up to the first firing.
+#
+# 🔑 Gate-off rerun of the members that fired (handoff_gate_off_2026-10-13, Step 3):
+#   RIKFLOW_GATE=off D6_ONLY=<pairs> D6_PAIR_WITH=output/D6_LinReg1 \
+#     D6_OUT=output/D6_LinReg1_nogate julia --project tools/run_d6.jl --only
+#   The 865 members that never fired are their own gate-off run; they are copied in afterwards.
 #
 # 🔑 Mini-D6 (plan §7 stage 3), on the desktop, one process so the solver compiles once:
 #   D6_CLOSURE=lstm D6_MODEL=diag/r3_lin_sd_h2 D6_BLOCK=selection D6_MEMBERS=5 D6_NLEAD=400 \
@@ -79,7 +93,8 @@ using CUDA
 
 # `select_ics`, `ic_path`, `manifest_path`, `N_WARM`, `N_LEAD` -- the one definition of D6's IC set.
 include(normpath(joinpath(@__DIR__, "..", "..", "analysis", "build_d6_ics.jl")))
-# `parse_closure`, `resolve_lstm_model`, `make_lstm_sampler`, `gate_census`, `check_out_dir` -- the
+# `parse_closure`, `resolve_lstm_model`, `make_lstm_sampler`, `gate_census`, `check_out_dir`,
+# `only_members`, `first_diff_col` -- the
 # M4 path, in a file the offline suite loads too (`test/test_d6_lstm.jl`).
 include(joinpath(@__DIR__, "d6_lib.jl"))
 
@@ -125,6 +140,9 @@ n_members() = parse(Int, get(ENV, "D6_MEMBERS", "10"))
 
 "`D6_NLEAD`, or `nothing` for the package's own forecast length."
 n_lead_env() = (s = strip(get(ENV, "D6_NLEAD", "")); isempty(s) ? nothing : parse(Int, s))
+
+"`D6_PAIR_WITH`, or `nothing`."
+pair_dir() = (s = strip(get(ENV, "D6_PAIR_WITH", "")); isempty(s) ? nothing : String(s))
 
 """
     member_seed(k, member)
@@ -406,6 +424,19 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     end
     nq = size(params_ic.qois, 1)
 
+    # 🔑 The turbulence gate (2026-10-13): switchable for the LinReg path only. The M4 path keeps
+    # the constant (out of scope, handoff_gate_off_2026-10-13) and the DDN has no gate to switch.
+    gate = RikFlow.gate_from_env()
+    if cl === :lrs
+        RikFlow.check_gate_dir(od, gate)
+    elseif gate != RikFlow.TURBULENCE_GATE
+        error("RIKFLOW_GATE=off is implemented for D6_CLOSURE=lrs only, not $cl")
+    end
+    subset = only_members()
+    pdir = pair_dir()
+    pdir === nothing || isdir(pdir) || error("D6_PAIR_WITH = $pdir is not a directory")
+    pdir !== nothing && abspath(pdir) == abspath(od) && error("D6_PAIR_WITH must differ from D6_OUT")
+
     block = filt.block === nothing ? "" : string(filt.block)
     run_id = (; closure = string(cl), model_name, block, nlead)
     # Validation files are `d6_valid_*`, which neither this check nor the scorer's glob sees.
@@ -425,6 +456,10 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     filt.active && @printf("  IC filter %s: t in [%g, %g] TU, stride %d; this IC t = %.2f (block %s)\n",
                            filt.label, filt.tmin, filt.tmax, filt.stride, t_k, ic_block(t_k))
     @printf("  ou_advance = %d, savefreq = %d (> nt, so no fields)\n", n_k, nt + 1)
+    cl === :ddn || @printf("  turbulence gate: threshold %g%s\n", gate, gate == 0 ? " (OFF)" : "")
+    subset === nothing || @printf("  D6_ONLY: members %s of this IC\n",
+                                join(sort(collect(get(subset, k, Set{Int}()))), ","))
+    pdir === nothing || println("  paired with ", pdir)
     if validation
         println("  🔑 VALIDATION run, not a scored one. This is R2's own online initial")
         println("     condition, so ou_advance = 0 -- the identity point of the replay -- and the")
@@ -443,6 +478,7 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     walls = Float64[]                  # per-member wall time; member 1 carries the compilation
     diverged_members = Int[]           # metric #16's raw material; see the short-`q` branch
     for member in 1:M
+        subset === nothing || member in get(subset, k, Set{Int}()) || continue
         out = joinpath(od, validation ? "d6_valid_ic$(k)_m$(member).jld2" :
                                         "d6_online_ic$(k)_m$(member).jld2")
         if isfile(out) && !force
@@ -452,6 +488,19 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
         end
 
         seed = validation ? validation_seed(member) : member_seed(k, member)
+        # 🔑 The pairing check, BEFORE the GPU time: `member_seed` is a `hash`, which Julia does not
+        # promise to keep stable across versions, so the earlier file's recorded seed decides.
+        pair_dQ = nothing
+        if pdir !== nothing
+            pf = joinpath(pdir, basename(out))
+            isfile(pf) || error("D6_PAIR_WITH: no $pf to pair member $member of IC $k with")
+            pd = load(pf)
+            pd["seed"] == seed || error("D6_PAIR_WITH: $pf has seed $(pd["seed"]), this run " *
+                                        "$seed -- member_seed's hash changed; no common random numbers")
+            (pd["k"], pd["member"], pd["nwarm"], pd["nlead"]) == (k, member, nwarm, nlead) ||
+                error("D6_PAIR_WITH: $pf is not the same (k, member, nwarm, nlead)")
+            pair_dQ = pd["dQ"]
+        end
         sampler = if cl === :lstm
             # 🔑 Same `dQ_warm`, same member seed, same IC, and the SAME gate constant `LinReg`
             # reads (`make_lstm_sampler`'s docstring). `Array{T}`, not `ArrayType{T}`: `StochLSTM`
@@ -465,7 +514,7 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
             q_hist = ArrayType{T}(zeros(T, nq, hist_len))
             hist_var == :q_star_q && (q_hist = cat(q_hist, q_hist, dims = 1))
             RikFlow.LinReg(mdl, Xoshiro(seed), ArrayType;
-                           q_hist, spinnup_data = ArrayType{T}(dQ_warm))
+                           q_hist, spinnup_data = ArrayType{T}(dQ_warm), gate)
         else
             # 🔑 Same `dQ_warm`, same member seed, same IC. The DDN replays the identical warm-up
             # the LRS does, so both enter the forecast from the same physical state -- and the
@@ -536,6 +585,19 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
         warm_identical || error("member $member: dQ[:, 1:$nchk] is NOT bit-identical to the " *
                                 "package's dQ_warm -- the warm-up replay is broken")
         gc = gate_census(view(dQ_run, :, 1:nstep_run), nwarm)
+        # 🔑 D6_PAIR_WITH: where does this run first leave the earlier one? For a gate-off rerun of a
+        # gated member the answer must be the original's first firing (`pair_expected`, a column);
+        # anything earlier means the rerun does not reproduce the original (software or hardware
+        # drift), and the pair is not common-random-numbers. Recorded, not raised: it is a result.
+        pair_meta = (;)
+        if pair_dQ !== nothing
+            pfd = first_diff_col(view(dQ_run, :, 1:nstep_run), pair_dQ)
+            pgc = gate_census(pair_dQ, nwarm)
+            # a rerun at the original's own setting (gate on, the fallback pair) must be identical
+            pexp = (gate == RikFlow.TURBULENCE_GATE || pgc.first_lead == 0) ? 0 : nwarm + pgc.first_lead
+            pair_meta = (; paired_with = abspath(pdir), pair_first_diff = pfd, pair_expected = pexp,
+                         pair_ok = pfd == pexp)
+        end
 
         # 🔴 TRUNCATE `dQ` AND `tau`. `allocate_arrays_outputs` builds them as
         # `Array{T}(undef, N_qois, nstep)` -- **uninitialised**, not zeros -- so on a short run the
@@ -555,9 +617,9 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
                 # 🔴 The turbulence-gate census, the same statistic for every closure (#59/#65):
                 # identically-zero forecast `dQ` columns. `gate_threshold` is NaN for the DDN,
                 # which has no gate by decision (#65).
-                gate_threshold = cl === :ddn ? NaN : RikFlow.TURBULENCE_GATE,
+                gate_threshold = cl === :ddn ? NaN : cl === :lrs ? gate : RikFlow.TURBULENCE_GATE,
                 gate_nfired = gc.nfired, gate_first_lead = gc.first_lead,
-                warm_identical, lstm_meta..., ar_meta...,
+                warm_identical, lstm_meta..., ar_meta..., pair_meta...,
                 # 🔑 `diverged` is the flag every consumer must branch on; `nstep` says where it
                 # stopped. A complete member carries `diverged = false` and `nstep = nt`, so the
                 # keys exist unconditionally and no reader needs a `haskey` fallback.
@@ -570,6 +632,9 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
         @printf("  member %2d/%d: %.1f s, q0 median rel %.1e, warm-up dQ bit-identical, gate %d/%d, %.0f kB%s\n",
                 member, M, wall, chk.median_rel, gc.nfired, gc.nsteps, filesize(out) / 1024,
                 diverged ? @sprintf("  🔴 partial, %d/%d steps", nstep_run, nt) : "")
+        isempty(pair_meta) || @printf("               paired: first differing dQ column %d, expected %d -- %s\n",
+                                      pair_meta.pair_first_diff, pair_meta.pair_expected,
+                                      pair_meta.pair_ok ? "OK" : "🔴 MISMATCH (not a CRN pair)")
         flush(stdout)
     end
 
@@ -651,7 +716,7 @@ every selected ordinal in this process, so the solver compiles once (the desktop
 `--list` prints the selection and stops.
 """
 function main(args = ARGS)
-    isempty(args) && error("usage: run_d6.jl <ordinal>[,<ordinal>...] | --all | --list   (ordinal 1..K is the " *
+    isempty(args) && error("usage: run_d6.jl <ordinal>[,<ordinal>...] | --all | --list | --only   (ordinal 1..K is the " *
                            "array task id; 0 = the validation IC, fields[1] of the record)")
     filt = ic_filter_from_env()
     if args[1] in ("--all", "--list")
@@ -677,7 +742,21 @@ function main(args = ARGS)
     # job-hour on gpu_h100). `batch_scripts/run_d6_packed.sh` hands each array task its slice. A
     # single ordinal is the one-element list, so the old call is unchanged.
     done = Int[]
-    for ordinal in parse.(Int, split(args[1], ","))
+    ordinals = if args[1] == "--only"
+        # 🔑 The ordinals of the ICs named in D6_ONLY (2026-10-13), in manifest order.
+        subset = only_members()
+        subset === nothing && error("--only needs D6_ONLY")
+        man = load(manifest_path(ic_dir()))
+        missing_k = setdiff(keys(subset), man["k"])
+        isempty(missing_k) || error("D6_ONLY names k = $(sort(collect(missing_k))), not in the manifest")
+        o = findall(in(keys(subset)), man["k"])
+        @printf("--only: %d ICs, %d members; ordinals %s\n", length(o), sum(length, values(subset)),
+                join(o, ","))
+        o
+    else
+        parse.(Int, split(args[1], ","))
+    end
+    for ordinal in ordinals
         if ordinal != 0 && filt.active
             ords, man = selected_ordinals(filt)
             if !(ordinal in ords)

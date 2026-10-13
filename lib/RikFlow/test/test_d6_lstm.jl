@@ -209,9 +209,12 @@ end
 @testitem "V72 the gate sits where LinReg's does, and the driver passes the one constant" default_imports = false setup = [D6Lstm] begin
     using Test
     RF = D6Lstm.RF
-    # LinReg: every gate site reads the named constant
+    # LinReg: every gate site reads the closure's own threshold, which defaults to the named
+    # constant (switchable since 2026-10-13, V86)
     tsm = read(joinpath(RF, "src", "time_series_methods.jl"), String)
-    @test count("any(abs.(q_star) .< TURBULENCE_GATE) && (dQ .= 0)", tsm) == 4
+    @test count("any(abs.(q_star) .< time_series_method.gate) && (dQ .= 0)", tsm) == 4
+    @test count("TURBULENCE_GATE) && (dQ .= 0)", tsm) == 0
+    @test occursin("gate::Real = TURBULENCE_GATE)", tsm)
     # StochLSTM: the gate is the LAST thing done to the correction -- after the output map and the
     # calibration offset -- and before the step is pushed into the lag window, as in LinReg
     src = read(joinpath(RF, "src", "ts_lstm_online.jl"), String)

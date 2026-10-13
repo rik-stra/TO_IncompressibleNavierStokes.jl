@@ -14,6 +14,11 @@
 #
 # Normally submitted through `submit_lrs.sh`, which fits the model first and sets the dependency.
 #
+# 🔑 Gate off (2026-10-13): `RIKFLOW_GATE=off sbatch --array=1-5 batch_scripts/run_online_array.sh 1`
+# deploys LinReg1's existing fit without the turbulence gate and writes `TO_LRS/LinReg1_nogate/`
+# (the driver refuses any other directory and never overwrites). Same seeds as the gated replicas.
+# Kept on gpu_h100: the gated LinReg1/LinReg6 long runs (2026-09-15/16) ran on this partition.
+#
 # 🔴 THE MODEL MUST ALREADY BE FITTED. This script does NOT train -- `run_online.sh` did both in one
 # job, which cannot become an array without five tasks writing the same `LinReg.jld2` at once. If
 # `output/TO_LRS/LinReg<n>/LinReg.jld2` is absent the tasks fail immediately, and if it is STALE
