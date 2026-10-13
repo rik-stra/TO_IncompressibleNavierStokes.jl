@@ -17,6 +17,10 @@ include(joinpath(@__DIR__, "score_d6.jl"))       # load_members, restrict, assem
 include(joinpath(SRC, "ts_history.jl"))
 include(joinpath(SRC, "ts_scaling.jl"))
 const OUTD = normpath(joinpath(@__DIR__, "..", "exp_square_HIT", "output"))
+# 🔑 BX_NOGATE=1 (2026-10-13, handoff_gate_off_2026-10-13): read the gate-off LinReg1 runs
+# (`D6_LinReg1_nogate`, `TO_LRS/LinReg1_nogate`) in place of the gated ones; the labels stay.
+const NOGATE = get(ENV, "BX_NOGATE", "") == "1"
+sfx(c) = NOGATE && c == "LinReg1" ? "_nogate" : ""
 const LABS = ("Z[0,6]", "E[0,6]", "Z[7,15]", "E[7,15]", "Z[16,32]", "E[16,32]")
 fmt6(v; d = 2) = join((@sprintf("%7.*f", d, x) for x in v), "")
 
@@ -27,7 +31,8 @@ sdref = vec(std(truth.q; dims = 2))
 println("1. Hindcast bias of the ensemble mean by lead, reference sd (policy ", POLICY,
         isempty(EXCLUDE_ICS) ? "" : "; D6_EXCLUDE_ICS = " * join(sort(collect(EXCLUDE_ICS)), ","), ")")
 const CL3 = ("LinReg1", "LinReg7", "DDN")
-ens = Dict(c => load_members(joinpath(OUTD, "D6_$c")) for c in CL3)
+ens = Dict(c => load_members(joinpath(OUTD, "D6_$c" * sfx(c))) for c in CL3)
+NOGATE && println("   (BX_NOGATE: LinReg1 = D6_LinReg1_nogate)")
 ks = sort(intersect((e.ks for e in values(ens))...))
 grid = filter(<=(minimum(e.nlead for e in values(ens))), LEADS)
 @printf("   K = %d ICs, leads %s\n   %-8s %-6s %s   mean\n", length(ks), join(grid, ","), "closure", "lead", join((lpad(l, 7) for l in LABS), ""))
@@ -57,7 +62,7 @@ end
 println("\n2. Long-run bias per 10 TU block, % of the reference mean over the same block (mean over replicas; range over QoIs)")
 function longruns(c)
     dir, pat = c == "DDN" ? (joinpath(OUTD, "TO_DDN"), r"^DDN_data_online_tsim100\.0_replica\d\.jld2$") :
-                            (joinpath(OUTD, "TO_LRS", c), r"^data_online_tsim100\.0_replica\d\.jld2$")
+                            (joinpath(OUTD, "TO_LRS", c * sfx(c)), r"^data_online_tsim100\.0_replica\d\.jld2$")
     fs = sort(filter(f -> occursin(pat, f), readdir(dir)))
     return [jldopen(io -> (q = io["data_online"].q, dQ = io["data_online"].dQ), joinpath(dir, f)) for f in fs]
 end
@@ -95,11 +100,16 @@ end
 println("\n4. ACF of dQ, long runs vs tracked record (0-100 TU), lags 1-200: max |difference| per QoI (worst replica, and replica mean)")
 dqref = rec["q"][:, 2:end] .- rec["q_star"]
 acfr = [autocorr(collect(dqref[i, :]), 200) for i in 1:6]
+# 🔑 Gate firings left out (Rik, 2026-10-13): the firing step and the hist_len steps after it
+# (`gate_keep`, `autocorr_masked`); a run that never fired is scored exactly as before.
 for c in ("LinReg1", "LinReg7", "DDN")
     worst = zeros(6); avg = zeros(6)
+    h = c == "DDN" ? 0 : Int(load(joinpath(OUTD, "TO_LRS", c, "LinReg.jld2"), "hist_len"))
     for r in runs[c]
+        dq = Float64.(r.dQ[:, 1:(size(r.q, 2) - 1)])          # past a divergence stop: uninitialised
+        keep = gate_keep(dq, h)[101:end]
         for i in 1:6
-            a = autocorr(collect(Float64.(r.dQ[i, 101:end])), 200)
+            a = autocorr_masked(collect(dq[i, 101:end]), keep, 200)
             d = maximum(abs, a[2:end] .- acfr[i][2:end])
             worst[i] = max(worst[i], d); avg[i] += d / length(runs[c])
         end

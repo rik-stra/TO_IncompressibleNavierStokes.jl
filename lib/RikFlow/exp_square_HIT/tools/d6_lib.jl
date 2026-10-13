@@ -162,6 +162,40 @@ function gate_census(dQ::AbstractMatrix, nwarm::Integer)
 end
 
 """
+    only_members(s = get(ENV, "D6_ONLY", "")) -> Union{Nothing, Dict{Int,Set{Int}}}
+
+`D6_ONLY` (`k:member` pairs, comma-separated; `k` the field index) parsed as `k => members`;
+`nothing` when unset, i.e. run every member (2026-10-13, the gate-off rerun of the members that
+fired).
+"""
+function only_members(s::AbstractString = get(ENV, "D6_ONLY", ""))
+    s = strip(s)
+    isempty(s) && return nothing
+    d = Dict{Int,Set{Int}}()
+    for tok in split(s, ',')
+        m = match(r"^\s*(\d+):(\d+)\s*$", tok)
+        m === nothing && error("D6_ONLY token $(repr(tok)): expected `k:member`")
+        push!(get!(d, parse(Int, m[1]), Set{Int}()), parse(Int, m[2]))
+    end
+    return d
+end
+
+"""
+    first_diff_col(a, b) -> Int
+
+First column where `a` and `b` differ, bitwise and NaN-safe (`isequal`), over their common width;
+`0` if none, `1` if the row counts differ. `run_d6.jl`'s `D6_PAIR_WITH` check: a gate-off rerun of a
+gated member must first differ at the original's first firing.
+"""
+function first_diff_col(a::AbstractMatrix, b::AbstractMatrix)
+    size(a, 1) == size(b, 1) || return 1
+    for c in 1:min(size(a, 2), size(b, 2))
+        isequal(view(a, :, c), view(b, :, c)) || return c
+    end
+    return 0
+end
+
+"""
     check_out_dir(od, identity)
 
 Refuse to write into `od` if it already holds D6 members of a different experiment (closure, model,

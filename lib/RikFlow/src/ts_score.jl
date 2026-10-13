@@ -37,6 +37,60 @@ function autocorr(x::AbstractVector, maxlag::Int)
 end
 
 """
+    autocorr_masked(x, keep, maxlag)
+
+`autocorr` over the steps with `keep[i] == true` only: mean and variance from the kept steps, and at
+lag `k` only the pairs whose two steps are both kept. Each lag is rescaled to the full series' taper,
+
+    r_k = (Σ_pairs / N_k) / (Σ_kept / N_0) · (N_0 - k) / N_0,
+
+with `N_k` the number of kept pairs, so a gap does not pull the estimate towards zero. With every step
+kept this is `autocorr(x, maxlag)` exactly (it calls it). Used to leave out a gated step and the
+`hist_len` steps whose history holds it (`gate_keep`; Rik, 2026-10-13).
+"""
+function autocorr_masked(x::AbstractVector, keep::AbstractVector{Bool}, maxlag::Int)
+    length(keep) == length(x) || error("autocorr_masked: keep has $(length(keep)) entries, x $(length(x))")
+    all(keep) && return autocorr(x, maxlag)
+    idx = findall(keep)
+    n0 = length(idx)
+    n0 > maxlag || error("autocorr_masked: $n0 kept steps for maxlag $maxlag")
+    mu = sum(view(x, idx)) / n0
+    xc = x .- mu
+    var0 = sum(abs2, view(xc, idx)) / n0
+    amax = maximum(abs, view(x, idx))
+    (var0 == 0 || (amax > 0 && sqrt(var0) <= CONSTANT_RTOL * amax)) && return zeros(Float64, maxlag + 1)
+    r = zeros(Float64, maxlag + 1)
+    for k in 0:maxlag
+        s, nk = 0.0, 0
+        for i in (k + 1):length(x)
+            keep[i] && keep[i - k] || continue
+            s += xc[i] * xc[i - k]
+            nk += 1
+        end
+        r[k + 1] = nk == 0 ? NaN : (s / nk) / var0 * (n0 - k) / n0
+    end
+    return r
+end
+
+"""
+    gate_keep(dQ, h) -> Vector{Bool}
+
+The steps of a run to keep in a `dQ` statistic: `false` at every turbulence-gate firing (an
+identically-zero `dQ` column, #35) and at the `h` steps after it, whose regression history still
+holds the gated step (`h` = the closure's `hist_len`). All `true` for a run that never fired.
+"""
+function gate_keep(dQ::AbstractMatrix, h::Integer)
+    n = size(dQ, 2)
+    keep = trues(n)
+    for c in 1:n
+        if all(iszero, view(dQ, :, c))
+            keep[c:min(n, c + h)] .= false
+        end
+    end
+    return collect(keep)
+end
+
+"""
     CONSTANT_RTOL
 
 A series varying by less than this fraction of its own magnitude counts as constant in

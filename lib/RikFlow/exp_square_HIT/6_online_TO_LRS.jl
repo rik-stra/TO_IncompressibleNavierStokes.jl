@@ -109,7 +109,26 @@ end
 replicas = replica_arg === nothing ? (1:n_replicas) : (replica_arg:replica_arg)
 @info "Deploying $name" model_index lambda=lambda_info replicas=collect(replicas) n_replicas
 
-out_dir = TO_folder*"/$(name)/"
+# 🔑 The turbulence gate (2026-10-13, handoff_gate_off_2026-10-13): `RIKFLOW_GATE=off` deploys the
+# same model with the gate switched off, from the model's own directory, and writes the replicas to
+# `<name>_nogate/` -- never beside or over the gated runs (`check_gate_dir`). Same seeds, so each
+# gate-off replica is its gated namesake's common-random-numbers partner.
+gate = RikFlow.gate_from_env()
+model_src_dir = TO_folder*"/$(name)/"
+out_dir = gate == 0 ? TO_folder*"/$(name)_nogate/" : model_src_dir
+RikFlow.check_gate_dir(out_dir, gate)
+mkpath(out_dir)
+# 🔴 NO RUN OVERWRITES AN EARLIER ONE, gated or not (2026-10-13). The first version guarded gate-off
+# runs only; a gate-off submission whose `RIKFLOW_GATE` never reached the job then ran gated and
+# replaced the September LinReg1/LinReg6 replicas on Snellius. `RIKFLOW_OVERWRITE=1` is the
+# deliberate override (e.g. redeploying a refitted LinReg<n>).
+if get(ENV, "RIKFLOW_OVERWRITE", "") != "1"
+    for i in replicas
+        f = out_dir*"data_online_tsim$(tsim)_replica$(i).jld2"
+        isfile(f) && error("$f exists; refusing to overwrite it (set RIKFLOW_OVERWRITE=1 to replace it)")
+    end
+end
+@info "Turbulence gate" threshold=gate out_dir
 
 # load reference data
 
@@ -153,7 +172,7 @@ params.ou_bodyforce.freeze == 1 || error(
 
 # Run replicas -- all of them, or the single one this array task owns (resolved above).
 for i in replicas
-    LinReg_file_name = out_dir*"LinReg.jld2"
+    LinReg_file_name = model_src_dir*"LinReg.jld2"
     if hist_len == 0
         q_hist = nothing
     else
@@ -162,11 +181,14 @@ for i in replicas
             q_hist = cat(q_hist, q_hist, dims=1)
         end
     end
-    time_series_sampler = RikFlow.LinReg(LinReg_file_name, Xoshiro(seeds.to+i+2), ArrayType, q_hist = q_hist, spinnup_data = ArrayType{T}(dQ_data));
-    
+    time_series_sampler = RikFlow.LinReg(LinReg_file_name, Xoshiro(seeds.to+i+2), ArrayType, q_hist = q_hist, spinnup_data = ArrayType{T}(dQ_data), gate = gate);
+
 # run the sim
     @info "Running sim $i out of $n_replicas"
     data_online = online_sgs(; params..., ustart=ustart, time_series_method=time_series_sampler);
 # Save tracking data
-    jldsave(out_dir*"data_online_tsim$(tsim)_replica$(i).jld2"; data_online, params);
+    # `gate_threshold` and `model` since 2026-10-13: the file says how the gate was set and which
+    # fit it deployed (a `_nogate` directory holds no LinReg.jld2 of its own).
+    jldsave(out_dir*"data_online_tsim$(tsim)_replica$(i).jld2"; data_online, params,
+            gate_threshold = gate, model = LinReg_file_name);
 end

@@ -92,6 +92,12 @@ function hindcast()
     return (; d = out, ks, grid, t = out["LinReg1"].ens.t)
 end
 
+"`dQ` of a long run cut at the run's own length: past a divergence stop it is uninitialised memory."
+dq_of(r) = r.dQ[:, 1:(size(r.q, 2) - 1)]
+
+"The closure's history length (0 for the DDN, which has no history and no gate)."
+hist_len_of(dir) = (f = joinpath(OUTD, replace(dir, "_nogate" => ""), "LinReg.jld2"); isfile(f) ? Int(load(f, "hist_len")) : 0)
+
 "Long free runs (q, dQ per replica) of a closure directory under exp_square_HIT/output."
 function longruns(dir; pat = r"^(DDN_)?data_online_tsim100\.0_replica\d\.jld2$")
     d = joinpath(OUTD, dir)
@@ -450,6 +456,15 @@ function fig_dqacf(; L = 200)
     fig = Figure(size = (W, 240), figure_padding = (2, 6, 2, 2))
     axs = qoi_axes(fig; LAGAX...)
     runs = Dict(dir => longruns(dir) for (_, dir, _) in sets)
+    # 🔑 Gate firings left out (Rik, 2026-10-13): a gated step (dQ = 0) and the hist_len steps whose
+    # history holds it are not the closure's own correction. `gate_keep`/`autocorr_masked` (ts_score.jl);
+    # a run that never fired is scored exactly as before. `dQ` is cut at the run's own length (a
+    # diverged run's `dQ` is uninitialised past its stop).
+    keeps = Dict(dir => [gate_keep(dq_of(r), hist_len_of(dir))[101:end] for r in runs[dir]] for (_, dir, _) in sets)
+    for (lab, dir, _) in sets
+        @printf("dqacf: %-8s steps left out per run (firing + %d after): %s\n", lab, hist_len_of(dir),
+                join((count(!, k) for k in keeps[dir]), " "))
+    end
     for i in 1:NQ
         ar = autocorr(collect(dqref[i, :]), L)
         ax = axs[i]
@@ -457,7 +472,7 @@ function fig_dqacf(; L = 200)
         for (lab, dir, col) in sets
             # one line per run, not a mean: a single run's burst (LinReg1 replica 4, E[0,6], 30-40 TU:
             # dQ alternating in sign step to step) would otherwise move the mean and stay invisible
-            A = reduce(hcat, [autocorr(r.dQ[i, 101:end], L) for r in runs[dir]])
+            A = reduce(hcat, [autocorr_masked(dq_of(r)[i, 101:end], k, L) for (r, k) in zip(runs[dir], keeps[dir])])
             am = vec(mean(A; dims = 2))
             @printf("dqacf: %-8s %-8s lag1 %.2f (record %.2f; runs %s), max |mean - record| %.2f, per run %s\n",
                     LABELS[i], lab, am[2], ar[2], join((@sprintf("%.2f", v) for v in A[2, :]), " "),

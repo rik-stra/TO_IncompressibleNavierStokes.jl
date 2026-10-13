@@ -54,8 +54,46 @@ value and changing it would split the comparison.
 DDN has no laminar-start gate at all -- a real defect on Taylor-Green, where it would inject an SGS
 term into a laminar flow. On HIT it means the two closures are not treated alike; see
 `analysis/results.md`.
+
+🔑 **Switchable per `LinReg` since 2026-10-13** (Rik reopened the "no gate-off rerun" lock):
+`LinReg(...; gate = 0.0)` never fires (`abs(x) < 0` holds for no `x`, NaN included), and the drivers
+read `RIKFLOW_GATE=off` through `gate_from_env`. The default stays this constant, bit for bit.
 """
 const TURBULENCE_GATE = 1e-2
+
+"""
+    gate_from_env(env = ENV) -> Float64
+
+The turbulence-gate threshold a driver deploys, from `RIKFLOW_GATE`: unset, empty or `on` give
+`TURBULENCE_GATE`; `off` gives `0.0` (the gate never fires). Anything else is refused, so a typo
+cannot silently run the wrong experiment.
+"""
+function gate_from_env(env = ENV)
+    s = lowercase(strip(get(env, "RIKFLOW_GATE", "")))
+    s in ("", "on") && return TURBULENCE_GATE
+    s == "off" && return 0.0
+    error("RIKFLOW_GATE = $(repr(s)): expected `on` (or unset) or `off`")
+end
+
+"""
+    check_gate_dir(dir, gate)
+
+Refuse to write a run into a directory whose name does not say how the gate was set: a gate-off run
+(`gate == 0`) only into a directory ending in `_nogate`, a gated one never into such a directory.
+Only the two driver settings are accepted. Keeps gate-off output from ever landing beside, or on
+top of, a gated run of the same closure.
+"""
+function check_gate_dir(dir::AbstractString, gate::Real)
+    nogate_dir = endswith(basename(rstrip(dir, ['/', '\\'])), "_nogate")
+    if gate == 0
+        nogate_dir || error("gate-off run into $dir: the directory name must end in `_nogate`")
+    elseif gate == TURBULENCE_GATE
+        nogate_dir && error("gated run (threshold $gate) into $dir, whose name ends in `_nogate`")
+    else
+        error("gate threshold $gate: the drivers deploy only TURBULENCE_GATE ($TURBULENCE_GATE) or 0.0")
+    end
+    return nothing
+end
 
 function get_next_item_timeseries(time_series_method::Reference_reader)
     val = time_series_method.vals[:,time_series_method.index[]]
@@ -171,7 +209,8 @@ function get_next_item_timeseries(time_series_method::ANN, q_star)
 end
 
 """
-    LinReg(file_name, rng, ArrayType; q_hist = nothing, spinnup_data = nothing)
+    LinReg(file_name, rng, ArrayType; q_hist = nothing, spinnup_data = nothing,
+           gate = TURBULENCE_GATE)
 
 The linear-regression closure (M0): a level prediction `q^n = scale_output(c [x; 1] + η)`, with
 `x` the scaled predictor + history and `η` the residual draw in **scaled units**.
@@ -221,9 +260,13 @@ This consumes `rng`, only in the AR path, and never in the D6 configuration (`nw
 
 # Turbulence gate
 
-When `TURBULENCE_GATE` zeroes `dQ`, the AR state is **still advanced** (the `ξ` draw happens before
+When the gate zeroes `dQ`, the AR state is **still advanced** (the `ξ` draw happens before
 the gate is applied, as the white draw always did). The gate censors the closure's output, not its
 noise process, so a gated step does not shift every later draw of the member's stream.
+
+The threshold is the field `gate` (keyword, default `TURBULENCE_GATE`; `0.0` switches it off). Since
+the draw precedes the gate, a gate-off run with the same seed is the gated run's common-random-numbers
+partner: identical up to the step before the first firing, and differing from that step on.
 """
 struct LinReg
     c
@@ -240,8 +283,11 @@ struct LinReg
     ArrayType
     ar          # nothing (white η), or the AR(p) residual state -- see `load_ar_residual`
     scale       # nothing, or step 4p's power-law scale -- see `load_powerlaw_scale`
+    gate::Float64   # turbulence-gate threshold; TURBULENCE_GATE by default, 0.0 = off
 
-    function LinReg(file_name, rng, ArrayType; q_hist = nothing, spinnup_data = nothing)
+    function LinReg(file_name, rng, ArrayType; q_hist = nothing, spinnup_data = nothing,
+                    gate::Real = TURBULENCE_GATE)
+        isfinite(gate) && gate >= 0 || error("LinReg: gate threshold $gate must be finite and >= 0")
 
         c, stoch_distr, scaling, hist_var, include_predictor, fitted_qois = load(file_name, "c", "stoch_distr", "scaling", "hist_var", "include_predictor", "fitted_qois")
         target = :q
@@ -258,7 +304,7 @@ struct LinReg
         if !isnothing(spinnup_data) && isnothing(q_hist)
             @error "Spinnup not implemented without history"
         end
-        new(c, stoch_distr, scaling, q_hist, spinnup_data, counter, hist_var, include_predictor, fitted_qois, target, rng, ArrayType, ar, scale)
+        new(c, stoch_distr, scaling, q_hist, spinnup_data, counter, hist_var, include_predictor, fitted_qois, target, rng, ArrayType, ar, scale, Float64(gate))
     end
 end
 
@@ -441,10 +487,10 @@ function get_next_item_timeseries(time_series_method::LinReg, q_star)
             if time_series_method.target == :dq
                 dQ = pred
                 # set dQ_i to 0 if q*_i is 0
-                any(abs.(q_star) .< TURBULENCE_GATE) && (dQ .= 0)
+                any(abs.(q_star) .< time_series_method.gate) && (dQ .= 0)
             elseif time_series_method.target == :q
                 dQ = pred - q_star
-                any(abs.(q_star) .< TURBULENCE_GATE) && (dQ .= 0)
+                any(abs.(q_star) .< time_series_method.gate) && (dQ .= 0)
             end
         end
         time_series_method.q_hist[:,2:end] = time_series_method.q_hist[:,1:end-1] # shift history
@@ -469,10 +515,10 @@ function get_next_item_timeseries(time_series_method::LinReg, q_star)
 
         if time_series_method.target == :dq
             dQ = pred
-            any(abs.(q_star) .< TURBULENCE_GATE) && (dQ .= 0)
+            any(abs.(q_star) .< time_series_method.gate) && (dQ .= 0)
         elseif time_series_method.target == :q
             dQ = pred - q_star
-            any(abs.(q_star) .< TURBULENCE_GATE) && (dQ .= 0)
+            any(abs.(q_star) .< time_series_method.gate) && (dQ .= 0)
         end
     end
     return dQ
