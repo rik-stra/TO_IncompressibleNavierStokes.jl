@@ -4,6 +4,7 @@
 #SBATCH --partition=gpu_h100
 #SBATCH --gpus=1
 #SBATCH --array=1-5
+#SBATCH --export=ALL
 
 # One TO-LRS ensemble member per array task: 64^3 LF, Float64, LMWray3, 100 TU (40,000 steps).
 # `SLURM_ARRAY_TASK_ID` IS the replica index.
@@ -14,10 +15,16 @@
 #
 # Normally submitted through `submit_lrs.sh`, which fits the model first and sets the dependency.
 #
-# 🔑 Gate off (2026-10-13): `RIKFLOW_GATE=off sbatch --array=1-5 batch_scripts/run_online_array.sh 1`
-# deploys LinReg1's existing fit without the turbulence gate and writes `TO_LRS/LinReg1_nogate/`
-# (the driver refuses any other directory and never overwrites). Same seeds as the gated replicas.
-# Kept on gpu_h100: the gated LinReg1/LinReg6 long runs (2026-09-15/16) ran on this partition.
+# 🔑 Gate off (2026-10-13): `sbatch --array=1-5 batch_scripts/run_online_array.sh 1 off` deploys
+# LinReg1's existing fit without the turbulence gate and writes `TO_LRS/LinReg1_nogate/` (the driver
+# refuses any other directory). Same seeds as the gated replicas. Kept on gpu_h100: the gated
+# LinReg1/LinReg6 long runs (2026-09-15/16) ran on this partition.
+#
+# 🔴 The gate is the SECOND ARGUMENT (on | off, default on), never an inherited variable. The first
+# gate-off submission, `RIKFLOW_GATE=off sbatch ... 1`, ran GATED: the variable did not reach the
+# array tasks on Snellius, and the gated runs overwrote the September replicas (2026-10-13). This
+# script now sets `RIKFLOW_GATE` itself, prints it, and the driver refuses to overwrite any replica
+# (`RIKFLOW_OVERWRITE=1` to override).
 #
 # 🔴 THE MODEL MUST ALREADY BE FITTED. This script does NOT train -- `run_online.sh` did both in one
 # job, which cannot become an array without five tasks writing the same `LinReg.jld2` at once. If
@@ -47,6 +54,12 @@ if ! [[ "$INDEX" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 
+GATE=${2:-on}
+case "$GATE" in
+    on|off) export RIKFLOW_GATE=$GATE ;;
+    *) echo "run_online_array.sh: second argument must be on or off (the turbulence gate)" >&2; exit 1 ;;
+esac
+
 REPLICA=${SLURM_ARRAY_TASK_ID:-}
 if [ -z "$REPLICA" ]; then
     echo "run_online_array.sh: no SLURM_ARRAY_TASK_ID -- submit with sbatch --array, not bash" >&2
@@ -70,5 +83,5 @@ fi
 julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' ||
     echo "precompile step failed — continuing; the run will compile in-process (slower start)" >&2
 
-echo "== LinReg$INDEX, replica $REPLICA of array $SLURM_ARRAY_JOB_ID, 100 TU"
+echo "== LinReg$INDEX, replica $REPLICA of array $SLURM_ARRAY_JOB_ID, 100 TU, gate $RIKFLOW_GATE"
 julia --project "$EXP/6_online_TO_LRS.jl" "$INDEX" "$REPLICA"

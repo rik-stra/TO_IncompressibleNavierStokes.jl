@@ -118,10 +118,14 @@ model_src_dir = TO_folder*"/$(name)/"
 out_dir = gate == 0 ? TO_folder*"/$(name)_nogate/" : model_src_dir
 RikFlow.check_gate_dir(out_dir, gate)
 mkpath(out_dir)
-if gate == 0
+# 🔴 NO RUN OVERWRITES AN EARLIER ONE, gated or not (2026-10-13). The first version guarded gate-off
+# runs only; a gate-off submission whose `RIKFLOW_GATE` never reached the job then ran gated and
+# replaced the September LinReg1/LinReg6 replicas on Snellius. `RIKFLOW_OVERWRITE=1` is the
+# deliberate override (e.g. redeploying a refitted LinReg<n>).
+if get(ENV, "RIKFLOW_OVERWRITE", "") != "1"
     for i in replicas
         f = out_dir*"data_online_tsim$(tsim)_replica$(i).jld2"
-        isfile(f) && error("$f exists; a gate-off run never overwrites an earlier one")
+        isfile(f) && error("$f exists; refusing to overwrite it (set RIKFLOW_OVERWRITE=1 to replace it)")
     end
 end
 @info "Turbulence gate" threshold=gate out_dir
