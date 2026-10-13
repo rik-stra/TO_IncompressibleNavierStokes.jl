@@ -7,6 +7,14 @@
 # run_d6_linreg7.sh with the model and the directory changed; member_seed(k, m) is closure-
 # independent, so the members pair with D6_LinReg1/7 (common random numbers).
 #
+# 🔴 For a FULL hindcast use batch_scripts/run_d6_packed.sh instead (9 ICs per task, ~10x less
+# start-up billed); this one-IC-per-task script is for rerunning single ordinals only. The
+# 2026-10-13 run was submitted packed (job 28003020), after this script's job 28002910 was
+# cancelled:
+#
+#     D6_OUT=$PWD/output/D6_LinReg6 D6_CLOSURE=lrs \
+#         D6_MODEL=$PWD/output/TO_LRS/LinReg6/LinReg.jld2 sbatch batch_scripts/run_d6_packed.sh
+#
 #     sbatch batch_scripts/run_d6_linreg6.sh          # from exp_square_HIT/
 #
 # One array task = one initial condition = M members run sequentially. $SLURM_ARRAY_TASK_ID is the
