@@ -2590,3 +2590,23 @@ Rik: every measure is computed per QoI and then combined over the six (paper Sec
 
   The σ-unit values of §15 reproduce exactly. At 0.5 and 2.5 TU the sign is the same in every QoI;
   at 25–50 steps the [16,32] bands of the LinRegs are slightly positive.
+
+- **Scale figure (2026-10-13, Rik):** `plot_paper_secs45.jl scale` now shows, per tenth of the level
+  (edges from 1-10 TU), the sd of the standardized residual about the bin mean (was the rms), for
+  LinReg1 and LinReg7. LinReg1's bin means are at most 0.14 sd, so its numbers do not move (fifths
+  0.50-0.55 / 1.34-1.40 either way); lowest / highest tenth, middle and small scales, 0.32-0.37 /
+  1.43-1.47 (1-10 TU), 0.42-0.46 / 1.62-1.65 (10-100 TU). LinReg7's bin means reach 0.47 sd on 1-10 TU
+  and 0.46 sd on 10-100 TU; its spread is 0.39-0.63 / 1.16-1.35 in the middle and small scales,
+  and 0.57 / 1.20 in Z[0,6] (LinReg1 0.75 / 1.16).
+- **Shape of the residual (2026-10-13, Rik):** `plot_paper_secs45.jl shape` (paper Fig. colour-shape).
+  LinReg1, 10-100 TU, each curve standardized on that window: excess kurtosis ÷ constant scale ->
+  ÷ power-law scale, Z/E[0,6] 0.60/0.63 -> 0.43/0.50, Z/E[7,15] 2.19/2.02 -> 0.35/0.32, Z/E[16,32]
+  1.82/1.94 -> 0.25/0.29; |z| > 3 vs Gaussian, middle and small 4.0-4.4x -> 1.6-1.8x, large 2.1-2.2x
+  -> 1.8-2.1x; |skew| <= 0.12. LinReg7 alike (kurtosis 0.54-1.16 -> 0.08-0.39), except a skewness of
+  +0.23 in E[7,15] after the division.
+- **Shape, LinReg7 and DDN (2026-10-13, Rik):** `fig_shape(name)` writes `colour_shape_<name>.pdf` for
+  LinReg1, LinReg7 and the DDN (`ddn_residual`: dQ on the record about its 1-10 TU mean). DDN, constant
+  scale: large and middle scales near Gaussian (10-100 TU kurtosis 0.45-0.74, |z| > 3 1.9-2.4x); small
+  scales skewed, +0.54/+0.49 on 1-10 TU and -0.64/-0.57 on 10-100 TU (long low tail, almost no high
+  tail). A power law fitted to the DDN's correction (beta -0.54 in [16,32]) makes the held-out small
+  scales worse (skewness -1.28/-1.19).

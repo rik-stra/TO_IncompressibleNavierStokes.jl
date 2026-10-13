@@ -496,50 +496,145 @@ function full_residual(name)
 end
 
 """
-LinReg1's residual, standardised by its 1-10 TU sd, binned in deciles of q*/q_ref (edges from 1-10 TU):
-rms per bin on 1-10 TU (filled) and 10-100 TU (open), the power law of step 4p fitted on 1-10 TU and
-clipped as deployed, and the constant scale of LinReg + MVG. Reprints β and the held-out gain.
+The residuals of LinReg1 and LinReg7, each standardised by its own 1-10 TU sd, binned in deciles of
+q*/q_ref (edges from 1-10 TU, per closure): the standard deviation about the bin mean on 1-10 TU
+(filled) and 10-100 TU (open), the power law of step 4p fitted on 1-10 TU and clipped as deployed, and
+the constant scale of LinReg + MVG. Reprints β, the held-out gain, the bin means, and the spread in
+the lowest and highest fifth (the text's numbers).
+
+Rik, 2026-10-13: the spread about the bin mean replaces the rms per bin, which also counted the
+residual's mean in the bin (a bias of the closure's mean at that level, not a scale).
 """
 function fig_scale(; nbin = 10)
-    r = full_residual("LinReg1")
-    sd = vec(std(r.R[r.tr, :]; dims = 1))
-    E = r.R ./ sd'
-    fig = Figure(size = (W, 240), figure_padding = (2, 6, 2, 2))
+    fig = Figure(size = (W, 250), figure_padding = (2, 6, 2, 2))
     axs = qoi_axes(fig; xscale = log10, yscale = log10, xticks = [0.5, 1, 1.5],
                    yticks = [0.3, 0.5, 0.7, 1, 1.4, 2], xtickformat = vs -> [@sprintf("%g", v) for v in vs],
                    ytickformat = vs -> [@sprintf("%g", v) for v in vs])
     for i in 1:NQ
-        ax = axs[i]
-        p = fit_powerlaw_scale(E[r.tr, i], r.qs[r.tr, i])
-        x = r.qs[:, i] ./ p.qref
-        edges = quantile(x[r.tr], range(0, 1; length = nbin + 1)[2:(end - 1)])
-        hlines!(ax, [1.0]; color = :gray55, linestyle = :dash, linewidth = 0.6)
-        lo, hi = p.qclip ./ p.qref
-        xx = exp.(range(log(0.3), log(2.1); length = 200))
-        lines!(ax, xx, exp(p.logvar / 2) .* clamp.(xx, lo, hi) .^ p.beta; color = COL["LinReg1"], linewidth = 1.1)
-        for (rows, filled) in ((r.tr, true), (r.ho, false))
-            b = searchsortedfirst.(Ref(edges), x[rows])
-            xm = [exp(mean(log.(x[rows][b .== k]))) for k in 1:nbin]
-            ym = [sqrt(mean(abs2, E[rows[b .== k], i])) for k in 1:nbin]
-            scatter!(ax, xm, ym; color = filled ? C_REF : :white, strokecolor = C_REF, strokewidth = 0.6,
-                     markersize = 4)
+        hlines!(axs[i], [1.0]; color = :gray55, linestyle = :dash, linewidth = 0.6)
+    end
+    "Spread about the mean and the mean, per bin of `x[rows]` cut at `edges`."
+    function binned(x, e, rows, edges)
+        b = searchsortedfirst.(Ref(edges), x[rows])
+        nb = length(edges) + 1
+        xm = [exp(mean(log.(x[rows][b .== k]))) for k in 1:nb]
+        ym = [std(e[rows[b .== k]]) for k in 1:nb]
+        mu = [mean(e[rows[b .== k]]) for k in 1:nb]
+        return xm, ym, mu
+    end
+    for name in ("LinReg1", "LinReg7")
+        r = full_residual(name)
+        sd = vec(std(r.R[r.tr, :]; dims = 1))
+        E = r.R ./ sd'
+        col = COL[name]
+        for i in 1:NQ
+            ax = axs[i]
+            p = fit_powerlaw_scale(E[r.tr, i], r.qs[r.tr, i])
+            x = r.qs[:, i] ./ p.qref
+            edges = quantile(x[r.tr], range(0, 1; length = nbin + 1)[2:(end - 1)])
+            lo, hi = p.qclip ./ p.qref
+            xx = exp.(range(log(0.3), log(2.1); length = 200))
+            lines!(ax, xx, exp(p.logvar / 2) .* clamp.(xx, lo, hi) .^ p.beta; color = col, linewidth = 1.1)
+            for (rows, filled) in ((r.tr, true), (r.ho, false))
+                xm, ym, _ = binned(x, E[:, i], rows, edges)
+                scatter!(ax, xm, ym; color = filled ? col : :white, strokecolor = col, strokewidth = 0.7,
+                         markersize = 4.5)
+            end
+            nllc(rows) = mean(0.5 .* (log(2pi) .+ log(mean(abs2, E[r.tr, i])) .+ E[rows, i] .^ 2 ./ mean(abs2, E[r.tr, i])))
+            lv(rows) = p.logvar .+ 2p.beta .* log.(clamp.(r.qs[rows, i], p.qclip...) ./ p.qref)
+            nllp(rows) = mean(0.5 .* (log(2pi) .+ lv(rows) .+ E[rows, i] .^ 2 .* exp.(-lv(rows))))
+            # The text's numbers: the lowest and highest tenth (the figure's end points).
+            _, str_, mtr = binned(x, E[:, i], r.tr, edges)
+            _, sho, mho = binned(x, E[:, i], r.ho, edges)
+            @printf("scale: %-8s %-8s beta %.2f, clip/q_ref %.2f-%.2f, held-out NLL gain %.3f; lowest/highest tenth sd %.2f/%.2f (1-10), %.2f/%.2f (10-100); bin means 1-10 max |.| %.2f, 10-100 %s\n",
+                    name, LABELS[i], p.beta, lo, hi, nllc(r.ho) - nllp(r.ho), str_[1], str_[end],
+                    sho[1], sho[end], maximum(abs, mtr), join((@sprintf("%+.2f", v) for v in mho), " "))
         end
-        nllc(rows) = mean(0.5 .* (log(2pi) .+ log(mean(abs2, E[r.tr, i])) .+ E[rows, i] .^ 2 ./ mean(abs2, E[r.tr, i])))
-        lv(rows) = p.logvar .+ 2p.beta .* log.(clamp.(r.qs[rows, i], p.qclip...) ./ p.qref)
-        nllp(rows) = mean(0.5 .* (log(2pi) .+ lv(rows) .+ E[rows, i] .^ 2 .* exp.(-lv(rows))))
-        @printf("scale: %-8s beta %.2f, clip/q_ref %.2f-%.2f, held-out NLL gain %.3f nats/step\n", LABELS[i],
-                p.beta, lo, hi, nllc(r.ho) - nllp(r.ho))
+    end
+    for i in 1:NQ
         rr, cc = pos(i)
+        ax = axs[i]
         rr == 2 ? (ax.xlabel = L"q^{n*}_i / q_{\mathrm{ref},i}") : (ax.xticklabelsvisible = false)
-        cc == 1 ? (ax.ylabel = "rms / constant scale") : (ax.yticklabelsvisible = false)
+        cc == 1 ? (ax.ylabel = "spread / constant scale") : (ax.yticklabelsvisible = false)
         xlims!(ax, 0.3, 2.1); ylims!(ax, 0.25, 2.1)
     end
-    Legend(fig[3, 1:3], [MarkerElement(color = C_REF, marker = :circle, markersize = 4),
-                         MarkerElement(color = :white, strokecolor = C_REF, strokewidth = 0.6, marker = :circle, markersize = 4),
-                         LineElement(color = COL["LinReg1"]), LineElement(color = :gray55, linestyle = :dash)],
-           ["1–10 TU", "10–100 TU", "power law (fitted on 1–10 TU)", "constant scale"]; orientation = :horizontal)
+    mk(c, filled) = MarkerElement(color = filled ? c : :white, strokecolor = c, strokewidth = 0.7,
+                                  marker = :circle, markersize = 4.5)
+    Legend(fig[3, 1:3],
+           Any[[mk(COL["LinReg1"], true), LineElement(color = COL["LinReg1"])],
+               [mk(COL["LinReg7"], true), LineElement(color = COL["LinReg7"])],
+               mk(:gray35, true), mk(:gray35, false), LineElement(color = :gray55, linestyle = :dash)],
+           ["LinReg1", "LinReg7", "1–10 TU", "10–100 TU", "constant scale"]; orientation = :horizontal)
     rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
     savefig("colour_scale.pdf", fig)
+end
+
+# The DDN's residual on the tracked record: the correction dQ^n = q^{n+1} - q^{n*} about its mean on
+# 1-10 TU (the MVG the DDN fits on columns 400:4000, `7_online_DDN.jl`), with q^{n*} in physical units,
+# in the layout of `full_residual`.
+function ddn_residual()
+    dq = permutedims(REC["q"][:, 2:end] .- REC["q_star"])
+    n = 1:size(dq, 1)
+    tr = findall(k -> 400 <= k <= 4000, n)
+    ho = findall(k -> 10 < k * DT <= 100, n)
+    return (; R = dq .- mean(dq[tr, :]; dims = 1), qs = permutedims(REC["q_star"]), tr, ho)
+end
+
+"""
+The shape of a closure's residual (LinReg1, LinReg7 or the DDN) on 10-100 TU (held out): its density divided by the constant scale of
+LinReg + MVG and by the power-law scale of step 4p (fitted on 1-10 TU, clipped as deployed), each
+then standardized to zero mean and unit variance on 10-100 TU so that only the shape is compared, against
+N(0, 1). Log density, histogram of width 0.25. Reprints the excess kurtosis, the skewness and the rate
+of |z| > 3 relative to the Gaussian's, on both windows.
+
+Rik, 2026-10-13 ("add plots of the distributions of the residuals"): with a scale that depends on the
+level, the marginal of residual / constant scale is a scale mixture and heavy-tailed even if every
+conditional is Gaussian, so the shape is shown under both scales. Later the same day: LinReg7
+and the DDN too (Rik), one file per closure, `colour_shape_<name>.pdf`.
+"""
+function fig_shape(name = "LinReg1"; zmax = 6.0, dz = 0.25)
+    kurt(x) = (y = x .- mean(x); mean(y .^ 4) / mean(y .^ 2)^2 - 3)
+    skw(x) = (y = x .- mean(x); mean(y .^ 3) / mean(y .^ 2)^1.5)
+    tail3(x) = mean(abs.((x .- mean(x)) ./ std(x)) .> 3) / 0.0026998   # P(|z| > 3) of N(0, 1)
+    r = name == "DDN" ? ddn_residual() : full_residual(name)
+    E = r.R ./ vec(std(r.R[r.tr, :]; dims = 1))'
+    S = map(1:NQ) do i
+        p = fit_powerlaw_scale(E[r.tr, i], r.qs[r.tr, i])
+        s = exp.(p.logvar / 2 .+ p.beta .* log.(clamp.(r.qs[:, i], p.qclip...) ./ p.qref))
+        @printf("shape: %-8s %-8s beta %.2f\n", name, LABELS[i], p.beta)
+        (E[:, i], E[:, i] ./ s)
+    end
+    for i in 1:NQ, (lab, x) in (("constant", S[i][1]), ("power law", S[i][2]))
+        @printf("shape: %-8s %-8s %-9s kurt %5.2f / %5.2f, skew %+.2f / %+.2f, |z|>3 %.1f / %.1f x Gaussian (1-10 / 10-100 TU)\n",
+                name, LABELS[i], lab, kurt(x[r.tr]), kurt(x[r.ho]), skw(x[r.tr]), skw(x[r.ho]),
+                tail3(x[r.tr]), tail3(x[r.ho]))
+    end
+    edges = collect(-zmax:dz:zmax)
+    mids = edges[1:(end - 1)] .+ dz / 2
+    fig = Figure(size = (W, 250), figure_padding = (2, 6, 2, 2))
+    axs = qoi_axes(fig; yscale = log10, yticks = [1e-4, 1e-3, 1e-2, 1e-1, 1],
+                   ytickformat = vs -> [@sprintf("%g", v) for v in vs], xticks = -6:2:6)
+    zz = range(-zmax, zmax; length = 400)
+    for i in 1:NQ
+        ax = axs[i]
+        lines!(ax, zz, exp.(-zz .^ 2 ./ 2) ./ sqrt(2pi); color = C_REF, linestyle = :dash, linewidth = 0.8)
+        for (x, col) in ((S[i][1], :gray55), (S[i][2], COL[name]))
+            z = x[r.ho]
+            z = (z .- mean(z)) ./ std(z)
+            h = [count(e -> lo <= e < lo + dz, z) for lo in edges[1:(end - 1)]] ./ (length(z) * dz)
+            keep = h .> 0
+            lines!(ax, mids[keep], h[keep]; color = col, linewidth = 1.0)
+        end
+        rr, cc = pos(i)
+        rr == 2 ? (ax.xlabel = "standardized residual") : (ax.xticklabelsvisible = false)
+        cc == 1 ? (ax.ylabel = "density") : (ax.yticklabelsvisible = false)
+        xlims!(ax, -zmax, zmax); ylims!(ax, 1e-4, 1)
+    end
+    Legend(fig[3, 1:3], [LineElement(color = :gray55), LineElement(color = COL[name]),
+                         LineElement(color = C_REF, linestyle = :dash)],
+           ["÷ constant scale", "÷ power-law scale", L"\mathcal{N}(0,1)"]; orientation = :horizontal)
+    rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
+    savefig("colour_shape_$(name).pdf", fig)
 end
 
 # --------------------------------------------------------------------------------------------------
@@ -556,4 +651,5 @@ if abspath(PROGRAM_FILE) == @__FILE__
     "sweep" in want && fig_sweep()
     "dqacf" in want && fig_dqacf()
     "scale" in want && fig_scale()
+    "shape" in want && foreach(fig_shape, ("LinReg1", "LinReg7", "DDN"))
 end
