@@ -28,6 +28,13 @@ const NSTEP = 40001                                    # 100 TU at dt = 2.5e-3, 
 const BLOCKS = [((b - 1) * 4000 + 1):(b * 4000 + 1) for b in 1:10]
 const CLOSURES = (("LinReg1", "0"), ("LinReg6", "1e-4"), ("LinReg7", "1"), ("LinReg8", "10"),
                   ("LinReg9", "100"), ("LinReg10", "1e4"), ("DDN", "-"))
+# 🔑 LRS_NOGATE=1 (2026-10-13, handoff_gate_off_2026-10-13): the gate-off reruns of the two closures
+# that fired, beside their gated originals. A gate-off run can diverge; the statistics then use the
+# runs that reach 100 TU only (all of them when every run is stable, i.e. exactly as before), and a
+# closure with no stable run gets none.
+const NOGATE = get(ENV, "LRS_NOGATE", "") == "1"
+const CLOSURES_RUN = NOGATE ? (("LinReg1", "0"), ("LinReg1_nogate", "0"), ("LinReg6", "1e-4"),
+                               ("LinReg6_nogate", "1e-4")) : CLOSURES
 
 function runs(c)
     dir, pat = c == "DDN" ? (joinpath(OUTD, "TO_DDN"), r"^DDN_data_online_tsim100\.0_replica\d\.jld2$") :
@@ -55,18 +62,23 @@ function main()
     @printf("%-9s %-5s %6s %-15s %6s %-12s %6s %s\n", "closure", "lam", "b", "b single runs", "D",
             "D single", "ratio", "stable")
     detail = String[]
-    for (c, lam) in CLOSURES
-        rs = runs(c)
+    for (c, lam) in CLOSURES_RUN
+        rs_all = runs(c)
+        rs = filter(stable, rs_all)
+        if isempty(rs)
+            @printf("%-9s %-5s no run reaches 100 TU (0 of %d stable): no long-run statistics\n",
+                    c, lam, length(rs_all))
+            continue
+        end
         K = minimum(size(r, 2) for r in rs)
         B = reduce(hcat, [bias_i(r, 1:K) for r in rs])              # QoIs x runs
         b_run = vec(mean(B; dims = 1))
         D_run = [summed_ks(r, QREF).total for r in rs]
         Dp = ensemble_ks(rs, QREF).total
         ss = longrun_ratio(rs)
-        nst = count(stable, rs)
         @printf("%-9s %-5s %+6.1f [%+5.1f, %+5.1f] %6.2f %.2f-%.2f %6.2f %d of %d\n", c, lam,
                 mean(b_run), minimum(b_run), maximum(b_run), Dp, minimum(D_run), maximum(D_run),
-                ss.ratio, nst, length(rs))
+                ss.ratio, count(stable, rs_all), length(rs_all))
         # sign agreement over the QoIs, per run; the pooled b_i per QoI; the blocks
         mixed = count(j -> minimum(B[:, j]) < 0 < maximum(B[:, j]), axes(B, 2))
         bpool = vec(mean(B; dims = 2))

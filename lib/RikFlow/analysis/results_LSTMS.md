@@ -2590,3 +2590,52 @@ Rik: every measure is computed per QoI and then combined over the six (paper Sec
 
   The σ-unit values of §15 reproduce exactly. At 0.5 and 2.5 TU the sign is the same in every QoI;
   at 25–50 steps the [16,32] bands of the LinRegs are slightly positive.
+
+## 22. The turbulence gate: census and gate-off reruns of the baselines (2026-10-13, laptop + Snellius; Rik reopened the lock)
+
+**Census** (`analysis/gate_census.jl`; firing = identically-zero forecast `dQ` column, #35): the gate
+fires in LinReg1 (hindcast 4498 / 1 077 981 forecast steps = 0.42 %, 35/900 members, 27/90 ICs, first
+lead 302, none in the CRPS_0.5 window; long runs 2259 / 199 500 = 1.13 %, 5/5 replicas, 14 episodes)
+and LinReg6 (long runs 0.80 %, 5/5, 13 episodes); never in LinReg7–10 or D6 LinReg7; the DDN has no
+gate. Every firing is E[16,32]. Episodes: E[16,32] under 1e-2 for 0.2–1.5 TU.
+
+**Switch:** `LinReg(...; gate)` (default `TURBULENCE_GATE`, `0.0` = off), `RIKFLOW_GATE=off` in
+`run_d6.jl`, gate as 2nd argument of `run_online_array.sh`; output only into `*_nogate` dirs; files
+record `gate_threshold`. `run_d6.jl` `D6_ONLY` (member subset) and `D6_PAIR_WITH` (seed check +
+`pair_first_diff`). Tests V86 (default bit-identical to the pre-AR oracle; gate-off = gate-on up to the
+first firing, CRN). `analysis/gate_pairs.jl` (pairing check, `assemble`), `longrun_stats.jl`
+`LRS_NOGATE=1`, `baseline_extras.jl` `BX_NOGATE=1`.
+
+**Runs** (Snellius; every rerun bit-identical to its gated original up to the original's first
+firing): D6 LinReg1, the 35 fired members, gate off (A100, job 27992255) + the 865 never-fired
+originals = `out/D6_LinReg1_nogate/`; long LinReg1/LinReg6 gate off (H100, 27993397/8) =
+`out/TO_LRS/LinReg{1,6}_nogate/`.
+
+**Gate effect, paired:**
+
+| | gated | gate off |
+|---|---|---|
+| hindcast CRPS_0.5 / δ_0.5 | 0.2208 / 0.4505 | identical (by construction) |
+| hindcast CRPS_all | 0.38888 | 0.38881 (−0.02 %, CI [−0.20 %, +0.15 %]) |
+| hindcast calibrated cells | 28 | 27 (CI [−1, +1]) |
+| hindcast bias of the ensemble mean, 2.5 TU | −5.9 % | −5.4 % (partly the joint mask) |
+| hindcast diverged members | 3 | **21** (17 ICs, leads 368–1142, 52–332 steps after the first would-be firing) |
+| long LinReg1 stable runs | 5 of 5 | **0 of 5** (die at 6.2, 16.0, 18.6, 82.0, 82.3 TU, each 0.23–0.5 TU into an episode) |
+| long LinReg6 stable runs | 5 of 5 | 4 of 5 (r5 at 45.5 TU) |
+| long LinReg6, r1–r4: b / D / ratio | −6.1 % / 0.80 / 1.45 | −5.8 % / 0.78 / 1.56 |
+
+Sec. 4.2's ordering holds with gate-off LinReg1 (LinReg7 − LinReg1 CRPS_0.5 +19.1 %, CI [+12.1, +26.7] %;
+calibrated 5 vs 27). **Reading:** the hindcast does not depend on the gate; LinReg1's long runs do —
+the gate is what brings it back from a sub-threshold E[16,32] episode (#65's "alarm, not cause" is
+half wrong). Sec. 5's dqacf cannot be redone gate-off (r4 dies at 6.2 TU, before the 36.3 TU event).
+
+🔴 Diverged long-run files hold uninitialised `dQ` past `size(q, 2) - 1`: truncate. Incident: the first
+long-run submission ran gated (env var lost) and overwrote 8 Snellius replicas; restored, arrays were
+bit-identical. Full report: `meta_files/report_gate_off_2026-10-13.md`.
+
+**Addendum (Rik, 2026-10-13): the gate stays on; the long-run dQ ACF leaves out each firing step and
+the `hist_len` steps after it** (`gate_keep`/`autocorr_masked`, `src/ts_score.jl`, V86; applied in
+`plot_paper_secs45.jl dqacf` and `baseline_extras.jl` §4). 0.5–2.6 % of LinReg1's steps go; LinReg7/DDN
+unchanged. Large and middle bands unchanged; in Z/E[16,32] LinReg1's runs now decorrelate faster than
+the record beyond lag ~50 (max |run − record| up to 0.25 / 0.23, was 0.18 / 0.16): the gated episodes
+had added a slow component. Four-run bound in the other QoIs 0.18 → 0.22.

@@ -100,11 +100,16 @@ end
 println("\n4. ACF of dQ, long runs vs tracked record (0-100 TU), lags 1-200: max |difference| per QoI (worst replica, and replica mean)")
 dqref = rec["q"][:, 2:end] .- rec["q_star"]
 acfr = [autocorr(collect(dqref[i, :]), 200) for i in 1:6]
+# 🔑 Gate firings left out (Rik, 2026-10-13): the firing step and the hist_len steps after it
+# (`gate_keep`, `autocorr_masked`); a run that never fired is scored exactly as before.
 for c in ("LinReg1", "LinReg7", "DDN")
     worst = zeros(6); avg = zeros(6)
+    h = c == "DDN" ? 0 : Int(load(joinpath(OUTD, "TO_LRS", c, "LinReg.jld2"), "hist_len"))
     for r in runs[c]
+        dq = Float64.(r.dQ[:, 1:(size(r.q, 2) - 1)])          # past a divergence stop: uninitialised
+        keep = gate_keep(dq, h)[101:end]
         for i in 1:6
-            a = autocorr(collect(Float64.(r.dQ[i, 101:end])), 200)
+            a = autocorr_masked(collect(dq[i, 101:end]), keep, 200)
             d = maximum(abs, a[2:end] .- acfr[i][2:end])
             worst[i] = max(worst[i], d); avg[i] += d / length(runs[c])
         end

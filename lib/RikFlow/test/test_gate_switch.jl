@@ -163,3 +163,26 @@ end
     @test X.first_diff_col(nan, orig) == 3
     @test X.first_diff_col(ones(3, 2), ones(2, 2)) == 1
 end
+
+@testitem "V86 masked ACF: identical with nothing masked; gated steps and their history left out" default_imports = false begin
+    using Test, Random
+    module MACF
+        include(joinpath(@__DIR__, "..", "src", "ts_score.jl"))
+    end
+    x = cumsum(randn(Xoshiro(3), 2000)) .* 0.01 .+ randn(Xoshiro(4), 2000)
+    @test MACF.autocorr_masked(x, trues(2000) |> collect, 50) == MACF.autocorr(x, 50)  # bit for bit
+    # gate_keep: a zero column and the h steps after it are dropped, clipped at the end
+    dQ = ones(2, 20); dQ[:, 5] .= 0; dQ[:, 19] .= 0; dQ[1, 10] = 0          # one band zero: no firing
+    k = MACF.gate_keep(dQ, 3)
+    @test findall(!, k) == [5, 6, 7, 8, 19, 20]
+    @test all(MACF.gate_keep(ones(2, 8), 5))
+    # a burst masked out is gone from the estimate: AR(1) with a corrupting block, masked = clean
+    rng = Xoshiro(7); n = 20_000; y = zeros(n)
+    for t in 2:n; y[t] = 0.8y[t - 1] + randn(rng); end
+    keep = trues(n); keep[5001:5300] .= false
+    z = copy(y); z[5001:5300] .= 50 .* (-1) .^ (1:300)                      # sign-alternating burst
+    rm = MACF.autocorr_masked(z, collect(keep), 10)
+    @test abs(rm[2] - 0.8) < 0.02 && abs(rm[11] - 0.8^10) < 0.03
+    @test MACF.autocorr(z, 10)[2] < 0                                       # unmasked: the burst wins
+    @test rm[1] ≈ (n - 300) / (n - 300)                                     # lag 0 is 1
+end
