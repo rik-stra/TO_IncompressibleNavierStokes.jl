@@ -16,7 +16,7 @@
 using JLD2, Printf
 
 const OUTD = joinpath(@__DIR__, "..", "exp_square_HIT", "output")
-const D6_DIRS = ("D6_LinReg1", "D6_LinReg7", "D6_DDN")
+const D6_DIRS = ("D6_LinReg1", "D6_LinReg6", "D6_LinReg7", "D6_DDN")   # LinReg6 (lambda = 1e-4) added 2026-10-13
 const LRS_DIRS = (("LinReg1", "0"), ("LinReg6", "1e-4"), ("LinReg7", "1"), ("LinReg8", "10"),
                   ("LinReg9", "100"), ("LinReg10", "1e4"), ("LinReg5", "- (not in paper)"))
 const CRPS05 = 200          # CRPS_0.5 window, leads 1..200

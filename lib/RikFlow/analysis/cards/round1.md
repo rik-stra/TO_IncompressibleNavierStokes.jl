@@ -84,6 +84,24 @@ Clause S and the CRPS part of clause C now read the window CRPS_0.5. Plan and me
    δ₀.₅, calibrated count's reference, rank-histogram figure (slopes), mean bias by lead, long-run
    bias and spread–skill (per run), divergences, gate firings.
 
+### Amendment 2026-10-13 (Rik), before any round-1 closure was run
+
+6. **Criterion, two baselines** (paper Sec. 3.7): the KS guard G compares with **LinReg7** (the
+   better baseline in the long runs): FAIL iff all 5 single-run summed KS lie above all 5 of
+   LinReg7's. Clauses S and C still compare with LinReg1. Against a matched partner, the partner
+   replaces both. Reason: against LinReg7 alone an improvement is cheap (LinReg6, indistinguishable
+   from LinReg1, passes S and C against LinReg7); LinReg1's long runs depend on the guard
+   (results_LSTMS.md §22–23).
+7. **Training hindcast, a diagnostic** (Rik: "just evaluate on the training hindcast", no tuning):
+   5 ICs inside the fit window (k = 5, 11, 16, 22, 28; t = 1.00–6.75 TU; warm-up and the 3 TU
+   forecast inside steps 400–4000; `build_d6_ics.jl training`, `select_train_ics`, V87), M = 10, the
+   same member seeds, for LinReg1, LinReg6, LinReg7 and every round-1 closure; output
+   `D6train_<closure>`. Reported for every closure: divergences, gate firings, spread–skill pooled
+   over leads ≤ 0.5 TU and over 1–3 TU, pooled rank histograms, ensemble-mean bias. **Not scored
+   against the held-out set, no clause, no tuning.** A closure skips its full hindcast only for a
+   defect: a diverged member, or a pooled spread–skill ratio (leads ≤ 0.5 TU) outside [0.5, 2] in
+   any QoI. Everything else runs.
+
 ## Settings and where they come from
 
 - No offset and no noise scale fitted against coupled runs (D-10: none in round 1).

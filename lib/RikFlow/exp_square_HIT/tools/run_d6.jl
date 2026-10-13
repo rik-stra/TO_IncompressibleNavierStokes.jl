@@ -301,9 +301,12 @@ function load_ic(ordinal::Integer; dir = ic_dir())
     man = load(manifest_path(dir))
     K = man["K"]
     1 <= ordinal <= K || error("ordinal $ordinal is outside 1..$K")
-    sel = select_ics(; K)
-    man["k"] == sel.k || error("manifest disagrees with select_ics(K = $K); the IC packages were " *
-                               "built from a different configuration than this driver assumes")
+    # 🔑 The training hindcast's set (Rik, 2026-10-13) is checked against its own rule,
+    # `select_train_ics`; a manifest without `set` is the held-out set of `select_ics`.
+    set = get(man, "set", "scored")
+    sel = set == "training" ? select_train_ics(; K) : select_ics(; K)
+    man["k"] == sel.k || error("manifest disagrees with the $(set) IC rule (K = $K); the IC packages " *
+                               "were built from a different configuration than this driver assumes")
     k = man["k"][ordinal]
     pkg = load(ic_path(k, dir))
     pkg["ordinal"] == ordinal || error("package $(ic_path(k, dir)) says ordinal $(pkg["ordinal"])")
@@ -438,7 +441,7 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     pdir !== nothing && abspath(pdir) == abspath(od) && error("D6_PAIR_WITH must differ from D6_OUT")
 
     block = filt.block === nothing ? "" : string(filt.block)
-    run_id = (; closure = string(cl), model_name, block, nlead)
+    run_id = (; closure = string(cl), model_name, block, nlead, ic_set = string(get(pkg, "set", "scored")))
     # Validation files are `d6_valid_*`, which neither this check nor the scorer's glob sees.
     validation || check_out_dir(od, run_id)
     mkpath(od)
@@ -612,7 +615,8 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
                 hist_var, model_name,
                 # 🔑 The partition (plan §7) and the IC filter, recorded per file: the scorer
                 # refuses a directory whose members disagree on `block` (`d6_run_identity`).
-                block, ic_block = string(ic_block(t_k)), ic_filter_label = filt.label,
+                block, ic_block = string(ic_block(t_k)), ic_set = string(get(pkg, "set", "scored")),
+                ic_filter_label = filt.label,
                 ic_tmin = filt.tmin, ic_tmax = filt.tmax, ic_stride = filt.stride,
                 # 🔴 The turbulence-gate census, the same statistic for every closure (#59/#65):
                 # identically-zero forecast `dQ` columns. `gate_threshold` is NaN for the DDN,

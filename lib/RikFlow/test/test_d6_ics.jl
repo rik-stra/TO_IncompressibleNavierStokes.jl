@@ -416,3 +416,29 @@ end
         @test !any(l -> occursin(edge, l), codelines(p))
     end
 end
+
+@testitem "V87 the training hindcast's ICs lie inside the fit window and apart from the held-out set" default_imports = false setup = [D6] begin
+    using Test
+    # Rik, 2026-10-13: a training hindcast, 5 ICs x 10 members, a diagnostic of the fits in-sample.
+    sel = D6.select_train_ics()
+    @test sel.k == [5, 11, 16, 22, 28]
+    @test sel.t == [1.0, 2.5, 3.75, 5.25, 6.75]
+    @test sel.set === :training
+    # every step a member touches: the warm-up n_k + 1 .. n_k + N_WARM and the forecast to
+    # n_k + N_WARM + N_LEAD, inside the fit window's dQ columns 400 .. 4000
+    @test all(>=(D6.TRAIN_FIT_ROWS[1]), sel.n)
+    @test all(n -> n + D6.N_WARM + D6.N_LEAD <= D6.TRAIN_FIT_ROWS[2], sel.n)
+    @test first(D6.warmup_range(first(sel.n))) >= D6.TRAIN_FIT_ROWS[1]
+    # the pool is exactly k in [5, 28]: one more field on either side leaves the window
+    @test (sel.kmin, sel.kmax) == (5, 28)
+    @test 100 * (5 - 2) < D6.TRAIN_FIT_ROWS[1]
+    @test 100 * (29 - 1) + D6.N_WARM + D6.N_LEAD > D6.TRAIN_FIT_ROWS[2]
+    # disjoint from the held-out set, and each set is checked against its own rule
+    @test isempty(intersect(sel.k, D6.select_ics(; K = 180).k))
+    @test isempty(intersect(D6.select_train_ics(; K = 24).k, D6.select_ics(; K = 180).k))
+    @test_throws ErrorException D6.select_train_ics(; K = 25)
+    # a training member is its own run identity: it can never share a directory with a held-out one
+    d = Dict("closure" => "lrs", "model_name" => "LinReg1", "block" => "none", "nlead" => 1200)
+    @test D6.d6_run_identity(merge(d, Dict("ic_set" => "training"))) != D6.d6_run_identity(d)
+    @test D6.d6_run_identity(d).ic_set == "scored"
+end

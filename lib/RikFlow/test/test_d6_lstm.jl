@@ -248,7 +248,7 @@ end
     @test c == (; nfired = 2, nsteps = 5, first_lead = 2)
     @test X.gate_census(ones(3, 4), 4) == (; nfired = 0, nsteps = 0, first_lead = 0)
 
-    id = (; closure = "lstm", model_name = "diag/x", block = "selection", nlead = 400)
+    id = (; closure = "lstm", model_name = "diag/x", block = "selection", nlead = 400, ic_set = "scored")
     mktempdir() do od
         @test X.check_out_dir(joinpath(od, "absent"), id) === nothing
         @test X.check_out_dir(od, id) === nothing                     # empty
@@ -259,9 +259,10 @@ end
         @test_throws ErrorException X.check_out_dir(od, (; id..., closure = "lrs"))
         @test_throws ErrorException X.check_out_dir(od, (; id..., block = ""))
         @test_throws ErrorException X.check_out_dir(od, (; id..., nlead = 1200))
+        @test_throws ErrorException X.check_out_dir(od, (; id..., ic_set = "training"))   # V87
     end
     # a pre-2026-09-28 LinReg file identifies itself from its model path
     @test X.d6_run_identity(Dict("model" => "/x/TO_LRS/LinReg1/LinReg.jld2", "closure" => "lrs",
                                  "nlead" => 1200)) ==
-          (; closure = "lrs", model_name = "LinReg1", block = "", nlead = 1200)
+          (; closure = "lrs", model_name = "LinReg1", block = "", nlead = 1200, ic_set = "scored")
 end

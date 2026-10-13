@@ -332,6 +332,48 @@ function report_ics(sel; io = stdout)
 end
 
 # --------------------------------------------------------------------------------------------
+# the TRAINING hindcast set (Rik, 2026-10-13): a few ICs inside the fit window
+# --------------------------------------------------------------------------------------------
+
+"The fit window's dQ columns (`train_range` of every fit)."
+const TRAIN_FIT_ROWS = (400, 4000)
+const DEFAULT_TRAIN_IC_DIR = joinpath(@__DIR__, "output", "d6_ics_train")
+
+"""
+    select_train_ics(; K = 5, nwarm = N_WARM, nlead = N_LEAD, nstride = FIELD_STRIDE,
+                     dt_field = FIELD_DT, fit = TRAIN_FIT_ROWS)
+
+The ICs of the **training hindcast**: a diagnostic of the fits on the data they were fitted to
+(calibration and stability in-sample), never scored with the held-out set. Rule: every step a
+member touches -- the replayed warm-up `n_k + 1 .. n_k + nwarm` and the forecast up to
+`n_k + nwarm + nlead` -- lies inside the fit window `fit`; `K` fields evenly over the pool, endpoints
+included. At the defaults: k in [5, 28] (t = 1.00 .. 6.75 TU), K = 5 -> k = 5, 11, 16, 22, 28.
+
+🔴 **Kept apart from `select_ics` on purpose.** That set asserts `t_k > 10` (the held-out ICs, V28);
+this one is the opposite. Separate directory (`DEFAULT_TRAIN_IC_DIR`), a manifest with
+`set = "training"`, and every package and member carries the set, so the two can never be mixed.
+"""
+function select_train_ics(; K::Integer = 5, nwarm::Integer = N_WARM, nlead::Integer = N_LEAD,
+                          nstride::Integer = FIELD_STRIDE, dt_field::Real = FIELD_DT,
+                          fit = TRAIN_FIT_ROWS)
+    K >= 1 || error("select_train_ics: K must be at least 1, got $K")
+    kmin = cld(fit[1], nstride) + 1                         # n_k = nstride (k - 1) >= fit[1]
+    kmax = fld(fit[2] - nwarm - nlead, nstride) + 1         # n_k + nwarm + nlead <= fit[2]
+    kmax >= kmin || error("select_train_ics: no field fits a $(nwarm) + $(nlead)-step member inside $fit")
+    pool = kmax - kmin + 1
+    K <= pool || error("select_train_ics: K = $K exceeds the pool of $pool fields (k in [$kmin, $kmax])")
+    k = K == 1 ? [kmin] : round.(Int, range(kmin, kmax; length = K))
+    allunique(k) && issorted(k) || error("select_train_ics: bad index selection $k")
+    n = nstride .* (k .- 1)
+    t = dt_field .* (k .- 1)
+    all(n .>= fit[1]) && all(n .+ nwarm .+ nlead .<= fit[2]) ||
+        error("select_train_ics: an IC leaves the fit window")
+    spacing_fields = K == 1 ? NaN : (kmax - kmin) / (K - 1)
+    return (; k, n, t, ordinal = collect(1:K), spacing_tu = spacing_fields * dt_field, spacing_fields,
+            pool, kmin, kmax, nwarm, nlead, nref = N_REF, K, set = :training)
+end
+
+# --------------------------------------------------------------------------------------------
 # the partition -- which ICs a run may use (plan §7, "Screening funnel, partition and training
 # window", 2026-09-28)
 # --------------------------------------------------------------------------------------------
@@ -478,7 +520,10 @@ function d6_run_identity(d)
     else
         basename(dirname(string(get(d, "model", "?/?"))))
     end
-    return (; closure, model_name, block = string(get(d, "block", "")), nlead = Int(d["nlead"]))
+    # `ic_set` (2026-10-13): "training" for the training hindcast; absent = the held-out set, so a
+    # directory can never mix the two.
+    return (; closure, model_name, block = string(get(d, "block", "")), nlead = Int(d["nlead"]),
+            ic_set = string(get(d, "ic_set", "scored")))
 end
 
 # --------------------------------------------------------------------------------------------
@@ -553,8 +598,10 @@ Each package holds the velocity field `u`, its step `n_k` and time `t_k`, the `n
 warm-up slice of the reference `dQ`, the reference QoI column at the IC, the `PARAM_KEYS` subset of
 `params_track`, and provenance. Returns the selection.
 """
-function build_d6_ics(; K::Integer = 180, track_file = DEFAULT_TRACK_FILE, outdir = DEFAULT_IC_DIR,
-                      force::Bool = false)
+function build_d6_ics(; K::Integer = 180, track_file = DEFAULT_TRACK_FILE, outdir = nothing,
+                      force::Bool = false, set::Symbol = :scored)
+    set in (:scored, :training) || error("build_d6_ics: set must be :scored or :training, got $set")
+    outdir === nothing && (outdir = set === :training ? DEFAULT_TRAIN_IC_DIR : DEFAULT_IC_DIR)
     isfile(track_file) || error("no such tracking file: $track_file")
     mkpath(outdir)
 
@@ -583,9 +630,16 @@ function build_d6_ics(; K::Integer = 180, track_file = DEFAULT_TRACK_FILE, outdi
     params_track.savefreq == FIELD_STRIDE ||
         error("params_track.savefreq = $(params_track.savefreq), expected $FIELD_STRIDE")
 
-    sel = select_ics(; K, nfields, nref)
-    println("\nIC selection")
-    report_ics(sel)
+    if set === :training
+        sel = select_train_ics(; K)
+        @printf("\nTRAINING IC selection (inside the fit window, a diagnostic, never scored with the held-out set)\n")
+        @printf("  pool k in [%d, %d]; K = %d -> k = %s, t = %s TU\n", sel.kmin, sel.kmax, sel.K,
+                join(sel.k, ", "), join((@sprintf("%.2f", x) for x in sel.t), ", "))
+    else
+        sel = select_ics(; K, nfields, nref)
+        println("\nIC selection")
+        report_ics(sel)
+    end
 
     params = NamedTuple{PARAM_KEYS}(map(k -> getproperty(params_track, k), PARAM_KEYS))
     provenance = (; source = abspath(track_file), source_bytes = filesize(track_file),
@@ -620,14 +674,15 @@ function build_d6_ics(; K::Integer = 180, track_file = DEFAULT_TRACK_FILE, outdi
         jldsave(out; u, n_k, t_k, k, ordinal = i, dQ_warm,
                 q_at_ic = Array(d.q[:, ic_q_column(n_k)]),
                 q_window = Array(d.q[:, wcols]), q_window_offsets = collect(woff),
-                params, provenance)
+                params, provenance, set = string(set))
         written += 1
         bytes += filesize(out)
     end
 
     manifest = manifest_path(outdir)
     jldsave(manifest; k = sel.k, n = sel.n, t = sel.t, ordinal = sel.ordinal, K = sel.K,
-            kmin = sel.kmin, kmax = sel.kmax, spacing_tu = sel.spacing_tu, provenance, params)
+            kmin = sel.kmin, kmax = sel.kmax, spacing_tu = sel.spacing_tu, provenance, params,
+            set = string(set))
 
     @printf("  %d written, %d already present; %.1f MB total, %.2f MB each\n",
             written, sel.K - written, bytes / 2^20, bytes / 2^20 / sel.K)
@@ -793,6 +848,9 @@ if abspath(PROGRAM_FILE) == @__FILE__
     args = filter(!=("--force"), ARGS)
     if !isempty(args) && args[1] == "validation"
         build_validation_ic(; force)
+    elseif !isempty(args) && args[1] == "training"
+        # the training hindcast's ICs (Rik, 2026-10-13): `build_d6_ics.jl training [K]`, K = 5
+        build_d6_ics(; K = length(args) >= 2 ? parse(Int, args[2]) : 5, force, set = :training)
     else
         K = isempty(args) ? 180 : parse(Int, args[1])
         build_d6_ics(; K, force)

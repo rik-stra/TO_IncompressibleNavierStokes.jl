@@ -618,7 +618,7 @@ end
         end
         ens = D6Score.load_members(dir; filt = sel)
         @test ens.identity == (; closure = "lstm", model_name = "diag/x", block = "selection",
-                               nlead = 400)
+                               nlead = 400, ic_set = "scored")
         # a selection run cannot be scored as the confirmation block
         @test_throws ErrorException D6Score.load_members(dir;
                                                          filt = D6Score.ic_filter(; block = "confirmation"))

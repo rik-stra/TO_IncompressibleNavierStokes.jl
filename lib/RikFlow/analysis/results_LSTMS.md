@@ -2659,3 +2659,53 @@ the `hist_len` steps after it** (`gate_keep`/`autocorr_masked`, `src/ts_score.jl
 unchanged. Large and middle bands unchanged; in Z/E[16,32] LinReg1's runs now decorrelate faster than
 the record beyond lag ~50 (max |run − record| up to 0.25 / 0.23, was 0.18 / 0.16): the gated episodes
 had added a slow component. Four-run bound in the other QoIs 0.18 → 0.22.
+
+## 23. D6 hindcast of LinReg6 (λ = 1e-4) (2026-10-13, Snellius + laptop; Rik asked)
+
+Question: does a small penalty keep LinReg1's hindcast skill and the stability of λ ≥ 1? Snellius job
+28003020 (`run_d6_packed.sh`, gpu_a100, 10 tasks of 33–35 min), `out/D6_LinReg6` (900 members,
+digest 5a45d6e591bd laptop = Snellius); seeds `member_seed(k, m)`, so paired (CRN) with D6_LinReg1/7.
+
+| `score_d6.jl --compare`, lead-wise, 90 ICs | LinReg6 | vs LinReg1 (90 % CI) | vs LinReg7 (90 % CI) |
+|---|---|---|---|
+| CRPS_0.5 | 0.2229 | +0.97 % [−0.32, +2.24] | −15.2 % [−22.2, −8.9] |
+| CRPS_all | 0.3875 | −0.72 % [−2.5, +1.3] | −4.9 % [−8.8, −1.1] |
+| δ_0.5 | 0.4530 | +0.54 % [−0.8, +1.8] | −5.9 % [−12.8, +0.8] |
+| calibrated (of 36) | 25 | −3 [−5, +1] | +20 [+10, +25] |
+| diverged members | 0 | (LinReg1 3) | (LinReg7 0) |
+
+Gate census (`gate_census.jl`, D6_LinReg6 added): 4774 of 1 080 000 forecast steps (0.44 %), 39/900
+members, 27/90 ICs, first firing at lead 321, none in leads 1–200 (LinReg1: 0.42 %, 35/900, 27/90).
+
+**Reading:** at λ = 1e-4 the hindcast cannot be told apart from LinReg1's on any score, and the
+guard fires as often; the long runs are close to LinReg1's too (b −6.3 vs −7.3 %, D 0.81 vs 0.84,
+ratio 1.45 vs 1.53), though gate-off 4 of 5 long runs survive (0 of 5 for LinReg1, §22). The
+long-run gains of ridge appear only at λ = 1, with the loss of skill. Bias of the ensemble mean not
+computed for LinReg6 (`baseline_extras.jl` masks its closures jointly; adding LinReg6 would move the
+published LinReg1/7/DDN columns). Paper: Sec. 4 closing paragraph, abstract scaffold (3).
+
+## 24. The two implementations draw common random numbers (2026-10-13, laptop; Rik: option (b))
+
+`analysis/crn_check.jl`. LinReg1 (`LinReg`) and its exact translation into the second implementation
+(`StochLSTM`, `TO_LSTM/diag/control_LinReg1`, §14), built as the D6 driver builds them: the member seed
+`Xoshiro(seed)`, the warm-up replayed from the record (draws nothing).
+
+- **A. First sampled step**, full prediction path, 12 starts on 11–97.5 TU, max over the 6 QoIs:
+  same seed 1.0e-5 to 3.6e-4 sd(dQ) (the Float32 mean, as GATE 2); other seed 0.16 to 2.3 sd(dQ).
+- **B. The noise sequences**, 2000 steps, each drawn exactly as the closure draws it (`draw_eta` per
+  step; `sample_emission!` per step with the mean set to zero), in physical units: same seed max
+  7–8e-7 sd(dQ) over all 2000 steps and 4 seeds (Float32 round-off; never desynchronizes); other seed
+  median 0.09 sd(dQ) (noise sd 0.24 / 0.63 / 0.09 / 0.05 / 0.06 / 0.06 sd(dQ)).
+
+**So the second implementation draws the same standard normals, in the same order and number per
+step, as LinReg: common random numbers.** Why: both seed `Xoshiro(member_seed(k, m))` (`run_d6.jl`
+516 / `d6_lib.jl` 141); `rand(rng, MvNormal)` = 6 × `randn` then the lower Cholesky factor;
+`sample_emission!` = 6 × `randn` (Float64, then cast) then `D L_R`, and chol(DRD) = D chol(R);
+`arch = :lstm` and the MLP draw no latent; both draw before the guard. Paper Sec. 6.1's "differs ...
+in its random numbers" was an assumption (M4 notes: "paired by IC only"), never measured — it is
+wrong for every planned closure. Holds as long as a closure draws exactly N_Q deviates per step from
+the member stream before the guard (a latent path or the AR(2) innovation in the network path would
+need checking). Teacher-forced trajectories cannot be compared beyond a few steps: on the recorded
+q* the closed history has no restoring force (§7) and both blow up after ~200 steps, amplifying
+round-off. Online, trajectories still separate through the Float32 mean and chaos; the control's
+full hindcast measures the realized pairing.
