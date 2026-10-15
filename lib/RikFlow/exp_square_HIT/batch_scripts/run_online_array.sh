@@ -49,8 +49,11 @@
 set -u
 
 INDEX=${1:-}
-if ! [[ "$INDEX" =~ ^[0-9]+$ ]]; then
-    echo "run_online_array.sh: first argument must be a model index, e.g. 5" >&2
+# A model index (the `inputs_example.jld2` row) or, since 2026-10-13, the NAME of a prebuilt model under
+# output/TO_LRS/<name>/ (the `_ar2n` variants, the splices), which `6_online_TO_LRS.jl` already accepts:
+#     sbatch --array=1-5 batch_scripts/run_online_array.sh LinReg7_ar2n
+if ! [[ "$INDEX" =~ ^[0-9]+$ || "$INDEX" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
+    echo "run_online_array.sh: first argument must be a model index (e.g. 5) or a TO_LRS model name" >&2
     exit 1
 fi
 
@@ -83,5 +86,5 @@ fi
 julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.precompile()' ||
     echo "precompile step failed — continuing; the run will compile in-process (slower start)" >&2
 
-echo "== LinReg$INDEX, replica $REPLICA of array $SLURM_ARRAY_JOB_ID, 100 TU, gate $RIKFLOW_GATE"
+echo "== model $INDEX, replica $REPLICA of array $SLURM_ARRAY_JOB_ID, 100 TU, gate $RIKFLOW_GATE"
 julia --project "$EXP/6_online_TO_LRS.jl" "$INDEX" "$REPLICA"
