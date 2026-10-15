@@ -2709,3 +2709,113 @@ need checking). Teacher-forced trajectories cannot be compared beyond a few step
 q* the closed history has no restoring force (§7) and both blow up after ~200 steps, amplifying
 round-off. Online, trajectories still separate through the Float32 mean and chaos; the control's
 full hindcast measures the realized pairing.
+
+## 25. Overdetermined Yule–Walker vs the ACF fit for the AR(2) residual (2026-10-13, laptop; Rik asked)
+
+Offline only; nothing deployed changes. Prompted by the question of whether the paper's ACF fit
+(Sec. 6, Eq. ACF fit = `ar2_ls`) is the textbook method: it is not — it is a minimum-distance fit to
+the ACF. The closest textbook estimator is the overdetermined (extended) Yule–Walker method: least
+squares on ρ̂(k) = φ1 ρ̂(k−1) + φ2 ρ̂(k−2), k = 1..20, linear in φ, = ordinary Yule–Walker at L = 2.
+
+**Code.** `ar2_eyw(racf; L = 20, nonneg = false, margin = 1e-3)` in `m0c_checks.jl`: exact convex QP
+(active-set enumeration) with the stationarity triangle shrunk by `margin` (the overdetermined solution
+is not stationary by construction) and, with `nonneg`, the round-1 restriction φ1 ≥ 0, φ2 ≤ 0 (§16).
+Builder variants `lrs_ar_variant.jl <src> 2e | 2en` → `<src>_ar2e` / `<src>_ar2en` (none built).
+Tests V83 (`test_round1.jl`): = `ar2_yw` at L = 2; recovers 200 random AR(2)s from their exact ACF to
+1e-8 (cf. `ar2_ls`, V81: 33 of 200 miss by > 5e-4); stationary with margin on unfittable ACFs; at or
+below a 0.005-grid minimum of its own objective, free and restricted; `fit_ar(eyw = true)` wiring.
+Round-1 suite: 555 pass, 5 broken (the V81 ones, unchanged).
+
+**Comparison.** `analysis/ar2_eyw_compare.jl`, on the deployed residual of the six round-1 AR(2)
+sources (scaled units, fit on 1–10 TU, ACF misfit also on 10–74 TU). `LSn` reproduces every deployed
+`<src>_ar2n` φ exactly (asserted). The five source fits and their `_ar2n` were copied from the desktop
+for this (`data_locations.md`). Summary over the 18 distinct coloured cells (ρ̂1 ≥ 0.2; the splices'
+other rows are LinReg1's, near white, where all four fits agree to |φ| ≤ 0.02):
+
+| | EYW vs LS (free) | EYWn vs LSn (restricted) |
+|---|---|---|
+| \|ρ1 of the AR − ρ̂1\|, median | **0.004** vs 0.031 | **0.007** vs 0.028 |
+| \|xi_d/σ_ξ − 1\|, median (one-step calibration) | **0.031** vs 0.048; better in 14/18 | **0.036** vs 0.101; better in 17/18 |
+| ACF misfit lags 1–20, 1–10 TU, median RMS | 0.043 vs **0.033** | 0.043 vs **0.033** |
+| ACF misfit lags 1–20, 10–74 TU, median RMS | 0.062 vs **0.057**; better in 5/18 | 0.063 vs **0.059**; better in 5/18 |
+| \|log LRV ratio AR/data\| (lags ≤ 200), median | 0.23 vs **0.16** | 0.23 vs **0.16** |
+
+Where the restriction binds:
+- LinReg7 Z[0,6]: LSn (0.838, 0), xi_d/σξ 1.169; EYWn (0.822, 0), 1.119. Free EYW keeps a
+  much smaller negative pole than free LS: −0.066 vs −0.416.
+- LinReg7 Z[16,32]: free EYW is already admissible, with poles 0.812 and 0.115, so EYWn = EYW
+  (0.927, −0.093), xi_d/σξ 1.094 vs LSn 1.118. Its LRV ratio drops, though: 0.37 vs 0.45.
+- LinReg16 Z[0,6]: 1.084 → 1.056. LinReg14 Z[0,6]: 1.007 → 1.004.
+
+The largest changes are in the cells the restriction does not touch, all in the direction of
+one-step calibration:
+- LinReg16 E[7,15]: 1.137 → 0.964.
+- LinReg14 E[7,15]: 1.082 → 0.978.
+- LinReg7 E[16,32]: 0.838 → 0.973.
+- LinReg16 E[16,32]: 0.820 → 0.964.
+- LinReg7 Z[7,15]: 0.621 → 0.692. Both fits are still strongly over-dispersed one step ahead
+  there: variance matching gives σ_ξ 1.4–1.6× the realized innovation.
+
+**So EYW trades the ACF beyond lag 1, and with it part of the low-frequency power, for lag 1 and
+the one-step spread.** It matches ρ1 almost exactly in every cell. It halves the restricted fit's
+one-step miscalibration. It fits the ACF at lags 1–20 worse, inside and outside the fit window,
+and keeps less of the long-run variance in Z[16,32] and E[16,32]: LRV ratio 0.37–0.40 vs
+0.43–0.48, and 0.76–0.78 vs 0.87–0.90. In the restricted cells this is the same trade-off as
+`ar2_ls_lag1` (§12b), which was not adopted. Which matters more for the hindcast, the lag-1 and
+one-step spread or the low-frequency power, is not settled offline. A `2en` round would test it.
+Rik's call.
+
+## 25. The training hindcast: baselines and round 1 (2026-10-13, Snellius + laptop; Rik)
+
+5 ICs inside the fit window (k = 5, 11, 16, 22, 28; t = 1.00–6.75 TU) x 10 members, same member seeds;
+`batch_scripts/run_d6_train.sh` (jobs 28020744: LinReg1/6/7; 28026554: the nine round-1 closures;
+18–19 min each on A100), output `out/D6train_<closure>`; diagnostics `analysis/train_hindcast.jl`, fans
+`analysis/plot_train_fans.jl` -> `analysis/figures/train/train_fans_<closure>.pdf`.
+
+Spread–skill pooled over ICs and leads, per QoI (Z/E[0,6], Z/E[7,15], Z/E[16,32]):
+
+| closure | ≤ 0.5 TU | 0.5–3 TU | gate | ratio / partner (≤ 0.5 TU) |
+|---|---|---|---|---|
+| LinReg1 | .61 .69 .73 .73 .78 .78 | 1.30 1.30 1.24 1.24 1.22 1.22 | 0.41 % | — |
+| LinReg6 | .60 .70 .70 .70 .75 .74 | 1.31 1.33 1.25 1.25 1.24 1.24 | 0 | — |
+| LinReg7 | .40 .44 .39 .39 .42 .42 | .84 .81 .78 .78 .78 .78 | 0 | — |
+| S1.1 LinReg7_ar2n | .73 .62 .83 .84 .87 .86 | 1.26 1.12 1.20 1.21 1.19 1.18 | 0.04 % | 1.82 1.42 2.12 2.14 2.06 2.06 (flagged) |
+| S1.2a Splice1_E0x11 | .59 .55 .75 .75 .79 .78 | 1.14 1.07 1.11 1.12 1.10 1.10 | 0.01 % | .96 .80 1.02 1.02 1.00 1.00 |
+| S1.2b Splice1_E0x7 | .55 .42 .72 .73 .76 .76 | 1.00 .84 .99 1.00 .98 .98 | 0 | .90 .62 .99 .99 .98 .98 |
+| S1.2c Splice1_E0x8 | .54 .38 .69 .70 .74 .73 | .92 .75 .88 .89 .87 .87 | 0 | .87 .56 .94 .95 .94 .94 |
+| S1.3a Splice1_E0x11_ar2n | .62 .64 .75 .75 .78 .77 | 1.18 1.13 1.17 1.17 1.15 1.15 | 0.03 % | 1.04 1.17 1.00 1.00 .99 .99 |
+| S1.3b Splice1_E0x7_ar2n | .61 .64 .72 .73 .75 .75 | 1.20 1.16 1.17 1.18 1.15 1.15 | 0.07 % | 1.10 1.51 1.00 1.00 .98 .98 |
+| S1.3c Splice1_E0x8_ar2n | .61 .68 .69 .69 .72 .72 | 1.15 1.08 1.11 1.12 1.09 1.09 | 0.06 % | 1.14 1.79 .99 .99 .98 .98 |
+| S1.4 LinReg14_ar2n | .60 .62 .74 .74 .81 .79 | 1.24 1.22 1.16 1.17 1.16 1.15 | 0.10 % | .98 .97 .99 .98 1.03 1.03 |
+| S1.5 LinReg16_ar2n | .64 .60 .78 .77 .83 .82 | 1.14 1.07 1.09 1.10 1.08 1.08 | 0 | 1.04 .94 1.08 1.06 1.11 1.10 |
+
+No member diverged in any closure. Ensemble-mean bias at 0.5 TU −6 to −8.5 % in every closure (5 ICs:
+noise-level). **Training vs held-out (LinReg1, LinReg7):** every training number lies inside the 90 %
+range of random 5-IC subsets of the held-out 90 (LinReg1 ≤ 0.5 TU 0.72 vs 0.94 [0.61, 1.56]; 0.5–3 TU
+1.25 vs 1.33 [1.03, 1.77]; LinReg7 0.41 vs 0.57 [0.33, 0.89]; bias at one lead ±10 points by
+sampling) — no generalization gap visible at 5 ICs; LinReg1 too wide at 0.5–3 TU and LinReg7 too
+narrow ≤ 0.5 TU hold in-sample. The defect rule (card amendment 7, partner-relative) flagged S1.1 for
+the intended widening; Rik ran it anyway (card, Post hoc). S1.1 full hindcast: job 28033409 (packed).
+
+## 26. Round 1, S1.1 = LinReg7 + AR(2): full hindcast and long runs (2026-10-13/15, Snellius + laptop)
+
+Hindcast: job 28033409 (`run_d6_packed.sh`, A100, 10 tasks of 31–35 min), `out/D6_LinReg7_ar2n`
+(digest 5616cb50c055 laptop = Snellius). Long runs: job 28099390 (`run_online_array.sh LinReg7_ar2n on`,
+H100, 8:08–8:17 per replica), `out/TO_LRS/LinReg7_ar2n/` (desktop-built model; the laptop's own
+round-off build moved to `TO_LRS/LinReg7_ar2n_laptopbuild/`), digest dfa1d64a4e21 laptop = Snellius.
+
+- **vs LinReg1 (criterion):** CRPS_0.5 0.2338 vs 0.2208, +5.9 % [+0.0, +12.3]; CRPS_all +5.5 %
+  [+2.6, +8.6]; δ₀.₅ +7.3 % [+1.0, +14.0]; calibrated 36 vs 28, +8 [+1, +13]. S fails; C fails on the
+  margin (upper end +12.3 % > 10 %). Per band CRPS_0.5: better than LinReg1 in E[0,6] only (−0.010).
+- **vs LinReg7 (partner):** CRPS_0.5 −11.1 % [−14.6, −7.7]; CRPS_all +0.9 % (n.r.); δ₀.₅ +0.5 % (n.r.);
+  calibrated 36 vs 5, +31 [+20, +33].
+- Hindcast spread–skill ≤ 0.5 TU 0.91–1.05, 0.5–3 TU 1.04–1.22; extreme ranks 0.16–0.20 (0.18
+  calibrated); bias −4.2 / −6.0 % at 0.5 / 2.5 TU; 0 diverged; gate 350 of 1 080 000 steps, 14 members.
+- **Long runs:** b −6.2 % [−7.3, −4.1]; D pooled 0.84 (single 0.55–1.07); ratio 1.24 (per QoI 1.31
+  1.14 1.24 1.25 1.24 1.24); 5 of 5 stable; gate 0/0/25/83/7 of 39 900. **KS guard vs LinReg7: pass**
+  (ranges overlap). Verdict vs LinReg1: G pass, S fail, C fail → does not improve.
+- **Correction ACF in the long runs** (gated steps out): lag one record / LinReg7 / S1.1: Z[0,6] .96 /
+  .43 / .93; E[0,6] .74 / .40 / .73; Z[7,15] .98 / .09 / .95; E[7,15] .99 / .09 / .98; small scales
+  1.00 / .98 / 1.00, .99. The AR(2) restores the colour ridge removed.
+- Paper: Sec. 7.1.1, Table `tab: res s11`, Figs. `results_s11_{fans,dqacf,longrun}.pdf`
+  (`analysis/plot_results_round1.jl`).

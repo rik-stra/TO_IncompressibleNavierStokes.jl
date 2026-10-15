@@ -33,7 +33,10 @@ const CLOSURES = (("LinReg1", "0"), ("LinReg6", "1e-4"), ("LinReg7", "1"), ("Lin
 # runs that reach 100 TU only (all of them when every run is stable, i.e. exactly as before), and a
 # closure with no stable run gets none.
 const NOGATE = get(ENV, "LRS_NOGATE", "") == "1"
-const CLOSURES_RUN = NOGATE ? (("LinReg1", "0"), ("LinReg1_nogate", "0"), ("LinReg6", "1e-4"),
+# 🔑 Closure names as arguments (2026-10-13, round 1): `longrun_stats.jl LinReg1 LinReg7 LinReg7_ar2n`
+# runs those TO_LRS directories instead of the default table (the second column is then "-").
+const CLOSURES_RUN = !isempty(ARGS) ? Tuple((String(a), "-") for a in ARGS) :
+                     NOGATE ? (("LinReg1", "0"), ("LinReg1_nogate", "0"), ("LinReg6", "1e-4"),
                                ("LinReg6_nogate", "1e-4")) : CLOSURES
 
 function runs(c)

@@ -99,8 +99,13 @@ Clause S and the CRPS part of clause C now read the window CRPS_0.5. Plan and me
    `D6train_<closure>`. Reported for every closure: divergences, gate firings, spread–skill pooled
    over leads ≤ 0.5 TU and over 1–3 TU, pooled rank histograms, ensemble-mean bias. **Not scored
    against the held-out set, no clause, no tuning.** A closure skips its full hindcast only for a
-   defect: a diverged member, or a pooled spread–skill ratio (leads ≤ 0.5 TU) outside [0.5, 2] in
-   any QoI. Everything else runs.
+   defect: a diverged member, or a pooled spread–skill ratio (leads ≤ 0.5 TU) more than a factor 2
+   from its matched partner's in any QoI. Everything else runs.
+   *Corrected the same day (Rik: "go with b"), after the baselines' training hindcasts and before
+   any round-1 closure's:* the first version ("a ratio outside [0.5, 2]") flagged LinReg7 itself
+   (0.39–0.44 in-sample; held-out median 0.56), so it would have skipped closures for the real
+   under-dispersion step 1 tests rather than for a broken artefact. Partners as in the table above
+   (S1.1 → LinReg7; S1.2a–c → LinReg1; S1.3a–c → S1.2a–c; S1.4 → S1.3a; S1.5 → S1.3b).
 
 ## Settings and where they come from
 
@@ -121,4 +126,12 @@ Clause S and the CRPS part of clause C now read the window CRPS_0.5. Plan and me
   the E[0,6] rule itself was formulated after a pilot scan.
 
 ## Post hoc
-(none yet)
+
+- **2026-10-13, training hindcast (amendment 7), after the round-1 closures' training runs.** No
+  member diverged in any closure. The defect rule (ratio ≤ 0.5 TU more than a factor 2 from the
+  partner's) flagged **S1.1** only: LinReg7 + AR(2) / LinReg7 = 1.82 1.42 2.12 2.14 2.06 2.06
+  (S1.1's own ratios 0.73 0.62 0.83 0.84 0.87 0.86, LinReg7's 0.40–0.44). That is the widening step 1
+  predicts for S1.1 ("vs LinReg7: more calibrated cells"), not a broken artefact (its fans and
+  ratios are ordinary, close to LinReg1's). **Rik: "go with i, run S1.1 anyway".** S1.1 gets its
+  full hindcast; the rule's intent (catch a broken artefact) is unchanged, and this exception is the
+  only one. The other eight: ratio to partner 0.56–1.79, no defect. Numbers: results_LSTMS.md §25.

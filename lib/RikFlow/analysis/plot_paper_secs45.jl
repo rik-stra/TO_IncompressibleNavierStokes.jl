@@ -10,14 +10,16 @@
 #   baseline_spread_skill.pdf     spread-skill ratio per (QoI, lead) cell, and the long-run ratio
 #   baseline_rank_histograms.pdf  rank histogram per (QoI, lead) cell, LinReg1 against LinReg7
 #   baseline_step_response.pdf    the solver's response to a step in the correction (Sec. 4.3)
-#   colour_residual_acf.pdf       residual ACF of LinReg1 and LinReg7, AR(1)/AR(2) fits (Sec. 5)
+#   colour_residual_acf.pdf       residual ACF of LinReg1 and LinReg7, AR(2) fits (Sec. 5)
+#   colour_residual_acf_ar1.pdf   LinReg7's residual ACF with the AR(1) fit (Sec. 5, 2026-10-15)
 #   colour_dq_acf.pdf             ACF of dQ in the long runs against the tracked record (Sec. 5)
 #
 # Every number a figure shows comes from the code that made the paper's tables: the hindcast through
 # score_d6.jl (assemble, cell_moments, cell_ratios, rank_histogram_by_lead_lw; the lead-wise policy,
 # all 90 ICs, a diverged member left out of all three baselines from its stop on, 2026-10-08), the long runs and the dQ ACF as in baseline_extras.jl, the residual as in
 # colour_tables.jl (deployed C, training rows 400-4000), the AR fits as lrs_ar_variant.jl's
-# (`ar2_ls` on lags 1-20; AR(1) phi = lag-1 ACF). Each figure prints the numbers the text quotes, so
+# (`ar2_ls` on lags 1-20; the AR(1) by `ar1_ls`, the same fit on lags 1-20, since 2026-10-15; before,
+# phi = lag-1 ACF). Each figure prints the numbers the text quotes, so
 # a mismatch shows here and not in the PDF.
 #
 # The step response needs `exp_square_HIT/output/TO_LSTM/response/response_kernel.jld2`, written by
@@ -319,7 +321,7 @@ function _defname(e)
     e.head in (:function, :(=)) && e.args[1] isa Expr && e.args[1].head === :call && return e.args[1].args[1]
     return nothing
 end
-let src = joinpath(@__DIR__, "m0c_checks.jl"), want = Set([:ar2_acf, :ar2_stationary, :ar2_ls]), got = Set{Symbol}()
+let src = joinpath(@__DIR__, "m0c_checks.jl"), want = Set([:ar2_acf, :ar2_stationary, :ar2_ls, :ar1_ls]), got = Set{Symbol}()
     for e in Meta.parseall(read(src, String); filename = src).args
         n = _defname(e)
         n in want || continue
@@ -394,27 +396,42 @@ function train_residual(name)
     return Y .- X * C
 end
 
-function fig_resacf(; L = 200)
+# `PAPER45_FIT_LAGS` (default 20, the closures' window) refits the AR(1) and AR(2) on lags 1..Lf, for
+# exploration only; the files then get the suffix `_L<Lf>` (2026-10-15).
+function fig_resacf(; L = 200, Lf = parse(Int, get(ENV, "PAPER45_FIT_LAGS", "20")))
     lags = 1:L                                   # log lag axis: lag 0 (= 1) is not drawn
     R = Dict(c => train_residual(c) for c in ("LinReg1", "LinReg7"))
     F7 = full_residual("LinReg7")                # its residual on 10-100 TU: the tail beyond the fit
     fig = Figure(size = (W, 240), figure_padding = (2, 6, 2, 2))
     axs = qoi_axes(fig; LAGAX...)
+    fig1 = Figure(size = (W, 230), figure_padding = (2, 6, 2, 2))
+    axs1 = qoi_axes(fig1; LAGAX...)
     for i in 1:NQ
         ax = axs[i]
         hlines!(ax, [0.0]; color = :gray70, linewidth = 0.5)
         a1 = autocorr(R["LinReg1"][:, i], L)
         a7 = autocorr(R["LinReg7"][:, i], L)
-        p1, p2 = ar2_ls(a7; L = 20, nonneg = true)          # the fit the closures use (Sec. 6.1)
-        u1, u2 = ar2_ls(a7; L = 20)                         # unconstrained, for comparison
+        p1, p2 = ar2_ls(a7; L = Lf, nonneg = true)          # the fit the closures use (Sec. 6.1)
+        u1, u2 = ar2_ls(a7; L = Lf)                         # unconstrained, for comparison
         f2 = ar2_acf(p1, p2, L)
         fu = ar2_acf(u1, u2, L)
-        f1 = a7[2] .^ (0:L)
-        q1, q2 = ar2_ls(a1; L = 20, nonneg = true)
+        # AR(1) fitted as the AR(2) is, on lags 1-20 (2026-10-15, Rik); g1 = the old phi = rho_1
+        r1 = ar1_ls(a7; L = Lf)
+        f1 = ar2_acf(r1, 0.0, L)
+        g1 = a7[2] .^ (0:L)
+        below(x) = something(findfirst(<(0.1), x[2:end]), -1)   # first lag below 0.1
+        @printf("resacf: %-8s AR(1) LS phi %.3f (rho1 %.3f), max |fit - data| lags 1-20 %.3f (rho1 version %.3f), fit - data at lag 1 %+.3f; first lag < 0.1: data %d, LS %d, rho1 %d; LRV LS %.1f, rho1 %.1f\n",
+                LABELS[i], r1, a7[2], maximum(abs, f1[2:21] .- a7[2:21]), maximum(abs, g1[2:21] .- a7[2:21]),
+                f1[2] - a7[2], below(a7), below(f1), below(g1), 1 + 2sum(f1[2:end]), 1 + 2sum(g1[2:end]))
+        q1, q2 = ar2_ls(a1; L = Lf, nonneg = true)
         @printf("resacf: %-8s rho1 LinReg1 %.2f, LinReg7 %.2f | LinReg7 AR(2) constrained phi = (%.3f, %.3f), fitted rho1 %.2f, max |fit - data| lags 1-20 %.3f; unconstrained (%.3f, %.3f), rho1 %.2f, max %.3f; min ACF lags 1-40 data %+.3f, AR(2) %+.3f; LRV data %.1f AR2 %.1f (unconstr. %.1f) AR1 %.1f | LinReg1 AR(2) phi = (%.3f, %.3f)\n",
                 LABELS[i], a1[2], a7[2], p1, p2, f2[2], maximum(abs, f2[2:21] .- a7[2:21]), u1, u2, fu[2],
                 maximum(abs, fu[2:21] .- a7[2:21]), minimum(a7[2:41]), minimum(f2[2:41]),
                 1 + 2sum(a7[2:end]), 1 + 2sum(f2[2:end]), 1 + 2sum(fu[2:end]), 1 + 2sum(f1[2:end]), q1, q2)
+        w = 2:(Lf + 1)
+        @printf("resacf: %-8s fit on lags 1-%d: max |fit - data| there AR(2) constrained %.3f, unconstrained %.3f, AR(1) %.3f
+",
+                LABELS[i], Lf, maximum(abs, f2[w] .- a7[w]), maximum(abs, fu[w] .- a7[w]), maximum(abs, f1[w] .- a7[w]))
         lines!(ax, lags, a1[2:end]; color = COL["LinReg1"], linewidth = 1.1)
         lines!(ax, lags, a7[2:end]; color = COL["LinReg7"], linewidth = 1.1)
         a7h = autocorr(F7.R[F7.ho, i], L)
@@ -423,21 +440,32 @@ function fig_resacf(; L = 200)
         lines!(ax, lags, a7h[2:end]; color = (COL["LinReg7"], 0.45), linewidth = 1.1)
         lines!(ax, lags, fu[2:end]; color = :gray55, linewidth = 0.6, linestyle = :dashdot)
         lines!(ax, lags, f2[2:end]; color = C_REF, linewidth = 0.8, linestyle = :dash)
-        lines!(ax, lags, f1[2:end]; color = C_REF, linewidth = 0.8, linestyle = :dot)
-        r, cc = pos(i)
-        r == 2 ? (ax.xlabel = "lag (steps)") : (ax.xticklabelsvisible = false)
-        cc == 1 ? (ax.ylabel = "autocorrelation") : (ax.yticklabelsvisible = false)
-        xlims!(ax, 1, L); ylims!(ax, -0.3, 1.02)
+        # the AR(1) in a figure of its own (Rik, 2026-10-15: one plot with both fits is too much)
+        ax1 = axs1[i]
+        hlines!(ax1, [0.0]; color = :gray70, linewidth = 0.5)
+        lines!(ax1, lags, a7[2:end]; color = COL["LinReg7"], linewidth = 1.1)
+        lines!(ax1, lags, f1[2:end]; color = C_REF, linewidth = 0.8, linestyle = :dash)
+        for a in (ax, ax1)
+            r, cc = pos(i)
+            r == 2 ? (a.xlabel = "lag (steps)") : (a.xticklabelsvisible = false)
+            cc == 1 ? (a.ylabel = "autocorrelation") : (a.yticklabelsvisible = false)
+            xlims!(a, 1, L); ylims!(a, -0.3, 1.02)
+        end
     end
     Legend(fig[3, 1:3], [LineElement(color = COL["LinReg1"]), LineElement(color = COL["LinReg7"]),
                          LineElement(color = (COL["LinReg7"], 0.45)),
                          LineElement(color = C_REF, linestyle = :dash),
-                         LineElement(color = :gray55, linestyle = :dashdot),
-                         LineElement(color = C_REF, linestyle = :dot)],
-           ["LinReg1", "LinReg7", "LinReg7, 10–100 TU", "AR(2), constrained", "AR(2), unconstrained", "AR(1)"];
+                         LineElement(color = :gray55, linestyle = :dashdot)],
+           ["LinReg1", "LinReg7", "LinReg7, 10–100 TU", "AR(2), constrained", "AR(2), unconstrained"];
            orientation = :horizontal, nbanks = 2)
-    rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
-    savefig("colour_residual_acf.pdf", fig)
+    Legend(fig1[3, 1:3], [LineElement(color = COL["LinReg7"]), LineElement(color = C_REF, linestyle = :dash)],
+           ["LinReg7", "AR(1)"]; orientation = :horizontal, nbanks = 1)
+    for f in (fig, fig1)
+        rowgap!(f.layout, 3); colgap!(f.layout, 10)
+    end
+    sfx = Lf == 20 ? "" : "_L$Lf"
+    savefig("colour_residual_acf$sfx.pdf", fig)
+    savefig("colour_residual_acf_ar1$sfx.pdf", fig1)
 end
 
 # --------------------------------------------------------------------------------------------------
@@ -496,7 +524,7 @@ function fig_dqacf(; L = 200)
                          [LineElement(color = col) for (_, _, col) in sets];
                          [LineElement(color = COL["LinReg1"], linestyle = :dot, linewidth = 0.9)]],
            ["tracked record"; [lab * ", long runs" for (lab, _, _) in sets]; "LinReg1, run with the alternating burst"];
-           orientation = :horizontal)
+           orientation = :horizontal, nbanks = length(sets) > 2 ? 2 : 1)
     rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
     savefig("colour_dq_acf.pdf", fig)
 end

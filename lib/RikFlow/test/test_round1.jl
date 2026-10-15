@@ -7,6 +7,11 @@
 #     AR(2)s, and returns a pair its own stationarity test accepts for ACFs no stationary AR(2) fits;
 #     V82 (2026-10-07): its `nonneg = true` restriction (φ1 ≥ 0, φ2 ≤ 0) is feasible, leaves a fit
 #     it does not bind unchanged, and is a minimum over the restricted set, also inside `fit_ar`;
+#     V83 (2026-10-13): `ar2_eyw`, the overdetermined Yule–Walker fit, is ordinary Yule–Walker at
+#     L = 2, recovers known AR(2)s exactly, stays stationary, and is the constrained minimum of its
+#     own (linear) objective, also inside `fit_ar`;
+#     V88 (2026-10-15): `ar1_ls`, the AR(1) fitted by `ar2_ls`'s objective (paper Fig. colour-resacf),
+#     recovers known AR(1)s, is the restricted AR(2) fit where that lies on φ2 = 0, and a minimum;
 #   * Σ_ξ (exp_square_HIT/tools/lrs_ar_variant.jl): the innovation variance gives the AR(2) the
 #     residual's marginal variance -- in closed form, and by a long simulation with the builder's own
 #     simulator -- and `fit_ar` assembles Σ_ξ = D R D from it;
@@ -78,7 +83,7 @@
     end
 
     defs_from!(@__MODULE__, joinpath(RF, "analysis", "m0c_checks.jl"),
-               (:NQ, :acf, :ar2_acf, :ar2_stationary, :ar2_ls))
+               (:NQ, :acf, :ar2_acf, :ar2_stationary, :ar2_yw, :ar2_ls, :ar1_ls, :ar2_eyw))
     defs_from!(@__MODULE__, joinpath(RF, "exp_square_HIT", "tools", "lrs_ar_variant.jl"),
                (:ar_acf, :ar_poles, :ar2_ls_lag1, :ar_innovation_var, :fit_ar, :sim_ar_S))
     defs_from!(@__MODULE__, joinpath(RF, "exp_square_HIT", "tools", "lrs_splice.jl"),
@@ -237,6 +242,32 @@ end
     @test ar2_ls(r; L = 20, nonneg = false) == ar2_ls(r; L = 20)
 end
 
+@testitem "V88 ar1_ls: exact recovery, the restricted AR(2) fit on its edge, a minimum" default_imports = false setup = [Round1] begin
+    using Test
+    using .Round1: ar2_acf, ar2_ls, ar1_ls
+    sse(a, r) = sum(abs2, ar2_acf(a, 0.0, 20)[2:end] .- r[2:21])
+    # (i) the exact ACF of an AR(1) gives back its coefficient
+    for p in (0.0, 0.3, 0.8, 0.95, 0.99)
+        @test ar1_ls(p .^ (0:20); L = 20) ≈ p atol = 1e-9
+    end
+    # (ii) where the restricted AR(2) fit lies on the edge φ2 = 0 (negative real pole in the target,
+    # as LinReg7's Z[0,6] and Z[16,32]), the AR(1) fit is that fit
+    targets = [ar2_acf(p1, p2, 20) for (p1, p2) in ((0.44, 0.36), (0.39, 0.43), (0.6, 0.2), (0.3, 0.6))]
+    fits = [ar2_ls(r; L = 20, nonneg = true) for r in targets]
+    onedge = [(r, a) for (r, (a, b)) in zip(targets, fits) if b == 0]
+    @test length(onedge) >= 2
+    for (r, a) in onedge
+        @test abs(ar1_ls(r; L = 20) - a) <= 1e-4
+    end
+    # (iii) a minimum: no worse than a 10x finer grid, and never worse than φ = ρ̂(1), the AR(1) the
+    # figure drew before (on an ACF that falls fast and then decays slowly, as the middle band's)
+    for r in (ar2_acf(0.44, 0.36, 20), ar2_acf(1.2, -0.3, 20), [1; 0.95 .* 0.8 .^ (0:19)])
+        a = ar1_ls(r; L = 20)
+        @test sse(a, r) <= minimum(sse(x, r) for x in 0:1e-5:0.99999) + 1e-6
+        @test sse(a, r) <= sse(r[2], r)
+    end
+end
+
 @testitem "V82 fit_ar(nonneg = true) gives every QoI a pair with phi1 >= 0, phi2 <= 0" default_imports = false setup = [Round1] begin
     using Test
     using Random
@@ -253,6 +284,63 @@ end
     @test f.p2[1] <= 0 && f.p2[2] <= 0                 # ... the restricted one does not
     @test f.phi[:, 3:6] == g.phi[:, 3:6]               # where it does not bind, nothing changes
     @test_throws AssertionError fit_ar(Z, 2; lag1 = true, nonneg = true)
+end
+
+@testitem "V83 ar2_eyw: Yule-Walker at L = 2, exact recovery, stationary, the constrained minimum" default_imports = false setup = [Round1] begin
+    using Test
+    using Random
+    using .Round1: ar2_acf, ar2_yw, ar2_eyw, ar2_stationary, ar_poles
+    rng = Xoshiro(83)
+    # (i) L = 2 is ordinary Yule-Walker, on an ACF that no AR(2) fits exactly
+    for _ in 1:20
+        r = ar2_acf(1.2, -0.4, 20) .+ [0; 0.01 .* randn(rng, 20)]
+        @test all(isapprox.(ar2_eyw(r; L = 2), ar2_yw(r[2], r[3]); atol = 1e-12))
+    end
+    # (ii) the exact ACF of a stationary AR(2) satisfies the recursion at every lag: recovered to
+    # round-off, on and off any grid (unlike ar2_ls, V81), when its poles keep inside the margin
+    n = Ref(0)
+    while n[] < 200
+        p1, p2 = 4 * rand(rng) - 2, 2 * rand(rng) - 1
+        (ar2_stationary(p1, p2) && maximum(ar_poles(p1, p2)) < 0.97) || continue
+        n[] += 1
+        a, b = ar2_eyw(ar2_acf(p1, p2, 20); L = 20)
+        @test abs(a - p1) < 1e-8 && abs(b - p2) < 1e-8
+    end
+    # (iii) ACFs no stationary AR(2) fits: the result is stationary, with a margin (no ulp-inside
+    # pairs, cf. V81)
+    for r in (ones(21), cos.(0.3 .* (0:20)), [1.0; 0.9; fill(-0.9, 19)], 0.9999 .^ (0:20))
+        a, b = ar2_eyw(r; L = 20)
+        @test ar2_stationary(a, b)
+        @test maximum(ar_poles(a, b)) < 1 - 1e-4
+    end
+    # (iv) the constrained minimum of the Yule-Walker misfit, free and restricted, against a fine grid
+    sse(a, b, r) = sum(abs2, r[k + 1] - a * r[abs(k - 1) + 1] - b * r[abs(k - 2) + 1] for k in 1:20)
+    # the feasible set of ar2_eyw: the stationarity triangle shrunk by margin = 1e-3
+    ok(a, b, nn) = abs(b) <= 0.999 && a + b <= 0.999 && b - a <= 0.999 && (!nn || (a >= 0 && b <= 0))
+    for (p1, p2) in ((0.44, 0.36), (0.6, 0.2), (-0.4, 0.3), (1.2, -0.5)), nn in (false, true)
+        r = ar2_acf(p1, p2, 20) .+ [0; 0.02 .* randn(rng, 20)]
+        a, b = ar2_eyw(r; L = 20, nonneg = nn)
+        @test !nn || (a >= 0 && b <= 0)
+        gridbest = minimum(sse(x, y, r) for x in -1.99:0.005:1.99, y in -0.99:0.005:0.99 if ok(x, y, nn))
+        @test sse(a, b, r) <= gridbest + 1e-9
+    end
+end
+
+@testitem "V83 fit_ar(eyw = true) uses ar2_eyw per QoI, restricted with nonneg" default_imports = false setup = [Round1] begin
+    using Test
+    using Random
+    using .Round1: sim_ar_S, fit_ar, acf, ar2_eyw, NQ
+    p1 = [0.44, 0.39, 1.2, 0.6, 0.9, 0.3]
+    p2 = [0.36, 0.43, -0.5, -0.1, -0.1, -0.2]
+    Z = permutedims(sim_ar_S(p1, p2, [i == j ? 1.0 : 0.2 for i in 1:6, j in 1:6], 100_000, Xoshiro(7)))
+    for nn in (false, true)
+        f = fit_ar(Z, 2; eyw = true, nonneg = nn)
+        @test all(i -> f.phi[:, i] == collect(ar2_eyw(acf(Z[:, i], 0:20); L = 20, nonneg = nn)), 1:NQ)
+        @test !nn || all(i -> f.p1[i] >= 0 && f.p2[i] <= 0, 1:NQ)
+    end
+    f = fit_ar(Z, 2; eyw = true)
+    @test maximum(abs.(f.p1 .- p1)) < 0.03 && maximum(abs.(f.p2 .- p2)) < 0.03
+    @test_throws AssertionError fit_ar(Z, 2; lag1 = true, eyw = true)
 end
 
 # ---------------------------------------------------------------------------------------------

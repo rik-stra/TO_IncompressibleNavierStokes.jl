@@ -158,6 +158,67 @@ function ar2_ls(racf; L = 20, nonneg = false)
     return p1, p2
 end
 
+"""
+    ar1_ls(racf; L = 20)
+
+AR(1) whose ACF best matches the empirical one at lags 1..L: `ar2_ls`'s objective on its edge
+φ2 = 0, searched over φ in [0, 1) at 1e-4 as `ar2_ls(...; nonneg = true)` searches that edge, so
+where the restricted AR(2) fit lies on the edge the two coincide. For the paper's residual ACF figure
+(2026-10-15, Rik: fit the AR(1) the same way as the AR(2), not by φ = ρ̂(1)).
+"""
+function ar1_ls(racf; L = 20)
+    best = (Inf, 0.0)
+    for a in 0:1e-4:(1 - 1e-4)
+        e = sum(abs2, ar2_acf(a, 0.0, L)[2:end] .- racf[2:(L + 1)])
+        e < best[1] && (best = (e, a))
+    end
+    return best[2]
+end
+
+"""
+    ar2_eyw(racf; L = 20, nonneg = false, margin = 1e-3)
+
+AR(2) by the overdetermined (extended) Yule–Walker method (2026-10-13): least squares on the
+Yule–Walker equations at lags 1..L,
+
+    ρ̂(k) = φ1 ρ̂(k−1) + φ2 ρ̂(k−2),   k = 1..L,   ρ̂(−1) = ρ̂(1),
+
+with `racf` = ρ̂ at lags 0:L. Linear in φ; `L = 2` is ordinary Yule–Walker (`ar2_yw`). Unlike
+`ar2_ls`, which matches the AR's own ACF to ρ̂, this fits the recursion. The overdetermined solution
+is not guaranteed stationary, so the stationarity triangle (shrunk by `margin`) is imposed;
+`nonneg = true` adds φ1 ≥ 0, φ2 ≤ 0, as in `ar2_ls`. A convex QP in two unknowns, solved exactly by
+enumerating the active sets of at most two constraints.
+"""
+function ar2_eyw(racf; L = 20, nonneg = false, margin = 1e-3)
+    rho(k) = racf[abs(k) + 1]
+    A = [rho(k - j) for k in 1:L, j in 1:2]
+    b = [rho(k) for k in 1:L]
+    # Constraints C φ ≤ d: the stationarity triangle, then the sign restriction.
+    C = [0.0 1.0; 0.0 -1.0; 1.0 1.0; -1.0 1.0]
+    d = fill(1 - margin, 4)
+    if nonneg
+        C = [C; -1.0 0.0; 0.0 1.0]
+        d = [d; 0.0; 0.0]
+    end
+    H, g = A' * A, A' * b
+    m = size(C, 1)
+    best, pbest = Inf, [NaN, NaN]
+    for act in Iterators.flatten(([Int[]], ([i] for i in 1:m), ([i, j] for i in 1:m for j in (i + 1):m)))
+        Ca = C[act, :]
+        K = [H Ca'; Ca zeros(length(act), length(act))]
+        rank(K) < size(K, 1) && continue
+        p = (K \ [g; d[act]])[1:2]
+        all(C * p .<= d .+ 1e-12) || continue
+        e = sum(abs2, A * p .- b)
+        if e < best
+            best, pbest = e, p
+        end
+    end
+    # On an active sign constraint the solve lands within round-off of it (±1e-17): put it on it.
+    nonneg && (pbest = [max(pbest[1], 0.0), min(pbest[2], 0.0)])
+    return pbest[1], pbest[2]
+end
+
 "sigma^2 g' T(rho) g: the variance of sum_k g_k e_{n-k} for a stationary e with ACF rho (lags 0:K-1)."
 function kpower(g, rho, s2)
     K = length(g)
