@@ -268,6 +268,23 @@ end
     end
 end
 
+@testitem "V89 fit_ar(1; ls = true) uses ar1_ls per QoI; plain AR(1) stays phi = rho_1" default_imports = false setup = [Round1] begin
+    using Test
+    using Random
+    using .Round1: sim_ar_S, fit_ar, acf, ar1_ls, NQ
+    # an ACF that falls fast and then decays slowly (AR(2) with two positive poles), where the two differ
+    p1 = [0.44, 0.39, 1.2, 0.6, 0.9, 0.3]
+    p2 = [0.36, 0.43, -0.3, 0.2, -0.1, 0.4]
+    Z = permutedims(sim_ar_S(p1, p2, [i == j ? 1.0 : 0.2 for i in 1:6, j in 1:6], 50_000, Xoshiro(89)))
+    f = fit_ar(Z, 1; ls = true)
+    g = fit_ar(Z, 1)
+    @test all(i -> f.phi[1, i] == ar1_ls(acf(Z[:, i], 0:20); L = 20), 1:NQ)
+    @test all(i -> g.phi[1, i] == acf(Z[:, i], 0:20)[2], 1:NQ)
+    @test size(f.phi) == (1, NQ) && f.p2 == zeros(NQ)
+    @test any(abs.(f.p1 .- g.p1) .> 0.02)
+    @test_throws AssertionError fit_ar(Z, 2; ls = true)
+end
+
 @testitem "V82 fit_ar(nonneg = true) gives every QoI a pair with phi1 >= 0, phi2 <= 0" default_imports = false setup = [Round1] begin
     using Test
     using Random

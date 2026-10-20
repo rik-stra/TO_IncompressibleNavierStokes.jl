@@ -2820,9 +2820,53 @@ round-off build moved to `TO_LRS/LinReg7_ar2n_laptopbuild/`), digest dfa1d64a4e2
 - Paper: Sec. 7.1.1, Table `tab: res s11`, Figs. `results_s11_{fans,dqacf,longrun}.pdf`
   (`analysis/plot_results_round1.jl`).
 
+## 27. LinReg7 + AR(1) by least squares (`LinReg7_ar1ls`), built 2026-10-15 (laptop)
+
+`lrs_ar_variant.jl LinReg7 1ls` (new variant `ls`, `fit_ar(...; ls = true)` → `ar1_ls`; test V89).
+Same mean and Σ_ξ = DRD construction as S1.1; only the AR differs. φ = 0.838 0.406 0.833 0.841 0.850
+0.770 (the figure's `ar1_ls` on `train_residual`: 0.837 0.405 0.835 0.841 0.850 0.770; the two
+residuals differ by the builder's per-QoI scaling and μ_η, and the ACF estimates by up to 0.002 in φ).
+In Z[0,6] and Z[16,32] this is S1.1's AR (constrained AR(2) on the edge φ2 = 0): identical φ.
+- Kernel power, full 6×6, as built / white: 2.72 1.95 3.23 3.30 3.05 3.06 (data 2.80 2.96 3.08 3.18
+  2.72 2.74 under the §10h construction).
+- Offline (teacher-forced 1–10 TU): marginal sd model / residual 0.97–1.01; one-step data innovation
+  sd / σ_ξ 1.17 0.98 **0.61 0.53** 1.12 0.83 → expect over-dispersion at short leads in the middle band
+  (φ ≈ 0.84 against ρ̂₁ 0.95 / 0.97: the AR(1) puts too much variance in the innovation).
+- **Training hindcast** (job 28110566, A100, 17:59, `out/D6train_LinReg7_ar1ls`, 50 files; partner
+  LinReg7 added to `train_hindcast.jl`'s PARTNER): 0 diverged; gate 11 of 60 000 steps (2 members).
+  Spread–skill ≤ 0.5 TU 0.75 0.63 0.85 0.86 0.88 0.87 (S1.1 0.73 0.62 0.83 0.84 0.87 0.86), 0.5–3 TU
+  1.26 1.12 1.19 1.20 1.17 1.17 (S1.1 1.26 1.12 1.20 1.21 1.19 1.18); extreme ranks ≤ 0.5 TU 0.17–0.29
+  (S1.1 0.17–0.30); bias −8.4 / +4.2 % at 0.5 / 2.5 TU (S1.1 −8.5 / +4.5). **Indistinguishable from
+  S1.1 at this sample.** The one-step middle-band over-dispersion the offline check predicts does not
+  show over the first 0.5 TU (0.85 / 0.86 vs 0.83 / 0.84). Defect rule: flagged, as S1.1, for the same
+  intended widening (ratio / LinReg7 1.85 1.44 2.16 2.19 2.08 2.09). Fans:
+  `analysis/figures/train/train_fans_LinReg7_ar1ls.pdf`.
+- Submitted 2026-10-15 (Rik: "submit both"): full hindcast job 28111209 (`run_d6_packed.sh`, A100,
+  10 tasks, → `out/D6_LinReg7_ar1ls`); long runs job 28111211 (`run_online_array.sh LinReg7_ar1ls on`,
+  H100, 5 replicas, → `out/TO_LRS/LinReg7_ar1ls/`). Model on Snellius: sha256 64c6c9a3… = laptop.
+- **Results** (hindcast 10 tasks 31:44–34:08; long runs 8:08–8:16). `score_d6.jl --compare`, lead-wise,
+  90 ICs; scoring log in the session scratchpad.
+  - **vs S1.1 (AR(2), same mean, shared random numbers):** CRPS_0.5 −0.05 % [−0.23, +0.13]; CRPS_all
+    −0.13 % (n.r.); δ₀.₅ +0.05 % (n.r.); calibrated 36 vs 36. **The AR order does not matter in the
+    hindcast.**
+  - **vs LinReg1 (criterion):** CRPS_0.5 0.2337 vs 0.2208, +5.8 % [−0.1, +12.2]; CRPS_all +5.4 %
+    [+2.6, +8.3]; δ₀.₅ +7.4 % [+1.0, +14.1]; calibrated 36 vs 28, +8 [+1, +12]. S fails, C fails on the
+    margin (+12.2 % > 10 %). Per band as S1.1: better than LinReg1 in E[0,6] only (−0.011).
+  - **vs LinReg7 (partner):** CRPS_0.5 −11.2 % [−14.7, −7.7]; calibrated 36 vs 5, +31 [+19, +33].
+  - 0 diverged; guard 780 of 1 080 000 hindcast steps (18 members, 15 ICs; S1.1 350, 14), none in the
+    CRPS_0.5 window; long runs 127 of 199 500 (one run, 2 events; S1.1 115, 3 runs).
+  - **Long runs:** b −6.6 % [−8.5, −5.0]; D pooled 0.90 (single 0.71–1.10); ratio 1.25 (per QoI 1.32
+    1.16 1.25 1.26 1.26 1.26); 5 of 5 stable. KS guard vs LinReg7 (single 0.54–0.91): pass. S1.1: b
+    −6.2 %, D 0.84 (0.55–1.07), ratio 1.24. Verdict vs LinReg1: G pass, S fail, C fail → does not improve.
+  - **Correction ACF in the long runs** (gated steps out), lag one record / S1.1 / AR(1): Z[0,6] .96 /
+    .93 / .93; E[0,6] .74 / .73 / .72; **Z[7,15] .98 / .95 / .89; E[7,15] .99 / .98 / .92**; small scales
+    1.00 / 1.00 / 1.00, .99 / .99. The AR(1) is less persistent at lag one in the middle band, as its
+    φ ≈ 0.84 predicts; max |mean − record| over lags 1–200 middle band .14 / .08 (S1.1 .14 / .03).
+    Figure: `analysis/figures/train/dqacf_LinReg7_ar1_ar2.pdf`.
+
 ## 28. Step 2, LinReg1 + power-law scale (`LinReg1_pl`): training hindcast, full hindcast and long runs (2026-10-15/16, Snellius + laptop)
 
-(Numbered 28: §27 is `LinReg7_ar1ls`, uncommitted on `conditional-density_time-series`.) Card
+(§27 is `LinReg7_ar1ls`, from a parallel session.) Card
 `analysis/cards/step2.md` (opened after the training hindcast; Rik saw it 2026-10-15). Artefact
 `TO_LRS/LinReg1_pl` as built on 2026-10-07 (§17), re-checked with `--report`; Rik kept it although its
 fit rows are steps 400–4000 and LinReg1's training rows 405–3999 (|Δβ| ≤ 0.009; card, Settings).

@@ -6,7 +6,9 @@
 # `LinReg7_ar2c`, the AR(2) with the residual's lag 1 exact (`ar2_ls_lag1`); `2n` writes `LinReg7_ar2n`,
 # the AR(2) restricted to φ1 ≥ 0, φ2 ≤ 0 (`ar2_ls(...; nonneg = true)`: no step-to-step alternating
 # component; 2026-10-07, paper Sec. 6.1). `2e` / `2en` write `LinReg7_ar2e` / `LinReg7_ar2en`, the AR(2) by
-# overdetermined Yule–Walker on lags 1-20 (`ar2_eyw`, free / restricted; 2026-10-13). `--report`
+# overdetermined Yule–Walker on lags 1-20 (`ar2_eyw`, free / restricted; 2026-10-13). `1ls` writes
+# `LinReg7_ar1ls`, the AR(1) fitted as the AR(2) is, by LS on the residual ACF at lags 1-20 (`ar1_ls`;
+# 2026-10-15, the AR(1) of paper Fig. colour-resacf-ar1); plain `1` stays φ = ρ̂(1). `--report`
 # re-prints the tables for existing variants (checking the file holds exactly the refit) and writes nothing.
 #
 # The new directory holds a byte copy of `<src>/LinReg.jld2` with three keys ADDED (`ar_phi`,
@@ -20,7 +22,8 @@
 #   z_t = (q^t − mu_out) / sigma_out − c [x_t; 1] − μ_η
 #
 #  * p = 2: per-QoI AR(2) by least squares on the residual ACF at lags 1-20 (`ar2_ls`, stationary
-#    by construction). p = 1: φ = the residual's lag-1 autocorrelation.
+#    by construction). p = 1: φ = the residual's lag-1 autocorrelation, or with `ls` (`1ls`) by
+#    least squares on the ACF at lags 1-20 (`ar1_ls`, φ in [0, 1)).
 #  * Σ_ξ = D R D: R the lag-0 correlation of the implied innovations ξ_t = z_t − Σ φ_k z_{t−k}, D the
 #    per-QoI scale that makes the AR's stationary MARGINAL variance equal var(z):
 #    σ_ξ² = var(z) (1 − φ1 ρ1 − φ2 ρ2), ρ the AR's own ACF.
@@ -84,9 +87,10 @@ variance and a long simulation.
 """
 ar_innovation_var(s2, p1, p2) = (rho = ar_acf(p1, p2, 2); s2 * (1 - p1 * rho[2] - p2 * rho[3]))
 
-function fit_ar(Z, p; lag1 = false, nonneg = false, eyw = false)
+function fit_ar(Z, p; lag1 = false, nonneg = false, eyw = false, ls = false)
     @assert !(lag1 && nonneg) "lag1 and nonneg are separate variants"
     @assert !(lag1 && eyw) "lag1 and eyw are separate variants"
+    @assert !ls || p == 1 "ls is the AR(1) variant"
     phi = zeros(p, NQ)
     for i in 1:NQ
         r = acf(Z[:, i], 0:20)
@@ -94,7 +98,7 @@ function fit_ar(Z, p; lag1 = false, nonneg = false, eyw = false)
             phi[:, i] .= lag1 ? ar2_ls_lag1(r; L = 20) :
                          eyw ? ar2_eyw(r; L = 20, nonneg) : ar2_ls(r; L = 20, nonneg)
         else
-            phi[1, i] = r[2]
+            phi[1, i] = ls ? ar1_ls(r; L = 20) : r[2]
         end
     end
     p1 = phi[1, :]
@@ -209,14 +213,15 @@ function offline_sanity(file, name, f; io, seed = 1)
     return (; werr, rows)
 end
 
-function build(src, p; io = stdout, report_only = false, lag1 = false, nonneg = false, eyw = false)
+function build(src, p; io = stdout, report_only = false, lag1 = false, nonneg = false, eyw = false, ls = false)
     @assert (!lag1 && !nonneg && !eyw) || p == 2
-    dst = "$(src)_ar$(p)" * (lag1 ? "c" : "") * (eyw ? "e" : "") * (nonneg ? "n" : "")
+    @assert !ls || p == 1
+    dst = "$(src)_ar$(p)" * (lag1 ? "c" : "") * (eyw ? "e" : "") * (nonneg ? "n" : "") * (ls ? "ls" : "")
     ddir = joinpath(LRS, dst)
     report_only || !isdir(ddir) || error("$ddir exists; refusing to overwrite (--report re-prints it)")
     fitr = guard(steps_of(1, 10))
     d = scaled_resid(src, fitr)
-    f = fit_ar(d.Z, p; lag1, nonneg, eyw)
+    f = fit_ar(d.Z, p; lag1, nonneg, eyw, ls)
     Sw = Matrix(cov(d.m["stoch_distr"]))
     println(io, "\n==== $dst: AR($p) on $(src)'s scaled residual, steps $(first(fitr))-$(last(fitr)) (1-10 TU)")
     @printf(io, "  %-9s %7s %7s %7s | %13s | %9s %9s %11s\n", "QoI", "rho1", "phi1", "phi2", "|poles|",
@@ -246,7 +251,8 @@ function build(src, p; io = stdout, report_only = false, lag1 = false, nonneg = 
                      eyw ? "ar2_eyw: overdetermined Yule-Walker on residual ACF lags 1-20, stationary" *
                            (nonneg ? ", restricted to phi1 >= 0, phi2 <= 0" : "") :
                      nonneg ? "ar2_ls on residual ACF lags 1-20, restricted to phi1 >= 0, phi2 <= 0" :
-                     p == 2 ? "ar2_ls on residual ACF lags 1-20" : "AR(1) at residual lag 1",
+                     p == 2 ? "ar2_ls on residual ACF lags 1-20" :
+                     ls ? "ar1_ls: AR(1) by LS on residual ACF lags 1-20, phi in [0, 1)" : "AR(1) at residual lag 1",
             sigma = "innovation lag-0 correlation, marginal variance matched to var(z)",
             fit_steps = (first(fitr), last(fitr)), units = "scaled (out_scaling), minus mean(stoch_distr)",
             record = "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2",
@@ -276,11 +282,11 @@ if abspath(PROGRAM_FILE) == @__FILE__
     src = isempty(args) ? "LinReg7" : args[1]
     ps = length(args) > 1 ? args[2:end] : ["2", "1"]
     # "2c" = AR(2) with lag 1 exact; "2n" = AR(2) restricted to phi1 >= 0, phi2 <= 0; "2e" = overdetermined
-    # Yule-Walker (`ar2_eyw`), "2en" the same restricted
+    # Yule-Walker (`ar2_eyw`), "2en" the same restricted; "1ls" = AR(1) by `ar1_ls`
     for p in ps
         flags = lstrip(p, collect('0':'9'))
-        @assert flags in ("", "c", "n", "e", "en") "unknown variant $p"
+        @assert flags in ("", "c", "n", "e", "en", "ls") "unknown variant $p"
         build(src, parse(Int, p[1:(end - length(flags))]); report_only, lag1 = 'c' in flags,
-              nonneg = 'n' in flags, eyw = 'e' in flags)
+              nonneg = 'n' in flags, eyw = 'e' in flags, ls = flags == "ls")
     end
 end

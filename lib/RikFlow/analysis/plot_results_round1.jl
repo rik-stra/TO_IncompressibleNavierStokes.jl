@@ -4,7 +4,8 @@
 #   results_s11_longrun.pdf   long-run QoI distributions (5 runs x 100 TU pooled) against the reference,
 #                             with the pooled KS distance per QoI and closure
 #   results_s11_dqacf.pdf     ACF of the correction in the long runs (gated steps and the h after them left
-#                             out, as Fig. 6), S1.1 and LinReg7 against the tracked record
+#                             out, as Fig. 6), S1.1, LinReg7 + AR(1) (`LinReg7_ar1ls`, Sec. 7.1.2, added
+#                             2026-10-15) and LinReg7 against the tracked record
 #
 # Usage (from lib/RikFlow): julia --project=analysis analysis/plot_results_round1.jl [--step s2] [fans] [longrun] [dqacf] [traj]
 #
@@ -20,6 +21,10 @@ const STEP = let i = findfirst(==("--step"), ARGS)
 end
 haskey(STEPS, STEP) || error("--step $STEP: known steps are $(join(sort(collect(keys(STEPS))), ", "))")
 const S11, SLAB = STEPS[STEP]           # (S11 kept as the name: the closure of the third column)
+const S11_AR1 = "LinReg7_ar1ls"          # LinReg7 + AR(1) by `ar1_ls` (2026-10-15), on S1.1's ACF figure
+# the closures added to the step's correction-ACF figure (PAPER45_DQ_EXTRA)
+const DQ_EXTRA = STEP == "s11" ? SLAB * "=TO_LRS/" * S11 * ",LinReg7 + AR(1)=TO_LRS/" * S11_AR1 :
+                 SLAB * "=TO_LRS/" * S11
 const R1_SETS = (("LinReg1", "TO_LRS/LinReg1", COL["LinReg1"]), ("LinReg7", "TO_LRS/LinReg7", COL["LinReg7"]),
                  (SLAB, "TO_LRS/" * S11, to_color("#009E73")))
 
@@ -157,9 +162,12 @@ function fig_r1_traj(lab; others = (), stride = 20, file = nothing)
     savefig(something(file, "results_traj_" * replace(lab, " + " => "_", "(" => "", ")" => "") * ".pdf"), fig)
 end
 
-"The correction's ACF in the long runs, as Fig. 6, for LinReg1, LinReg7 and the step's closure against the record."
+"""
+The correction's ACF in the long runs, as Fig. 6, for LinReg1, LinReg7 and the step's closure against the
+record (s11: also LinReg7 + AR(1)).
+"""
 function fig_r1_dqacf(; L = 200)
-    withenv("PAPER45_DQ_EXTRA" => SLAB * "=TO_LRS/" * S11) do
+    withenv("PAPER45_DQ_EXTRA" => DQ_EXTRA) do
         fig_dqacf(; L)
     end
     mv(joinpath(FIGDIR, "colour_dq_acf.pdf"), joinpath(FIGDIR, "results_$(STEP)_dqacf.pdf"); force = true)

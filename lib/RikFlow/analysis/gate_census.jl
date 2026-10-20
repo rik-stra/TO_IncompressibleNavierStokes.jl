@@ -11,22 +11,19 @@
 #              `plot_paper_secs45.jl dqacf`; t = column * dt (dt = 2.5e-3). An event is a run of
 #              firings with gaps of at most EVENT_GAP steps.
 #
-# Usage: julia --project=analysis analysis/gate_census.jl [closure ...]
-#
-# 🔑 Closure names as arguments (2026-10-16, step 2): `gate_census.jl LinReg1_pl` counts out/D6_<name>
-# and out/TO_LRS/<name> for those names instead of the default table (a name without one of the two
-# directories is skipped there; the lambda column is then "-").
+# Usage: julia --project=analysis analysis/gate_census.jl [closure names]
 
 using JLD2, Printf
 
 const OUTD = joinpath(@__DIR__, "..", "exp_square_HIT", "output")
-const NAMES = String.(ARGS)
-const D6_DIRS = isempty(NAMES) ? ("D6_LinReg1", "D6_LinReg6", "D6_LinReg7", "D6_DDN") :   # LinReg6 (lambda = 1e-4) added 2026-10-13
-                Tuple("D6_" * n for n in NAMES if isdir(joinpath(OUTD, "D6_" * n)))
-const LRS_DIRS = isempty(NAMES) ?
-                 (("LinReg1", "0"), ("LinReg6", "1e-4"), ("LinReg7", "1"), ("LinReg8", "10"),
-                  ("LinReg9", "100"), ("LinReg10", "1e4"), ("LinReg5", "- (not in paper)")) :
-                 Tuple((n, "-") for n in NAMES if isdir(joinpath(OUTD, "TO_LRS", n)))
+const D6_DIRS = ("D6_LinReg1", "D6_LinReg6", "D6_LinReg7", "D6_DDN")   # LinReg6 (lambda = 1e-4) added 2026-10-13
+const LRS_DIRS = (("LinReg1", "0"), ("LinReg6", "1e-4"), ("LinReg7", "1"), ("LinReg8", "10"),
+                  ("LinReg9", "100"), ("LinReg10", "1e4"), ("LinReg5", "- (not in paper)"))
+# 🔑 Closure names as arguments (2026-10-15, round 1): `gate_census.jl LinReg7_ar2n LinReg7_ar1ls` counts
+# out/D6_<name> and TO_LRS/<name> of those closures instead of the default tables. A name without one
+# of the two directories is skipped there (2026-10-16, step 2: `gate_census.jl LinReg1_pl LinReg1`).
+const D6_RUN = isempty(ARGS) ? D6_DIRS : Tuple("D6_" * a for a in ARGS if isdir(joinpath(OUTD, "D6_" * a)))
+const LRS_RUN = isempty(ARGS) ? LRS_DIRS : Tuple((String(a), "-") for a in ARGS if isdir(joinpath(OUTD, "TO_LRS", a)))
 const CRPS05 = 200          # CRPS_0.5 window, leads 1..200
 const LRS_SKIP = 100        # long runs: count from column 101 on
 const DT = 2.5e-3
@@ -135,16 +132,16 @@ function report_lrs(dir, lam)
 end
 
 println("Gate census -- firing = identically-zero forecast dQ column (#35)")
-s6 = Dict(d => report_d6(d, census_d6(d)) for d in D6_DIRS)
-sl = Dict(d => report_lrs(d, l) for (d, l) in LRS_DIRS)
+s6 = Dict(d => report_d6(d, census_d6(d)) for d in D6_RUN)
+sl = Dict(d => report_lrs(d, l) for (d, l) in LRS_RUN)
 
 println("\n== Summary")
-for d in D6_DIRS
+for d in D6_RUN
     s = s6[d]
     @printf("  %-12s %6d / %7d (%.3f %%)  members %3d/%d  ICs %2d/%d  in CRPS_0.5 window %d\n",
             d, s.nf, s.ns, 100s.nf / s.ns, s.members, s.nmem, s.ics, s.nics, s.in05)
 end
-for (d, _) in LRS_DIRS
+for (d, _) in LRS_RUN
     s = sl[d]; s === nothing && continue
     @printf("  %-12s %6d / %7d (%.3f %%)  replicas %d/%d  events %d\n",
             "LRS " * d, s.tot, s.totn, 100s.tot / s.totn, s.nrep, s.nfiles, s.allev)
