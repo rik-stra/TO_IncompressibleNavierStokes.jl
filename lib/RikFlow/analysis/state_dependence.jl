@@ -2,9 +2,9 @@
 #
 #     julia --startup-file=no --project=lib/RikFlow/analysis lib/RikFlow/analysis/state_dependence.jl
 #
-# Step 4 (paper Sec. 6, 4a/4c) replaces the constant Σ of LinReg + MVG by a state-dependent scale. This
+# Step 5 (paper Sec. 6, 5a/5c) replaces the constant Σ of LinReg + MVG by a state-dependent scale. This
 # asks, offline and before any such closure is chosen, whether there is state dependence to learn, and
-# where. For LinReg1 (4p and 4a) and LinReg7 (4c's mean), the deployed coefficients applied
+# where. For LinReg1 (steps 2 and 5a) and LinReg7 (5c's mean), the deployed coefficients applied
 # teacher-forced to R1's tracked record, residual standardised by its training-window sd (the constant
 # MVG scale); fits on 1-10 TU (steps 400-4000, the training window), evaluated there and on 10-100 TU
 # (no fit uses it). Per QoI:
@@ -23,7 +23,7 @@
 include(joinpath(@__DIR__, "..", "src", "ts_history.jl"))   # HistorySpec, build_history
 include(joinpath(@__DIR__, "..", "src", "ts_scaling.jl"))   # scale_input
 include(joinpath(@__DIR__, "..", "src", "ts_score.jl"))     # autocorr
-include(joinpath(@__DIR__, "..", "src", "ts_scale.jl"))     # fit_powerlaw_scale: step 4p's own fit
+include(joinpath(@__DIR__, "..", "src", "ts_scale.jl"))     # fit_powerlaw_scale: step 2's own fit
 using JLD2, LinearAlgebra, Statistics, Printf
 
 const DT = 2.5e-3
@@ -41,7 +41,7 @@ function residual(name)
     X, Y, st = build_history(hist, scale_input(REC["q_star"], s), scale_input(REC["q"], s))
     tr = findall(n -> 400 <= n <= 4000, st)                     # = colour_tables.jl's training rows
     ho = findall(n -> 10 < n * DT <= 100, st)
-    # the state: q*^n, the predicted level the closure (step 4p) and its guard read -- the first block
+    # the state: q*^n, the predicted level the closure (step 2) and its guard read -- the first block
     # of `build_history`'s row [q*^n; q^{n-1}; q*^{n-1}; ...; 1], scaled. The latest corrected level
     # q^{n-1} (the next block) gives the same numbers (2026-10-07: 0.481 vs 0.483 nats/step held out).
     lev = X[:, 1:NQ]
@@ -118,7 +118,7 @@ for name in ("LinReg1", "LinReg7")
     end
     @printf("   %-8s %11.3f | %8.3f %14.3f | %8.3f   (sum over QoIs)\n", "total", tot...)
 
-    # 4. the simplest physical form, step 4p: σ_i ∝ (q*_i^n)^β_i, fitted by `fit_powerlaw_scale` and
+    # 4. the simplest physical form, step 2: σ_i ∝ (q*_i^n)^β_i, fitted by `fit_powerlaw_scale` and
     #    evaluated as deployed (state clipped to its 1-10 TU range)
     println("4. power law in the own level, σ ∝ q^β (ML on 1-10 TU): β, and NLL gain, nats/step [train | held]")
     tot4 = zeros(2)

@@ -11,14 +11,22 @@
 #              `plot_paper_secs45.jl dqacf`; t = column * dt (dt = 2.5e-3). An event is a run of
 #              firings with gaps of at most EVENT_GAP steps.
 #
-# Usage: julia --project=analysis analysis/gate_census.jl
+# Usage: julia --project=analysis analysis/gate_census.jl [closure ...]
+#
+# 🔑 Closure names as arguments (2026-10-16, step 2): `gate_census.jl LinReg1_pl` counts out/D6_<name>
+# and out/TO_LRS/<name> for those names instead of the default table (a name without one of the two
+# directories is skipped there; the lambda column is then "-").
 
 using JLD2, Printf
 
 const OUTD = joinpath(@__DIR__, "..", "exp_square_HIT", "output")
-const D6_DIRS = ("D6_LinReg1", "D6_LinReg6", "D6_LinReg7", "D6_DDN")   # LinReg6 (lambda = 1e-4) added 2026-10-13
-const LRS_DIRS = (("LinReg1", "0"), ("LinReg6", "1e-4"), ("LinReg7", "1"), ("LinReg8", "10"),
-                  ("LinReg9", "100"), ("LinReg10", "1e4"), ("LinReg5", "- (not in paper)"))
+const NAMES = String.(ARGS)
+const D6_DIRS = isempty(NAMES) ? ("D6_LinReg1", "D6_LinReg6", "D6_LinReg7", "D6_DDN") :   # LinReg6 (lambda = 1e-4) added 2026-10-13
+                Tuple("D6_" * n for n in NAMES if isdir(joinpath(OUTD, "D6_" * n)))
+const LRS_DIRS = isempty(NAMES) ?
+                 (("LinReg1", "0"), ("LinReg6", "1e-4"), ("LinReg7", "1"), ("LinReg8", "10"),
+                  ("LinReg9", "100"), ("LinReg10", "1e4"), ("LinReg5", "- (not in paper)")) :
+                 Tuple((n, "-") for n in NAMES if isdir(joinpath(OUTD, "TO_LRS", n)))
 const CRPS05 = 200          # CRPS_0.5 window, leads 1..200
 const LRS_SKIP = 100        # long runs: count from column 101 on
 const DT = 2.5e-3

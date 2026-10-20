@@ -1,4 +1,4 @@
-# The state-dependent scale of the residual, step 4p (paper Sec. 6.4, Eq. power law; added 2026-10-07).
+# The state-dependent scale of the residual, step 2 (paper Sec. 6.3, Eq. power law; added 2026-10-07 as step 4p, renumbered 2026-10-13).
 #
 #     η = μ_η + f(q*) ⊙ ε,   ε ~ N(0, Σ_ε),   f_i(q) = (clamp(q_i, lo_i, hi_i) / q_ref,i)^β_i
 #

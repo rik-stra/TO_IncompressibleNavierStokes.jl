@@ -453,6 +453,10 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
             model_name, basename(mdl), hist_len, hist_var)
     ar_meta.ar_order > 0 && println("  AR(", ar_meta.ar_order, ") residual, phi = ",
                                     round.(ar_meta.ar_phi; digits = 4))
+    # step 2's power-law scale (2026-10-16): printed so the log says which residual ran (WORKFLOW GATE 3)
+    cl === :lrs && jldopen(f -> haskey(f, "scale_beta"), mdl) &&
+        println("  power-law scale of the residual, beta = ", round.(load(mdl, "scale_beta"); digits = 3),
+                ar_meta.ar_order > 0 ? " (on the AR process)" : "")
     cl === :lstm && @printf("  M4: arch %s, emission %s, window %d, target %s, knobs [%s], deploy seed %d\n",
                             lstm_meta.lstm_arch, lstm_meta.lstm_emission, lstm_meta.lstm_window,
                             lstm_meta.lstm_target, lstm_meta.lstm_knobs, lstm_meta.deploy_seed)

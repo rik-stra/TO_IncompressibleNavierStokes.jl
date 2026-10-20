@@ -2819,3 +2819,106 @@ round-off build moved to `TO_LRS/LinReg7_ar2n_laptopbuild/`), digest dfa1d64a4e2
   1.00 / .98 / 1.00, .99. The AR(2) restores the colour ridge removed.
 - Paper: Sec. 7.1.1, Table `tab: res s11`, Figs. `results_s11_{fans,dqacf,longrun}.pdf`
   (`analysis/plot_results_round1.jl`).
+
+## 28. Step 2, LinReg1 + power-law scale (`LinReg1_pl`): training hindcast, full hindcast and long runs (2026-10-15/16, Snellius + laptop)
+
+(Numbered 28: §27 is `LinReg7_ar1ls`, uncommitted on `conditional-density_time-series`.) Card
+`analysis/cards/step2.md` (opened after the training hindcast; Rik saw it 2026-10-15). Artefact
+`TO_LRS/LinReg1_pl` as built on 2026-10-07 (§17), re-checked with `--report`; Rik kept it although its
+fit rows are steps 400–4000 and LinReg1's training rows 405–3999 (|Δβ| ≤ 0.009; card, Settings).
+Runs from the Snellius checkout `conditional-density_time-series` @ `697e074f` (the branch
+`step2-powerlaw-scale` differs only in comments, laptop-only builders, tests, analysis).
+
+**Implementation review (2026-10-15, read-only agent):** no result-changing bug; units, state (q*^n,
+physical), μ_η, clip (never binds in-sample; 2–3 % of 10–100 TU steps above, ~0 below) and the common
+random numbers checked end to end on the real files (same RNG state after replay + gate + 400 steps;
+per-QoI correlation of paired deviations ≥ 0.9999; V83 now pins this). Average scaled variance on the training states
+1.000–1.005 × diag Σ (these review numbers come from the agent's own checks, not a repo script). Added to V83: the state passed through `get_next_item_timeseries` (vs scaled q*
+and the previous level) and the built `LinReg1_pl` against LinReg1; `--report` compares with a
+tolerance (Newton stop: |Δβ| ~ 3e-9 across machines). 413 tests pass.
+
+**Training hindcast** (job 28110732, `out/D6train_LinReg1_pl`; §25's protocol): no divergence, guard
+246 → 0 firings, spread–skill ≤ 0.5 TU .63 .73 .74 .74 .79 .78 (LinReg1 .61–.78; ratio to LinReg1
+1.01–1.06, no defect), 0.5–3 TU 1.08–1.16 (LinReg1 1.22–1.30); member-steps below the training range
+at 0.5–3 TU 0.6–1.0 % vs 2.0–3.4 %.
+
+**Full hindcast** (job 28112414, packed, gpu_a100, 32–34 min per task; `out/D6_LinReg1_pl`, 900
+files, digest 4f26d1b4aea1 laptop = Snellius) and **long runs** (28112415 replicas 1–3; 4–5 cancelled
+at dispatch for `reason=budget`, rerun as 28112831; ~8:10 per replica on gpu_h100;
+`out/TO_LRS/LinReg1_pl/`, digest eebb4d3183b7 laptop = Snellius):
+
+- **vs LinReg1:** CRPS_0.5 0.2202 vs 0.2208, −0.3 % [−1.0, +0.5]; CRPS_all +0.5 % [−0.7, +1.9];
+  δ₀.₅ −0.2 % [−0.6, +0.2]; calibrated 27 vs 28, −1 [−2, +6] (reference 35.7). None resolved.
+- **vs LinReg7:** CRPS_0.5 −16.3 % [−22.9, −10.4]; CRPS_all −3.9 % [−7.1, −0.7]; δ₀.₅ −6.5 %
+  [−12.4, −0.7]; calibrated +22 [+14, +29].
+- Spread vs error (joint mask, `train_hindcast.jl --full`): ensemble sd LinReg1_pl / LinReg1 0.91–1.00 at
+  every lead and QoI (0.93–0.94 in the middle and small scales already at lead 25); ensemble-mean
+  rmse 0.99–1.01 up to lead 400, 0.95–0.98 at lead 1000. So r falls through the spread.
+- r per lead a few % below LinReg1's almost everywhere: leads 50–100 0.77–0.91 (0.78–0.93), 400
+  1.06–1.13 (1.14–1.24), 1000 1.33–1.43 (1.37–1.48). Lost cell: E[16,32] at lead 100 (0.80 → 0.79).
+- Bias of the ensemble mean −2.8 / −5.0 % at 0.5 / 2.5 TU (LinReg1 −2.9 / −5.9). 0 diverged (LinReg1 3).
+  Guard 2146 of 1 080 000 steps (0.20 %), 16 members, 15 ICs (LinReg1 0.42 %, 35, 27).
+  Member-steps at leads 201–1200 with the level below its training range (the clip floor): 1.7–2.2 %
+  vs LinReg1's 2.7–3.4 % (reference 0–0.3 %), about a third fewer (`train_hindcast.jl --full`).
+- **Long runs:** 5 of 5 stable; b −6.1 % [−7.4, −3.2] (LinReg1 −7.3 [−9.5, −4.2]); D pooled 0.79
+  (single 0.57–0.95; LinReg1 0.84, 0.59–1.01); ratio 1.36 (per QoI 1.42 1.36 1.35 1.36 1.35 1.35;
+  LinReg1 1.53); guard 83 / 0 / 488 / 0 / 243 of 39 900 = 0.41 % (LinReg1 1.13 %), first firing
+  at 58.9 TU in replicas 1 and 3 (shared forcing).
+- **Verdict vs LinReg1:** G pass, S fail, C fail → **does not improve.** The scale buys stability
+  (half the guard firings, no divergence) but neither skill nor calibration; the offline 0.48
+  nats/step does not carry (memory #75, now for a fixed physical form too).
+- Figures (`plot_results_round1.jl --step s2`): long-run pooled KS per QoI 0.14 0.10 0.14 0.14 0.13
+  0.13 (LinReg1 0.14 0.11 0.15 0.15 0.14 0.14); two runs dive together near 59 TU (where the
+  long-run guard first fires, shared forcing). Correction ACF in the long runs (gated steps + 5 out:
+  157 / 0 / 715 / 0 / 435): lag one record / LinReg1_pl Z[0,6] .96 / .96, E[0,6] .74 / .76, Z[7,15]
+  .98 / .98, E[7,15] .99 / .98, small scales 1.00 / 1.00; max |mean − record| 0.11 0.07 0.20 0.17
+  0.18 0.16 (LinReg1 0.06 0.17 0.16 0.11 0.18 0.17): close to LinReg1's, slightly more persistent in
+  Z[0,6] and the middle band.
+- Paper: Sec. 7.2 (`sec:res-scale`), Table `tab: res s2`, Figs. `results_s2_{fans,traj,dqacf}.pdf`
+  (`fig:res-s2-fans`, `fig:res-s2-longrun`, `fig:res-s2-dqacf`).
+- **Reproduce** (from `lib/RikFlow`, `--project=analysis`; each reprints the numbers above):
+  `score_d6.jl --compare <out>/D6_LinReg1_pl <out>/D6_LinReg1` (and `.../D6_LinReg7`): CRPS, δ₀.₅,
+  calibrated counts, clauses; `train_hindcast.jl LinReg1 LinReg1_pl` (training hindcast, defect rule,
+  spread/error split, below-range share) and `train_hindcast.jl --full LinReg1 LinReg1_pl` (full
+  hindcast: spread/error split, r per lead, below-range share); `baseline_extras.jl LinReg1_pl` §1
+  (bias in %); `gate_census.jl LinReg1_pl LinReg1` (guard, hindcast and long runs);
+  `longrun_stats.jl LinReg1 LinReg7 LinReg1_pl` (b, D, ratio); `plot_results_round1.jl --step s2
+  fans dqacf traj` (figures). Since 2026-10-16 `baseline_extras.jl` and `gate_census.jl` take
+  closure names, `plot_results_round1.jl` takes `--step`, and `train_hindcast.jl` has the step-2
+  section and `--full`.
+
+## 29. Step 2 on LinReg7: S2b = LinReg7 + power-law scale, S2c = LinReg7 + AR(2) + power-law scale (2026-10-16, laptop + Snellius; Rik: "do both")
+
+Card `analysis/cards/step2_linreg7.md` (written before any run). Methods: closures.tex §Step 2, Eq.
+`eq: power law AR`. S2c scales the coloured residual, η = μ_η + s(q*) ⊙ z, z an AR(2) in unit scale.
+
+**Code.** `time_series_methods.jl`: AR + scale no longer refused; `draw_eta` draws the AR path's ξ
+(one per step) and multiplies z by f(q*); `ar_warm_residual!` pushes the realised residual ÷ f(q*).
+`run_d6.jl` prints β. Builder `lrs_scale_variant.jl LinReg7 --ar2n`: the scale exactly as
+`LinReg7_pl`, the AR(2) by `fit_ar(Z ./ f, 2; nonneg = true)`. V83 items added: AR + scale at β = 0 is
+the AR closure bit for bit (outputs, RNG, warm state); at β ≠ 0 the innovations equal the AR closure's
+to Float32 round-off (< 1e-4 sd over 290 steps; without the factor the misfit is > 1e-2) and the warm
+state is the AR closure's ÷ f; the built files against LinReg7. 1012 tests pass (+5 pre-existing
+`@test_broken` in `test_round1.jl`); V83 alone 306.
+
+**Artefacts** (laptop, 2026-10-16; `--report` re-checks both exactly):
+- `LinReg7_pl`: β 1.029 / 0.509 / 1.358 / 0.956 / 0.717 / 1.058, fit-window gain 0.273 nats/step (§17:
+  0.273, held out 0.283); deployed draws ÷ f have covariance Σ_ε to 0.008; quintile sd pattern of the
+  draws follows the data's (Z[7,15] model 0.63 .. 1.25 vs data 0.51 .. 1.28).
+- `LinReg7_ar2n_pl`: the same scale keys; φ1 / φ2 on Z ÷ f .826/0, .458/−.052, 1.215/−.325,
+  1.573/−.634, .873/0, .796/0 (on Z, laptop refit of S1.1's: .838/0, .451/−.047, 1.221/−.340,
+  1.608/−.669, .850/0, .833/−.054; the constraint now also binds in E[16,32]). σ_ξ / sd(Z ÷ f) 0.21–0.90.
+  Teacher-forced sanity: warm state = data's Z ÷ f to 1e-15; model z ACF follows the AR's; marginal sd
+  model / data 0.97–1.03; one-step xi_d / σ_ξ 1.17 / 1.00 / 0.62 / 0.68 / 1.16 / 0.84 (S1.1's pattern:
+  under-dispersed one step in Z[0,6] / Z[16,32], over-dispersed in the middle band).
+- sha256 `LinReg.jld2`: `LinReg7_pl` 0e546b47…, `LinReg7_ar2n_pl` 8f2c9803…, equal on Snellius.
+
+**Smoke (laptop CPU, S2c, IC 42, 1 member, 200 lead steps):** warm-up dQ bit-identical (and equal to
+S1.1's member 1 there), gate 0/200, finite; the forecast differs from S1.1's member from the first
+step.
+
+**S2b training hindcast** (job 28127114, `out/D6train_LinReg7_pl`, 50 files, laptop = Snellius):
+no divergence, no guard firing; spread–skill ≤ 0.5 TU .42 .45 .41 .40 .43 .43 (LinReg7 .40–.44, ratio
+1.03 in every QoI: no defect), 0.5–3 TU .82–.88 (LinReg7 .78–.84). Spread / error against LinReg7
+≤ 0.5 TU 1.03 / 1.00, 1–3 TU 1.02–1.04 / 0.97–0.98. Below-range member steps 0.2–0.5 % (LinReg7
+0.1–0.4 %). S2c: not yet run on Snellius (needs the new sampler there).

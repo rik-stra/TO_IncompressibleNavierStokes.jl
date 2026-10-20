@@ -13,9 +13,22 @@
 #   bias             ensemble mean minus truth, % of the reference mean over the ICs, mean over the
 #                    QoIs, at leads 200 and 1000 (0.5 and 2.5 TU)
 #
+# and, for every closure given together with its matched partner (step 2, 2026-10-16; paper Sec. 7.2,
+# results_LSTMS.md §28):
+#
+#   spread / error   per QoI, closure / partner: the root of the pooled ensemble variance (spread) and
+#                    of the pooled squared error of the ensemble mean (error), at the leads of the grid
+#                    and over three windows, with the joint mask (a member that diverged in either
+#                    closure is left out of both from its stop); r per lead of each closure on its own
+#   below range      share of member steps at leads 201-1200 whose level lies below its training
+#                    range: the clip floor of step 2's scale (`TO_LRS/LinReg1_pl`, the minimum of q*
+#                    over steps 400-4000), every closure given and the reference
+#
 # Usage (from lib/RikFlow):
 #   julia --project=analysis analysis/train_hindcast.jl LinReg1 LinReg6 LinReg7 ...
-# reads exp_square_HIT/output/D6train_<name>.
+#   julia --project=analysis analysis/train_hindcast.jl --full LinReg1 LinReg1_pl
+# reads exp_square_HIT/output/D6train_<name>; with `--full` the held-out hindcast D6_<name> instead
+# (the defect rule is then not printed: it is the training hindcast's).
 
 
 include(joinpath(@__DIR__, "score_d6.jl"))
@@ -28,7 +41,9 @@ const WIN = (("<=0.5 TU", 1:200), ("0.5-3 TU", 201:1200))
 const PARTNER = Dict("LinReg7_ar2n" => "LinReg7", "Splice1_E0x11" => "LinReg1", "Splice1_E0x7" => "LinReg1",
                      "Splice1_E0x8" => "LinReg1", "Splice1_E0x11_ar2n" => "Splice1_E0x11",
                      "Splice1_E0x7_ar2n" => "Splice1_E0x7", "Splice1_E0x8_ar2n" => "Splice1_E0x8",
-                     "LinReg14_ar2n" => "Splice1_E0x11_ar2n", "LinReg16_ar2n" => "Splice1_E0x7_ar2n")
+                     "LinReg14_ar2n" => "Splice1_E0x11_ar2n", "LinReg16_ar2n" => "Splice1_E0x7_ar2n",
+                     "LinReg1_pl" => "LinReg1",      # step 2 (analysis/cards/step2.md)
+                     "LinReg7_pl" => "LinReg7", "LinReg7_ar2n_pl" => "LinReg7_ar2n")   # step2_linreg7.md
 
 function diagnose(name; truth = load_truth(), prefix = "D6train_")
     dir = joinpath(OUTD, prefix * name)
@@ -83,12 +98,62 @@ function defect(name, res)
             "ratio / partner's ($p): " * join((@sprintf("%.2f", x) for x in q), " "))
 end
 
-if abspath(PROGRAM_FILE) == @__FILE__
-    truth = load_truth()
-    res = Dict(name => diagnose(name; truth) for name in ARGS)
-    println("\nDEFECT RULE (a diverged member, or a ratio <= 0.5 TU more than a factor 2 from the partner's)")
-    for name in ARGS
-        bad, why = defect(name, res)
-        @printf("   %-20s %-4s %s\n", name, bad ? "YES" : "no", why)
+fmtq(v; d = 3) = join((@sprintf("%.*f", d, x) for x in v), " ")
+
+"Spread and error of `name` against `partner` (joint mask), and r per lead of each on its own."
+function spread_error(name, partner; truth = load_truth(), prefix = "D6train_")
+    ens = Dict(n => load_members(joinpath(OUTD, prefix * n)) for n in (name, partner))
+    ks = sort(intersect(ens[name].ks, ens[partner].ks))
+    own = Dict(n => assemble(restrict(ens[n], ks), truth, 1:1200) for n in (name, partner))
+    jm = Dict(n => (copy(own[n][1]), own[n][2]) for n in (name, partner))
+    mask_joint!([jm[name][1], jm[partner][1]])
+    mo = Dict(n => cell_moments(own[n]...) for n in (name, partner))
+    mj = Dict(n => cell_moments(jm[n]...) for n in (name, partner))
+    nq = size(own[name][1], 2)
+    ratio(F, w) = [sqrt(sum(getfield(mj[name], F)[:, i, w]) / sum(getfield(mj[partner], F)[:, i, w])) for i in 1:nq]
+    r(n, j) = [sqrt(sum(mo[n].W[:, i, j] .* mo[n].V[:, i, j]) / sum(mo[n].E[:, i, j])) for i in 1:nq]
+    @printf("\n== %s / %s, %s: %d ICs; spread = ensemble sd, error = rmse of the ensemble mean (joint mask);\n",
+            name, partner, prefix, length(ks))
+    println("   r of each closure on its own; columns ", join(LAB, " "))
+    for j in LEADS
+        @printf("   lead %4d  spread %s | error %s | r %s %s | r %s %s\n", j, fmtq(ratio(:V, j:j)),
+                fmtq(ratio(:E, j:j)), name, fmtq(r(name, j); d = 2), partner, fmtq(r(partner, j); d = 2))
     end
+    for (wl, w) in (("<=0.5 TU", 1:200), ("0.5-1 TU", 201:400), ("1-3 TU", 401:1200))
+        @printf("   %-9s  spread %s | error %s\n", wl, fmtq(ratio(:V, w)), fmtq(ratio(:E, w)))
+    end
+end
+
+"Share of member steps (leads 201-1200) below step 2's clip floor, per QoI, for `names` and the reference."
+function below_range(names; truth = load_truth(), prefix = "D6train_", w = 201:1200)
+    lo = load(joinpath(OUTD, "TO_LRS", "LinReg1_pl", "LinReg.jld2"), "scale_qclip")[:, 1]
+    @printf("\n== member steps at leads %d-%d below the training range of the level (clip floor of LinReg1_pl), %s\n",
+            first(w), last(w), prefix)
+    tr = nothing
+    for n in names
+        fc, tr = assemble(load_members(joinpath(OUTD, prefix * n)), truth, 1:last(w))
+        sh = [count(x -> !isnan(x) && x < lo[i], view(fc, :, i, :, w)) / count(!isnan, view(fc, :, i, :, w)) for i in eachindex(lo)]
+        @printf("   %-20s %s\n", n, fmtq(sh))
+    end
+    tr === nothing || @printf("   %-20s %s\n", "reference", fmtq([count(<(lo[i]), view(tr, :, i, w)) / length(view(tr, :, i, w)) for i in eachindex(lo)]))
+end
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    full = "--full" in ARGS
+    names = filter(!=("--full"), ARGS)
+    prefix = full ? "D6_" : "D6train_"
+    truth = load_truth()
+    res = Dict(name => diagnose(name; truth, prefix) for name in names)
+    if !full
+        println("\nDEFECT RULE (a diverged member, or a ratio <= 0.5 TU more than a factor 2 from the partner's)")
+        for name in names
+            bad, why = defect(name, res)
+            @printf("   %-20s %-4s %s\n", name, bad ? "YES" : "no", why)
+        end
+    end
+    pairs_ = [(n, PARTNER[n]) for n in names if haskey(PARTNER, n) && PARTNER[n] in names]
+    for (n, p) in pairs_
+        spread_error(n, p; truth, prefix)
+    end
+    isempty(pairs_) || below_range(names; truth, prefix)
 end

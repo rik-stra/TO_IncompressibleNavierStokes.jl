@@ -227,14 +227,24 @@ The linear-regression closure (M0): a level prediction `q^n = scale_output(c [x;
     with `μ_η = mean(stoch_distr)`. The innovation `ξ`, not `η`, is what is drawn (plan §5 D2): the
     closure knows its own past draws. `η` enters exactly where the white draw does.
 
-  * **Power-law scale (optional, step 4p, 2026-10-07; `ts_scale.jl`):** when the file carries
+  * **Power-law scale (optional, step 2, 2026-10-07; `ts_scale.jl`):** when the file carries
     `"scale_beta"`, `"scale_qref"`, `"scale_qclip"` (`n_qoi × 2`) and `"scale_sigma_eps"`,
 
         η_n = μ_η + f(q*_n) ⊙ ε_n,   ε_n ~ N(0, Σ_ε),   f_i = (clamp(q*_i, lo_i, hi_i) / q_ref,i)^β_i,
 
     with `q*` the predictor in physical units. One `rand(rng, MvNormal(0, Σ_ε))` replaces the white
     call, so the stream is LinReg1's; with `β = 0` and `Σ_ε = Σ` the draws equal the white ones bit
-    for bit. Not combined with AR (refused).
+    for bit.
+
+  * **Power-law scale on an AR(p) residual (both key sets; step 2 on LinReg7 + AR(2), 2026-10-16;
+    paper Eq. power law AR):** the scale multiplies the AR process, which lives in unit scale,
+
+        η_n = μ_η + f(q*_n) ⊙ z_n,   z_n = Σ_{k=1..p} φ_k ⊙ z_{n-k} + ξ_n,   ξ_n ~ N(0, Σ_ξ),
+
+    with `φ`, `Σ_ξ` fitted to the residual divided by `f` (`lrs_scale_variant.jl --ar2n`). The draw is
+    the AR path's (one `ξ` per step, so the stream is the AR closure's), and the warm start pushes the
+    realised residual divided by `f(q*)` of that step. `Σ_ε` is not drawn from here. With `β = 0`
+    this is the AR closure bit for bit (`f ≡ 1.0`).
 
 🔴 **Without the AR keys the behaviour is bit-identical to the pre-AR code, RNG stream included**:
 the white branch is the same `rand(rng, stoch_distr)` call at the same point, and nothing else
@@ -282,7 +292,7 @@ struct LinReg
     rng
     ArrayType
     ar          # nothing (white η), or the AR(p) residual state -- see `load_ar_residual`
-    scale       # nothing, or step 4p's power-law scale -- see `load_powerlaw_scale`
+    scale       # nothing, or step 2's power-law scale -- see `load_powerlaw_scale`
     gate::Float64   # turbulence-gate threshold; TURBULENCE_GATE by default, 0.0 = off
 
     function LinReg(file_name, rng, ArrayType; q_hist = nothing, spinnup_data = nothing,
@@ -295,7 +305,6 @@ struct LinReg
         c= adapt(ArrayType, c)
         ar = load_ar_residual(file_name, stoch_distr)
         scale = load_powerlaw_scale(file_name, stoch_distr)
-        !isnothing(ar) && !isnothing(scale) && error("$file_name: AR residual and power-law scale together are not implemented")
 
         counter = zeros(Int)
         if !isnothing(q_hist)
@@ -311,7 +320,7 @@ end
 """
     load_powerlaw_scale(file_name, stoch_distr)
 
-Step 4p's optional scale of a `LinReg` file: `nothing` without the `"scale_*"` keys (every file
+Step 2's optional scale of a `LinReg` file: `nothing` without the `"scale_*"` keys (every file
 before 2026-10-07), else `(; beta, qref, qclip, eps_distr, mu_eta)`. Refuses a partial key set, a
 size mismatch, a non-positive reference or clip range, or a missing `stoch_distr`.
 """
@@ -396,17 +405,17 @@ end
     draw_eta(m::LinReg, q_star = nothing)
 
 The residual draw in scaled units: `rand(rng, stoch_distr)` for a white `LinReg` (the pre-AR call,
-unchanged), `μ_η + z_n` for an AR one, `μ_η + f(q*) ⊙ ε` with step 4p's scale (`q_star` in physical
-units, required then).
+unchanged), `μ_η + z_n` for an AR one, `μ_η + f(q*) ⊙ ε` with step 2's scale, and `μ_η + f(q*) ⊙ z_n`
+with both (`q_star` in physical units, required with a scale).
 """
 function draw_eta(m::LinReg, q_star = nothing)
     sc = m.scale
-    if !isnothing(sc)
-        isnothing(q_star) && error("a power-law scale needs q_star")
+    ar = m.ar
+    !isnothing(sc) && isnothing(q_star) && error("a power-law scale needs q_star")
+    if !isnothing(sc) && isnothing(ar)
         eps = rand(m.rng, sc.eps_distr)
         return sc.mu_eta .+ powerlaw_factor(vec(Array(q_star)), sc.beta, sc.qref, sc.qclip) .* eps
     end
-    ar = m.ar
     isnothing(ar) && return rand(m.rng, m.stoch_distr)
     p = size(ar.z, 2)
     if ar.nz[] < p            # fallback: approximately stationary state (see the docstring)
@@ -416,7 +425,9 @@ function draw_eta(m::LinReg, q_star = nothing)
         end
         ar.nz[] = p
     end
-    return ar.mu_eta .+ ar_step!(ar, m.rng)
+    z = ar_step!(ar, m.rng)
+    isnothing(sc) && return ar.mu_eta .+ z
+    return ar.mu_eta .+ powerlaw_factor(vec(Array(q_star)), sc.beta, sc.qref, sc.qclip) .* z
 end
 
 "The regression input `[x; 1]` (scaled) of the history branch, exactly as the prediction uses it."
@@ -444,7 +455,8 @@ end
     ar_warm_residual!(m::LinReg, q_star, dQ)
 
 Warm start: the residual the replayed step realised, `scale(q* + dQ) − c [x; 1] − μ_η`, from the
-history the model holds now (call BEFORE the history shift), pushed into the AR state.
+history the model holds now (call BEFORE the history shift), pushed into the AR state -- divided by
+`f(q*)` of this step when the file also carries a power-law scale (the AR state is in unit scale).
 """
 function ar_warm_residual!(m::LinReg, q_star, dQ)
     ar = m.ar
@@ -453,7 +465,10 @@ function ar_warm_residual!(m::LinReg, q_star, dQ)
     mu = zeros(n)
     mu[m.fitted_qois] .= vec(Array(m.c * data))
     lev = vec(Array(scale_input(q_star + dQ, m.scaling.out_scaling)))
-    ar_push!(ar, lev .- mu .- ar.mu_eta)
+    zw = lev .- mu .- ar.mu_eta
+    sc = m.scale
+    isnothing(sc) || (zw = zw ./ powerlaw_factor(vec(Array(q_star)), sc.beta, sc.qref, sc.qclip))
+    ar_push!(ar, zw)
     ar.nz[] = min(ar.nz[] + 1, size(ar.z, 2))
     return ar
 end

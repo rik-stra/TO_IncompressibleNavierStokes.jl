@@ -1,7 +1,7 @@
 # Paper Sec. 4 (baseline.tex) and Sec. 5's last paragraph: the numbers not in score_d6.jl's tables
 # (results_LSTMS.md §15). Reads the reused baselines (D6_LinReg1/7/DDN, the R2 long runs).
 #
-#     julia --startup-file=no --project=lib/RikFlow/analysis lib/RikFlow/analysis/baseline_extras.jl
+#     julia --startup-file=no --project=lib/RikFlow/analysis lib/RikFlow/analysis/baseline_extras.jl [closure ...]
 #
 # 1. bias of the ensemble mean by lead in the hindcast (lead-wise policy, the default since
 #    2026-10-08: all 90 ICs, a diverged member left out of all three closures from its stop on;
@@ -21,6 +21,11 @@ const OUTD = normpath(joinpath(@__DIR__, "..", "exp_square_HIT", "output"))
 # (`D6_LinReg1_nogate`, `TO_LRS/LinReg1_nogate`) in place of the gated ones; the labels stay.
 const NOGATE = get(ENV, "BX_NOGATE", "") == "1"
 sfx(c) = NOGATE && c == "LinReg1" ? "_nogate" : ""
+# 🔑 Closure names as arguments (2026-10-16, step 2; as longrun_stats.jl): `baseline_extras.jl
+# LinReg1_pl` runs Secs. 1, 2 and 4 on out/D6_<name> and out/TO_LRS/<name> for those names instead of
+# LinReg1, LinReg7 and the DDN; Sec. 1's joint mask then spans the closures given. Sec. 3 (LinReg1's
+# residual on the record) is unchanged.
+const CL = isempty(ARGS) ? ("LinReg1", "LinReg7", "DDN") : Tuple(String.(ARGS))
 const LABS = ("Z[0,6]", "E[0,6]", "Z[7,15]", "E[7,15]", "Z[16,32]", "E[16,32]")
 fmt6(v; d = 2) = join((@sprintf("%7.*f", d, x) for x in v), "")
 
@@ -30,15 +35,14 @@ sdref = vec(std(truth.q; dims = 2))
 # --- 1. hindcast bias by lead ---------------------------------------------------------------------
 println("1. Hindcast bias of the ensemble mean by lead, reference sd (policy ", POLICY,
         isempty(EXCLUDE_ICS) ? "" : "; D6_EXCLUDE_ICS = " * join(sort(collect(EXCLUDE_ICS)), ","), ")")
-const CL3 = ("LinReg1", "LinReg7", "DDN")
-ens = Dict(c => load_members(joinpath(OUTD, "D6_$c" * sfx(c))) for c in CL3)
+ens = Dict(c => load_members(joinpath(OUTD, "D6_$c" * sfx(c))) for c in CL)
 NOGATE && println("   (BX_NOGATE: LinReg1 = D6_LinReg1_nogate)")
 ks = sort(intersect((e.ks for e in values(ens))...))
 grid = filter(<=(minimum(e.nlead for e in values(ens))), LEADS)
 @printf("   K = %d ICs, leads %s\n   %-8s %-6s %s   mean\n", length(ks), join(grid, ","), "closure", "lead", join((lpad(l, 7) for l in LABS), ""))
-asm = Dict(c => assemble(restrict(ens[c], ks), truth, grid) for c in CL3)
-mask_joint!([asm[c][1] for c in CL3])          # a member missing in one closure is missing in all
-for c in CL3
+asm = Dict(c => assemble(restrict(ens[c], ks), truth, grid) for c in CL)
+mask_joint!([asm[c][1] for c in CL])          # a member missing in one closure is missing in all
+for c in CL
     fc, tr = asm[c]
     b = dropdims(mean(ensemble_mean(fc) .- tr; dims = 1); dims = 1) ./ sdref  # nq x L
     for (j, l) in pairs(grid)
@@ -49,7 +53,7 @@ end
 # unit, so that forecast and long run compare): the mean over the ICs of the ensemble mean against
 # that of the reference, minus one, in %, per QoI and its mean over the QoIs.
 println("   the same, % of the reference mean over the ICs (Eq. mean bias)")
-for c in CL3
+for c in CL
     fc, tr = asm[c]
     b = (dropdims(mean(ensemble_mean(fc); dims = 1); dims = 1) ./
          dropdims(mean(tr; dims = 1); dims = 1) .- 1) .* 100                    # nq x L
@@ -67,8 +71,8 @@ function longruns(c)
     return [jldopen(io -> (q = io["data_online"].q, dQ = io["data_online"].dQ), joinpath(dir, f)) for f in fs]
 end
 blocks = [((b - 1) * 4000 + 1):(b * 4000 + 1) for b in 1:10]
-runs = Dict(c => longruns(c) for c in ("LinReg1", "LinReg7", "DDN"))
-for c in ("LinReg1", "LinReg7", "DDN")
+runs = Dict(c => longruns(c) for c in CL)
+for c in CL
     rs = runs[c]
     @printf("   %-8s (%d runs)", c, length(rs))
     for bl in blocks
@@ -102,7 +106,7 @@ dqref = rec["q"][:, 2:end] .- rec["q_star"]
 acfr = [autocorr(collect(dqref[i, :]), 200) for i in 1:6]
 # 🔑 Gate firings left out (Rik, 2026-10-13): the firing step and the hist_len steps after it
 # (`gate_keep`, `autocorr_masked`); a run that never fired is scored exactly as before.
-for c in ("LinReg1", "LinReg7", "DDN")
+for c in CL
     worst = zeros(6); avg = zeros(6)
     h = c == "DDN" ? 0 : Int(load(joinpath(OUTD, "TO_LRS", c, "LinReg.jld2"), "hist_len"))
     for r in runs[c]

@@ -32,7 +32,7 @@
 include(joinpath(@__DIR__, "score_d6.jl"))            # load_members, restrict, assemble, load_truth, ...
 include(joinpath(SRC, "ts_history.jl"))               # HistorySpec, build_history
 include(joinpath(SRC, "ts_scaling.jl"))               # scale_input
-include(joinpath(SRC, "ts_scale.jl"))                 # fit_powerlaw_scale (step 4p's fit)
+include(joinpath(SRC, "ts_scale.jl"))                 # fit_powerlaw_scale (step 2's fit)
 using CairoMakie
 
 const OUTD = normpath(joinpath(@__DIR__, "..", "exp_square_HIT", "output"))
@@ -530,7 +530,7 @@ function fig_dqacf(; L = 200)
 end
 
 # --------------------------------------------------------------------------------------------------
-# Sec. 5.6: the scale of the residual against the level (step 4p)
+# Sec. 5.5: the scale of the residual against the level (step 2)
 # --------------------------------------------------------------------------------------------------
 "A deployed LinReg's residual on the whole record, with q*^n in physical units, and the 1-10 / 10-100 TU rows."
 function full_residual(name)
@@ -547,7 +547,7 @@ end
 """
 The residuals of LinReg1 and LinReg7, each standardised by its own 1-10 TU sd, binned in deciles of
 q*/q_ref (edges from 1-10 TU, per closure): the standard deviation about the bin mean on 1-10 TU
-(filled) and 10-100 TU (open), the power law of step 4p fitted on 1-10 TU and clipped as deployed, and
+(filled) and 10-100 TU (open), the power law of step 2 fitted on 1-10 TU and clipped as deployed, and
 the constant scale of LinReg + MVG. Reprints β, the held-out gain, the bin means, and the spread in
 the lowest and highest fifth (the text's numbers).
 
@@ -631,7 +631,7 @@ end
 
 """
 The shape of a closure's residual (LinReg1, LinReg7 or the DDN) on 10-100 TU (held out): its density divided by the constant scale of
-LinReg + MVG and by the power-law scale of step 4p (fitted on 1-10 TU, clipped as deployed), each
+LinReg + MVG and by the power-law scale of step 2 (fitted on 1-10 TU, clipped as deployed), each
 then standardized to zero mean and unit variance on 10-100 TU so that only the shape is compared, against
 N(0, 1). Log density, histogram of width 0.25. Reprints the excess kurtosis, the skewness and the rate
 of |z| > 3 relative to the Gaussian's, on both windows.

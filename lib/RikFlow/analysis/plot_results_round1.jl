@@ -6,17 +6,26 @@
 #   results_s11_dqacf.pdf     ACF of the correction in the long runs (gated steps and the h after them left
 #                             out, as Fig. 6), S1.1 and LinReg7 against the tracked record
 #
-# Usage (from lib/RikFlow): julia --project=analysis analysis/plot_results_round1.jl [fans] [longrun] [dqacf]
+# Usage (from lib/RikFlow): julia --project=analysis analysis/plot_results_round1.jl [--step s2] [fans] [longrun] [dqacf] [traj]
+#
+# 🔑 `--step <tag>` (2026-10-16) picks the closure in the third column and the file names
+# results_<tag>_*.pdf: s11 (default) = LinReg7 + AR(2); s2 = LinReg1 + power-law scale (Sec. 7.2).
 
 include(joinpath(@__DIR__, "plot_paper_secs45.jl"))
 
-const S11 = "LinReg7_ar2n"
+const STEPS = Dict("s11" => ("LinReg7_ar2n", "LinReg7 + AR(2)"),
+                   "s2" => ("LinReg1_pl", "LinReg1 + power-law scale"))
+const STEP = let i = findfirst(==("--step"), ARGS)
+    i === nothing ? "s11" : ARGS[i + 1]
+end
+haskey(STEPS, STEP) || error("--step $STEP: known steps are $(join(sort(collect(keys(STEPS))), ", "))")
+const S11, SLAB = STEPS[STEP]           # (S11 kept as the name: the closure of the third column)
 const R1_SETS = (("LinReg1", "TO_LRS/LinReg1", COL["LinReg1"]), ("LinReg7", "TO_LRS/LinReg7", COL["LinReg7"]),
-                 ("LinReg7 + AR(2)", "TO_LRS/" * S11, to_color("#009E73")))
+                 (SLAB, "TO_LRS/" * S11, to_color("#009E73")))
 
 function fig_r1_fans(; tics = (10.25, 15.0, 20.0, 24.75))
     names = ("LinReg1", "LinReg7", S11)
-    labels = ("LinReg1", "LinReg7", "LinReg7 + AR(2)")
+    labels = ("LinReg1", "LinReg7", SLAB)
     fig = Figure(size = (W, 560), figure_padding = (2, 8, 2, 2))
     q_ref = TRUTH.q
     t0, t1 = first(tics) - 0.4, last(tics) + 3.4
@@ -49,7 +58,7 @@ function fig_r1_fans(; tics = (10.25, 15.0, 20.0, 24.75))
         linkyaxes!(contents(fig[i, :])...)
     end
     rowgap!(fig.layout, 2); colgap!(fig.layout, 4)
-    savefig("results_s11_fans.pdf", fig)
+    savefig("results_$(STEP)_fans.pdf", fig)
 end
 
 "Long-run distributions, pooled over the 5 runs and every step, against the reference; KS per QoI."
@@ -92,7 +101,7 @@ function fig_r1_longrun(; nbin = 60)
         @printf("longrun: %-16s pooled KS per QoI %s, summed %.2f\n", lab,
                 join((@sprintf("%.2f", v) for v in e.per_qoi), " "), e.total)
     end
-    savefig("results_s11_longrun.pdf", fig)
+    savefig("results_$(STEP)_longrun.pdf", fig)
 end
 
 """
@@ -148,23 +157,27 @@ function fig_r1_traj(lab; others = (), stride = 20, file = nothing)
     savefig(something(file, "results_traj_" * replace(lab, " + " => "_", "(" => "", ")" => "") * ".pdf"), fig)
 end
 
-"The correction's ACF in the long runs, as Fig. 6, for LinReg7 and S1.1 against the record."
+"The correction's ACF in the long runs, as Fig. 6, for LinReg1, LinReg7 and the step's closure against the record."
 function fig_r1_dqacf(; L = 200)
-    withenv("PAPER45_DQ_EXTRA" => "LinReg7 + AR(2)=TO_LRS/" * S11) do
+    withenv("PAPER45_DQ_EXTRA" => SLAB * "=TO_LRS/" * S11) do
         fig_dqacf(; L)
     end
-    mv(joinpath(FIGDIR, "colour_dq_acf.pdf"), joinpath(FIGDIR, "results_s11_dqacf.pdf"); force = true)
+    mv(joinpath(FIGDIR, "colour_dq_acf.pdf"), joinpath(FIGDIR, "results_$(STEP)_dqacf.pdf"); force = true)
     fig_dqacf(; L)                       # restore Fig. 6 (colour_dq_acf.pdf) as the paper has it
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    want = isempty(ARGS) ? ["fans", "longrun", "dqacf"] : ARGS
+    i = findfirst(==("--step"), ARGS)
+    args = i === nothing ? ARGS : ARGS[setdiff(eachindex(ARGS), (i, i + 1))]
+    want = isempty(args) ? ["fans", "longrun", "dqacf"] : args
     "fans" in want && fig_r1_fans()
     "longrun" in want && fig_r1_longrun()
     "dqacf" in want && fig_r1_dqacf()
     if "traj" in want
-        fig_r1_traj("LinReg7 + AR(2)"; others = ("LinReg1", "LinReg7"), file = "results_s11_traj.pdf")
-        fig_r1_traj("LinReg1"; file = "results_traj_LinReg1.pdf")
-        fig_r1_traj("LinReg7"; file = "results_traj_LinReg7.pdf")
+        fig_r1_traj(SLAB; others = ("LinReg1", "LinReg7"), file = "results_$(STEP)_traj.pdf")
+        if STEP == "s11"                 # the baselines' own panels, once
+            fig_r1_traj("LinReg1"; file = "results_traj_LinReg1.pdf")
+            fig_r1_traj("LinReg7"; file = "results_traj_LinReg7.pdf")
+        end
     end
 end
