@@ -4,13 +4,15 @@
 #   results_s11_longrun.pdf   long-run QoI distributions (5 runs x 100 TU pooled) against the reference,
 #                             with the pooled KS distance per QoI and closure
 #   results_s11_dqacf.pdf     ACF of the correction in the long runs (gated steps and the h after them left
-#                             out, as Fig. 6), S1.1 and LinReg7 against the tracked record
+#                             out, as Fig. 6), S1.1, LinReg7 + AR(1) (`LinReg7_ar1ls`, Sec. 7.1.2, added
+#                             2026-10-15) and LinReg7 against the tracked record
 #
 # Usage (from lib/RikFlow): julia --project=analysis analysis/plot_results_round1.jl [fans] [longrun] [dqacf]
 
 include(joinpath(@__DIR__, "plot_paper_secs45.jl"))
 
 const S11 = "LinReg7_ar2n"
+const S11_AR1 = "LinReg7_ar1ls"          # LinReg7 + AR(1) by `ar1_ls` (2026-10-15)
 const R1_SETS = (("LinReg1", "TO_LRS/LinReg1", COL["LinReg1"]), ("LinReg7", "TO_LRS/LinReg7", COL["LinReg7"]),
                  ("LinReg7 + AR(2)", "TO_LRS/" * S11, to_color("#009E73")))
 
@@ -148,9 +150,9 @@ function fig_r1_traj(lab; others = (), stride = 20, file = nothing)
     savefig(something(file, "results_traj_" * replace(lab, " + " => "_", "(" => "", ")" => "") * ".pdf"), fig)
 end
 
-"The correction's ACF in the long runs, as Fig. 6, for LinReg7 and S1.1 against the record."
+"The correction's ACF in the long runs, as Fig. 6, for LinReg7, S1.1 and LinReg7 + AR(1) against the record."
 function fig_r1_dqacf(; L = 200)
-    withenv("PAPER45_DQ_EXTRA" => "LinReg7 + AR(2)=TO_LRS/" * S11) do
+    withenv("PAPER45_DQ_EXTRA" => "LinReg7 + AR(2)=TO_LRS/" * S11 * ",LinReg7 + AR(1)=TO_LRS/" * S11_AR1) do
         fig_dqacf(; L)
     end
     mv(joinpath(FIGDIR, "colour_dq_acf.pdf"), joinpath(FIGDIR, "results_s11_dqacf.pdf"); force = true)

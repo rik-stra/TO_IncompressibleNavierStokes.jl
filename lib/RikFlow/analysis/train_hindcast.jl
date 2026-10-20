@@ -25,7 +25,7 @@ const OUTD = normpath(joinpath(HERE, "..", "exp_square_HIT", "output"))
 const LAB = ("Z[0,6]", "E[0,6]", "Z[7,15]", "E[7,15]", "Z[16,32]", "E[16,32]")
 const WIN = (("<=0.5 TU", 1:200), ("0.5-3 TU", 201:1200))
 # matched partners (analysis/cards/round1.md); the baselines have none here
-const PARTNER = Dict("LinReg7_ar2n" => "LinReg7", "Splice1_E0x11" => "LinReg1", "Splice1_E0x7" => "LinReg1",
+const PARTNER = Dict("LinReg7_ar2n" => "LinReg7", "LinReg7_ar1ls" => "LinReg7", "Splice1_E0x11" => "LinReg1", "Splice1_E0x7" => "LinReg1",
                      "Splice1_E0x8" => "LinReg1", "Splice1_E0x11_ar2n" => "Splice1_E0x11",
                      "Splice1_E0x7_ar2n" => "Splice1_E0x7", "Splice1_E0x8_ar2n" => "Splice1_E0x8",
                      "LinReg14_ar2n" => "Splice1_E0x11_ar2n", "LinReg16_ar2n" => "Splice1_E0x7_ar2n")

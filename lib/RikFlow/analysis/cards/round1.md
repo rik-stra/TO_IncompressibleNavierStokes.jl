@@ -135,3 +135,9 @@ Clause S and the CRPS part of clause C now read the window CRPS_0.5. Plan and me
   ratios are ordinary, close to LinReg1's). **Rik: "go with i, run S1.1 anyway".** S1.1 gets its
   full hindcast; the rule's intent (catch a broken artefact) is unchanged, and this exception is the
   only one. The other eight: ratio to partner 0.56–1.79, no defect. Numbers: results_LSTMS.md §25.
+- **2026-10-15, LinReg7 + AR(1) added after S1.1 was scored (Rik: "add a closure to run online based
+  on linreg7+AR1 fit").** `LinReg7_ar1ls`: the AR(1) fitted as the AR(2) is, by LS on the residual ACF
+  at lags 1–20 (`ar1_ls`, the AR(1) of paper Fig. colour-resacf-ar1), Σ_ξ = DRD as in S1.1. Not a
+  registered round-1 closure: an ablation of the AR order, compared with S1.1 (same mean, same window)
+  and LinReg7. Not the old `LinReg7_ar1` (φ = ρ̂(1), §12e′). Built before any of its runs; its offline
+  check predicts one-step over-dispersion in the middle band (data innovation sd / σ_ξ 0.61, 0.53).
