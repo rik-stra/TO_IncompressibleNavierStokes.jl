@@ -399,6 +399,60 @@ end
     @test maximum(abs, m0.xwin .- m.xwin) > 1e-2
 end
 
+@testitem "V91 a widening input_map: the dense MLP reads P x with n_in > the regressor's width" default_imports = false setup = [OnlineFix] begin
+    using Test
+    using Random
+    using LinearAlgebra
+    # step 3a (2026-10-22): extra inputs that are linear combinations of the regressor, e.g. the
+    # predictor increments, as rows of a non-square P; the network reads n_in = size(P, 1) inputs
+    T = Float32
+    hist = OnlineFix.HistorySpec(; h = 2, n_qoi = OnlineFix.NQ, hist_var = :q_star_q)
+    nreg = OnlineFix.nfeatures(hist)
+    nextra = 4
+    H, L = 5, 3
+    spec = OnlineFix.LSTMSpec(; hist, n_hidden = H, n_latent = 0, n_encoder = 0, arch = :dense,
+                              emission = :constant, window = 1, n_layers = L, n_in = nreg + nextra)
+    @test OnlineFix.n_input(spec) == nreg + nextra
+    nin, nq = OnlineFix.n_input(spec), OnlineFix.NQ
+    nenc = OnlineFix.n_encoder_out(spec)
+    rng = Xoshiro(7)
+    w = OnlineFix.LSTMWeights{T}(randn(rng, T, H, nin) ./ 3, randn(rng, T, H, (L - 1) * H) ./ 3,
+                                 randn(rng, T, L * H) ./ 3, nothing, nothing, zeros(T, 0, nenc),
+                                 zeros(T, 0, nenc), randn(rng, T, nq, H), nothing, randn(rng, T, nq),
+                                 zeros(T, nq, H), T[-1, -0.5, 0], Matrix{T}(I, nq, nq))
+    @test OnlineFix.check_shapes(w, spec)
+    P = vcat(Matrix{Float64}(I, nreg, nreg), randn(Xoshiro(3), nextra, nreg))
+    sc = merge(OnlineFix.scaling(), (; input_map = P))
+    q_star, dQ = OnlineFix.stream(; n = 12, nwarm = 5)
+    m = OnlineFix.StochLSTM(spec, w, sc; spinnup_data = dQ, rng = Xoshiro(1), gate = 0.0,
+                            stochastic = false)
+    s(v) = vec(OnlineFix.scale_input(v, sc.in_scaling))
+    qs_hist = Vector{Vector{Float64}}()                  # the levels the closure itself stores
+    for k in 1:12
+        dq = OnlineFix.get_next_item_timeseries(m, q_star[:, k])
+        k > 5 || (push!(qs_hist, q_star[:, k] .+ dQ[:, k]); continue)
+        # the regressor written out: [q*^n | q^{n-1}, q*^{n-1} | q^{n-2}, q*^{n-2} | 1]
+        x = vcat(s(q_star[:, k]), s(qs_hist[end]), s(q_star[:, k - 1]), s(qs_hist[end - 1]),
+                 s(q_star[:, k - 2]), 1.0)
+        z = P * x
+        @test m.xwin[:, end] ≈ T.(z) rtol = 1e-5
+        # the deployed output is the MLP on the widened input, written out
+        hh = tanh.(w.Wx * T.(z) .+ w.b[1:H])
+        for l in 2:L
+            hh = tanh.(w.Wh[:, ((l - 2) * H + 1):((l - 1) * H)] * hh .+ w.b[((l - 1) * H + 1):(l * H)])
+        end
+        @test m.state.y ≈ w.V1 * hh .+ w.cdec rtol = 1e-5
+        push!(qs_hist, q_star[:, k] .+ dq)
+    end
+    # refused: a wide network without a map, a map of the wrong height, a wide input off :dense
+    @test_throws ErrorException OnlineFix.StochLSTM(spec, w, OnlineFix.scaling(); spinnup_data = dQ,
+                                                    rng = Xoshiro(1))
+    bad = merge(OnlineFix.scaling(), (; input_map = P[1:(end - 1), :]))
+    @test_throws ErrorException OnlineFix.StochLSTM(spec, w, bad; spinnup_data = dQ, rng = Xoshiro(1))
+    @test_throws ErrorException OnlineFix.LSTMSpec(; hist, arch = :lstm, n_latent = 0,
+                                                   emission = :constant, n_in = nreg + 1)
+end
+
 @testitem "V67 noise_scale scales every draw (window mode)" default_imports = false setup = [OnlineFix] begin
     using Test
     using Random

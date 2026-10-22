@@ -92,12 +92,17 @@ function RF.init_lstm_params(rng::AbstractRNG, spec::RF.LSTMSpec; T::Type = Floa
 
     dense = RF.is_dense(spec)
     G = dense ? H : 4H                     # the dense arch's first layer is H wide, no gates
-    b = zeros(T, dense ? 2H : 4H)
+    b = zeros(T, dense ? spec.n_layers * H : 4H)
     dense || (b[(H + 1):(2H)] .= one(T))   # forget-gate bias (recurrent archs only)
+    Wx = T.(Lux.glorot_uniform(rng, G, ncin))
+    # dense, `n_layers = L`: hidden layers 2..L side by side, each its own H x H Glorot draw, in
+    # order -- at L = 2 one draw, the call sequence (and so every RNG stream) of the earlier layout
+    Wh = dense ? reduce(hcat, [T.(Lux.glorot_uniform(rng, H, H)) for _ in 2:spec.n_layers]) :
+         T.(Lux.glorot_uniform(rng, G, H))
 
     return (;
-        Wx = T.(Lux.glorot_uniform(rng, G, ncin)),
-        Wh = T.(Lux.glorot_uniform(rng, G, H)),
+        Wx,
+        Wh,
         b,
         We = (has_latent && spec.n_encoder > 0) ?
              T.(Lux.glorot_uniform(rng, nenc, RF.n_encoder_in(spec))) : nothing,
@@ -364,7 +369,7 @@ function _forward(::Val{true}, spec::RF.LSTMSpec, ps::NamedTuple, X::AbstractArr
     MU2, SIG2, Z2 = _zpath(post, hasz, encv, ps, X2, Y2, reshape(epsz, nz, L * B), T, nz, L * B)
     F = vcat(reshape(X, nin * L, B), reshape(Z2, nz * L, B))
     H1 = tanh.(ps.Wx * F .+ ps.b[1:H])
-    H2 = tanh.(ps.Wh * H1 .+ ps.b[(H + 1):(2H)])
+    H2 = RF.dense_hidden(spec.n_layers, ps.Wh, ps.b, H1, H)     # the last hidden layer
     ylast = _linear_skip(Val(spec.skip), ps.V1 * H2 .+ ps.cdec, ps, X[:, L, :])
     ld = _logd(Val(spec.emission === :constant), ps, H2)
     spec.uclip !== nothing && (ld = clamp.(ld, T(spec.uclip[1]), T(spec.uclip[2])))

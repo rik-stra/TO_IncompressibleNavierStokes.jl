@@ -1180,6 +1180,142 @@ const RF = RikFlow
         @test_throws ErrorException RF.LSTMSpec(; hist, arch = :vrnn, n_latent = 0)
     end
 
+    # V90 -- arch = :dense with n_layers > 2: the deeper MLP of step 3a (2026-10-22, Rik: depth 4)
+    @testset "V90 n_layers = 2 is the earlier dense layout exactly (n_latent = $nz)" for nz in (0, 2)
+        T = Float32
+        nq, H = 3, 6
+        hist = RF.HistorySpec(; h = 2, n_qoi = nq, hist_var = :q_star_q)
+        spec = RF.LSTMSpec(; hist, n_hidden = H, n_latent = nz, n_encoder = 0, arch = :dense,
+                           window = 2, emission = :constant, skip = true)
+        @test spec.n_layers == 2
+        # the init before n_layers, frozen here: Wx, Wh, Bmu, V1 drawn in that order from one stream
+        rng = Xoshiro(3)
+        Wx = T.(Lux.glorot_uniform(rng, H, RF.n_cell_input(spec)))
+        Wh = T.(Lux.glorot_uniform(rng, H, H))
+        Bmu = T.(Lux.glorot_uniform(rng, nz, RF.n_encoder_out(spec)))
+        V1 = T.(Lux.glorot_uniform(rng, nq, H))
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        @test ps.Wx == Wx && ps.Wh == Wh && ps.Bmu == Bmu && ps.V1 == V1 && length(ps.b) == 2H
+        # the forward pass is the old two-layer formula, bit for bit
+        p1 = merge(ps, (; b = randn(Xoshiro(7), T, 2H), cdec = randn(Xoshiro(8), T, nq),
+                        Ws = randn(Xoshiro(9), T, nq, RF.n_input(spec)) ./ 3))
+        X = randn(Xoshiro(6), T, RF.n_input(spec), 2, 4)
+        E = randn(Xoshiro(10), T, nz, 2, 4)
+        o = RF.lstm_forward(spec, p1, X, E)
+        Z = nz == 0 ? zeros(T, 0, 4) : reshape(p1.Bmu * reshape(X, RF.n_input(spec), :) .+
+                                               log(T(2)) .* reshape(E, nz, :), nz * 2, 4)
+        F = vcat(reshape(X, :, 4), Z)
+        old = p1.V1 * tanh.(p1.Wh * tanh.(p1.Wx * F .+ p1.b[1:H]) .+ p1.b[(H + 1):(2H)]) .+ p1.cdec .+
+              p1.Ws * X[:, end, :]
+        @test o.Y[:, end, :] == old
+    end
+
+    @testset "V90 n_layers = 4: shapes, training forward == deployed map, gradients, save/load (W = $W)" for
+            W in (1, 3)
+        T = Float32
+        nq, H, L = 3, 5, 4
+        hist = RF.HistorySpec(; h = 2, n_qoi = nq, hist_var = :q_star_q)
+        spec = RF.LSTMSpec(; hist, n_hidden = H, n_latent = 0, n_encoder = 0, arch = :dense,
+                           window = W, emission = :constant, skip = false, n_layers = L)
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        @test size(ps.Wh) == (H, (L - 1) * H) && length(ps.b) == L * H
+        # each hidden layer its own draw: no two blocks equal
+        blocks = [ps.Wh[:, ((k - 1) * H + 1):(k * H)] for k in 1:(L - 1)]
+        @test all(blocks[i] != blocks[j] for i in 1:(L - 1) for j in (i + 1):(L - 1))
+        p1 = merge(ps, (; V1 = randn(Xoshiro(5), T, nq, H), b = randn(Xoshiro(7), T, L * H) ./ 2,
+                        bd = T[-1, -0.5, 0]))
+        # the forward pass is L tanh layers, written out
+        X = randn(Xoshiro(6), T, RF.n_input(spec), W, 4)
+        hh = tanh.(p1.Wx * reshape(X, :, 4) .+ p1.b[1:H])
+        for k in 2:L
+            hh = tanh.(blocks[k - 1] * hh .+ p1.b[((k - 1) * H + 1):(k * H)])
+        end
+        o = RF.lstm_forward(spec, p1, X, zeros(T, 0, W, 4))
+        @test o.Y[:, end, :] ≈ p1.V1 * hh .+ p1.cdec
+        # training forward == deployed window map
+        w = RF.LSTMWeights(p1, spec)
+        @test RF.check_shapes(w, spec)
+        mu, sd = reshape([0.1, 0.2, 0.3], nq, 1), reshape([2.0, 2.5, 3.0], nq, 1)
+        sc = (; in_scaling = (; mu, sigma = sd), out_scaling = (; mu, sigma = sd), target = :dQ)
+        rng = Xoshiro(11)
+        q_star = randn(rng, nq, 12) .+ 1.0
+        m = RF.StochLSTM(spec, w, sc; spinnup_data = randn(rng, nq, 6) ./ 10, rng = Xoshiro(5),
+                         gate = 0.0, stochastic = true)
+        for k in 1:12
+            RF.get_next_item_timeseries(m, q_star[:, k])
+            k > 6 || continue
+            od = RF.lstm_forward(spec, p1, reshape(copy(m.xwin), :, W, 1), zeros(T, 0, W, 1))
+            @test od.Y[:, end, 1] ≈ m.state.y rtol = 1e-5
+            @test od.LOGD[:, end, 1] ≈ T[-1, -0.5, 0]
+        end
+        # every hidden layer receives a gradient
+        Y = randn(Xoshiro(13), T, nq, W, 4)
+        g = Zygote.gradient(p -> RF.elbo(spec, p, X, Y, W:W, zeros(T, 0, W, 4); beta = 0), p1)[1]
+        @test all(norm(g.Wh[:, ((k - 1) * H + 1):(k * H)]) > 0 for k in 1:(L - 1))
+        @test all(norm(g.b[((k - 1) * H + 1):(k * H)]) > 0 for k in 1:L)
+        # save/load keeps the depth; a weight set of the wrong depth is refused
+        path = joinpath(mktempdir(), "dense4.jld2")
+        RF.save_stochlstm(path, spec, w, sc)
+        back = RF.load_stochlstm(path)
+        @test back.spec.n_layers == L && back.weights.Wh == w.Wh
+        spec2 = RF.LSTMSpec(; hist, n_hidden = H, n_latent = 0, n_encoder = 0, arch = :dense,
+                            window = W, emission = :constant)
+        @test_throws ErrorException RF.check_shapes(w, spec2)
+        # a short fit runs end to end
+        N = 200
+        Xc = randn(Xoshiro(12), T, RF.n_input(spec), N); Yc = randn(Xoshiro(13), T, nq, N)
+        _, h = RF.train_stochlstm(spec, Xc, Yc, collect(1:N); L = W, burn = W - 1, stride = 1,
+                                  epochs = 2, batch = 8, verbose = false, T, weight_decay = 1e-2,
+                                  decay_exclude = (:bd, :Araw))
+        @test all(isfinite, h.val)
+        # depth is a dense-only setting, and at least 2
+        @test_throws ErrorException RF.LSTMSpec(; hist, arch = :dense, window = W, n_latent = 0,
+                                                emission = :constant, n_layers = 1)
+        @test_throws ErrorException RF.LSTMSpec(; hist, arch = :vrnn, n_layers = 4)
+    end
+
+    # V91 -- n_in: the network reads P x, a WIDENED regressor (step 3a's extra inputs, 2026-10-22)
+    @testset "V91 n_in: init, training forward == deployed map, save/load (W = $W)" for W in (1, 2)
+        T = Float32
+        nq, H, L = 3, 5, 4
+        hist = RF.HistorySpec(; h = 2, n_qoi = nq, hist_var = :q_star_q)
+        nreg, nextra = RF.nfeatures(hist), 4
+        spec = RF.LSTMSpec(; hist, n_hidden = H, n_latent = 0, n_encoder = 0, arch = :dense,
+                           window = W, emission = :constant, n_layers = L, n_in = nreg + nextra)
+        ps = RF.init_lstm_params(Xoshiro(3), spec; T)
+        @test size(ps.Wx) == (H, W * (nreg + nextra))
+        p1 = merge(ps, (; V1 = randn(Xoshiro(5), T, nq, H), b = randn(Xoshiro(7), T, L * H) ./ 2,
+                        bd = T[-1, -0.5, 0]))
+        w = RF.LSTMWeights(p1, spec)
+        @test RF.check_shapes(w, spec)
+        P = vcat(Matrix{Float64}(I, nreg, nreg), randn(Xoshiro(4), nextra, nreg))
+        mu, sd = reshape([0.1, 0.2, 0.3], nq, 1), reshape([2.0, 2.5, 3.0], nq, 1)
+        sc = (; in_scaling = (; mu, sigma = sd), out_scaling = (; mu, sigma = sd), target = :dQ,
+              input_map = P)
+        rng = Xoshiro(11)
+        q_star = randn(rng, nq, 12) .+ 1.0
+        m = RF.StochLSTM(spec, w, sc; spinnup_data = randn(rng, nq, 6) ./ 10, rng = Xoshiro(5),
+                         gate = 0.0, stochastic = true)
+        for k in 1:12
+            RF.get_next_item_timeseries(m, q_star[:, k])
+            k > 6 || continue
+            o = RF.lstm_forward(spec, p1, reshape(copy(m.xwin), :, W, 1), zeros(T, 0, W, 1))
+            @test o.Y[:, end, 1] ≈ m.state.y rtol = 1e-5
+        end
+        # save/load keeps the width; the stored map travels in the scaling
+        path = joinpath(mktempdir(), "dense_wide.jld2")
+        RF.save_stochlstm(path, spec, w, sc)
+        back = RF.load_stochlstm(path)
+        @test back.spec.n_in == nreg + nextra && RF.n_input(back.spec) == nreg + nextra
+        @test back.scaling.input_map == P
+        # a short fit on the widened design runs end to end
+        N = 200
+        Xc = T.(P * randn(Xoshiro(12), nreg, N)); Yc = randn(Xoshiro(13), T, nq, N)
+        _, h = RF.train_stochlstm(spec, Xc, Yc, collect(1:N); L = W, burn = W - 1, stride = 1,
+                                  epochs = 2, batch = 8, verbose = false, T)
+        @test all(isfinite, h.val)
+    end
+
     # -----------------------------------------------------------------------------------------
     # V70 -- prior = :learned, the VRNN prior p(z_t | h_{t-1}): learned colour
     # -----------------------------------------------------------------------------------------

@@ -29,7 +29,8 @@ function save_stochlstm(path::AbstractString, spec::LSTMSpec, weights::LSTMWeigh
               # closure adds observation noise at all, so it is part of the model.
               emission = spec.emission,
               arch = spec.arch, uclip = spec.uclip, skip = spec.skip, window = spec.window,
-              posterior = spec.posterior, prior = spec.prior)
+              posterior = spec.posterior, prior = spec.prior, n_layers = spec.n_layers,
+              n_in = spec.n_in)
     wnt = (; weights.Wx, weights.Wh, weights.b, weights.We, weights.be,
            weights.Bmu, weights.Bsig, weights.V1, weights.V2, weights.cdec,
            weights.Wd, weights.bd, weights.LR, weights.Ws, weights.P)
@@ -69,7 +70,9 @@ function load_stochlstm(path::AbstractString)
         skip = hasproperty(s, :skip) ? s.skip : false,     # absent before 2026-09-24 = no skip
         window = hasproperty(s, :window) ? s.window : 0,   # absent = persistent state
         posterior = hasproperty(s, :posterior) ? s.posterior : :x,
-        prior = hasproperty(s, :prior) ? s.prior : :standard)
+        prior = hasproperty(s, :prior) ? s.prior : :standard,
+        n_layers = hasproperty(s, :n_layers) ? s.n_layers : 2,      # absent before 2026-10-22 = 2
+        n_in = hasproperty(s, :n_in) ? s.n_in : 0)                  # absent = the regressor width
     w = d["weights"]
     T = eltype(w.Wx)
     weights = LSTMWeights{T}(w.Wx, w.Wh, w.b, w.We, w.be, w.Bmu, w.Bsig,

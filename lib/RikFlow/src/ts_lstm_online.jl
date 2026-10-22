@@ -123,6 +123,18 @@ struct StochLSTM{T,S}
         check_shapes(weights, spec)
         nq = spec.hist.n_qoi
         W = spec.window
+        # the fixed input map must take the regressor the buffer builds to the width the network
+        # reads; without one the two widths must agree (`LSTMSpec`'s `n_in`, 2026-10-22)
+        nreg = nfeatures(spec.hist)
+        if hasproperty(scaling, :input_map)
+            size(scaling.input_map) == (n_input(spec), nreg) || error(
+                "StochLSTM: input_map is $(size(scaling.input_map)); the network reads " *
+                "$(n_input(spec)) inputs and the regressor has $nreg entries")
+        else
+            n_input(spec) == nreg || error(
+                "StochLSTM: the network reads $(n_input(spec)) inputs but the regressor has $nreg " *
+                "entries and the scaling carries no input_map to widen it")
+        end
         if W > 0
             nw = spinnup_data === nothing ? 0 : size(spinnup_data, 2)
             nw >= W - 1 || error(

@@ -88,6 +88,9 @@ Shape and architecture of an M4 model.
 - `skip`: a linear skip `y += Ws x` from the regressor to the output.
 - `window`: `0` (default) carries the recurrent state across solver steps. `W > 0` resets it for
   every prediction and replays the last `W` inputs -- see [`StochLSTM`](@ref).
+- `n_layers`: the number of hidden layers of `arch = :dense` (default 2); see [`is_dense`](@ref).
+- `n_in`: the network's input width when `scaling.input_map` widens the regressor (`:dense`
+  only); `0` (default) is the regressor's width.
 - `posterior`: `:x` (default, the source's encoder `q(z | x)`) or `:xy` (a conditional VAE:
   `q(z | x, y)` in training, the prior `N(0, I)` at deployment).
 
@@ -143,9 +146,20 @@ Base.@kwdef struct LSTMSpec
     # rewards predicting the innovation from the recurrent state -- LEARNED colour. Needs
     # `posterior = :xy` and a recurrent arch; deployment draws each new z from it (`StochLSTM`).
     prior::Symbol = :standard
+    # 🔑 DEPTH of the dense MLP (2026-10-22, Rik: step 3a at depth 4). The number of tanh hidden
+    # layers, all `n_hidden` wide; `:dense` only. Layers 2..n are stored side by side in `Wh`
+    # (`H x (n - 1) H`) and their biases after the first in `b` (`n H`), so the default 2 is the
+    # earlier layout exactly -- every existing fit, file and RNG stream is unchanged.
+    n_layers::Int = 2
+    # 🔑 INPUT WIDTH of the network (2026-10-22, Rik: the predictor increments as extra inputs).
+    # `0` (default) is the regressor's own width, `nfeatures(hist)`, as before. A positive value is
+    # the width of `P x` when the fit's fixed input map `scaling.input_map = P` WIDENS the regressor
+    # (extra inputs that are linear combinations of it); `StochLSTM` checks that `P` is
+    # `n_in x nfeatures(hist)`. `:dense` only.
+    n_in::Int = 0
 
     function LSTMSpec(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip, window,
-                      posterior, prior)
+                      posterior, prior, n_layers, n_in)
         arch in (:lstm, :vaernn, :storn, :vrnn, :dense) ||
             error("LSTMSpec: arch must be one of :lstm, :vaernn, :storn, :vrnn, :dense; got $(arch)")
         (arch !== :dense || window > 0) ||
@@ -175,7 +189,14 @@ Base.@kwdef struct LSTMSpec
             error("LSTMSpec: prior = :learned needs posterior = :xy and a recurrent latent arch")
         (posterior === :x || arch !== :lstm) ||
             error("LSTMSpec: posterior = :xy needs a latent path; arch = :lstm has none")
-        new(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip, window, posterior, prior)
+        n_layers >= 2 || error("LSTMSpec: n_layers must be >= 2; got $n_layers")
+        (n_layers == 2 || arch === :dense) ||
+            error("LSTMSpec: n_layers is the depth of the dense MLP; arch $(arch) has none")
+        n_in >= 0 || error("LSTMSpec: n_in must be >= 0 (0 = the regressor's width); got $n_in")
+        (n_in == 0 || arch === :dense) ||
+            error("LSTMSpec: n_in (a widened input) is implemented for arch = :dense only")
+        new(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip, window, posterior, prior,
+            n_layers, n_in)
     end
 end
 
@@ -225,10 +246,28 @@ latent_to_cell(spec::LSTMSpec) = spec.arch === :storn || spec.arch === :vrnn || 
 `arch = :dense` (Phase D, 2026-09-27): no recurrence -- a two-layer tanh MLP on the whole window,
 `y_n = V1 tanh(Wh tanh(Wx [x_{n-W+1..n}; z_{n-W+1..n}] + b1) + b2) + cdec (+ Ws x_n)`. `Wx` is
 `H x W (n_input + n_latent)` (all inputs first, then all latents), `Wh` is `H x H`, `b = [b1; b2]`.
+With `n_layers = L > 2` (2026-10-22) there are `L` hidden layers: `Wh = [W_2 ... W_L]` is
+`H x (L - 1) H` and `b = [b1; ...; bL]`; see [`dense_hidden`](@ref).
 `n_latent = 0` is allowed here (and only here among the latent archs): a deterministic residual MLP
 whose noise is the emission head alone (M3ᶠ, plan step 1).
 """
 is_dense(spec::LSTMSpec) = spec.arch === :dense
+
+"""
+    dense_hidden(n_layers, Wh, b, h1, H)
+
+Hidden layers 2..`n_layers` of the dense MLP, from the first layer's output `h1` (`H` rows, any
+number of columns): `h_k = tanh(W_k h_{k-1} + b_k)` with `W_k` the `k - 1`-th `H x H` block of `Wh`
+and `b_k` the `k`-th `H` entries of `b`. The training forward pass (Lux extension) and the deployed
+`dense_window!` both call it, so the two cannot drift apart. Non-mutating, so Zygote differentiates it.
+"""
+function dense_hidden(n_layers::Int, Wh::AbstractMatrix, b::AbstractVector, h1::AbstractVecOrMat, H::Int)
+    h = h1
+    for k in 2:n_layers
+        h = tanh.(Wh[:, ((k - 2) * H + 1):((k - 1) * H)] * h .+ b[((k - 1) * H + 1):(k * H)])
+    end
+    return h
+end
 
 """
     latent_to_decoder(spec)
@@ -240,9 +279,10 @@ latent_to_decoder(spec::LSTMSpec) = spec.arch === :vrnn || spec.arch === :vaernn
 """
     n_input(spec)
 
-Width of the regressor row `x_t`, including its trailing bias entry.
+Width of the network's input row `x_t`: the regressor's, including its trailing bias entry, or
+`spec.n_in` when a fixed input map widens it (see `LSTMSpec`'s `n_in`).
 """
-n_input(spec::LSTMSpec) = nfeatures(spec.hist)
+n_input(spec::LSTMSpec) = spec.n_in > 0 ? spec.n_in : nfeatures(spec.hist)
 
 """
     n_output(spec)
@@ -351,8 +391,10 @@ function check_shapes(w::LSTMWeights, spec::LSTMSpec)
     ncin, nenc = n_cell_input(spec), n_encoder_out(spec)
     G = is_dense(spec) ? H : 4H          # rows of the first layer: LSTM gates, or the dense layer
     size(w.Wx) == (G, ncin) || error("Wx is $(size(w.Wx)), expected $((G, ncin))")
-    size(w.Wh) == (G, H) || error("Wh is $(size(w.Wh)), expected $((G, H))")
-    length(w.b) == (is_dense(spec) ? 2H : 4H) || error("b is $(length(w.b)), expected $(is_dense(spec) ? 2H : 4H)")
+    nh = is_dense(spec) ? (spec.n_layers - 1) * H : H      # columns of Wh: the stacked hidden layers
+    size(w.Wh) == (G, nh) || error("Wh is $(size(w.Wh)), expected $((G, nh))")
+    nb = is_dense(spec) ? spec.n_layers * H : 4H
+    length(w.b) == nb || error("b is $(length(w.b)), expected $(nb)")
     size(w.V1) == (nout, H) || error("V1 is $(size(w.V1)), expected $((nout, H))")
     length(w.cdec) == nout || error("cdec is $(length(w.cdec)), expected $(nout)")
     size(w.Wd) == (nout, H) || error("Wd is $(size(w.Wd)), expected $((nout, H))")
@@ -646,7 +688,7 @@ function dense_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin
         F[(W * nin + (t - 1) * nz + 1):(W * nin + t * nz)] .= z
     end
     h1 = tanh.(w.Wx * F .+ w.b[1:H])
-    h2 = tanh.(w.Wh * h1 .+ w.b[(H + 1):(2H)])
+    h2 = dense_hidden(spec.n_layers, w.Wh, w.b, h1, H)       # the last hidden layer
     st.h .= h2
     st.y .= w.V1 * h2 .+ w.cdec
     spec.skip && (st.y .+= w.Ws * T.(view(xwin, :, W)))
