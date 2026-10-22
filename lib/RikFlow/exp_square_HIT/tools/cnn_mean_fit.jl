@@ -1,6 +1,16 @@
-# Step 3, an OFFLINE PROBE: a 1-D convolutional network mean on the lag history (Rik, 2026-10-22: "also
-# try an CNN architecture"), on the same data, target, input and comparators as the MLP of step 3a
-# (`step3_data.jl`). Not deployable: the closure path (`StochLSTM`) has no convolutional arch.
+# Step 3: a 1-D convolutional network mean on the lag history (Rik, 2026-10-22: "also try an CNN
+# architecture"), on the same data, target, input and comparators as the MLP of step 3a
+# (`step3_data.jl`). Not deployable yet: the closure path (`StochLSTM`) has no convolutional arch.
+#
+# 🔑 THE STEP-3 NETWORK (Rik, 2026-10-22: "make HEAD=identity the CNN tool's default and treat the
+# plain-likelihood CNN as the step-3 network") is this tool's DEFAULT: SEQ = lags, K = 2, INPUT = full,
+# 16 channels, D = 64, tanh, Glorot, the plain Gaussian likelihood with the head starting at Sigma = I,
+# Adam lr 1e-3, weight decay 1e-1 (network only), batch 256, early stopping on 8.2-10 TU, cap 40 000
+# updates, seeds 1-3. On the desktop (3 seeds): validation 0.5 SSE 0.2023-0.2030 (LS 0.2050), NLL -6.69
+# to -6.77 (LS -6.95); 10-100 TU rms / LS 1.01 1.00 1.15-1.19 1.23-1.28 1.36-1.42 1.28-1.31, within 0-10 %
+# of LS on states inside the training range, the rest is extrapolation. Every other option below was a
+# probe and lost (mse / rmse losses, the seeded head (equal), SEQ = full / fullq, kernel 3, 32 channels,
+# no weight decay, relu / He); the probes' numbers are in TO_LSTM/step3/*/fit.log.
 #
 #     julia --startup-file=no --project=lib/RikFlow/training \
 #           lib/RikFlow/exp_square_HIT/tools/cnn_mean_fit.jl
@@ -30,15 +40,17 @@
 # sequence"; dQ^{n-k} -- and Dq*^{n-k} with INPUT = full -- is unknown at k = 0, so it is set to 0, its
 # standardised mean, and a MASK channel, 0 at k = 0 and 1 elsewhere, lets the shared kernels tell the
 # missing value from a zero, Rik's choice; q^{n*} then no longer enters the dense layers separately).
-# Kernel size via RIKFLOW_CNN_K (Rik: 3, stride 1).
+# Kernel size via RIKFLOW_CNN_K (Rik: 3, stride 1). SEQ = fullq: q^{n*} both in the sequence (as full)
+# and appended to the dense layers (as lags) (Rik, 2026-10-22: "q* inside the sequence and added at the end").
 #
 # Device (2026-10-22, Rik: "lets go for cuDNN", for bigger kernels and histories): RIKFLOW_CNN_DEVICE = cpu
 # (default) | gpu. On the GPU the data and the parameters live on the device (CuArray, RikFlow's own CUDA
 # through its Lux extension) and Lux's Conv runs through cuDNN (`cuDNN` in training/Project.toml, loaded
 # only for DEVICE = gpu); the scores are computed on the host. Random draws stay on the host.
 #
-# Grid (RIKFLOW_CNN_*): CHS channels {16, 32}, LRS {1e-3, 3e-3}, WDS {1e-1}, SEEDS {1}, K = 2, D = 64,
-# MAXUPD 20000, OUT step3/probe_cnn. Prints, per fit, the validation 0.5 SSE and NLL against least
+# Grid (RIKFLOW_CNN_*): CHS channels {16}, LRS {1e-3}, WDS {1e-1}, SEEDS {1, 2, 3}, K = 2, D = 64,
+# MAXUPD 40000, OUT step3/CNN_step3 (defaults = the step-3 network; each a comma list for a grid). Prints,
+# per fit, the validation 0.5 SSE and NLL against least
 # squares on the same rows, and the rms one-step error on 10-100 TU per QoI over least squares'.
 
 using RikFlow
@@ -51,29 +63,55 @@ FEAT === :dqinc || error("the CNN reads the dqinc input (q*, dQ and Dq* per step
 
 envc(k, d) = (v = strip(get(ENV, "RIKFLOW_CNN_" * k, "")); isempty(v) ? d : v)
 envcv(k, d, U) = parse.(U, strip.(split(envc(k, d), ",")))
-const CHS = envcv("CHS", "16,32", Int)
-const LRS = envcv("LRS", "1e-3,3e-3", Float64)
+const CHS = envcv("CHS", "16", Int)
+const LRS = envcv("LRS", "1e-3", Float64)
 const CWDS = envcv("WDS", "1e-1", Float64)
-const CSEEDS = envcv("SEEDS", "1", Int)
+const CSEEDS = envcv("SEEDS", "1,2,3", Int)
 const K = parse(Int, envc("K", "2"))
 const D = parse(Int, envc("D", "64"))
+# RIKFLOW_CNN_NOSTOP = 1: never stop early, train to MAXUPD however flat the validation loss (Rik,
+# 2026-10-22: "keep continuing despite flat validation loss to see if we get an improvement later");
+# RIKFLOW_CNN_NODECAY = 1: also keep the learning rate constant. The validation curve is kept either way,
+# and the LAST iterate is scored next to the best one.
 const CST = (; batch = 256, val_every = 100, patience = 30, stop_patience = 80, min_lr = 1e-4,
-             lr_decay = 0.3, max_updates = parse(Int, envc("MAXUPD", "20000")))
-const COUT = envc("OUT", "step3/probe_cnn")
+             lr_decay = 0.3, max_updates = parse(Int, envc("MAXUPD", "40000")),
+             nostop = envc("NOSTOP", "0") == "1", nodecay = envc("NODECAY", "0") == "1")
+const COUT = envc("OUT", "step3/CNN_step3")
 const CDEV = Symbol(envc("DEVICE", "cpu"))
 CDEV in (:cpu, :gpu) || error("RIKFLOW_CNN_DEVICE must be cpu or gpu; got $CDEV")
 CDEV === :gpu && @eval using cuDNN                          # NNlib's cuDNN extension: Lux's Conv on CuArrays
 "To the device: `CuArray` on the GPU (errors if none is functional, never a silent CPU fallback), else identity."
 const DEVF = CDEV === :gpu ? RF.m4_device("cuda") : identity
 todev(x) = Lux.fmap(DEVF, x)
-const CLOSS = Symbol(envc("LOSS", "mse"))
+const CLOSS = Symbol(envc("LOSS", "nll"))
 CLOSS in (:mse, :rmse, :nll) || error("RIKFLOW_CNN_LOSS must be mse, rmse or nll; got $CLOSS")
 const CINPUT = Symbol(envc("INPUT", "full"))
 CINPUT in (:full, :nodiff) || error("RIKFLOW_CNN_INPUT must be full or nodiff; got $CINPUT")
+# RIKFLOW_CNN_ACT = tanh (default) | relu: the activation of both convolutions and the two hidden dense
+# layers (Rik, 2026-10-22: "try using relu instead of tanh"; relu is unbounded, so it extrapolates linearly
+# where tanh saturates). Lux's default (Glorot) initialisation either way.
+const CACT = Symbol(envc("ACT", "tanh"))
+CACT in (:tanh, :relu) || error("RIKFLOW_CNN_ACT must be tanh or relu; got $CACT")
+const ACTF = CACT === :relu ? relu : tanh
+# RIKFLOW_CNN_INIT = glorot (default, Lux's) | he: Kaiming-normal weights (gain sqrt 2) for both
+# convolutions and the two hidden dense layers, the usual initialisation for relu (Rik, 2026-10-22: "please
+# try tuning a relu network"); the linear output layer keeps Glorot.
+const CINIT = Symbol(envc("INIT", "glorot"))
+CINIT in (:glorot, :he) || error("RIKFLOW_CNN_INIT must be glorot or he; got $CINIT")
+const WINIT = CINIT === :he ? kaiming_normal : glorot_uniform
+# RIKFLOW_CNN_HEAD = identity (default: the head starts at Sigma = I, the plain likelihood; Rik,
+# 2026-10-22: "I am not sure if I like the preset likelihood loss", then made it the default) | ls (it
+# starts at least squares' residual covariance, `LS_HEAD`; within seed noise of identity, 3 seeds each).
+# Either way the head is trained with the network.
+const CHEAD = Symbol(envc("HEAD", "identity"))
+CHEAD in (:ls, :identity) || error("RIKFLOW_CNN_HEAD must be ls or identity; got $CHEAD")
+const HEAD0 = CHEAD === :ls ? (; bd = copy(LS_HEAD.bd), Araw = copy(LS_HEAD.Araw)) :
+              (; bd = zeros(T, nq), Araw = zeros(T, nq, nq))   # A = I (exp of a zero diagonal), Sigma = I
 const CSEQ = Symbol(envc("SEQ", "lags"))
-CSEQ in (:lags, :full) || error("RIKFLOW_CNN_SEQ must be lags or full; got $CSEQ")
-const NSTEP = CSEQ === :full ? cfg.h + 1 : cfg.h              # sequence length
-const NCH = (CINPUT === :full ? 3nq : 2nq) + (CSEQ === :full ? 1 : 0)   # channels per step (+ mask)
+const INSEQ = CSEQ in (:full, :fullq)                    # q^{n*} inside the sequence (with the mask)
+CSEQ in (:lags, :full, :fullq) || error("RIKFLOW_CNN_SEQ must be lags, full or fullq; got $CSEQ")
+const NSTEP = INSEQ ? cfg.h + 1 : cfg.h              # sequence length
+const NCH = (CINPUT === :full ? 3nq : 2nq) + (INSEQ ? 1 : 0)   # channels per step (+ mask)
 NSTEP - 2(K - 1) >= 1 || error("kernel $K leaves no position after two convolutions of $NSTEP steps")
 
 """
@@ -84,7 +122,7 @@ is known and dQ^n (and Dq*^n) are not: they stay 0 and the mask channel (the las
 function lagtensor(Z)
     N, H = size(Z, 2), cfg.h
     A = zeros(T, NSTEP, NCH, N)
-    ks = CSEQ === :full ? (H:-1:0) : (H:-1:1)
+    ks = INSEQ ? (H:-1:0) : (H:-1:1)
     for (t, k) in enumerate(ks)
         if k == 0
             A[t, 1:nq, :] = Z[1:nq, :]                       # q^{n*}; dQ^n, Dq*^n unknown: 0, mask 0
@@ -95,25 +133,27 @@ function lagtensor(Z)
         A[t, (nq + 1):(2nq), :] = Z[lr.q, :]                # dQ^{n-k}
         CINPUT === :full &&                                 # Dq*^{n-k}
             (A[t, (2nq + 1):(3nq), :] = Z[nreg .+ (((k - 1) * nq + 1):(k * nq)), :])
-        CSEQ === :full && (A[t, NCH, :] .= one(T))          # the mask: known
+        INSEQ && (A[t, NCH, :] .= one(T))          # the mask: known
     end
     return A, T.(Z[1:nq, :])
 end
 
 function mkmodel(C)
-    conv = Chain(Conv((K,), NCH => C, tanh), Conv((K,), C => C, tanh), FlattenLayer())
+    conv = Chain(Conv((K,), NCH => C, ACTF; init_weight = WINIT), Conv((K,), C => C, ACTF; init_weight = WINIT),
+                 FlattenLayer())
     nflat = (NSTEP - 2(K - 1)) * C
     CSEQ === :full &&                                       # q^{n*} is in the sequence
-        return Chain(conv, Dense(nflat => D, tanh), Dense(D => D, tanh), Dense(D => nq))
-    return Chain(Parallel(vcat, conv, NoOpLayer()), Dense(nflat + nq => D, tanh), Dense(D => D, tanh),
-                 Dense(D => nq))
+        return Chain(conv, Dense(nflat => D, ACTF; init_weight = WINIT), Dense(D => D, ACTF; init_weight = WINIT),
+                     Dense(D => nq))
+    return Chain(Parallel(vcat, conv, NoOpLayer()), Dense(nflat + nq => D, ACTF; init_weight = WINIT),
+                 Dense(D => D, ACTF; init_weight = WINIT), Dense(D => nq))
 end
-"The model's input: the sequence alone (SEQ = full), or the sequence and q^{n*} (SEQ = lags)."
+"The model's input: the sequence alone (SEQ = full), or the sequence and q^{n*} (SEQ = lags, fullq)."
 modelin(A, Q) = CSEQ === :full ? A : (A, Q)
 
 Atr, Qtr = lagtensor(Float64.(Xc[:, 1:ntr]))
 # the sequence is a rearrangement of the checked input (step3_data.jl); check the current step's layout
-if CSEQ === :full
+if INSEQ
     Atr[end, 1:nq, :] == Qtr || error("the last step of the sequence is not q^{n*}")
     all(iszero, Atr[end, (nq + 1):end, :]) || error("dQ^n / Dq*^n / mask at the current step are not 0")
     all(isone, Atr[1:(end - 1), NCH, :]) || error("the mask is not 1 at the history steps")
@@ -122,7 +162,7 @@ end
 Ava, Qva = lagtensor(Float64.(Xc[:, (ntr + 1):end]))
 Aho, Qho = lagtensor(Xf[:, HO])
 Ytr32, Yva32 = T.(Ytr), T.(Yva)
-@info "CNN probe" CHS LRS CWDS CSEEDS K D CLOSS CINPUT CSEQ NSTEP NCH CST.max_updates fit_rows = ntr val_rows = ncol - ntr
+@info "CNN probe" CHS LRS CWDS CSEEDS K D CLOSS CHEAD CINPUT CSEQ CACT CINIT NSTEP NCH CST.max_updates fit_rows = ntr val_rows = ncol - ntr
 
 # the likelihood's head, as the library's: Sigma = D R D, D = diag(exp(bd)), R^{-1} = A'A with A lower
 # triangular from Araw (strict lower part, exp of the diagonal); the strict-lower mask is a constant
@@ -144,7 +184,7 @@ function fit_cnn(C, lr, wd, seed)
     rng = Xoshiro(seed)
     model = mkmodel(C)
     net, st = Lux.setup(rng, model)
-    ps = todev((; net, head = (; bd = copy(LS_HEAD.bd), Araw = copy(LS_HEAD.Araw))))
+    ps = todev((; net, head = (; bd = copy(HEAD0.bd), Araw = copy(HEAD0.Araw))))
     st = todev(st)
     rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
     opt = Optimisers.setup(rule, ps)
@@ -156,6 +196,7 @@ function fit_cnn(C, lr, wd, seed)
                        CLOSS === :rmse ? rmse_sum(out(p, A, Q), Y) : head_nll(p.head, out(p, A, Q) .- Y)
     vloss(p) = Float64(loss(p, Ava_d, Qva_d, Yva_d))
     best = (; val = vloss(ps), ps = deepcopy(ps), update = 0)
+    hist = (; update = Int[], val = Float64[], lr = Float64[])
     cur, since_best, since_decay, upd, stop = T(lr), 0, 0, 0, :cap
     nb = fld(ntr, CST.batch)
     while upd < CST.max_updates
@@ -167,6 +208,7 @@ function fit_cnn(C, lr, wd, seed)
             upd += 1
             upd % CST.val_every == 0 || continue
             v = vloss(ps)
+            push!(hist.update, upd); push!(hist.val, v); push!(hist.lr, cur)
             if v < best.val
                 best = (; val = v, ps = deepcopy(ps), update = upd)
                 since_best, since_decay = 0, 0
@@ -174,12 +216,12 @@ function fit_cnn(C, lr, wd, seed)
                 since_best += 1
                 since_decay += 1
             end
-            if since_decay >= CST.patience && cur > CST.min_lr
+            if !CST.nodecay && since_decay >= CST.patience && cur > CST.min_lr
                 cur = max(T(CST.min_lr), cur * T(CST.lr_decay))
                 Optimisers.adjust!(opt, cur)
                 since_decay = 0
             end
-            if cur <= CST.min_lr && since_best >= CST.stop_patience
+            if !CST.nostop && cur <= CST.min_lr && since_best >= CST.stop_patience
                 stop = :floor
                 break
             end
@@ -188,12 +230,18 @@ function fit_cnn(C, lr, wd, seed)
         stop === :floor && break
     end
     pb = best.ps
-    pred(A, Q) = Float64.(Array(out(pb, A, Q)))
+    pred(A, Q; p = pb) = Float64.(Array(out(p, A, Q)))
     rtr, rva = Ytr .- pred(Atr_d, Qtr_d), Yva .- pred(Ava_d, Qva_d)
     ho_ratio = rmsq(Yf[:, HO] .- pred(Aho_d, Qho_d)) ./ ls_ho
+    # the last iterate too: with NOSTOP the best and the last can be far apart
+    rva_last = Yva .- pred(Ava_d, Qva_d; p = ps)
+    last = (; val = vloss(ps), half_sse = 0.5 * sum(abs2, rva_last) / size(rva_last, 2),
+            ho_ratio = rmsq(Yf[:, HO] .- pred(Aho_d, Qho_d; p = ps)) ./ ls_ho)
     return (; ps = Lux.fmap(Array, pb), st = Lux.fmap(Array, st), device = CDEV, val_loss = best.val, val_half_sse = 0.5 * sum(abs2, rva) / size(rva, 2),
             nll_refit = gnll(rva, cov(permutedims(rtr))), ho_ratio, best_update = best.update, updates = upd,
-            stop, nparams = Lux.parameterlength(model), loss = CLOSS, input = CINPUT, seq = CSEQ)
+            stop, nparams = Lux.parameterlength(model), loss = CLOSS, head = CHEAD, input = CINPUT, seq = CSEQ, act = CACT,
+            init = CINIT,
+            hist, last)
 end
 
 res = Dict{Tuple{Int,Float64,Float64,Int},Any}()
@@ -201,14 +249,21 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
     t0 = time()
     r = fit_cnn(C, lr, wd, seed)
     res[(C, lr, wd, seed)] = merge(r, (; wall = time() - t0))
-    @printf("cnn  C %3d K %d D %d (%6d weights) lr %.0e wd %.0e seed %d %s %s seq %s %s | %5d upd, best @ %5d (%s) | val loss %.4f, NLL Sigma refit %.4f (LS %.4f) | 0.5 SSE %.4f (LS %.4f) | 10-100 TU rms / LS %s | %.1f min\n",
-            C, K, D, r.nparams, lr, wd, seed, CLOSS, CINPUT, CSEQ, CDEV, r.updates, r.best_update, r.stop, r.val_loss, r.nll_refit, ls_val,
+    @printf("cnn  C %3d K %d D %d (%6d weights) lr %.0e wd %.0e seed %d %s %s seq %s %s %s | %5d upd, best @ %5d (%s) | val loss %.4f, NLL Sigma refit %.4f (LS %.4f) | 0.5 SSE %.4f (LS %.4f) | 10-100 TU rms / LS %s | %.1f min\n",
+            C, K, D, r.nparams, lr, wd, seed, CLOSS === :nll ? string("nll/", CHEAD) : string(CLOSS), CINPUT, CSEQ,
+            string(CACT, "/", CINIT), CDEV, r.updates, r.best_update, r.stop, r.val_loss, r.nll_refit, ls_val,
             r.val_half_sse, ls_sse, join((@sprintf("%.2f", x) for x in r.ho_ratio), " "), (time() - t0) / 60)
     @printf("     %.2f ms per update (including validations and scoring)\n", 1e3 * (time() - t0) / r.updates)
+    # the validation curve at checkpoints, and the last iterate
+    cps = [u for u in (1_000, 5_000, 10_000, 20_000, 50_000, 100_000, 150_000, 200_000, 300_000) if u <= r.updates]
+    @printf("     val loss at %s\n", join((@sprintf("%dk: %.3f (lr %.0e)", u ÷ 1000, r.hist.val[findfirst(>=(u), r.hist.update)],
+                                                    r.hist.lr[findfirst(>=(u), r.hist.update)]) for u in cps), ", "))
+    @printf("     last iterate (update %d): val loss %.4f, 0.5 SSE %.4f | 10-100 TU rms / LS %s\n", r.updates,
+            r.last.val, r.last.half_sse, join((@sprintf("%.2f", x) for x in r.last.ho_ratio), " "))
     flush(stdout)
 end
 out_dir = joinpath(TO_folder, COUT)
 mkpath(out_dir)
 jldsave(joinpath(out_dir, "fits.jld2"); res, ls_val, ls_sse, ls_ho, settings = CST, K, D, feat = FEAT, cfg,
-        loss = CLOSS, input = CINPUT, seq = CSEQ)
+        loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT)
 @info "written" out_dir
