@@ -471,9 +471,21 @@ end
 # --------------------------------------------------------------------------------------------------
 # Sec. 5: ACF of dQ in the long runs against the tracked record
 # --------------------------------------------------------------------------------------------------
-function fig_dqacf(; L = 200)
+"""
+LinReg^E (white residual) at the three ridge strengths of step 1, on Fig. 6 as the mean ACF of its five
+long runs (Rik, 2026-10-21: "add LinReg^E and LinReg^E + AR(2) to Figure 6", then "actually only add
+linreg^E"). One sequential hue, light to dark with lambda (validate_palette.js: CVD, normal-vision floor
+and contrast pass; only the darkest step lies below the categorical lightness band, as the dark ends of
+Fig. 5's ramps do).
+"""
+const LINREGE = (("0.1", "TO_LRS/Splice1_E0x11", to_color("#8C6BC8")),
+                 ("1", "TO_LRS/Splice1_E0x7", to_color("#5B3A9E")),
+                 ("10", "TO_LRS/Splice1_E0x8", to_color("#2A0A5E")))
+
+function fig_dqacf(; L = 200, linrege::Bool = false)
     lags = 1:L                                   # log lag axis: lag 0 (= 1) is not drawn
     sets = [("LinReg1", LONGDIR["LinReg1"], COL["LinReg1"]), ("LinReg7", LONGDIR["LinReg7"], COL["LinReg7"])]
+    esets = linrege ? LINREGE : ()
     extra = get(ENV, "PAPER45_DQ_EXTRA", "")
     extracol = [to_color("#009E73"), to_color("#CC79A7"), to_color("#56B4E9")]
     for (j, s) in enumerate(filter(!isempty, split(extra, ",")))
@@ -483,16 +495,18 @@ function fig_dqacf(; L = 200)
     dqref = REC["q"][:, 2:end] .- REC["q_star"]
     fig = Figure(size = (W, 240), figure_padding = (2, 6, 2, 2))
     axs = qoi_axes(fig; LAGAX...)
-    runs = Dict(dir => longruns(dir) for (_, dir, _) in sets)
+    alldirs = [[dir for (_, dir, _) in sets]; [dir for (_, dir, _) in esets]]
+    runs = Dict(dir => longruns(dir) for dir in alldirs)
     # 🔑 Gate firings left out (Rik, 2026-10-13): a gated step (dQ = 0) and the hist_len steps whose
     # history holds it are not the closure's own correction. `gate_keep`/`autocorr_masked` (ts_score.jl);
     # a run that never fired is scored exactly as before. `dQ` is cut at the run's own length (a
     # diverged run's `dQ` is uninitialised past its stop).
-    keeps = Dict(dir => [gate_keep(dq_of(r), hist_len_of(dir))[101:end] for r in runs[dir]] for (_, dir, _) in sets)
-    for (lab, dir, _) in sets
-        @printf("dqacf: %-8s steps left out per run (firing + %d after): %s\n", lab, hist_len_of(dir),
+    keeps = Dict(dir => [gate_keep(dq_of(r), hist_len_of(dir))[101:end] for r in runs[dir]] for dir in alldirs)
+    for (lab, dir) in [[(l, d) for (l, d, _) in sets]; [("LinReg^E " * l, d) for (l, d, _) in esets]]
+        @printf("dqacf: %-12s steps left out per run (firing + %d after): %s\n", lab, hist_len_of(dir),
                 join((count(!, k) for k in keeps[dir]), " "))
     end
+    runacf(dir, i) = reduce(hcat, [autocorr_masked(dq_of(r)[i, 101:end], k, L) for (r, k) in zip(runs[dir], keeps[dir])])
     for i in 1:NQ
         ar = autocorr(collect(dqref[i, :]), L)
         ax = axs[i]
@@ -500,7 +514,7 @@ function fig_dqacf(; L = 200)
         for (lab, dir, col) in sets
             # one line per run, not a mean: a single run's burst (LinReg1 replica 4, E[0,6], 30-40 TU:
             # dQ alternating in sign step to step) would otherwise move the mean and stay invisible
-            A = reduce(hcat, [autocorr_masked(dq_of(r)[i, 101:end], k, L) for (r, k) in zip(runs[dir], keeps[dir])])
+            A = runacf(dir, i)
             am = vec(mean(A; dims = 2))
             @printf("dqacf: %-8s %-8s lag1 %.2f (record %.2f; runs %s), max |mean - record| %.2f, per run %s\n",
                     LABELS[i], lab, am[2], ar[2], join((@sprintf("%.2f", v) for v in A[2, :]), " "),
@@ -514,6 +528,16 @@ function fig_dqacf(; L = 200)
                        linestyle = ev ? :dot : :solid)
             end
         end
+        # LinReg^E: the mean over its five runs, one line per lambda (no run of it has a burst: the
+        # largest gap between a run and the mean is printed)
+        for (lam, dir, col) in esets
+            A = runacf(dir, i)
+            am = vec(mean(A; dims = 2))
+            @printf("dqacf: %-8s LinReg^E %-4s lag1 %.2f (runs %s), max |mean - record| %.2f, max |run - mean| %.2f\n",
+                    LABELS[i], lam, am[2], join((@sprintf("%.2f", v) for v in A[2, :]), " "),
+                    maximum(abs, am[2:end] .- ar[2:end]), maximum(abs, A[2:end, :] .- am[2:end]))
+            lines!(ax, lags, am[2:end]; color = col, linewidth = 1.0)
+        end
         lines!(ax, lags, ar[2:end]; color = C_REF, linewidth = 1.1, linestyle = :dash)
         r, cc = pos(i)
         r == 2 ? (ax.xlabel = "lag (steps)") : (ax.xticklabelsvisible = false)
@@ -522,9 +546,11 @@ function fig_dqacf(; L = 200)
     end
     Legend(fig[3, 1:3], [[LineElement(color = C_REF, linestyle = :dash)];
                          [LineElement(color = col) for (_, _, col) in sets];
-                         [LineElement(color = COL["LinReg1"], linestyle = :dot, linewidth = 0.9)]],
-           ["tracked record"; [lab * ", long runs" for (lab, _, _) in sets]; "LinReg1, run with the alternating burst"];
-           orientation = :horizontal, nbanks = length(sets) > 2 ? 2 : 1)
+                         [LineElement(color = COL["LinReg1"], linestyle = :dot, linewidth = 0.9)];
+                         [LineElement(color = col, linewidth = 1.0) for (_, _, col) in esets]],
+           ["tracked record"; [lab * ", long runs" for (lab, _, _) in sets]; "LinReg1, run with the alternating burst";
+            [L"\mathrm{LinReg}^E,\ \lambda = %$lam" for (lam, _, _) in esets]];
+           orientation = :horizontal, nbanks = length(sets) > 2 || !isempty(esets) ? 2 : 1)
     rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
     savefig("colour_dq_acf.pdf", fig)
 end
@@ -698,7 +724,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
     "step" in want && fig_step()
     "resacf" in want && fig_resacf()
     "sweep" in want && fig_sweep()
-    "dqacf" in want && fig_dqacf()
+    "dqacf" in want && fig_dqacf(; linrege = true)
     "scale" in want && fig_scale()
     "shape" in want && foreach(fig_shape, ("LinReg1", "LinReg7", "DDN"))
 end

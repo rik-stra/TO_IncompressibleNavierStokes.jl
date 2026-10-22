@@ -1010,6 +1010,43 @@ end
     @test isfinite(D6Score.window_delta(Pm, sc))
 end
 
+@testitem "V86 the window centre error: squared error of the mean less s^2/n, root after the mean" default_imports = false setup = [D6Score] begin
+    using Test
+    using Random
+    using Statistics
+    K, nq, M, L = 30, 6, 10, 12
+    fc, tr = D6Score.exchangeable(K, nq, M, L; rng = Xoshiro(5))
+    sc = [1.0, 2.0, 0.5, 1.0, 3.0, 1.0]
+    cols = 3:9
+    mu = dropdims(mean(fc; dims = 3); dims = 3)
+    s2 = dropdims(var(fc; dims = 3); dims = 3)
+    want(idx) = mean(sqrt(sum(mu[idx, i, cols] .- tr[idx, i, cols] .|> abs2) / (length(idx) * length(cols)) -
+                          sum(s2[idx, i, cols]) / (M * length(idx) * length(cols))) / sc[i] for i in 1:nq)
+    P = D6Score.window_centre_parts(fc, tr, cols)
+    @test size(P.D) == (K, nq) && P.N == length(cols)
+    @test D6Score.window_centre_error(P, sc) ≈ want(1:K)
+    idx = [1, 1, 2, 5, 30]                                   # a resample re-sums the parts
+    @test D6Score.window_centre_error(P, sc, idx) ≈ want(idx)
+    # it differs from delta by the finite-ensemble term only: eps^2 = delta^2 (1 + 1/M) - mean s^2 / M
+    Pd = D6Score.window_delta_parts(fc, tr, cols)
+    @test D6Score.window_centre_error(P, sc) ≈
+          mean(sqrt(sum(Pd.S[:, i]) / (K * length(cols)) - mean(s2[:, i, cols]) / M) / sc[i] for i in 1:nq)
+    # members that all agree: no correction, eps = RMSE of the mean over sigma
+    f1 = repeat(fc[:, :, 1:1, :], 1, 1, M, 1)
+    @test D6Score.window_centre_error(D6Score.window_centre_parts(f1, tr, cols), sc) ≈
+          mean(sqrt(mean(abs2, fc[:, i, 1, cols] .- tr[:, i, cols])) / sc[i] for i in 1:nq)
+    # with a member missing the correction uses the members kept at that IC and step
+    fm = copy(fc)
+    fm[4, :, 2, 8:9] .= NaN
+    Pm = D6Score.window_centre_parts(fm, tr, cols)
+    keep = [m for m in 1:M if m != 2]
+    d41 = sum(j -> j in 8:9 ? (mean(fc[4, 1, keep, j]) - tr[4, 1, j])^2 - var(fc[4, 1, keep, j]) / (M - 1) :
+                              (mu[4, 1, j] - tr[4, 1, j])^2 - s2[4, 1, j] / M, cols)
+    @test Pm.D[4, 1] ≈ d41 && Pm.D[3, 1] ≈ P.D[3, 1]
+    # a negative bracket (centre within the noise of the reference) keeps its sign
+    @test D6Score.signed_root(-4.0) == -2.0 && D6Score.signed_root(9.0) == 3.0
+end
+
 @testitem "V85 paired_primary and paired_compare average every step of the window" default_imports = false setup = [D6Score] begin
     using Test
     using JLD2
@@ -1049,6 +1086,7 @@ end
         # paired_compare: delta_0.5 on the window, no delta_all, no flat count
         c = D6Score.paired_compare(a, b; truth, nboot = 200, ndraw = 5, io = devnull)
         @test c.delta05.a ≈ D6Score.window_delta(D6Score.window_delta_parts(fa, tr, 1:200), sc)
+        @test c.e05.a ≈ D6Score.window_centre_error(D6Score.window_centre_parts(fa, tr, 1:200), sc)
         @test c.crps05.score_a ≈ r.score_a && c.crps_all.score_a ≈ rall.score_a
         @test !haskey(c, :delta_all) && !haskey(c, :flat_a)
         @test c.grid == [25, 50, 100, 200, 400]                 # the cells stay on the lead grid

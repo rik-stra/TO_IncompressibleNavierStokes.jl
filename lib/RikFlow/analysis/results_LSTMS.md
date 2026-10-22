@@ -2966,3 +2966,9 @@ no divergence, no guard firing; spread–skill ≤ 0.5 TU .42 .45 .41 .40 .43 .4
 1.03 in every QoI: no defect), 0.5–3 TU .82–.88 (LinReg7 .78–.84). Spread / error against LinReg7
 ≤ 0.5 TU 1.03 / 1.00, 1–3 TU 1.02–1.04 / 0.97–0.98. Below-range member steps 0.2–0.5 % (LinReg7
 0.1–0.4 %). S2c: not yet run on Snellius (needs the new sampler there).
+
+**S2c training hindcast** (job 28361794, 2026-10-20, Snellius @ `0495dbb6`; `out/D6train_LinReg7_ar2n_pl`,
+50 files, laptop = Snellius): no divergence, no guard firing (S1.1 22 steps); spread–skill ≤ 0.5 TU
+.74 .63 .85 .86 .89 .88 (S1.1 .73–.87; ratio 1.01–1.03: no defect), 0.5–3 TU 1.10–1.24. Spread / error
+against S1.1 ≤ 0.5 TU 1.00–1.02 / 0.99–1.00, 1–3 TU 0.99–1.01 / 1.00–1.02. Below-range member steps
+1.3–1.7 % (S1.1 1.7–2.3 %). Both S2b and S2c are cleared for their full runs (card review pending).

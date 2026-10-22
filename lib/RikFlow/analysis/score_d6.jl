@@ -1505,8 +1505,9 @@ end
 paired_calibration(ma, mb, t_ic; kw...) =
     paired_cell_bootstrap((m, idx) -> calibrated_count(cell_ratios(m, idx)), ma, mb, t_ic; kw...)
 
-"Number of ICs in a set of per-IC parts: `cell_moments` (`V`) or `window_delta_parts` (`S`)."
-n_ics(m) = hasproperty(m, :V) ? size(m.V, 1) : size(m.S, 1)
+"Number of ICs in a set of per-IC parts: `cell_moments` (`V`), `window_delta_parts` (`S`) or
+`window_centre_parts` (`D`)."
+n_ics(m) = hasproperty(m, :V) ? size(m.V, 1) : hasproperty(m, :S) ? size(m.S, 1) : size(m.D, 1)
 
 "Paired change A - B of the 36-cell mean normalized error (Sec. 3.5; review A4). Superseded in the
 paper by the window form, `paired_window_delta` (2026-10-08); kept for the cell tables."
@@ -1541,6 +1542,43 @@ window_delta(P, scale::AbstractVector{<:Real}, idx = axes(P.S, 1)) =
 "Paired change A - B of the window normalized error (delta_0.5), IC-block bootstrap."
 paired_window_delta(pa, pb, scale, t_ic; kw...) =
     paired_cell_bootstrap((m, idx) -> window_delta(m, scale, idx), pa, pb, t_ic; kw...)
+
+"""
+    window_centre_parts(fc, tr, cols) -> (; D, N)
+
+Per IC and QoI (`K x N_Q`), the sum over the window's steps `cols` of the squared error of the
+ensemble mean less its finite-ensemble part, `(mu - y)^2 - s^2/n` (`D`; `s^2` the members' unbiased
+variance, `n` the members present at that IC and step under `LEADWISE`, so `1/n = W - 1`), and the
+number of steps `N`. For members drawn with centre `c` and variance `v`, `E[(mu - y)^2] = (c - y)^2 +
+v/n` and `E[s^2] = v`: `D` estimates the squared error of `c`, the mean of an infinite ensemble,
+whatever `n` and the spread (fair-score logic, Ferro 2014; WeatherBench 2's debiased ensemble-mean
+MSE). The uncorrected `S` of `window_delta_parts` keeps `v/n`, which favours narrow ensembles.
+"""
+function window_centre_parts(fc::AbstractArray{<:Real,4}, tr::AbstractArray{<:Real,3}, cols)
+    m = cell_moments(view(fc, :, :, :, cols), view(tr, :, :, cols))
+    return (; D = dropdims(sum(m.E .- m.V .* (m.W .- 1); dims = 3); dims = 3), N = length(cols))
+end
+
+"""
+    window_centre_error(P, scale, idx = 1:K) -> Float64
+
+The centre error over a window, e (paper Eq. `centre error`; Rik, 2026-10-21, replaces the
+normalized error `window_delta` in the paper): per QoI `sqrt(sum_k sum_n D / (K N)) / sigma_i`,
+averaged over the QoIs, over the ICs `idx` (repeats allowed: a bootstrap resample). The bracket is
+averaged before the root. It comes out negative when the centre lies within the sampling noise of the
+reference (a planted closure in the tests; never in the paper's runs); the root then keeps the
+sign, `sign(x) sqrt(|x|)`, so that the estimate stays continuous across a bootstrap. 1 is the error of
+the climatological mean (an ensemble drawn from the climatology: `delta = e = 1`).
+"""
+window_centre_error(P, scale::AbstractVector{<:Real}, idx = axes(P.D, 1)) =
+    mean(signed_root(sum(view(P.D, idx, i)) / (length(idx) * P.N)) / scale[i] for i in axes(P.D, 2))
+
+"`sign(x) sqrt(|x|)`: the root of an unbiased estimate of a square that can come out negative."
+signed_root(x::Real) = copysign(sqrt(abs(x)), x)
+
+"Paired change A - B of the window centre error (e_0.5), IC-block bootstrap."
+paired_window_centre(pa, pb, scale, t_ic; kw...) =
+    paired_cell_bootstrap((m, idx) -> window_centre_error(m, scale, idx), pa, pb, t_ic; kw...)
 
 """
     criterion_clauses(p05_hi, score_b, cal_lo; margin = 10.0) -> (; S, C, hi_pct)
@@ -1612,6 +1650,8 @@ function paired_compare(dir_a, dir_b; truth = load_truth(), nboot::Integer = 10_
     w05 = 1:min(PRIMARY_MAX_LEAD, pl.nl)
     d05 = paired_window_delta(window_delta_parts(pl.fa, pl.tr, w05),
                               window_delta_parts(pl.fb, pl.tr, w05), sc, pl.t; nboot, level)
+    e05 = paired_window_centre(window_centre_parts(pl.fa, pl.tr, w05),
+                               window_centre_parts(pl.fb, pl.tr, w05), sc, pl.t; nboot, level)
     # the cell grid: step n is column n of the paired arrays
     grid = filter(<=(pl.nl), LEADS)
     fa, fb, tr = pl.fa[:, :, :, grid], pl.fb[:, :, :, grid], pl.tr[:, :, grid]
@@ -1630,6 +1670,9 @@ function paired_compare(dir_a, dir_b; truth = load_truth(), nboot::Integer = 10_
     @printf(io, "NORMALIZED ERROR delta_0.5 of the ensemble mean, every step 1..%d: A %.4f  B %.4f  A - B %+.4f (%+.2f%% of B), %.0f%% CI [%+.4f, %+.4f] -> %s\n",
             last(w05), d05.a, d05.b, d05.diff, 100 * d05.diff / d05.b, 100 * level, d05.lo, d05.hi,
             verdict(d05))
+    @printf(io, "CENTRE ERROR e_0.5 of the ensemble mean, every step 1..%d: A %.4f  B %.4f  A - B %+.4f (%+.2f%% of B), %.0f%% CI [%+.4f, %+.4f] -> %s\n",
+            last(w05), e05.a, e05.b, e05.diff, 100 * e05.diff / e05.b, 100 * level, e05.lo, e05.hi,
+            verdict(e05))
     @printf(io, "\nCALIBRATION, %d cells (r in [%.2f, %.2f]), K = %d paired ICs, leads %s\n",
             ncell, CAL_BAND[1], CAL_BAND[2], length(ks), join(grid, ","))
     @printf(io, "  calibrated  A %2d of %d   %s\n", cal.a, ncell, rf(ra, :calibrated))
@@ -1644,7 +1687,7 @@ function paired_compare(dir_a, dir_b; truth = load_truth(), nboot::Integer = 10_
     @printf(io, "  C  count CI lower end %+.0f > 0, CRPS_0.5 upper %+.2f%% < %+.0f%% : %s\n",
             cal.lo, hi_pct, margin, C ? "PASS" : "fail")
     @printf(io, "  -> improves on B iff G and (S or C): S or C = %s\n", S || C ? "yes" : "no")
-    return (; crps05 = p05, crps_all = pall, delta05 = d05, calibration = cal,
+    return (; crps05 = p05, crps_all = pall, delta05 = d05, e05 = e05, calibration = cal,
             reference_a = ra, reference_b = rb, ks, grid,
             S, C, crps05_hi_pct = hi_pct, margin = Float64(margin))
 end
@@ -1849,9 +1892,11 @@ function main(; dir = D6_DIR, preview_only::Bool = false, outdir = OUT, io = std
     w05 = 1:min(PRIMARY_MAX_LEAD, length(steps))
     window = (; crps05 = mean(view(cw, :, :, w05)), crps_all = mean(cw),
               delta05 = window_delta(window_delta_parts(fcw, trw, w05), scw),
+              e05 = window_centre_error(window_centre_parts(fcw, trw, w05), scw),
               last_step_05 = last(w05), last_step_all = last(steps))
-    @printf(io, "\nWINDOW SCORES (every step): CRPS_0.5 (steps 1..%d) %.5f   CRPS_all (steps 1..%d) %.5f   delta_0.5 %.4f\n",
-            window.last_step_05, window.crps05, window.last_step_all, window.crps_all, window.delta05)
+    @printf(io, "\nWINDOW SCORES (every step): CRPS_0.5 (steps 1..%d) %.5f   CRPS_all (steps 1..%d) %.5f   delta_0.5 %.4f   e_0.5 %.4f\n",
+            window.last_step_05, window.crps05, window.last_step_all, window.crps_all, window.delta05,
+            window.e05)
 
     mkpath(outdir)
     # 🔴 Named after the run directory. A fixed name meant scoring three closures in a row left

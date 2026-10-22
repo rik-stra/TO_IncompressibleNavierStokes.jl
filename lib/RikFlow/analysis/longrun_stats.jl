@@ -7,6 +7,11 @@
 #   long-run ratio   Eq. spread-skill with the five runs as members, k over every step, the sums also
 #                    over the QoIs, each QoI divided by sigma_i (std of the reference, whole record)
 #   stable runs      runs that reach 100 TU with every QoI finite
+#   long-run CRPS    the fair CRPS with the five runs as members, against the reference at the same
+#                    step, divided by sigma_i, mean over every step and the QoIs (`longrun_crps`;
+#                    added 2026-10-21, after the step-1 results: reported, no clause)
+#   long-run e       Eq. centre error with the five runs as members, over every step
+#                    (`longrun_centre`; added 2026-10-21 as the long-run CRPS)
 #
 # Rik, 2026-10-12: "define how every measure combines the six QoIs". Replaces the scratch scripts of
 # 2026-10-08/12 (perrun_bias.jl, pooled_ks.jl). score_m0_ddn.jl's `ss_of` used to pool the raw sums
@@ -61,9 +66,65 @@ function longrun_ratio(rs)
     return spread_skill(arr, Matrix(transpose(view(QREF, :, 1:K))) ./ SIG')
 end
 
+"""
+    longrun_crps(rs; shift = 0)
+
+Long-run CRPS (Rik, 2026-10-21; added after the step-1 results, reported, no clause): the fair
+CRPS of the five runs as members against the reference at the same step, each QoI divided by
+sigma_i, averaged over every step and the six QoIs -- the hindcast's CRPS (`crps_ensemble`, fair) on
+the long-run window. Past ~0.5 TU the runs no longer track the reference, and its expectation is the
+Cramer distance between the closure's and the reference's distributions plus the reference's own
+uncertainty (the same for every closure): a proper score of the long-run distribution, the L2
+sibling of the KS distance. `shift` (steps, circular) compares with the reference that many steps
+later instead: if the runs are uncorrelated with the reference past the first steps, the shifted
+value equals the aligned one.
+"""
+function longrun_crps(rs; shift::Integer = 0)
+    K = min(minimum(size(r, 2) for r in rs), size(QREF, 2))
+    x = Vector{Float64}(undef, length(rs))
+    s = 0.0
+    for n in 1:K, i in 1:6
+        for (j, r) in enumerate(rs)
+            x[j] = r[i, n]
+        end
+        s += crps_ensemble(x, QREF[i, mod(n - 1 + shift, K) + 1]) / SIG[i]
+    end
+    return s / (6K)
+end
+
+"""
+    longrun_centre(rs)
+
+Long-run centre error (Rik, 2026-10-21; added after the step-1 results, reported, no clause): Eq.
+centre error with the five runs as members, over every step -- per QoI the mean over the steps of
+`(mu - y)^2 - s^2/M` (`mu`, `s^2` the mean and unbiased variance of the runs, `y` the reference at
+the same step), its root divided by sigma_i, then the mean over the QoIs; `score_d6.jl`'s
+`window_centre_error` on the long-run window. It removes the sampling noise of the five-run mean,
+which the normalized error of the mean keeps and which favours closures whose runs vary too little
+(it replaced `longrun_delta`, the same day). 1 is the climatological mean; it is below 1 only
+because the runs follow the reference through the shared forcing.
+"""
+function longrun_centre(rs)
+    K = min(minimum(size(r, 2) for r in rs), size(QREF, 2))
+    M = length(rs)
+    x = Vector{Float64}(undef, M)
+    e = 0.0
+    for i in 1:6
+        s = 0.0
+        for n in 1:K
+            for (j, r) in enumerate(rs)
+                x[j] = r[i, n]
+            end
+            s += (mean(x) - QREF[i, n])^2 - var(x) / M
+        end
+        e += copysign(sqrt(abs(s / K)), s) / SIG[i]           # signed root, as score_d6.jl's
+    end
+    return e / 6
+end
+
 function main()
-    @printf("%-9s %-5s %6s %-15s %6s %-12s %6s %s\n", "closure", "lam", "b", "b single runs", "D",
-            "D single", "ratio", "stable")
+    @printf("%-9s %-5s %6s %-15s %6s %-12s %6s %6s %6s %s\n", "closure", "lam", "b", "b single runs",
+            "D", "D single", "ratio", "CRPS", "e", "stable")
     detail = String[]
     for (c, lam) in CLOSURES_RUN
         rs_all = runs(c)
@@ -79,9 +140,14 @@ function main()
         D_run = [summed_ks(r, QREF).total for r in rs]
         Dp = ensemble_ks(rs, QREF).total
         ss = longrun_ratio(rs)
-        @printf("%-9s %-5s %+6.1f [%+5.1f, %+5.1f] %6.2f %.2f-%.2f %6.2f %d of %d\n", c, lam,
-                mean(b_run), minimum(b_run), maximum(b_run), Dp, minimum(D_run), maximum(D_run),
-                ss.ratio, count(stable, rs_all), length(rs_all))
+        cr = longrun_crps(rs)
+        cr_shift = longrun_crps(rs; shift = (K - 1) ÷ 2)           # the reference 50 TU later
+        ep = longrun_centre(rs)
+        @printf("%-9s %-5s %+6.1f [%+5.1f, %+5.1f] %6.2f %.2f-%.2f %6.2f %6.3f %6.3f %d of %d\n", c,
+                lam, mean(b_run), minimum(b_run), maximum(b_run), Dp, minimum(D_run), maximum(D_run),
+                ss.ratio, cr, ep, count(stable, rs_all), length(rs_all))
+        push!(detail, @sprintf("%-9s long-run CRPS %.4f, against the reference shifted by 50 TU %.4f",
+                               c, cr, cr_shift))
         # sign agreement over the QoIs, per run; the pooled b_i per QoI; the blocks
         mixed = count(j -> minimum(B[:, j]) < 0 < maximum(B[:, j]), axes(B, 2))
         bpool = vec(mean(B; dims = 2))
