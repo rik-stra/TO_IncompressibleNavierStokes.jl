@@ -274,4 +274,30 @@ Every ssh and scp asks Rik.
   white base, and S2d's training hindcast against S1.3b had no defect (ratio ≤ 0.5 TU 1.01–1.03).
 - **2026-10-22, S2e submitted.** `TO_LRS/Splice1_E0x7_pl` copied by scp, sha256 equal; Snellius @
   `0495dbb6`. Full hindcast 28464658 (`D6_Splice1_E0x7_pl`), long runs 28464659 (5 × 100 TU, gate on),
-  gpu_a100.
+  gpu_a100. Later the same day (Rik: "can you submit one longrun on the H100 partion to see if that
+  is free?"): replica 1 moved to gpu_h100, job 28468583, after cancelling the still pending array task
+  28464659_1 so that the two cannot both write `replica1`; replicas 2–5 stay on gpu_a100. ⚠️ Replica 1
+  then runs on other hardware than the others (the earlier gated LinReg1/LinReg6 long runs also ran on
+  gpu_h100); all five use the same seeds and forcing.
+- **2026-10-22, S2e scored: full hindcast, long runs 4 of 5** (Rik: "get the runs from snellius";
+  hindcast 28464658 complete, 900 files; replicas 1–4 complete, replica 5 (28464659_5) still pending on
+  gpu_a100; logs scratch scores2/*s2e*, cmp_Splice1_E0x7_pl_vs_*). Against LinReg1: CRPS_0.5 0.2169,
+  −1.8 % [−4.3, +0.7], count 24 (−4 [−7, +8]) → **no** (S and C fail), as expected. G holds on the 4
+  runs (single-run D 0.39–0.72 < 0.91). Against S1.2b, nothing resolved: CRPS_0.5 −0.4 % [−1.1, +0.3],
+  CRPS_3 −0.8 %, e_0.5 0.440 / 0.440. ⚠️ **Not as expected: calibrated count 25 against S1.2b's 31**
+  (−6 [−6, +2], not resolved; "within a few cells" was predicted): the scale narrows the small-scale and
+  Z[0,6] cells at 0.25–1 TU by 2–5 %, and S1.2b's r there was 0.82–0.88, so five cells cross 0.80
+  (E[0,6] keeps 0–1 of 6, r 0.55–0.79). Guard firings: hindcast 10 steps (S1.2b 194), long runs 1
+  (184). Long runs (4 runs, provisional): D 0.55, single runs 0.39–0.72 (S1.2b 0.53, 0.33–0.73: not
+  smaller), ratio 1.04 (1.12, towards 1 as expected), CRPS_100 0.374 (0.373; difference +0.0004
+  [−0.016, +0.018]), e_100 0.673 (0.668), bias −4.7 % [−6.0, −3.0].
+- **2026-10-22, replica 5 moved to gpu_h100** (Rik: "cancel 28464659_5 and resubmit replica 5 on
+  gpu_h100, as for replica 1"): 28464659_5 was still pending, no `replica5` file; cancelled, resubmitted
+  as job 28470023 (`--array=5`, 45 min). ⚠️ Replicas 1 and 5 then run on gpu_h100, 2–4 on gpu_a100.
+- **2026-10-22, S2e written up from 4 runs** (Rik: "it is still in the queue. write the section based
+  on the results you do have"): paper Table `tab: res s2 all` (long-run values starred, 4 of 5 runs),
+  Sec. 7.2 opening and 7.2.3, Sec. 6.3 and `tab: closures`. Added for the text (scratch
+  scores2/train_full_s2e.log, dqacf_s2e.log): spread / error against S1.2b ≤ 0.5 TU 0.97–0.98 /
+  0.99–1.00, 0.5–1 TU 0.94–0.96, 1–3 TU 0.93–0.95 / 0.98–0.99; below range 0.2–0.7 % (0.4–1.1 %);
+  long-run ACF within 0.04 of S1.2b's. `train_hindcast.jl` PARTNER gained `Splice1_E0x7_pl`. To update
+  when replica 5 is in.
