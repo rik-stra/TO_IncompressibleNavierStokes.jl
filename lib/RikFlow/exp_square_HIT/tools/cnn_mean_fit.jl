@@ -32,6 +32,11 @@
 # missing value from a zero, Rik's choice; q^{n*} then no longer enters the dense layers separately).
 # Kernel size via RIKFLOW_CNN_K (Rik: 3, stride 1).
 #
+# Device (2026-10-22, Rik: "lets go for cuDNN", for bigger kernels and histories): RIKFLOW_CNN_DEVICE = cpu
+# (default) | gpu. On the GPU the data and the parameters live on the device (CuArray, RikFlow's own CUDA
+# through its Lux extension) and Lux's Conv runs through cuDNN (`cuDNN` in training/Project.toml, loaded
+# only for DEVICE = gpu); the scores are computed on the host. Random draws stay on the host.
+#
 # Grid (RIKFLOW_CNN_*): CHS channels {16, 32}, LRS {1e-3, 3e-3}, WDS {1e-1}, SEEDS {1}, K = 2, D = 64,
 # MAXUPD 20000, OUT step3/probe_cnn. Prints, per fit, the validation 0.5 SSE and NLL against least
 # squares on the same rows, and the rms one-step error on 10-100 TU per QoI over least squares'.
@@ -55,6 +60,12 @@ const D = parse(Int, envc("D", "64"))
 const CST = (; batch = 256, val_every = 100, patience = 30, stop_patience = 80, min_lr = 1e-4,
              lr_decay = 0.3, max_updates = parse(Int, envc("MAXUPD", "20000")))
 const COUT = envc("OUT", "step3/probe_cnn")
+const CDEV = Symbol(envc("DEVICE", "cpu"))
+CDEV in (:cpu, :gpu) || error("RIKFLOW_CNN_DEVICE must be cpu or gpu; got $CDEV")
+CDEV === :gpu && @eval using cuDNN                          # NNlib's cuDNN extension: Lux's Conv on CuArrays
+"To the device: `CuArray` on the GPU (errors if none is functional, never a silent CPU fallback), else identity."
+const DEVF = CDEV === :gpu ? RF.m4_device("cuda") : identity
+todev(x) = Lux.fmap(DEVF, x)
 const CLOSS = Symbol(envc("LOSS", "mse"))
 CLOSS in (:mse, :rmse, :nll) || error("RIKFLOW_CNN_LOSS must be mse, rmse or nll; got $CLOSS")
 const CINPUT = Symbol(envc("INPUT", "full"))
@@ -115,19 +126,26 @@ Ytr32, Yva32 = T.(Ytr), T.(Yva)
 
 # the likelihood's head, as the library's: Sigma = D R D, D = diag(exp(bd)), R^{-1} = A'A with A lower
 # triangular from Araw (strict lower part, exp of the diagonal); the strict-lower mask is a constant
-const LMASK = T[i > j for i in 1:nq, j in 1:nq]
+# (elementwise with constant masks, no `Diagonal` / `diag`, so the same code runs on a device)
+const LMASK = DEVF(T[i > j for i in 1:nq, j in 1:nq])
+const IMASK = DEVF(T[i == j for i in 1:nq, j in 1:nq])
 "Gaussian NLL per step of residuals `r` (nq x B) under the head `hd = (; bd, Araw)`."
 function head_nll(hd, r)
-    A = hd.Araw .* LMASK .+ Diagonal(exp.(diag(hd.Araw)))
+    A = hd.Araw .* LMASK .+ IMASK .* exp.(hd.Araw .* IMASK)      # exp only of the diagonal: no Inf * 0
     z = A * (r ./ exp.(hd.bd))
-    return T(0.5) * (nq * T(log(2pi)) + 2sum(hd.bd) - 2sum(diag(hd.Araw)) + sum(abs2, z) / size(r, 2))
+    return T(0.5) * (nq * T(log(2pi)) + 2sum(hd.bd) - 2sum(hd.Araw .* IMASK) + sum(abs2, z) / size(r, 2))
 end
+# the arrays the fits read, on the device
+const Atr_d, Qtr_d, Ytr_d = DEVF(Atr), DEVF(Qtr), DEVF(Ytr32)
+const Ava_d, Qva_d, Yva_d = DEVF(Ava), DEVF(Qva), DEVF(Yva32)
+const Aho_d, Qho_d = DEVF(Aho), DEVF(Qho)
 
 function fit_cnn(C, lr, wd, seed)
     rng = Xoshiro(seed)
     model = mkmodel(C)
     net, st = Lux.setup(rng, model)
-    ps = (; net, head = (; bd = copy(LS_HEAD.bd), Araw = copy(LS_HEAD.Araw)))
+    ps = todev((; net, head = (; bd = copy(LS_HEAD.bd), Araw = copy(LS_HEAD.Araw))))
+    st = todev(st)
     rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
     opt = Optimisers.setup(rule, ps)
     # the head: no weight decay; trained only by the likelihood
@@ -136,7 +154,7 @@ function fit_cnn(C, lr, wd, seed)
     out(p, A, Q) = first(model(modelin(A, Q), p.net, st))
     loss(p, A, Q, Y) = CLOSS === :mse ? T(0.5) * sum(abs2, out(p, A, Q) .- Y) / size(Y, 2) :
                        CLOSS === :rmse ? rmse_sum(out(p, A, Q), Y) : head_nll(p.head, out(p, A, Q) .- Y)
-    vloss(p) = Float64(loss(p, Ava, Qva, Yva32))
+    vloss(p) = Float64(loss(p, Ava_d, Qva_d, Yva_d))
     best = (; val = vloss(ps), ps = deepcopy(ps), update = 0)
     cur, since_best, since_decay, upd, stop = T(lr), 0, 0, 0, :cap
     nb = fld(ntr, CST.batch)
@@ -144,7 +162,7 @@ function fit_cnn(C, lr, wd, seed)
         idxs = shuffle(rng, 1:ntr)
         for k in 1:nb
             c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
-            g = Zygote.gradient(p -> loss(p, Atr[:, :, c], Qtr[:, c], Ytr32[:, c]), ps)[1]
+            g = Zygote.gradient(p -> loss(p, Atr_d[:, :, c], Qtr_d[:, c], Ytr_d[:, c]), ps)[1]
             opt, ps = Optimisers.update(opt, ps, g)
             upd += 1
             upd % CST.val_every == 0 || continue
@@ -170,10 +188,10 @@ function fit_cnn(C, lr, wd, seed)
         stop === :floor && break
     end
     pb = best.ps
-    pred(A, Q) = Float64.(out(pb, A, Q))
-    rtr, rva = Ytr .- pred(Atr, Qtr), Yva .- pred(Ava, Qva)
-    ho_ratio = rmsq(Yf[:, HO] .- pred(Aho, Qho)) ./ ls_ho
-    return (; ps = pb, st, val_loss = best.val, val_half_sse = 0.5 * sum(abs2, rva) / size(rva, 2),
+    pred(A, Q) = Float64.(Array(out(pb, A, Q)))
+    rtr, rva = Ytr .- pred(Atr_d, Qtr_d), Yva .- pred(Ava_d, Qva_d)
+    ho_ratio = rmsq(Yf[:, HO] .- pred(Aho_d, Qho_d)) ./ ls_ho
+    return (; ps = Lux.fmap(Array, pb), st = Lux.fmap(Array, st), device = CDEV, val_loss = best.val, val_half_sse = 0.5 * sum(abs2, rva) / size(rva, 2),
             nll_refit = gnll(rva, cov(permutedims(rtr))), ho_ratio, best_update = best.update, updates = upd,
             stop, nparams = Lux.parameterlength(model), loss = CLOSS, input = CINPUT, seq = CSEQ)
 end
@@ -183,9 +201,10 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
     t0 = time()
     r = fit_cnn(C, lr, wd, seed)
     res[(C, lr, wd, seed)] = merge(r, (; wall = time() - t0))
-    @printf("cnn  C %3d K %d D %d (%6d weights) lr %.0e wd %.0e seed %d %s %s seq %s | %5d upd, best @ %5d (%s) | val loss %.4f, NLL Sigma refit %.4f (LS %.4f) | 0.5 SSE %.4f (LS %.4f) | 10-100 TU rms / LS %s | %.1f min\n",
-            C, K, D, r.nparams, lr, wd, seed, CLOSS, CINPUT, CSEQ, r.updates, r.best_update, r.stop, r.val_loss, r.nll_refit, ls_val,
+    @printf("cnn  C %3d K %d D %d (%6d weights) lr %.0e wd %.0e seed %d %s %s seq %s %s | %5d upd, best @ %5d (%s) | val loss %.4f, NLL Sigma refit %.4f (LS %.4f) | 0.5 SSE %.4f (LS %.4f) | 10-100 TU rms / LS %s | %.1f min\n",
+            C, K, D, r.nparams, lr, wd, seed, CLOSS, CINPUT, CSEQ, CDEV, r.updates, r.best_update, r.stop, r.val_loss, r.nll_refit, ls_val,
             r.val_half_sse, ls_sse, join((@sprintf("%.2f", x) for x in r.ho_ratio), " "), (time() - t0) / 60)
+    @printf("     %.2f ms per update (including validations and scoring)\n", 1e3 * (time() - t0) / r.updates)
     flush(stdout)
 end
 out_dir = joinpath(TO_folder, COUT)
