@@ -20,8 +20,9 @@ include(joinpath(@__DIR__, "plot_paper_secs45.jl"))
 
 const KMAX = 200
 const NETCOL = [to_color("#CC79A7"), to_color("#E69F00"), to_color("#009E73")]   # validate_palette.js with LinReg1: pass
-isempty(ARGS) && error("usage: net_residual.jl Label=dir [Label=dir ...]")
-const NETS = [(; label = String(a[1]), dir = String(a[2])) for a in split.(ARGS, "=")]
+const NET_MAIN = abspath(PROGRAM_FILE) == @__FILE__        # false when net_sweep.jl includes this file
+NET_MAIN && isempty(ARGS) && error("usage: net_residual.jl Label=dir [Label=dir ...]")
+const NETS = NET_MAIN ? [(; label = String(a[1]), dir = String(a[2])) for a in split.(ARGS, "=")] : []
 
 "A network's residual on the record, in `full_residual`'s layout: rows = steps n, q^{n+1} - q^{n*} - dQhat."
 function net_residual(cols, pred)
@@ -39,7 +40,8 @@ const RL1 = let r = full_residual("LinReg1"),
 end
 
 # `Label=dirA,dirB,...`: the seeds of one network fitted in separate runs (one seed per process), merged
-const NETR = map(NETS) do net
+"The refitted network(s) of `net.dir` (comma-separated runs), their residual per seed, checked against LinReg1."
+function load_net(net)
     r, seeds, meta = Dict{Int,Any}(), Int[], nothing
     for dir in split(net.dir, ",")
         P = load(joinpath(OUTD, "TO_LSTM", dir, "pred.jld2"))
@@ -55,8 +57,9 @@ const NETR = map(NETS) do net
         end
         meta = P
     end
-    (; net..., seeds = sort(seeds), r, meta)
+    return (; net..., seeds = sort(seeds), r, meta)
 end
+const NETR = map(load_net, NETS)
 
 pr(v; f = "%.2f") = join((Printf.format(Printf.Format(f), x) for x in v), " ")
 rmsq(R, rows) = vec(sqrt.(mean(abs2, R[rows, :]; dims = 1)))
@@ -74,6 +77,66 @@ function report_error()
         @printf("error: %-5s seed %d: rms / LinReg1, 10-100 TU %s | 1-10 TU %s\n", net.label, s,
                 pr(rmsq(r.R, r.ho) ./ rmsq(RL1.R, RL1.ho)), pr(rmsq(r.R, r.tr) ./ rmsq(RL1.R, RL1.tr)))
     end
+end
+
+"""
+The steps of 10-100 TU at which at least one predicted level q^{n*}_j lies outside its range on 1-10 TU
+(the range Sec. 5 clips the power law to): their share; the one-step error inside and outside that range
+against LinReg1's on the same steps; the share of the network's excess squared error over LinReg1's that
+the outside steps carry; the residual's mean outside, in units of LinReg1's rms. Seed means. The rows of
+every network and of LinReg1 are the same steps (checked in `load_net`).
+"""
+function range_split(net)
+    r0 = net.r[net.seeds[1]]
+    lo, hi = vec(minimum(r0.qs[r0.tr, :]; dims = 1)), vec(maximum(r0.qs[r0.tr, :]; dims = 1))
+    out = [any((r0.qs[k, :] .< lo) .| (r0.qs[k, :] .> hi)) for k in r0.ho]
+    io, oo = r0.ho[.!out], r0.ho[out]                 # the network's rows
+    i1, o1 = RL1.ho[.!out], RL1.ho[out]               # LinReg1's rows, the same steps
+    ns = length(net.seeds)
+    sse(R, rows) = vec(sum(abs2, R[rows, :]; dims = 1))
+    rin = sum(rmsq(net.r[s].R, io) ./ rmsq(RL1.R, i1) for s in net.seeds) / ns
+    rout = sum(rmsq(net.r[s].R, oo) ./ rmsq(RL1.R, o1) for s in net.seeds) / ns
+    share = sum((sse(net.r[s].R, oo) .- sse(RL1.R, o1)) ./ (sse(net.r[s].R, r0.ho) .- sse(RL1.R, RL1.ho)) for s in net.seeds) / ns
+    bias = sum(vec(mean(net.r[s].R[oo, :]; dims = 1)) for s in net.seeds) / ns ./ rmsq(RL1.R, RL1.ho)
+    @printf("range: %-12s %.1f %% of the 10-100 TU steps have a level outside its 1-10 TU range\n", net.label, 100count(out) / length(out))
+    @printf("range: %-12s rms / LinReg1 inside %s | outside %s | outside share of the excess SSE %s | mean outside / LinReg1 rms %s\n",
+            net.label, pr(rin), pr(rout), pr(share), pr(bias; f = "%+.2f"))
+    # the colour without the outside steps: lag pairs with either step outside left out (autocorr_masked)
+    keep = .!out
+    am = [sum(autocorr_masked(collect(net.r[s].R[r0.ho, i]), keep, KMAX) for s in net.seeds) / ns for i in 1:NQ]
+    a1 = [autocorr_masked(collect(RL1.R[RL1.ho, i]), keep, KMAX) for i in 1:NQ]
+    @printf("range: %-12s ACF 10-100 TU inside only: rho1 %s | ratio %s (LinReg1 rho1 %s | ratio %s)\n", net.label,
+            pr([a[2] for a in am]), pr(lrv.(am); f = "%.1f"), pr([a[2] for a in a1]), pr(lrv.(a1); f = "%.1f"))
+end
+
+"""
+The network's residual on 10-100 TU as LinReg1's plus the difference of the two predictions,
+R_net = R_LR1 + d with d = dQhat_LR1 - dQhat_net (2026-10-23, Rik: "critically analyze ... the weight
+decay has a non monotone effect on the ACF"): per QoI, seed means of the share of d in the variance
+of R_net, the correlation of d with R_LR1, d's lag-one ACF and long-run variance ratio, and the
+lag-one ACF and ratio of R_net against what the two parts give if uncorrelated,
+rho_net = (1 - f) rho_LR1 + f rho_d with f = var(d) / var(R_net) (and the same for the ratio).
+Also the long-run variance ratio of R_net per seed.
+"""
+function decompose(net)
+    ns = length(net.seeds)
+    st = map(net.seeds) do s
+        r = net.r[s]
+        map(1:NQ) do i
+            rn, rl = collect(r.R[r.ho, i]), collect(RL1.R[RL1.ho, i])
+            d = rn .- rl
+            an, al, ad = autocorr(rn, KMAX), autocorr(rl, KMAX), autocorr(d, KMAX)
+            f = var(d) / var(rn)
+            (; f, c = cor(d, rl), rho_d = ad[2], L_d = lrv(ad), rho = an[2], L = lrv(an),
+             rho_pred = (1 - f) * al[2] + f * ad[2], L_pred = (1 - f) * lrv(al) + f * lrv(ad))
+        end
+    end
+    m(k) = [sum(st[j][i][k] for j in 1:ns) / ns for i in 1:NQ]
+    @printf("decomp: %-14s var share of d %s | cor(d, R_LR1) %s | d: rho1 %s, ratio %s\n", net.label,
+            pr(m(:f)), pr(m(:c); f = "%+.2f"), pr(m(:rho_d)), pr(m(:L_d); f = "%.0f"))
+    @printf("decomp: %-14s rho1 %s (from the parts %s) | ratio %s (from the parts %s) | ratio per seed %s\n",
+            net.label, pr(m(:rho)), pr(m(:rho_pred)), pr(m(:L); f = "%.1f"), pr(m(:L_pred); f = "%.1f"),
+            join((pr([st[j][i].L for i in 1:NQ]; f = "%.0f") for j in 1:ns), " / "))
 end
 
 # --------------------------------------------------------------------------------------------------
@@ -224,9 +287,12 @@ function fig_shape(net, col; zmax = 6.0, dz = 0.25)
     savefig("net_shape_$(net.label).pdf", fig)
 end
 
-report_error()
-fig_acf()
-fig_scale()
-for (j, net) in enumerate(NETR)
-    fig_shape(net, NETCOL[j])
+if NET_MAIN
+    report_error()
+    foreach(range_split, NETR)
+    fig_acf()
+    fig_scale()
+    for (j, net) in enumerate(NETR)
+        fig_shape(net, NETCOL[j])
+    end
 end

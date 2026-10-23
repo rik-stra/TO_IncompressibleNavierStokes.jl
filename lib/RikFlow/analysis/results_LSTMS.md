@@ -3079,3 +3079,67 @@ RIKFLOW_MLP_H=10 RIKFLOW_CNN_K=4 RIKFLOW_CNN_WDS=0.3 RIKFLOW_CNN_SEEDS=2 RIKFLOW
 julia --startup-file=no --project=training exp_square_HIT/tools/mlp_mean_fit.jl
 julia --startup-file=no --project=analysis analysis/mlp_residual.jl step3/MLP_h5_d4_dqinc
 ```
+
+## 32. Step 3 offline: refit, loss table, weight-decay sweep and the residual vs LinReg1 (2026-10-23, desktop CPU; Rik asked)
+
+Paper Sec. 6 written from this (paper branch `step3-mlp-offline`). `cnn_mean_fit.jl RIKFLOW_CNN_REFIT=1`:
+after stage 1, the same network trained again on all of 1–10 TU for its stage-1 best number of updates
+at the replayed stage-1 learning rate; `pred.jld2` holds the predictions on the whole record. One seed per
+process; 48 + 6 fits, ~2 min each, 16 at a time (`/export/scratch2/rik/tmp/run_sweep.sh`).
+Outputs `TO_LSTM/step3/grid_sw_<loss>_wd<wd>_s<seed>` (nll wd 0.1 and crps wd 0.3 are links to
+`grid_refit_*`). Analysis: `analysis/net_sweep.jl` (table, sweep figure, range split, decomposition;
+`step3/net_sweep.log`) and `analysis/net_residual.jl` (scale, shape; `step3/net_residual.log`).
+
+**Loss table** (seed means; wd chosen by each loss's own validation value over {0, .01, .03, .1, .3, 1}):
+
+| | wd | val ½SE | val NLL | val CRPS | 10–100 TU rms / LinReg1, Z/E[0,6] Z/E[7,15] Z/E[16,32] |
+|---|---|---|---|---|---|
+| LinReg1 (LS on 1–8.2 TU) | – | 0.2050 | −6.95 | 0.6158 | 1 |
+| likelihood | 0.1 | 0.2027 | −6.73 | 0.6188 | 1.02 1.00 1.15 1.23 1.39 1.28 |
+| CRPS | 0.3 | 0.2049 | −6.11 | 0.6232 | 1.02 1.00 1.11 1.25 1.27 1.18 |
+| RMSE | 0.3 | 0.2039 | −6.10 | 0.6227 | 1.02 1.00 1.11 1.24 1.24 1.16 |
+
+NLL/CRPS: the constant Gaussian fitted to the fit-row residuals (full Σ / per-QoI sd), as the closures
+do. On 1–10 TU the refitted networks are 0–9 % WORSE than LinReg1 (likelihood ≤ 1.04, CRPS ≤ 1.09):
+no offline gain from the nonlinearity anywhere.
+
+**Colour = departure from LinReg1** (Rik: "the weight decay has a non monotone effect on the ACF").
+R_net = R_LinReg1 + d, d = difference of the predictions. cor(d, R_LinReg1) ≤ 0.07 in size; d is as
+persistent as dQ (small scales ρ1 0.87–0.97, long-run ratio mostly 100–155, every wd and loss), so the
+residual's colour = share of d in its variance ≈ 1 − (σ_LinReg1/σ_net)² (ρ1 from the parts within 0.04
+of measured, except wd 1). That share is U-shaped in wd: small wd → early stop at 3–11k updates (CRPS/RMSE
+under-fit the middle band even on 1–10 TU, up to 1.41×; likelihood fits 1–10 TU but errs held out);
+wd 1 → shrinkage, coloured in sample too. The smallest error has the whitest residual; no colour–error
+trade-off as with ridge. Chosen wd, 10–100 TU: ρ1 0.2–0.5 mid/small, small-scale ratio 68/50
+(likelihood), 46/30 (CRPS), LinReg1 1.4/1.3.
+
+**Range split**: 6.3 % of 10–100 TU steps have some q*_j outside its 1–10 TU range; there the likelihood
+CNN is 1.4–2.3× LinReg1 (inside 1.08–1.12×), these steps carry 58–82 % of its excess SSE (mid/small), its
+mean there is −2.2/−1.8 × LinReg1 rms in the small scales (too large a correction). Masking them (lag
+pairs dropped) the small-scale ratio falls 68/50 → 9/7 (LinReg1 1.1). CRPS: mean −1.5/−1.2, 46/30 → 6.5/4.5.
+
+**Scale/shape** (first seed): β within 0.25 of LinReg1's; on 10–100 TU the highest-tenth spread 2.1–2.6
+(likelihood) / 1.9–2.3 (CRPS) vs 1.6, bin mean there −0.9…−1.6; power-law held-out gain 0.91 / 0.79 vs
+0.48 nats/step. Power-law-scaled tails on 10–100 TU 2.8–3.8× / 2.3–3.2× Gaussian (LinReg1 < 2×), skewed
+negative in the small scales; Gaussian on 1–10 TU.
+
+**Cap raised to 200 000** (Rik): the 15 fits that had reached 40 000 updates (chosen wd of each loss;
+wd 1 for CRPS and RMSE) redone as `step3/grid_cap_*` (the 39 floor-stopped fits linked unchanged); all
+now stop at the floor after 40.4–64.2k updates, 10 of 15 best iterates unchanged, likelihood seed 1
+38.4k → 56.2k. Table: likelihood 0.2027 / −6.74 / 0.6187, 1.02 1.00 1.15 1.22 1.40 1.29; CRPS 0.2050 /
+−6.11 / 0.6231, 1.02 1.00 1.12 1.25 1.26 1.18; RMSE 0.2040 / −6.08 / 0.6226, 1.02 1.00 1.11 1.25 1.23
+1.15. Chosen wd unchanged; conclusions unchanged (`step3/net_sweep_cap.log`, `net_residual_cap.log`;
+`NETSWEEP_PREFIX=step3/grid_cap_`). Paper Sec. 6 uses these.
+
+Caveat: the validation window (8.2–10 TU) lies inside the training range and cannot see the
+extrapolation that dominates 10–100 TU (the loss ranking reverses there).
+
+```bash
+# one sweep fit (desktop: wrap in script -qfec; OPENBLAS_NUM_THREADS=1 for 16 in parallel)
+RIKFLOW_CNN_REFIT=1 RIKFLOW_CNN_LOSS=crps RIKFLOW_CNN_WDS=0.3 RIKFLOW_CNN_SEEDS=1 RIKFLOW_CNN_OUT=step3/grid_sw_crps_wd0.3_s1 \
+  julia --startup-file=no --project=training exp_square_HIT/tools/cnn_mean_fit.jl
+PAPER_FIG_DIR=<dir> julia --startup-file=no --project=analysis analysis/net_sweep.jl
+PAPER_FIG_DIR=<dir> julia --startup-file=no --project=analysis analysis/net_residual.jl \
+  likelihood=step3/grid_refit_nll_s1,step3/grid_refit_nll_s2,step3/grid_refit_nll_s3 \
+  CRPS=step3/grid_refit_crps_s1,step3/grid_refit_crps_s2,step3/grid_refit_crps_s3
+```
