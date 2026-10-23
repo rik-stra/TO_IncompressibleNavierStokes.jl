@@ -31,7 +31,13 @@
 #
 # Second probes (Rik, 2026-10-22): RIKFLOW_CNN_LOSS = mse (default, above) | rmse (the per-QoI RMSE summed
 # over the QoIs) | nll (the Gaussian likelihood with a constant correlated head, trained jointly and
-# started at least squares' residual covariance, `LS_HEAD`); RIKFLOW_CNN_INPUT = full (default: q*, dQ
+# started at least squares' residual covariance, `LS_HEAD`) | crps (Rik, 2026-10-23: one-step CRPS against
+# the likelihood; the closed-form Gaussian CRPS of each QoI, summed over the QoIs, under a head of
+# marginal sds exp(bd) trained with the network; `Araw` stays frozen at A = I, since the marginal CRPS does
+# not see the correlations). Every fit, whatever its loss, also prints the validation CRPS with the
+# diagonal of Sigma refitted to the fit rows' residuals (least squares' beside it) and its own head's
+# marginal sd over the validation rms per QoI (1 = calibrated one step ahead; mse/rmse have no head).
+# RIKFLOW_CNN_INPUT = full (default: q*, dQ
 # and Dq* per step) | nodiff (q* and dQ per step: the kernel spans neighbouring steps and can form the
 # predictor increments itself, Rik: "the CNN might not need the inputs that were subtracted").
 #
@@ -84,9 +90,16 @@ CDEV === :gpu && @eval using cuDNN                          # NNlib's cuDNN exte
 const DEVF = CDEV === :gpu ? RF.m4_device("cuda") : identity
 todev(x) = Lux.fmap(DEVF, x)
 const CLOSS = Symbol(envc("LOSS", "nll"))
-CLOSS in (:mse, :rmse, :nll) || error("RIKFLOW_CNN_LOSS must be mse, rmse or nll; got $CLOSS")
+CLOSS in (:mse, :rmse, :nll, :crps) || error("RIKFLOW_CNN_LOSS must be mse, rmse, nll or crps; got $CLOSS")
+CLOSS === :crps && CDEV === :gpu && error("LOSS = crps is written for the CPU (norm_cdf is a scalar series)")
 const CINPUT = Symbol(envc("INPUT", "full"))
-CINPUT in (:full, :nodiff) || error("RIKFLOW_CNN_INPUT must be full or nodiff; got $CINPUT")
+CINPUT in (:full, :nodiff, :rel) || error("RIKFLOW_CNN_INPUT must be full, nodiff or rel; got $CINPUT")
+# INPUT = rel (Rik, 2026-10-22): per step [(q^{n-k*} - q^{n*}) / s_k, dQ^{n-k}] -- the predictor RELATIVE TO
+# NOW, each lag standardised by its own sd on the fit rows, so the within-window trajectory is on a usable
+# scale without step-to-step differencing; the level q^{n*} itself enters after the convolutions (SEQ = lags).
+# History length: RIKFLOW_MLP_H (step3_data.jl; default 5). Every fit is also scored against LinReg1's least
+# squares (h = 5) on the same columns, so fits at different h compare against one reference.
+CINPUT === :rel && envc("SEQ", "lags") != "lags" && error("INPUT = rel is defined for SEQ = lags")
 # RIKFLOW_CNN_ACT = tanh (default) | relu: the activation of both convolutions and the two hidden dense
 # layers (Rik, 2026-10-22: "try using relu instead of tanh"; relu is unbounded, so it extrapolates linearly
 # where tanh saturates). Lux's default (Glorot) initialisation either way.
@@ -112,6 +125,10 @@ const INSEQ = CSEQ in (:full, :fullq)                    # q^{n*} inside the seq
 CSEQ in (:lags, :full, :fullq) || error("RIKFLOW_CNN_SEQ must be lags, full or fullq; got $CSEQ")
 const NSTEP = INSEQ ? cfg.h + 1 : cfg.h              # sequence length
 const NCH = (CINPUT === :full ? 3nq : 2nq) + (INSEQ ? 1 : 0)   # channels per step (+ mask)
+"sd of (q^{n-k*} - q^{n*}) per QoI and lag on the fit rows, in the input's standardised units (INPUT = rel)"
+const REL_S = let Z = Float64.(Xc[:, 1:ntr])
+    reduce(hcat, [vec(std(Z[lagrows(k).s, :] .- Z[1:nq, :]; dims = 2)) for k in 1:cfg.h])
+end
 NSTEP - 2(K - 1) >= 1 || error("kernel $K leaves no position after two convolutions of $NSTEP steps")
 
 """
@@ -129,7 +146,8 @@ function lagtensor(Z)
             continue
         end
         lr = lagrows(k)
-        A[t, 1:nq, :] = Z[lr.s, :]                          # q^{n-k*}
+        A[t, 1:nq, :] = CINPUT === :rel ? (Z[lr.s, :] .- Z[1:nq, :]) ./ REL_S[:, k] :   # q^{n-k*} - q^{n*}
+                        Z[lr.s, :]                                                     # q^{n-k*}
         A[t, (nq + 1):(2nq), :] = Z[lr.q, :]                # dQ^{n-k}
         CINPUT === :full &&                                 # Dq*^{n-k}
             (A[t, (2nq + 1):(3nq), :] = Z[nreg .+ (((k - 1) * nq + 1):(k * nq)), :])
@@ -175,6 +193,36 @@ function head_nll(hd, r)
     z = A * (r ./ exp.(hd.bd))
     return T(0.5) * (nq * T(log(2pi)) + 2sum(hd.bd) - 2sum(hd.Araw .* IMASK) + sum(abs2, z) / size(r, 2))
 end
+"""
+Gaussian CRPS per step, summed over the QoIs, of residuals `r` (nq x B) under marginal sds `exp.(bd)`:
+s [z (2 Phi(z) - 1) + 2 phi(z) - 1/sqrt(pi)], z = r / s. The gradient is written out, since `norm_cdf` is
+a series that Zygote would otherwise differentiate term by term: d/dr = 2 Phi(z) - 1, d/ds = 2 phi(z) -
+1/sqrt(pi) (the z terms cancel), d/dbd = s d/ds.
+"""
+function head_crps(bd, r)
+    s = exp.(bd)
+    z = r ./ s
+    Phi, phi = T.(RF.norm_cdf.(z)), T.(RF.norm_pdf.(z))
+    return sum(s .* (z .* (2 .* Phi .- 1) .+ 2 .* phi .- 1 / sqrt(T(pi)))) / size(r, 2)
+end
+Zygote.@adjoint function head_crps(bd, r)
+    s = exp.(bd)
+    z = r ./ s
+    Phi, phi = T.(RF.norm_cdf.(z)), T.(RF.norm_pdf.(z))
+    B = size(r, 2)
+    y = sum(s .* (z .* (2 .* Phi .- 1) .+ 2 .* phi .- 1 / sqrt(T(pi)))) / B
+    back(dy) = (dy .* vec(sum(s .* (2 .* phi .- 1 / sqrt(T(pi))); dims = 2)) ./ B, dy .* (2 .* Phi .- 1) ./ B)
+    return y, back
+end
+"Validation CRPS per step, summed over the QoIs, of residuals `r` (nq x N) under marginal sds `s` (Float64)."
+crps_eval(r, s) = mean(sum(RF.crps_gaussian.(0.0, s, r); dims = 1))
+"The head's marginal sds: Sigma = D (A'A)^{-1} D, D = diag(exp(bd)) (A = I unless the head is a likelihood's)."
+function head_sd(hd)
+    Ar = Float64.(Array(hd.Araw))
+    A = tril(Ar, -1) + Diagonal(exp.(diag(Ar)))
+    return exp.(Float64.(Array(hd.bd))) .* sqrt.(diag(inv(A' * A)))
+end
+const LS_CRPS = crps_eval(Yva .- Cls' * Rva_, vec(std(Rls; dims = 2)))
 # the arrays the fits read, on the device
 const Atr_d, Qtr_d, Ytr_d = DEVF(Atr), DEVF(Qtr), DEVF(Ytr32)
 const Ava_d, Qva_d, Yva_d = DEVF(Ava), DEVF(Qva), DEVF(Yva32)
@@ -188,12 +236,14 @@ function fit_cnn(C, lr, wd, seed)
     st = todev(st)
     rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
     opt = Optimisers.setup(rule, ps)
-    # the head: no weight decay; trained only by the likelihood
+    # the head: no weight decay; trained only by the likelihood, or (its sds only) by the CRPS
     wd > 0 && Optimisers.adjust!(opt.head; lambda = zero(T))
-    CLOSS === :nll || Optimisers.freeze!(opt.head)
+    CLOSS in (:mse, :rmse) && Optimisers.freeze!(opt.head)
+    CLOSS === :crps && Optimisers.freeze!(opt.head.Araw)
     out(p, A, Q) = first(model(modelin(A, Q), p.net, st))
     loss(p, A, Q, Y) = CLOSS === :mse ? T(0.5) * sum(abs2, out(p, A, Q) .- Y) / size(Y, 2) :
-                       CLOSS === :rmse ? rmse_sum(out(p, A, Q), Y) : head_nll(p.head, out(p, A, Q) .- Y)
+                       CLOSS === :rmse ? rmse_sum(out(p, A, Q), Y) :
+                       CLOSS === :crps ? head_crps(p.head.bd, out(p, A, Q) .- Y) : head_nll(p.head, out(p, A, Q) .- Y)
     vloss(p) = Float64(loss(p, Ava_d, Qva_d, Yva_d))
     best = (; val = vloss(ps), ps = deepcopy(ps), update = 0)
     hist = (; update = Int[], val = Float64[], lr = Float64[])
@@ -233,12 +283,15 @@ function fit_cnn(C, lr, wd, seed)
     pred(A, Q; p = pb) = Float64.(Array(out(p, A, Q)))
     rtr, rva = Ytr .- pred(Atr_d, Qtr_d), Yva .- pred(Ava_d, Qva_d)
     ho_ratio = rmsq(Yf[:, HO] .- pred(Aho_d, Qho_d)) ./ ls_ho
+    ho_ratio1 = rmsq(Yf[:, HO] .- pred(Aho_d, Qho_d)) ./ ls1_ho     # against LinReg1 (h = 5)
     # the last iterate too: with NOSTOP the best and the last can be far apart
     rva_last = Yva .- pred(Ava_d, Qva_d; p = ps)
     last = (; val = vloss(ps), half_sse = 0.5 * sum(abs2, rva_last) / size(rva_last, 2),
             ho_ratio = rmsq(Yf[:, HO] .- pred(Aho_d, Qho_d; p = ps)) ./ ls_ho)
-    return (; ps = Lux.fmap(Array, pb), st = Lux.fmap(Array, st), device = CDEV, val_loss = best.val, val_half_sse = 0.5 * sum(abs2, rva) / size(rva, 2),
-            nll_refit = gnll(rva, cov(permutedims(rtr))), ho_ratio, best_update = best.update, updates = upd,
+    crps_refit = crps_eval(rva, vec(std(rtr; dims = 2)))
+    head_ratio = CLOSS in (:nll, :crps) ? head_sd(pb.head) ./ rmsq(rva) : fill(NaN, nq)
+    return (; ps = Lux.fmap(Array, pb), st = Lux.fmap(Array, st), device = CDEV, ho_ratio1, h = cfg.h, val_loss = best.val, val_half_sse = 0.5 * sum(abs2, rva) / size(rva, 2),
+            nll_refit = gnll(rva, cov(permutedims(rtr))), crps_refit, head_ratio, ho_ratio, best_update = best.update, updates = upd,
             stop, nparams = Lux.parameterlength(model), loss = CLOSS, head = CHEAD, input = CINPUT, seq = CSEQ, act = CACT,
             init = CINIT,
             hist, last)
@@ -253,6 +306,10 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
             C, K, D, r.nparams, lr, wd, seed, CLOSS === :nll ? string("nll/", CHEAD) : string(CLOSS), CINPUT, CSEQ,
             string(CACT, "/", CINIT), CDEV, r.updates, r.best_update, r.stop, r.val_loss, r.nll_refit, ls_val,
             r.val_half_sse, ls_sse, join((@sprintf("%.2f", x) for x in r.ho_ratio), " "), (time() - t0) / 60)
+    @printf("     h %d | against LinReg1 (h = 5): val 0.5 SSE %.4f (LinReg1 %.4f) | 10-100 TU rms / LinReg1 %s\n", r.h,
+            r.val_half_sse, ls1_sse, join((@sprintf("%.2f", x) for x in r.ho_ratio1), " "))
+    @printf("     val CRPS, diagonal Sigma refit %.4f (LS %.4f) | own head's sd / val rms %s\n", r.crps_refit, LS_CRPS,
+            join((@sprintf("%.3f", x) for x in r.head_ratio), " "))
     @printf("     %.2f ms per update (including validations and scoring)\n", 1e3 * (time() - t0) / r.updates)
     # the validation curve at checkpoints, and the last iterate
     cps = [u for u in (1_000, 5_000, 10_000, 20_000, 50_000, 100_000, 150_000, 200_000, 300_000) if u <= r.updates]
@@ -264,6 +321,6 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
 end
 out_dir = joinpath(TO_folder, COUT)
 mkpath(out_dir)
-jldsave(joinpath(out_dir, "fits.jld2"); res, ls_val, ls_sse, ls_ho, settings = CST, K, D, feat = FEAT, cfg,
+jldsave(joinpath(out_dir, "fits.jld2"); res, ls_val, ls_sse, ls_ho, ls_crps = LS_CRPS, settings = CST, K, D, feat = FEAT, cfg,
         loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT)
 @info "written" out_dir

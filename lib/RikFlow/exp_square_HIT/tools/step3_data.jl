@@ -179,6 +179,22 @@ rmsq(r) = vec(sqrt.(mean(abs2, r; dims = 2)))
 # the comparator: least squares fitted on the same 1-8.2 TU rows as the stage-1 networks
 ls_ho = rmsq(Yf[:, HO] .- Cls' * Xr64[:, HO])
 
+# LinReg1's least squares (h = 5) as a FIXED reference for every h (2026-10-22: histories 10 and 15): fitted
+# on the same 1-8.2 TU record columns as the networks' fit rows, in the same standardised target, scored on
+# the same validation and 10-100 TU columns. At h = 5 it is the floor above (checked).
+hist5 = RF.HistorySpec(; h = 5, n_qoi = nq, hist_var = :q_star_q, include_predictor = true)
+X5r, _, steps5 = RF.build_history(hist5, qss, qs)
+X5 = permutedims(Float64.(X5r))
+cols5 = (a - 1) .+ steps5
+at5(c) = c .- cols5[1] .+ 1                               # record column -> column of X5 (contiguous)
+Y5 = (rec.q[:, cols5 .+ 1] .- rec.q_star[:, cols5] .- mo) ./ so
+fit5, val5, ho5 = at5(cols_tr[1:ntr]), at5(cols_tr[(ntr + 1):end]), at5(cols[HO])
+C5 = X5[:, fit5]' \ Y5[:, fit5]'
+ls1_sse = 0.5 * sum(abs2, Y5[:, val5] .- C5' * X5[:, val5]) / length(val5)
+ls1_ho = rmsq(Y5[:, ho5] .- C5' * X5[:, ho5])
+cfg.h == 5 && (maximum(abs, ls1_ho .- ls_ho) < 1e-10 || error("the LinReg1 reference differs from the h = 5 floor"))
+@info "LinReg1 reference (h = 5, fit on the same 1-8.2 TU columns)" h = cfg.h val_half_sse = ls1_sse
+
 """
 The constant Gaussian head of the residuals `r` (nq x N, standardised target units), in the library's
 parametrisation: `bd = log sd`, `Araw` with `A'A = R^{-1}` (`A` lower triangular, log diagonal), so that

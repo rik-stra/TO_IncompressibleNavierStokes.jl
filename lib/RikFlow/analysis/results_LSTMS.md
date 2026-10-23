@@ -2972,3 +2972,110 @@ no divergence, no guard firing; spread–skill ≤ 0.5 TU .42 .45 .41 .40 .43 .4
 .74 .63 .85 .86 .89 .88 (S1.1 .73–.87; ratio 1.01–1.03: no defect), 0.5–3 TU 1.10–1.24. Spread / error
 against S1.1 ≤ 0.5 TU 1.00–1.02 / 0.99–1.00, 1–3 TU 0.99–1.01 / 1.00–1.02. Below-range member steps
 1.3–1.7 % (S1.1 1.7–2.3 %). Both S2b and S2c are cleared for their full runs (card review pending).
+
+## 30. Step-3 CNN: one-step CRPS against the one-step likelihood (2026-10-23, laptop CPU; Rik asked)
+
+`cnn_mean_fit.jl` `RIKFLOW_CNN_LOSS=crps`: the closed-form Gaussian CRPS per QoI, summed, under a head
+of marginal sds exp(bd) trained with the network (`Araw` frozen; hand-written adjoint, checked against
+central differences to 4e-7 in Float32). Every fit now also prints the validation CRPS with the diagonal
+of Σ refitted to the fit rows (LS 0.6158) and its own head's sd / validation rms. Everything else the
+step-3 defaults (fit 1–8.2 TU, early stop on 8.2–10 TU, cap 40 000). Out: `TO_LSTM/step3/lossmatch_*`.
+
+| loss, wd (seeds) | best update | val ½SSE (LS .2050) | val CRPS, Σ refit | val NLL, Σ refit (LS −6.95) | 10–100 TU rms / LS | own head sd / val rms |
+|---|---|---|---|---|---|---|
+| NLL, 0.1 (1–3) | 22–39k | .2020–.2031 | .618–.620 | −6.71…−6.77 | 1.01 1.00 1.16–1.19 1.23–1.27 1.35–1.47 1.27–1.35 | 1.11–1.12 1.10–1.11 .87–.88 .88–.89 .85 .83–.84 |
+| NLL, 0.3 (1–3) | 30–37k | .2026–.2033 | .625–.628 | −6.63…−6.65 | 1.03 1.01 1.25–1.29 1.30–1.39 1.46–1.55 1.35–1.39 | 1.15 1.12 .90–.91 .92–.94 .86–.87 .86 |
+| CRPS, 0.1 (1–3) | 4.9–6.6k | .2166–.2261 | .657–.668 | −4.79…−5.04 | 1.10–1.12 1.05 1.37–1.46 1.96–2.00 1.47–1.65 1.41–1.49 | .93–.98 .96–.98 .79–.86 .85–1.06 .81–1.01 .83–1.01 |
+| CRPS, 0.3 (1–3) | 36–37k (cap) | .2042–.2065 | .622–.626 | −6.02…−6.19 | 1.02–1.03 1.01 1.12–1.14 1.26–1.29 1.24–1.28 1.14–1.20 | 1.04–1.05 1.04–1.05 .80–.81 .84–.86 .80 .77–.78 |
+
+Seed 1 only, CRPS: wd 0.01 ½SSE .2482 / CRPS .712; wd 1 .2050 / .650; lr 3e-4 .2233 / .671; head
+started at LS's sds .2140 / .640.
+
+- **On validation the likelihood wins at each loss's best weight decay** (NLL 0.1, CRPS 0.3): ½SSE
+  .2020–.2031 vs .2042–.2065, CRPS .618–.620 vs .622–.626 (the CRPS-trained net loses on its own
+  score), NLL −6.7 vs −6.1. Neither beats LS on validation CRPS (.616). At wd 0.1 the CRPS fit stops
+  early (best at ~5k) and is 6–10 % worse in ½SSE: it needs the stronger weight decay.
+- **CRPS heads are narrower**: own sd / validation rms ~7–11 % below the NLL heads' at the same wd in
+  every QoI (the Monte Carlo of `meta_files/lit_crps_loss_2026-10-23.md` §5 predicted 7 % for a
+  residual shaped like LinReg1's). Both heads are under-dispersed out of sample except in the large
+  scales.
+- **10–100 TU (held out, not for selection):** CRPS at wd 0.3 extrapolates better in the middle and
+  small scales, 3/3 seeds, against NLL at either wd (e.g. Z[16,32]/E[16,32] 1.24–1.28 / 1.14–1.20 vs
+  1.35–1.55 / 1.27–1.39). Not from the weight decay: NLL at 0.3 is worse there than at 0.1.
+- For step 3 (Σ refitted after training) this is a question about the mean only: the validation rule
+  keeps the likelihood.
+
+## 31. Step 3 offline: the network mean — MLP and CNN probes, then the CNN architecture (2026-10-22/23, laptop + desktop; Rik asked)
+
+Paper Sec. 6 (`sec:mlp-offline`, skeleton only): fit the network mean offline and analyse its residual as
+Sec. 5 does LinReg1's, before any coupled run. Branch `step3-mlp-offline` (worktrees `code_base_step3/`,
+`paper_step3/`; desktop `/export/scratch2/rik/time_series_TO_step3`).
+
+**Data, shared by every fit (`tools/step3_data.jl`).** Target dQ^n = q^n − q^{n*} from the record's levels
+(column n+1 of `q` minus column n of `q_star`), **not** the recorded `rec.dQ`: the two differ by up to 0.12
+sd(dQ) per step, 0.04 rms in the small scales, about ⅔ of LinReg1's whole residual there. Input: LinReg1's
+regressor (h = 5) through a fixed map, `[q*^n | dQ^{n-k}, q*^{n-k} | 1 | Δq*^{n-k}]`, 97 entries, each dQ and
+Δq* = q*^{n-k+1} − q*^{n-k} standardised on 1–10 TU (stored as `scaling.input_map`). Every entry of the input
+and the target is rebuilt from the raw record and checked (8e-14); least squares on the input is LinReg1
+exactly (1e-12). Condition number of the input on its range 2.3e4 (raw regressor 1.9e6; dQ history alone 2.1e6,
+the predictor lags stay collinear). Protocol: fit on 1–8.2 TU, early stop on 8.2–10 TU (validation), batch 256,
+learning rate ×0.3 after 30 validations without a new best (floor 1e-4), stop at the floor after 80 more, cap
+40 000 updates; 10–100 TU is held out (scored, never used to select). Every fit is scored against least squares
+fitted on the same rows; since 2026-10-22 evening also against LinReg1 (h = 5) for any h.
+
+**MLP** (`tools/mlp_mean_fit.jl`; library `LSTMSpec` `n_layers`, `n_in`, tests V90/V91). Depth 4 (Rik),
+width {16, 64, 128} × wd {0, 1e-2, 1e-1} × 3 seeds, lr 1e-2, likelihood: best 4 × 16 at wd 0.1, validation
+½SSE ≈ 0.215 against LS 0.205; widths 64/128 peak at 100–300 updates. Probes (seed 1): lr 1e-3 gives ½SSE
+0.2065 but 10–100 TU rms/LS 1.04 1.01 1.36 1.63 1.93 1.80; per-QoI RMSE loss 0.2169, 1.06 1.02 1.20 1.48 1.62
+1.55; squared-error loss, a least-squares-seeded head and longer training worse. 11 % of the 10–100 TU states
+have an input outside the 1–8.2 TU range: there the MLP is 1.8–3.2 × LS in the middle and small scales,
+inside 1.2–1.3 ×: bounded tanh units do not extrapolate as a linear map does.
+
+**CNN** (`tools/cnn_mean_fit.jl`, Lux; offline only, the closure path has no convolutional arch). The 5
+history steps as a sequence, channels [q*^{n-k}, dQ^{n-k}, Δq*^{n-k}] (18), two Conv1D (kernel 2, 16 channels,
+tanh), q*^n appended, Dense 64-64 (tanh), 9 190 weights. The loss decides it: likelihood ½SSE 0.204 against
+0.36 (squared error) and 0.33 (per-QoI RMSE). Head started at Σ = I equals the least-squares-seeded head
+within seed noise (3 seeds each) and is the default (Rik). Seed 1: within 0–10 % of LS on 10–100 TU states
+inside the training range, 1.03–2.20 × outside. Lost: q* in the sequence with zero-padded dQ^n and a mask
+(± appended at the end; kernels 2, 3), 32 channels, wd 0 (best at 6–7k updates; run on to 200 000 updates
+without early stopping: no later improvement, the head over-fits), ReLU (He init, lr × wd grid, also with the
+RMSE loss: best wd 1 + RMSE, ½SSE 0.220, 1.10 1.01 1.46 1.91 2.10 1.68).
+
+**Architecture study** (desktop CPU; Rik: are q* increments against the idea of a CNN; kernels 3–4;
+histories 10, 15; channels 16, 32; no pooling). Against LinReg1 (h = 5): validation NLL −6.95, ½SSE 0.205.
+
+| CNN (16 ch unless noted) | wd | seeds | val NLL | val ½SSE | 10–100 TU rms / LinReg1, Z/E[0,6] Z/E[7,15] Z/E[16,32] |
+|---|---|---|---|---|---|
+| **h 5, k2, q* increments + plain** | **0.1** | 3 | **−6.71…−6.77** | .2023–.2030 | 1.01–1.02 1.00 1.15–1.19 1.23–1.28 1.36–1.42 1.28–1.31 |
+| h 5, k2, q* plain only | 0.1 | 3 | −6.56…−6.59 | .2077–.2110 | 1.06–1.07 1.04 1.26–1.28 1.33–1.36 1.40–1.49 1.34–1.41 |
+| h 5, k2, q* relative to now | 0.1 | 3 | −6.70…−6.78 | .2010–.2047 | 1.01–1.02 1.00 1.19–1.24 1.26–1.35 1.53–1.62 1.45–1.52 |
+| h 5, k2 | 0.3 | 3 | −6.62…−6.65 | .2027–.2030 | 1.02–1.03 1.01 1.25–1.29 1.30–1.39 1.48–1.55 1.36–1.38 |
+| h 10, k2 | 0.3 | 3 | −6.62…−6.67 | .2038–.2053 | 1.03 1.01–1.02 1.23–1.26 1.25–1.29 1.53–1.65 1.38–1.53 |
+| h 10, k4 | 0.3 | 3 | −6.59…−6.67 | .2046–.2054 | 1.03–1.04 1.01 1.30–1.31 1.38–1.42 1.58–1.71 1.46–1.58 |
+| h 15, k4 | 0.3 | 3 | −6.28…−6.42 | .2072–.2091 | 1.04–1.05 1.02 1.28–1.36 1.33–1.56 1.70–1.80 1.53–1.69 |
+| h 10/15, any k, wd 0.1 | 0.1 | 3 | −0.2…−6.4 | .206–.36 | 1.03–1.5 1.0–1.25 1.3–2.9 1.4–4.5 1.6–3.3 1.5–3.0 |
+| h 10/15, 32 ch | 0.3/1 | 1 | −1.4…−6.4 | .207–.30 | never better than 16 ch; at h 15 it over-fits within ~1 000 updates at wd 0.3 |
+| any h, wd 1 or 3 (16 ch) | 1/3 | 1 | −3.1…−5.8 | .24–.50 | under-fits |
+
+- Input (step 1): increments + plain and relative-to-now tie on validation; plain only is worse. Rik chose
+  increments + plain (it extrapolates better on 10–100 TU in the small scales, which is held out: noted).
+- Longer histories over-fit at wd 0.1 (best update 1k–23k against 22k–38k at h 5); at wd 0.3 they reach
+  LinReg1's validation error but stay behind h 5 in the small scales. Larger kernels help at long histories
+  at wd 0.1 (h 10: k4 > k3 > k2), not at their best wd. So: **h 5, k2, 16 channels, wd 0.1** stays.
+- Full table, 50 seed-1 rows of h × k × channels × wd: `/export/scratch2/rik/tmp/step3_summary.txt`.
+- GPU (`RIKFLOW_CNN_DEVICE=gpu`, `cuDNN` in `training/Project.toml`): reproduces the CPU fit to the last
+  digit; per update ≈ CPU at batch 256, 8 × faster at full batch. 🔴 On squamish it gave CUDA launch failures,
+  an illegal address and a corrupted host→device copy (indices arriving as zeros, with no other GPU user),
+  and the machine crashed on 2026-10-23 ~09:58; the six lost fits were rerun on the CPU. Use the CPU there.
+
+**Reproduce** (from `lib/RikFlow`, `--project=training`; on the desktop wrap in `script -qfec`):
+```bash
+# the step-3 CNN (defaults), 3 seeds; the history length is RIKFLOW_MLP_H (step3_data.jl)
+julia --startup-file=no --project=training exp_square_HIT/tools/cnn_mean_fit.jl
+# one row of the study, e.g. h 10, kernel 4, wd 0.3, seed 2
+RIKFLOW_MLP_H=10 RIKFLOW_CNN_K=4 RIKFLOW_CNN_WDS=0.3 RIKFLOW_CNN_SEEDS=2 RIKFLOW_CNN_OUT=step3/grid_x \
+  julia --startup-file=no --project=training exp_square_HIT/tools/cnn_mean_fit.jl
+# the MLP grid and its residual analysis
+julia --startup-file=no --project=training exp_square_HIT/tools/mlp_mean_fit.jl
+julia --startup-file=no --project=analysis analysis/mlp_residual.jl step3/MLP_h5_d4_dqinc
+```
