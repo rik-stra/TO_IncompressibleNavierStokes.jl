@@ -294,6 +294,10 @@ Every ssh and scp asks Rik.
 - **2026-10-22, replica 5 moved to gpu_h100** (Rik: "cancel 28464659_5 and resubmit replica 5 on
   gpu_h100, as for replica 1"): 28464659_5 was still pending, no `replica5` file; cancelled, resubmitted
   as job 28470023 (`--array=5`, 45 min). ⚠️ Replicas 1 and 5 then run on gpu_h100, 2–4 on gpu_a100.
+  Later (Rik: "switch back to A100", 28470023_5 pending with PartitionDown): still pending, no
+  `replica5` file; cancelled, resubmitted on gpu_a100 as job 28471013 (`--array=5`, 45 min). Replica 5
+  thus runs on gpu_a100 as 2–4, replica 1 alone on gpu_h100. At submission both gpu_a100 and gpu_h100
+  were DOWN (nodes draining/drained), so 28471013 also waits with PartitionDown.
 - **2026-10-22, S2e written up from 4 runs** (Rik: "it is still in the queue. write the section based
   on the results you do have"): paper Table `tab: res s2 all` (long-run values starred, 4 of 5 runs),
   Sec. 7.2 opening and 7.2.3, Sec. 6.3 and `tab: closures`. Added for the text (scratch
