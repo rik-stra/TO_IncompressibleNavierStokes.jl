@@ -305,3 +305,10 @@ Every ssh and scp asks Rik.
   0.99–1.00, 0.5–1 TU 0.94–0.96, 1–3 TU 0.93–0.95 / 0.98–0.99; below range 0.2–0.7 % (0.4–1.1 %);
   long-run ACF within 0.04 of S1.2b's. `train_hindcast.jl` PARTNER gained `Splice1_E0x7_pl`. To update
   when replica 5 is in.
+- **2026-10-23, S2e replica 5 in** (Rik: "the job should be done now"): 28471013_5 COMPLETED on
+  gpu_a100 (11 min); pulled by scp, size equal. Long runs rescored on 5 runs (scratch
+  scores2/*_s2e5.log): b −4.8 [−6.0, −3.0], D 0.55, single runs 0.39–0.72 (replica 5 inside, so G
+  holds on all five), ratio 1.05, CRPS_100 0.373 (S1.2b 0.373; difference −0.0003 [−0.016, +0.016]),
+  e_100 0.674, guard 1 of 199 500 steps, ACF within 0.03 of S1.2b's. Against the 4-run values: ratio
+  1.04 → 1.05, CRPS_100 0.374 → 0.373, b −4.7 → −4.8; no conclusion changes. Paper Table `tab: res s2
+  all` (stars removed) and Sec. 7.2.3 updated. S2e complete.
