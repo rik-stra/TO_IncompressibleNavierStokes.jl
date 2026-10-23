@@ -45,7 +45,11 @@ const PARTNER = Dict("LinReg7_ar2n" => "LinReg7", "LinReg7_ar1ls" => "LinReg7", 
                      "LinReg1_pl" => "LinReg1",      # step 2 (analysis/cards/step2.md)
                      "LinReg7_pl" => "LinReg7", "LinReg7_ar2n_pl" => "LinReg7_ar2n",   # step2_linreg7.md
                      "Splice1_E0x7_ar2n_pl" => "Splice1_E0x7_ar2n",   # S2d, added 2026-10-21
-                     "Splice1_E0x7_pl" => "Splice1_E0x7")             # S2e, added 2026-10-22
+                     "Splice1_E0x7_pl" => "Splice1_E0x7",             # S2e, added 2026-10-22
+                     # step 3a (analysis/cards/step3a.md, added 2026-10-23)
+                     "CNN_rmse_mvg" => "LinReg1", "CNN_crps_mvg" => "CNN_rmse_mvg",
+                     "CNN_crps_head" => "CNN_crps_mvg", "CNN_crps_headcorr" => "CNN_crps_mvg",
+                     "CNN_rmse_ar2n" => "CNN_rmse_mvg", "CNN_rmse_pl" => "CNN_rmse_mvg")
 
 function diagnose(name; truth = load_truth(), prefix = "D6train_")
     dir = joinpath(OUTD, prefix * name)
