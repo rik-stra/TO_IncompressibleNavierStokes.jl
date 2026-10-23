@@ -83,6 +83,14 @@ const CST = (; batch = 256, val_every = 100, patience = 30, stop_patience = 80, 
              lr_decay = 0.3, max_updates = parse(Int, envc("MAXUPD", "40000")),
              nostop = envc("NOSTOP", "0") == "1", nodecay = envc("NODECAY", "0") == "1")
 const COUT = envc("OUT", "step3/CNN_step3")
+# RIKFLOW_CNN_REFIT = 1 (2026-10-23, Rik: "take both losses forward"): after each stage-1 fit, the
+# protocol's second training (closures.tex `sec:closures-training`): the same network trained again on
+# ALL of 1-10 TU, from the same initialisation, for as many updates as its stage-1 best iterate took, at
+# the learning rate stage 1 used at each update (its plateau schedule replayed; no validation, the last
+# iterate is kept); same loss, head rules and weight decay. Then `pred.jld2`: the stage-1 and refitted
+# predictions of every seed on every step of the record (raw dQ), and least squares on 1-10 TU (at h = 5,
+# LinReg1), in the layout `analysis/net_residual.jl` reads. One (C, lr, wd) setting per run.
+const CREFIT = envc("REFIT", "0") == "1"
 const CDEV = Symbol(envc("DEVICE", "cpu"))
 CDEV in (:cpu, :gpu) || error("RIKFLOW_CNN_DEVICE must be cpu or gpu; got $CDEV")
 CDEV === :gpu && @eval using cuDNN                          # NNlib's cuDNN extension: Lux's Conv on CuArrays
@@ -227,6 +235,8 @@ const LS_CRPS = crps_eval(Yva .- Cls' * Rva_, vec(std(Rls; dims = 2)))
 const Atr_d, Qtr_d, Ytr_d = DEVF(Atr), DEVF(Qtr), DEVF(Ytr32)
 const Ava_d, Qva_d, Yva_d = DEVF(Ava), DEVF(Qva), DEVF(Yva32)
 const Aho_d, Qho_d = DEVF(Aho), DEVF(Qho)
+# REFIT: the 1-10 TU rows in record order (the fit rows, then the validation rows), on the device
+const Aall_d, Qall_d, Yall_d = DEVF(cat(Atr, Ava; dims = 3)), DEVF(hcat(Qtr, Qva)), DEVF(hcat(Ytr32, Yva32))
 
 function fit_cnn(C, lr, wd, seed)
     rng = Xoshiro(seed)
@@ -297,7 +307,58 @@ function fit_cnn(C, lr, wd, seed)
             hist, last)
 end
 
+"""
+The second training (RIKFLOW_CNN_REFIT = 1): set up exactly as `fit_cnn` (same seed, so the same
+initialisation; same loss, head rules and weight decay), trained on all 1-10 TU rows for `nupd` updates
+at the learning rate the stage-1 history `hist` used at each update; the last iterate, on the host.
+"""
+function refit_cnn(C, lr, wd, seed, hist, nupd)
+    rng = Xoshiro(seed)
+    model = mkmodel(C)
+    net, st = Lux.setup(rng, model)
+    ps = todev((; net, head = (; bd = copy(HEAD0.bd), Araw = copy(HEAD0.Araw))))
+    st = todev(st)
+    rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
+    opt = Optimisers.setup(rule, ps)
+    wd > 0 && Optimisers.adjust!(opt.head; lambda = zero(T))
+    CLOSS in (:mse, :rmse) && Optimisers.freeze!(opt.head)
+    CLOSS === :crps && Optimisers.freeze!(opt.head.Araw)
+    out(p, A, Q) = first(model(modelin(A, Q), p.net, st))
+    loss(p, A, Q, Y) = CLOSS === :mse ? T(0.5) * sum(abs2, out(p, A, Q) .- Y) / size(Y, 2) :
+                       CLOSS === :rmse ? rmse_sum(out(p, A, Q), Y) :
+                       CLOSS === :crps ? head_crps(p.head.bd, out(p, A, Q) .- Y) : head_nll(p.head, out(p, A, Q) .- Y)
+    # the rate stage 1 used at update u: recorded at the first validation at or after u (before any decay
+    # that validation triggered), as the MLP tool's `lr_at`
+    lr_at(u) = T(hist.lr[searchsortedfirst(hist.update, u)])
+    N = size(Yall_d, 2)
+    nb = fld(N, CST.batch)
+    upd, cur = 0, T(lr)
+    while upd < nupd
+        idxs = shuffle(rng, 1:N)
+        for k in 1:nb
+            upd >= nupd && break
+            l = lr_at(upd + 1)
+            l == cur || (Optimisers.adjust!(opt, l); cur = l)
+            c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
+            g = Zygote.gradient(p -> loss(p, Aall_d[:, :, c], Qall_d[:, c], Yall_d[:, c]), ps)[1]
+            opt, ps = Optimisers.update(opt, ps, g)
+            upd += 1
+        end
+    end
+    return Lux.fmap(Array, ps), Lux.fmap(Array, st), model
+end
+
+if CREFIT
+    length(CHS) == length(LRS) == length(CWDS) == 1 || error("RIKFLOW_CNN_REFIT = 1 takes one (C, lr, wd) setting per run")
+end
+# the whole record as the network reads it (host), and the standardised -> raw map of the target
+const Afull, Qfull = CREFIT ? lagtensor(Xf) : (zeros(T, 0, 0, 0), zeros(T, 0, 0))
+rawq(y) = y .* so .+ mo
+"The network's standardised prediction on the whole record, on the host."
+predfull(model, ps, st) = Float64.(first(model(modelin(Afull, Qfull), ps.net, st)))
+
 res = Dict{Tuple{Int,Float64,Float64,Int},Any}()
+pred1, pred3 = Dict{Int,Matrix{Float64}}(), Dict{Int,Matrix{Float64}}()
 for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
     t0 = time()
     r = fit_cnn(C, lr, wd, seed)
@@ -317,10 +378,31 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
                                                     r.hist.lr[findfirst(>=(u), r.hist.update)]) for u in cps), ", "))
     @printf("     last iterate (update %d): val loss %.4f, 0.5 SSE %.4f | 10-100 TU rms / LS %s\n", r.updates,
             r.last.val, r.last.half_sse, join((@sprintf("%.2f", x) for x in r.last.ho_ratio), " "))
+    if CREFIT
+        t1 = time()
+        ps3, st3, model3 = refit_cnn(C, lr, wd, seed, r.hist, r.best_update)
+        y1, y3 = predfull(model3, r.ps, r.st), predfull(model3, ps3, st3)
+        pred1[seed], pred3[seed] = rawq(y1), rawq(y3)
+        # the refitted network on its own training window, and on 10-100 TU against LinReg1
+        rows10 = findall(n -> cfg.train_range[1] <= n <= cfg.train_range[2], cols)
+        sse10 = 0.5 * sum(abs2, Yf[:, rows10] .- y3[:, rows10]) / length(rows10)
+        ho3 = rmsq(Yf[:, HO] .- y3[:, HO]) ./ ls1_ho
+        res[(C, lr, wd, seed)] = merge(res[(C, lr, wd, seed)], (; refit = (; ps = ps3, st = st3, updates = r.best_update,
+                                                                          half_sse_1_10 = sse10, ho_ratio1 = ho3)))
+        @printf("     refit on 1-10 TU (%d updates, %.1f min): 0.5 SSE on 1-10 TU %.4f | 10-100 TU rms / LinReg1 %s\n",
+                r.best_update, (time() - t1) / 60, sse10, join((@sprintf("%.2f", x) for x in ho3), " "))
+    end
     flush(stdout)
 end
 out_dir = joinpath(TO_folder, COUT)
 mkpath(out_dir)
 jldsave(joinpath(out_dir, "fits.jld2"); res, ls_val, ls_sse, ls_ho, ls_crps = LS_CRPS, settings = CST, K, D, feat = FEAT, cfg,
         loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT)
+if CREFIT
+    # least squares on the same regressor and all of 1-10 TU (at h = 5: LinReg1), in the same raw units
+    Cls10 = Float64.(dat.Xc)' \ Float64.(dat.Yc)'
+    jldsave(joinpath(out_dir, "pred.jld2"); cols, pred1, pred3, predls = rawq(Cls10' * Xr64), seeds = CSEEDS,
+            wd = only(CWDS), n_channels = only(CHS), loss = CLOSS, head = CHEAD, h = cfg.h, K, D, feat = FEAT,
+            input = CINPUT, seq = CSEQ, act = CACT, scaling)
+end
 @info "written" out_dir
