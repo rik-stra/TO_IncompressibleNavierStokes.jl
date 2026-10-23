@@ -136,6 +136,13 @@ end
         rec = X.lstm_record(X.load_stochlstm(p1))
         @test rec.lstm_arch == "vrnn" && rec.lstm_window == 0 && rec.lstm_target == "q"
         @test rec.lstm_knobs == ""
+        @test rec.lstm_noise == "white" && isempty(rec.lstm_ar_phi) && isempty(rec.lstm_scale_beta)
+        # the emission noise shared with LinReg (step 3a, 2026-10-23) is recorded
+        fit = X.load_stochlstm(p1)
+        sc2 = merge(fit.scaling, (; ar_phi = [0.5 0.1 0.0], scale_beta = [1.0, 0.5, 2.0]))
+        r2 = X.lstm_record(merge(fit, (; scaling = sc2)))
+        @test r2.lstm_noise == "ar(p = 1) + powerlaw"
+        @test r2.lstm_ar_phi == [0.5 0.1 0.0] && r2.lstm_scale_beta == [1.0, 0.5, 2.0]
     end
 end
 

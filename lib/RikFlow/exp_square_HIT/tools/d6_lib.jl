@@ -102,15 +102,26 @@ architecture, the target, and which of the deploy-time scaling knobs (`noise_sca
 `offset_ref`, `eta_ar`, `emission_scale`, `input_map`) the fit carries. The knobs live in the fit's
 `scaling` and are applied by `StochLSTM` itself, so D6 deploys a calibrated or coloured fit exactly
 as `12_online_StochLSTM.jl` does, with no environment variable in between.
+
+Also the emission noise model shared with `LinReg` (2026-10-23, step 3a; `ts_noise.jl`): `lstm_noise`
+("white", "ar(p = <p>)", "powerlaw", or both joined by " + "), `lstm_ar_phi` (`p × N_Q`, empty without
+an AR) and `lstm_scale_beta` (`N_Q`, empty without a power-law scale), so a run's file says which
+residual it drew (WORKFLOW GATE 3).
 """
 function lstm_record(fit)
     sc = fit.scaling
     knobs = [string(k) for k in (:noise_scale, :dq_offset, :offset_ref, :eta_ar, :emission_scale,
                                  :input_map) if hasproperty(sc, k)]
+    noise = String[]
+    hasproperty(sc, :ar_phi) && push!(noise, "ar(p = $(size(sc.ar_phi, 1)))")
+    hasproperty(sc, :scale_beta) && push!(noise, "powerlaw")
     return (; lstm_arch = string(fit.spec.arch), lstm_emission = string(fit.spec.emission),
             lstm_window = fit.spec.window, lstm_skip = fit.spec.skip,
             lstm_target = string(hasproperty(sc, :target) ? sc.target : :q),
-            lstm_knobs = join(knobs, ","))
+            lstm_knobs = join(knobs, ","),
+            lstm_noise = isempty(noise) ? "white" : join(noise, " + "),
+            lstm_ar_phi = hasproperty(sc, :ar_phi) ? Matrix{Float64}(sc.ar_phi) : zeros(0, 0),
+            lstm_scale_beta = hasproperty(sc, :scale_beta) ? Vector{Float64}(vec(sc.scale_beta)) : Float64[])
 end
 
 """

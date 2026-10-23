@@ -460,6 +460,10 @@ function run_ic(ordinal::Integer; M::Integer = n_members(), force::Bool = false,
     cl === :lstm && @printf("  M4: arch %s, emission %s, window %d, target %s, knobs [%s], deploy seed %d\n",
                             lstm_meta.lstm_arch, lstm_meta.lstm_emission, lstm_meta.lstm_window,
                             lstm_meta.lstm_target, lstm_meta.lstm_knobs, lstm_meta.deploy_seed)
+    # the emission noise shared with LinReg (step 3a, 2026-10-23): printed so the log says which residual ran
+    cl === :lstm && println("  M4 noise: ", lstm_meta.lstm_noise,
+                            isempty(lstm_meta.lstm_ar_phi) ? "" : ", ar_phi = $(round.(lstm_meta.lstm_ar_phi; digits = 4))",
+                            isempty(lstm_meta.lstm_scale_beta) ? "" : ", beta = $(round.(lstm_meta.lstm_scale_beta; digits = 3))")
     filt.active && @printf("  IC filter %s: t in [%g, %g] TU, stride %d; this IC t = %.2f (block %s)\n",
                            filt.label, filt.tmin, filt.tmax, filt.stride, t_k, ic_block(t_k))
     @printf("  ou_advance = %d, savefreq = %d (> nt, so no fields)\n", n_k, nt + 1)

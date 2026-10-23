@@ -108,6 +108,9 @@ fit = RF.load_stochlstm(model_file)
 # (the explore fits are all `StochLSTM2`) but not that row's `arch`/`emission`/target.
 @info "Deploying $(cfg.name)" arch=fit.spec.arch emission=fit.spec.emission target =
     RF._lstm_target(fit.scaling) deploy_seed replicas=collect(replicas)
+# the emission noise shared with LinReg (step 3a, 2026-10-23), so the log says which residual ran
+@info "Emission noise" ar_phi = (hasproperty(fit.scaling, :ar_phi) ? fit.scaling.ar_phi : "none") scale_beta =
+    (hasproperty(fit.scaling, :scale_beta) ? fit.scaling.scale_beta : "none")
 # 🔴 An exported fit must belong to the cell the index names: `n_replicas` and the seeds come from
 # `cfg`, and deploying cell 2's weights under cell 5's row would label the replicas wrongly.
 fit_cell = hasproperty(fit.extras, :cfg) ? fit.extras.cfg.name : cfg.name
