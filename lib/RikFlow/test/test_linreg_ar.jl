@@ -27,6 +27,7 @@
     adapt(::Any) = identity
     include(joinpath(SRC, "ts_scaling.jl"))
     include(joinpath(SRC, "ts_scale.jl"))            # step 2's scale, used by draw_eta (V83)
+    include(joinpath(SRC, "ts_noise.jl"))            # the AR recursion, shared with StochLSTM (2026-10-23)
     include(joinpath(SRC, "time_series_methods.jl"))
     include(joinpath(@__DIR__, "legacy_linreg.jl"))
 

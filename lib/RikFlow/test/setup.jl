@@ -23,6 +23,9 @@
     # verification matrix has to be able to reach. Training lives in `ext/RikFlowLuxExt.jl` and is
     # not loaded here.
     include(joinpath(SRC, "ts_lstm.jl"))
+    # StochLSTM's AR(p) and power-law emission noise (2026-10-23), shared with LinReg
+    include(joinpath(SRC, "ts_noise.jl"))
+    include(joinpath(SRC, "ts_scale.jl"))
     include(joinpath(SRC, "ts_lstm_online.jl"))
     include(joinpath(SRC, "ts_fit.jl"))
     include(joinpath(SRC, "ts_score.jl"))

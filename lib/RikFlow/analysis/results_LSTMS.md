@@ -3143,3 +3143,51 @@ PAPER_FIG_DIR=<dir> julia --startup-file=no --project=analysis analysis/net_resi
   likelihood=step3/grid_refit_nll_s1,step3/grid_refit_nll_s2,step3/grid_refit_nll_s3 \
   CRPS=step3/grid_refit_crps_s1,step3/grid_refit_crps_s2,step3/grid_refit_crps_s3
 ```
+
+## 33. Step 3a closures on the network path: the CNN in `StochLSTM`, shared noise, configs a1-c1 (2026-10-23; Rik asked)
+
+Rik: RMSE is the first stepping stone; likelihood / CRPS mix the mean with the covariance head
+(extensions). Run list (Rik): a1 CNN-RMSE + MVG, a2 CNN-CRPS + MVG, a3 CNN-CRPS + head as trained, a3'
+CNN-CRPS + learned sds with refitted correlations, b1 CNN-RMSE + AR(2), c1 CNN-RMSE + power law; Σ refitted
+about ZERO; first seed, chosen wd (0.3 for both); step 4 not in this campaign. Built on the NETWORK path
+(Rik: "the noise models could be shared between the paths").
+
+**Code** (branch `step3-cnn-closure`):
+- `LSTMSpec(arch = :cnn, n_conv, kernel)`; `LSTMWeights.Cv` (W1, b1, W2, b2, seq_index, q_index);
+  `conv1d_tanh` / `cnn_features` / `cnn_window!` (stdlib; NNlib's flipped-kernel convolution, Lux's
+  FlattenLayer order), the dense part shared with `:dense` (`dense_hidden`); `cnn_weights` converts the
+  Lux parameter tree of `cnn_mean_fit.jl`; save/load carry `n_conv`, `kernel`, `Cv`. window = 1, no latent.
+- `src/ts_noise.jl`: `AR_BURNIN`, `ar_stationary`, `ar_push!`, `ar_advance!`, `ar_state`, moved out of
+  `time_series_methods.jl` unchanged; `LinReg`'s `ar_step!` = `ar_advance!(ar, rand(rng, xi_distr))`.
+  LinReg bit-identical: 7 deployed files (white, `_pl`, `_ar2n`, `_ar2n_pl`, `_ar1ls`) x 1600 steps, old vs
+  new code, bit patterns equal (scratch `linreg_bitcheck.jl`); V73 passes.
+- `StochLSTM` emission options in the scaling: `ar_phi` (p ≤ 2; the emission draw is the innovation, the
+  head Σ_ξ; warm start from the last p replayed steps, residual = recorded dQ in the target units − the
+  network's mean, no draw; burn-in fallback) and `scale_beta/qref/qclip` (noise × f(q*), of the AR state
+  when both). N_Q normals per step either way; the gate censors after the state advances.
+- Tests: V92 (Lux suite: cnn_window! == the Lux CNN, save/load), V93 (spec, conv layout, rng count),
+  V94 (AR = shared recursion, φ = 0 / β = 0 = white, warm start, power law, gate).
+
+**Configs** (`exp_square_HIT/tools/cnn_closure_export.jl <run> <noise> <name>`, training project; files
+`output/TO_LSTM/step3/closures/<name>/StochLSTM_seed1.jld2`, D6_MODEL = step3/closures/<name>):
+
+| | name | network (seed 1, refit on 1-10 TU) | noise |
+|---|---|---|---|
+| a1 | CNN_rmse_mvg | grid_cap_rmse_wd0.3_s1 | MVG about zero |
+| a2 | CNN_crps_mvg | grid_cap_crps_wd0.3_s1 | MVG about zero |
+| a3 | CNN_crps_head | grid_cap_crps_wd0.3_s1 | learned sds (0.92-0.97 of the residual's), no correlation |
+| a3' | CNN_crps_headcorr | grid_cap_crps_wd0.3_s1 | learned sds + refitted correlation |
+| b1 | CNN_rmse_ar2n | grid_cap_rmse_wd0.3_s1 | AR(2) `fit_ar(Z, 2; nonneg)`: φ1 0.019 0.010 0.071 0.156 0.097 0.072, φ2 −0.002 / 0 |
+| c1 | CNN_rmse_pl | grid_cap_rmse_wd0.3_s1 | power law `fit_scale`: β 0.52 0.55 1.62 1.48 1.23 1.32 |
+
+Translation check (deployed StochLSTM, stochastic = false, 100-step warm-up from the record as D6, one
+prediction, 300 steps over 1-100 TU, against the Lux prediction): max 8.9e-5, rms 7.5e-6 sd(dQ) for
+every config -- the Float32 lag window, dQ^{n-k} = q − q* formed from it; tolerance 1e-3.
+
+**Offline AR check** (scratch `ar_check.jl`, desktop): on 1-10 TU the CNN residual is nearly white (ρ1
+≤ 0.13); the constrained AR(2) collapses to AR(1) in 5 of 6 QoIs (φ2 = 0), φ 0.01-0.16; it misses the
+training ACF by up to 0.18 (E[7,15], ratio 7.7 vs AR 1.4) and the 10-100 TU colour entirely (small scales
+ρ1 0.26-0.37 vs 0.07-0.10; ratio 24-41 vs 1.2). So b1 adds little colour; its AR(1) twin is redundant.
+
+Not done: no online runs (Snellius); the long-run script deploys via RIKFLOW_M4_MODEL_DIR (any
+model_index row with n_replicas = 5; the fit carries no `cfg`, so no cell check).

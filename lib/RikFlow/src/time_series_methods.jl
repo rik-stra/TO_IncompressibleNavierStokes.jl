@@ -341,16 +341,8 @@ function load_powerlaw_scale(file_name, stoch_distr)
             eps_distr, mu_eta = Vector{Float64}(mean(stoch_distr)))
 end
 
-"Steps of the AR recursion from zero used as the stationary-draw fallback (see `LinReg`)."
-const AR_BURNIN = 2000
-
-"Stationarity of a diagonal AR(p ≤ 2) with coefficients `phi` (`p × n`), per column."
-function ar_stationary(phi::AbstractMatrix)
-    p = size(phi, 1)
-    return all(eachcol(phi)) do f
-        p == 1 ? abs(f[1]) < 1 : (abs(f[2]) < 1 && f[2] + f[1] < 1 && f[2] - f[1] < 1)
-    end
-end
+# `AR_BURNIN`, `ar_stationary`, `ar_push!` and `ar_advance!` live in `ts_noise.jl` (2026-10-23), shared
+# with `StochLSTM`; moved unchanged.
 
 """
     load_ar_residual(file_name, stoch_distr)
@@ -385,20 +377,10 @@ end
 "AR order of a `LinReg`'s residual; 0 = white."
 ar_order(m::LinReg) = isnothing(m.ar) ? 0 : size(m.ar.phi, 1)
 
-"Push `znew` into the AR state (column 1 newest)."
-function ar_push!(ar, znew)
-    p = size(ar.z, 2)
-    p > 1 && (ar.z[:, 2:p] .= ar.z[:, 1:(p - 1)])
-    ar.z[:, 1] .= znew
-    return ar
-end
-
-"One step of the AR recursion: draw ξ, advance the state, return the new `z`."
+"One step of the AR recursion: draw ξ, advance the state (`ar_advance!`, ts_noise.jl), return the new `z`."
 function ar_step!(ar, rng)
     xi = rand(rng, ar.xi_distr)
-    znew = xi .+ vec(sum(ar.phi' .* ar.z; dims = 2))
-    ar_push!(ar, znew)
-    return znew
+    return ar_advance!(ar, xi)
 end
 
 """

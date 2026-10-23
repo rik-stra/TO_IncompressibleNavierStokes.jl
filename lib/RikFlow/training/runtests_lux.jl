@@ -1316,6 +1316,53 @@ const RF = RikFlow
         @test all(isfinite, h.val)
     end
 
+    # V92 -- arch = :cnn (2026-10-23, step 3a on the network path): the deployed forward pass is the Lux
+    # CNN of cnn_mean_fit.jl (SEQ = lags, tanh), and the closure survives save/load unchanged
+    @testset "V92 :cnn: cnn_window! == the Lux CNN; StochLSTM save/load" begin
+        T = Float32
+        nq, h, C, K, D = 3, 4, 5, 2, 7
+        hist = RF.HistorySpec(; h, n_qoi = nq, hist_var = :q_star_q, include_predictor = true)
+        nreg = RF.nfeatures(hist)
+        nin = nreg + h * nq
+        spec = RF.LSTMSpec(; hist, n_hidden = D, n_latent = 0, n_encoder = 0, arch = :cnn,
+                           emission = :constant, window = 1, n_in = nin, n_conv = C, kernel = K)
+        conv = Chain(Conv((K,), 3nq => C, tanh), Conv((K,), C => C, tanh), FlattenLayer())
+        model = Chain(Parallel(vcat, conv, NoOpLayer()), Dense((h - 2(K - 1)) * C + nq => D, tanh),
+                      Dense(D => D, tanh), Dense(D => nq))
+        ps, st = Lux.setup(Xoshiro(1), model)
+        lagq(k) = (nq + 2(k - 1) * nq + 1):(nq + (2k - 1) * nq)
+        seq = zeros(Int, h, 3nq)
+        for (t, k) in enumerate(h:-1:1)
+            seq[t, :] = vcat(collect(lagq(k)) .+ nq, collect(lagq(k)), nreg .+ (((k - 1) * nq + 1):(k * nq)))
+        end
+        w = RF.cnn_weights(ps, spec; seq_index = seq, q_index = 1:nq, bd = fill(-1.0, nq),
+                           LR = Matrix(1.0I, nq, nq))
+        X = randn(Xoshiro(2), T, nin, 9)
+        A = cat((X[seq, j] for j in 1:9)...; dims = 3)          # h x channels x batch, Lux's Conv layout
+        Y = first(model((A, X[1:nq, :]), ps, st))
+        state = RF.LSTMState(spec, T)
+        for j in 1:9
+            RF.cnn_window!(state, w, spec, reshape(X[:, j], :, 1))
+            @test state.y ≈ Y[:, j] rtol = 1e-5 atol = 1e-6
+        end
+        P = vcat(Matrix{Float64}(I, nreg, nreg), randn(Xoshiro(4), h * nq, nreg) ./ 4)
+        mu, sd = reshape(collect(range(0.1, 0.3; length = nq)), nq, 1), reshape(fill(2.0, nq), nq, 1)
+        sc = (; in_scaling = (; mu, sigma = sd), out_scaling = (; mu, sigma = sd), target = :dQ,
+              input_map = P, ar_phi = [0.4 0.2 0.0])
+        path = joinpath(mktempdir(), "cnn.jld2")
+        RF.save_stochlstm(path, spec, w, sc)
+        back = RF.load_stochlstm(path)
+        @test back.spec.arch === :cnn && back.spec.n_conv == C && back.spec.kernel == K
+        @test back.weights.Cv.seq_index == seq && back.scaling.ar_phi == sc.ar_phi
+        q_star = randn(Xoshiro(6), nq, 14) .+ 3.0
+        warm = randn(Xoshiro(7), nq, 6) ./ 10
+        outs = map((w, back.weights)) do ww
+            m = RF.StochLSTM(spec, ww, sc; spinnup_data = warm, rng = Xoshiro(5), gate = 0.0)
+            [RF.get_next_item_timeseries(m, q_star[:, k]) for k in 1:14]
+        end
+        @test outs[1] == outs[2]
+    end
+
     # -----------------------------------------------------------------------------------------
     # V70 -- prior = :learned, the VRNN prior p(z_t | h_{t-1}): learned colour
     # -----------------------------------------------------------------------------------------

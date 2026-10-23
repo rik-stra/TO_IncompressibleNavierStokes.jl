@@ -89,8 +89,10 @@ Shape and architecture of an M4 model.
 - `window`: `0` (default) carries the recurrent state across solver steps. `W > 0` resets it for
   every prediction and replays the last `W` inputs -- see [`StochLSTM`](@ref).
 - `n_layers`: the number of hidden layers of `arch = :dense` (default 2); see [`is_dense`](@ref).
-- `n_in`: the network's input width when `scaling.input_map` widens the regressor (`:dense`
-  only); `0` (default) is the regressor's width.
+- `n_in`: the network's input width when `scaling.input_map` widens the regressor (`:dense` and
+  `:cnn` only); `0` (default) is the regressor's width.
+- `n_conv`, `kernel`: `arch = :cnn` only (2026-10-23, step 3a): the channels and the kernel length of
+  its two convolutions over the `h` history steps; see [`is_cnn`](@ref).
 - `posterior`: `:x` (default, the source's encoder `q(z | x)`) or `:xy` (a conditional VAE:
   `q(z | x, y)` in training, the prior `N(0, I)` at deployment).
 
@@ -157,13 +159,34 @@ Base.@kwdef struct LSTMSpec
     # (extra inputs that are linear combinations of it); `StochLSTM` checks that `P` is
     # `n_in x nfeatures(hist)`. `:dense` only.
     n_in::Int = 0
+    # 🔑 THE CNN of step 3a (2026-10-23, Rik: "build it on the network path"; paper Sec. 6). `arch =
+    # :cnn` reads the h history steps of ONE mapped regressor row as a sequence: two tanh convolutions
+    # with `n_conv` channels and kernel `kernel`, flattened, the current predictor appended, then the
+    # dense layers of `:dense` (two, `n_hidden` wide) and the linear output. Zero for every other arch.
+    n_conv::Int = 0
+    kernel::Int = 0
 
     function LSTMSpec(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip, window,
-                      posterior, prior, n_layers, n_in)
-        arch in (:lstm, :vaernn, :storn, :vrnn, :dense) ||
-            error("LSTMSpec: arch must be one of :lstm, :vaernn, :storn, :vrnn, :dense; got $(arch)")
+                      posterior, prior, n_layers, n_in, n_conv, kernel)
+        arch in (:lstm, :vaernn, :storn, :vrnn, :dense, :cnn) ||
+            error("LSTMSpec: arch must be one of :lstm, :vaernn, :storn, :vrnn, :dense, :cnn; got $(arch)")
         (arch !== :dense || window > 0) ||
             error("LSTMSpec: arch = :dense is a feed-forward map of the window -- it needs window > 0")
+        if arch === :cnn
+            window == 1 || error("LSTMSpec: arch = :cnn reads one regressor row (its lags are the " *
+                                 "sequence) -- it needs window = 1; got $window")
+            n_latent == 0 && n_encoder == 0 && posterior === :x && prior === :standard && !skip ||
+                error("LSTMSpec: arch = :cnn has no latent path, encoder or skip")
+            emission !== :none || error("LSTMSpec: arch = :cnn is a deterministic mean -- it needs an " *
+                                        "emission head for its noise")
+            n_in > 0 || error("LSTMSpec: arch = :cnn reads the mapped input (scaling.input_map): n_in > 0")
+            n_layers == 2 || error("LSTMSpec: arch = :cnn has two dense layers after the convolutions")
+            n_conv > 0 && kernel >= 1 || error("LSTMSpec: arch = :cnn needs n_conv > 0 and kernel >= 1")
+            hist.h - 2(kernel - 1) >= 1 ||
+                error("LSTMSpec: kernel $kernel leaves no position after two convolutions of $(hist.h) steps")
+        else
+            n_conv == 0 && kernel == 0 || error("LSTMSpec: n_conv and kernel are for arch = :cnn only")
+        end
         emission in (:none, :constant, :state_dependent) ||
             error("LSTMSpec: emission must be :none, :constant or :state_dependent; got $(emission)")
         (emission !== :none || arch !== :lstm) || error(
@@ -174,7 +197,7 @@ Base.@kwdef struct LSTMSpec
         # 🔑 `arch = :dense` with `n_latent = 0` (2026-09-28, plan step 1, M3ᶠ): a DETERMINISTIC
         # residual MLP on the window -- no latent path at all -- whose only noise is the emission
         # head. It needs that head, exactly as `:lstm` does.
-        (arch === :lstm || n_latent > 0 || (arch === :dense && n_latent == 0)) ||
+        (arch === :lstm || n_latent > 0 || (arch in (:dense, :cnn) && n_latent == 0)) ||
             error("LSTMSpec: arch $(arch) has a latent path, so n_latent must be positive")
         n_latent >= 0 || error("LSTMSpec: n_latent must be >= 0")
         (arch !== :dense || n_latent > 0 || emission !== :none) || error(
@@ -193,10 +216,10 @@ Base.@kwdef struct LSTMSpec
         (n_layers == 2 || arch === :dense) ||
             error("LSTMSpec: n_layers is the depth of the dense MLP; arch $(arch) has none")
         n_in >= 0 || error("LSTMSpec: n_in must be >= 0 (0 = the regressor's width); got $n_in")
-        (n_in == 0 || arch === :dense) ||
-            error("LSTMSpec: n_in (a widened input) is implemented for arch = :dense only")
+        (n_in == 0 || arch in (:dense, :cnn)) ||
+            error("LSTMSpec: n_in (a widened input) is implemented for arch = :dense and :cnn only")
         new(hist, n_hidden, n_latent, n_encoder, arch, emission, uclip, skip, window, posterior, prior,
-            n_layers, n_in)
+            n_layers, n_in, n_conv, kernel)
     end
 end
 
@@ -227,9 +250,9 @@ emission_noise(spec::LSTMSpec) = spec.emission !== :none
 """
     latent_sampled(spec)
 
-Whether the architecture has a latent path at all. `false` only for `:lstm`.
+Whether the architecture has a latent path at all. `false` for `:lstm` and `:cnn`.
 """
-latent_sampled(spec::LSTMSpec) = spec.arch !== :lstm
+latent_sampled(spec::LSTMSpec) = spec.arch !== :lstm && spec.arch !== :cnn
 
 """
     latent_to_cell(spec)
@@ -252,6 +275,22 @@ With `n_layers = L > 2` (2026-10-22) there are `L` hidden layers: `Wh = [W_2 ...
 whose noise is the emission head alone (M3ᶠ, plan step 1).
 """
 is_dense(spec::LSTMSpec) = spec.arch === :dense
+
+"""
+    is_cnn(spec)
+
+`arch = :cnn` (2026-10-23, step 3a; paper Sec. 6): the history of ONE mapped regressor row `x` as a
+sequence over the `h` lags, oldest first, with the channels `Cv.seq_index` picks from `x`; two tanh
+convolutions (kernel `spec.kernel`, `spec.n_conv` channels, no padding), flattened; the current
+predictor `x[Cv.q_index]` appended; then `:dense`'s two hidden layers (`Wx`, `Wh`, `b`) and the linear
+output `V1 h + cdec` -- `cnn_mean_fit.jl`'s `mkmodel` (SEQ = lags, ACT = tanh) exactly, see
+[`cnn_features`](@ref). No latent path; its noise is the emission head (and the emission options of
+`StochLSTM`).
+"""
+is_cnn(spec::LSTMSpec) = spec.arch === :cnn
+
+"Number of positions left after `cnn`'s two convolutions of the `h` history steps."
+cnn_positions(spec::LSTMSpec) = spec.hist.h - 2(spec.kernel - 1)
 
 """
     dense_hidden(n_layers, Wh, b, h1, H)
@@ -313,6 +352,7 @@ Width of what the LSTM cell actually consumes: the regressor, plus `z` where the
 feeds it upstream.
 """
 n_cell_input(spec::LSTMSpec) =
+    is_cnn(spec) ? cnn_positions(spec) * spec.n_conv + n_output(spec) :     # the dense layers' input
     is_dense(spec) ? spec.window * (n_input(spec) + spec.n_latent) :
     n_input(spec) + (latent_to_cell(spec) ? spec.n_latent : 0)
 
@@ -356,6 +396,11 @@ model trains, the forward pass runs, and the closure is wrong.
 - `LR`: lower Cholesky factor of the constant correlation matrix `R`, so `R = LR * LR'`.
 - `Ws`: the linear skip, `N_Q x n_input`, added to the decoder output; `nothing` unless
   `spec.skip`. Last, so the 13-argument form every older call site uses still constructs.
+- `Cv`: `arch = :cnn` only, else `nothing` (2026-10-23): the convolutions and the sequence layout,
+  `(; W1, b1, W2, b2, seq_index, q_index)` -- `W1` `kernel x n_ch x n_conv`, `W2` `kernel x n_conv x
+  n_conv` (Lux's `Conv` layout), `seq_index` (`h x n_ch`) the entries of the mapped input `x` that
+  form the sequence (row t = lag h - t + 1, oldest first), `q_index` (`N_Q`) those of the current
+  predictor. `Wx`/`Wh`/`b`/`V1`/`cdec` are then the dense layers after the convolutions.
 """
 struct LSTMWeights{T}
     Wx::Matrix{T}
@@ -374,11 +419,15 @@ struct LSTMWeights{T}
     Ws::Union{Nothing,Matrix{T}}
     # the learned prior (`spec.prior = :learned`): (; Wm, bm, Ws, bs), n_latent x H / n_latent
     P::Union{Nothing,NamedTuple}
+    # `arch = :cnn`: the convolutions and the sequence layout, see above
+    Cv::Union{Nothing,NamedTuple}
 end
 LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR) where {T} =
-    LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, nothing, nothing)
+    LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, nothing, nothing, nothing)
 LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, Ws) where {T} =
-    LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, Ws, nothing)
+    LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, Ws, nothing, nothing)
+LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, Ws, P) where {T} =
+    LSTMWeights{T}(Wx, Wh, b, We, be, Bmu, Bsig, V1, V2, cdec, Wd, bd, LR, Ws, P, nothing)
 
 """
     check_shapes(w::LSTMWeights, spec::LSTMSpec)
@@ -389,11 +438,28 @@ Assert that a weight set matches a spec. Called on load, because the alternative
 function check_shapes(w::LSTMWeights, spec::LSTMSpec)
     H, nin, nout, nz = spec.n_hidden, n_input(spec), n_output(spec), spec.n_latent
     ncin, nenc = n_cell_input(spec), n_encoder_out(spec)
-    G = is_dense(spec) ? H : 4H          # rows of the first layer: LSTM gates, or the dense layer
+    ff = is_dense(spec) || is_cnn(spec)  # a feed-forward net: dense layers instead of LSTM gates
+    G = ff ? H : 4H                      # rows of the first layer: LSTM gates, or the dense layer
     size(w.Wx) == (G, ncin) || error("Wx is $(size(w.Wx)), expected $((G, ncin))")
-    nh = is_dense(spec) ? (spec.n_layers - 1) * H : H      # columns of Wh: the stacked hidden layers
+    nh = ff ? (spec.n_layers - 1) * H : H                  # columns of Wh: the stacked hidden layers
     size(w.Wh) == (G, nh) || error("Wh is $(size(w.Wh)), expected $((G, nh))")
-    nb = is_dense(spec) ? spec.n_layers * H : 4H
+    nb = ff ? spec.n_layers * H : 4H
+    if is_cnn(spec)
+        cv = w.Cv
+        cv === nothing && error("arch = :cnn but the convolution weights Cv are nothing")
+        K, C = spec.kernel, spec.n_conv
+        size(cv.seq_index, 1) == spec.hist.h ||
+            error("seq_index has $(size(cv.seq_index, 1)) rows, expected h = $(spec.hist.h)")
+        nch = size(cv.seq_index, 2)
+        size(cv.W1) == (K, nch, C) || error("W1 is $(size(cv.W1)), expected $((K, nch, C))")
+        size(cv.W2) == (K, C, C) || error("W2 is $(size(cv.W2)), expected $((K, C, C))")
+        length(cv.b1) == C && length(cv.b2) == C || error("b1 / b2 must have n_conv = $C entries")
+        length(cv.q_index) == nout || error("q_index has $(length(cv.q_index)) entries, expected $nout")
+        all(i -> 1 <= i <= nin, cv.seq_index) && all(i -> 1 <= i <= nin, cv.q_index) ||
+            error("seq_index / q_index point outside the $nin inputs")
+    else
+        w.Cv === nothing || error("Cv (convolution weights) is set but arch = $(spec.arch)")
+    end
     length(w.b) == nb || error("b is $(length(w.b)), expected $(nb)")
     size(w.V1) == (nout, H) || error("V1 is $(size(w.V1)), expected $((nout, H))")
     length(w.cdec) == nout || error("cdec is $(length(w.cdec)), expected $(nout)")
@@ -699,6 +765,88 @@ function dense_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin
         fill!(st.logd, zero(T))
     end
     return st.y, st.logd
+end
+
+"""
+    conv1d_tanh(A, W, b)
+
+One tanh convolution layer as Lux's `Conv((K,), cin => cout, tanh)` computes it (NNlib's `conv`, a true
+convolution: the kernel is flipped), no padding, stride 1: `A` is `L x cin`, `W` `K x cin x cout`,
+`b` `cout`; returns `(L - K + 1) x cout`, `Y[t, o] = tanh(b[o] + Σ_c Σ_j W[j, c, o] A[t + K - j, c])`.
+"""
+function conv1d_tanh(A::AbstractMatrix{T}, W::AbstractArray{T,3}, b::AbstractVector{T}) where {T}
+    K, cin, cout = size(W)
+    size(A, 2) == cin || error("conv1d_tanh: the input has $(size(A, 2)) channels, the kernel $cin")
+    L = size(A, 1) - K + 1
+    Y = zeros(T, L, cout)
+    @inbounds for o in 1:cout, t in 1:L
+        s = b[o]
+        for c in 1:cin, j in 1:K
+            s += W[j, c, o] * A[t + K - j, c]
+        end
+        Y[t, o] = tanh(s)
+    end
+    return Y
+end
+
+"""
+    cnn_features(w, spec, x)
+
+`arch = :cnn`: the input of the dense layers for the mapped regressor row `x` -- the sequence
+`A[t, c] = x[seq_index[t, c]]`, two `conv1d_tanh` layers, flattened column-major as Lux's
+`FlattenLayer` does (`vec`), and the current predictor `x[q_index]` appended (Lux's
+`Parallel(vcat, conv, NoOpLayer())`).
+"""
+function cnn_features(w::LSTMWeights{T}, spec::LSTMSpec, x::AbstractVector) where {T}
+    cv = w.Cv
+    S, nch = size(cv.seq_index)
+    A = T[T(x[cv.seq_index[t, c]]) for t in 1:S, c in 1:nch]
+    h2 = conv1d_tanh(conv1d_tanh(A, cv.W1, cv.b1), cv.W2, cv.b2)
+    return vcat(vec(h2), T[T(x[i]) for i in cv.q_index])
+end
+
+"""
+    cnn_window!(st, w, spec, xwin)
+
+`arch = :cnn`, deployed: the output for the last (only) column of the window `xwin` (`n_input x 1`),
+written to `st.y` and `st.logd` as `dense_window!` writes them: `cnn_features`, then the two hidden
+layers (`dense_hidden`, shared with `:dense` and the training side) and `V1 h + cdec`.
+"""
+function cnn_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin::AbstractMatrix) where {T}
+    H = spec.n_hidden
+    F = cnn_features(w, spec, view(xwin, :, size(xwin, 2)))
+    h1 = tanh.(w.Wx * F .+ w.b[1:H])
+    h2 = dense_hidden(spec.n_layers, w.Wh, w.b, h1, H)
+    st.h .= h2
+    st.y .= w.V1 * h2 .+ w.cdec
+    st.logd .= w.Wd * h2 .+ w.bd
+    spec.uclip !== nothing && (st.logd .= clamp.(st.logd, T(spec.uclip[1]), T(spec.uclip[2])))
+    return st.y, st.logd
+end
+
+"""
+    cnn_weights(net, spec; seq_index, q_index, bd, LR, T = Float32)
+
+`LSTMWeights` of a CNN trained by `cnn_mean_fit.jl` (SEQ = lags): `net` is the Lux parameter tree of its
+`Chain(Parallel(vcat, Chain(Conv, Conv, FlattenLayer()), NoOpLayer()), Dense, Dense, Dense)` as plain
+arrays (`layer_1.layer_1.layer_{1,2}` the convolutions, `layer_{2,3}` the hidden dense layers,
+`layer_4` the output); `bd` (log sd) and `LR` (lower Cholesky factor of the correlation) the constant
+emission head. Plain arrays in, plain arrays out: no Lux here.
+"""
+function cnn_weights(net, spec::LSTMSpec; seq_index::AbstractMatrix{<:Integer},
+                     q_index::AbstractVector{<:Integer}, bd::AbstractVector, LR::AbstractMatrix,
+                     T::Type = Float32)
+    is_cnn(spec) || error("cnn_weights: spec.arch is $(spec.arch), not :cnn")
+    c1, c2 = net.layer_1.layer_1.layer_1, net.layer_1.layer_1.layer_2
+    d1, d2, o = net.layer_2, net.layer_3, net.layer_4
+    H, nq = spec.n_hidden, n_output(spec)
+    Cv = (; W1 = Array{T,3}(c1.weight), b1 = Vector{T}(vec(c1.bias)), W2 = Array{T,3}(c2.weight),
+          b2 = Vector{T}(vec(c2.bias)), seq_index = Matrix{Int}(seq_index), q_index = Vector{Int}(q_index))
+    w = LSTMWeights{T}(Matrix{T}(d1.weight), Matrix{T}(d2.weight), Vector{T}(vcat(vec(d1.bias), vec(d2.bias))),
+                       nothing, nothing, zeros(T, 0, 0), zeros(T, 0, 0), Matrix{T}(o.weight), nothing,
+                       Vector{T}(vec(o.bias)), zeros(T, nq, H), Vector{T}(bd), Matrix{T}(LR), nothing, nothing, Cv)
+    check_shapes(w, spec)
+    return w
 end
 
 # ---------------------------------------------------------------------------------------------

@@ -22,6 +22,8 @@
     include(joinpath(SRC, "ts_scaling.jl"))
     include(joinpath(SRC, "ts_history.jl"))
     include(joinpath(SRC, "ts_lstm.jl"))
+    include(joinpath(SRC, "ts_noise.jl"))
+    include(joinpath(SRC, "ts_scale.jl"))
     include(joinpath(SRC, "ts_lstm_online.jl"))
     include(joinpath(SRC, "ts_lstm_io.jl"))
     include(joinpath(RF, "analysis", "build_d6_ics.jl"))

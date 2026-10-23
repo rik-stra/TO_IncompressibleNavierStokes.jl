@@ -254,6 +254,8 @@ function rf_smag_navierstokes!(force, state, t; setup, cache, viscosity)
     nothing
 end
 
+# the AR recursion shared by `LinReg` and `StochLSTM` (stdlib; 2026-10-23)
+include("ts_noise.jl")
 include("time_series_methods.jl")
 include("filter.jl")
 export FaceAverage, VolumeAverage

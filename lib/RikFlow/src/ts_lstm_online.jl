@@ -96,6 +96,23 @@ step is first predicted, and stored beside its input; every replay forms
   run the paper on.
 - `tie_noise`: window mode only. `true` (default) draws each step's latent once and replays it;
   `false` re-draws the whole window at every prediction -- an ablation, not a model.
+
+# Emission noise options of the scaling (2026-10-23, shared with `LinReg`; `ts_noise.jl`, `ts_scale.jl`)
+
+The emission draw `e = D LR ε` (the head) is the innovation, in the network's standardised target:
+
+- `scaling.ar_phi` (`p × N_Q`, `p ≤ 2`): a diagonal AR(p), `z_n = e_n + Σ_k φ_k ⊙ z_{n-k}`, added in place
+  of `e_n` -- `LinReg`'s AR residual (step 1), the same recursion (`ar_advance!`); the head is then the
+  innovation covariance Σ_ξ. Warm start as `LinReg`'s: on each of the last `p` warm-up steps whose lag
+  window is full, the realised residual (the replayed `dQ` in the target's units minus the network's
+  mean for that step, which draws nothing) is pushed into the state; with fewer than `p` such steps the
+  state is burnt in from zero (`AR_BURNIN` emission draws, at the first prediction only).
+- `scaling.scale_beta`, `scale_qref`, `scale_qclip` (`N_Q`, `N_Q`, `N_Q × 2`): step 2's power-law scale,
+  the noise multiplied by `f(q*) = powerlaw_factor(q*, β, q_ref, clip)` with `q*` in physical units -- the
+  AR state's when both are set (the AR then lives in unit scale, and the warm start divides by `f`).
+
+Both act after `noise_scale` / `emission_scale` / `eta_ar` (which `ar_phi` excludes), on the draw only:
+one draw of `N_Q` normals per step either way, and the gate censors `dQ` after the state is advanced.
 """
 struct StochLSTM{T,S}
     spec::LSTMSpec
@@ -116,6 +133,8 @@ struct StochLSTM{T,S}
     nwin::Vector{Int}
     tie_noise::Bool
     eprev::Vector{T}        # the previous step's emission noise, for `scaling.eta_ar`
+    ar::Union{Nothing,NamedTuple}   # `scaling.ar_phi`: the AR(p) state (`ar_state`, ts_noise.jl), else nothing
+    pl::Union{Nothing,NamedTuple}   # `scaling.scale_*`: (; beta, qref, qclip), else nothing
 
     function StochLSTM(spec::LSTMSpec, weights::LSTMWeights{T}, scaling;
                        spinnup_data = nothing, rng, gate::Real = 1e-2,
@@ -149,11 +168,33 @@ struct StochLSTM{T,S}
                 "needs $(spec.hist.h). The history would still be part zero at the first " *
                 "prediction.")
         end
+        ar = nothing
+        if hasproperty(scaling, :ar_phi)
+            hasproperty(scaling, :eta_ar) && error("StochLSTM: scaling has both eta_ar and ar_phi")
+            emission_noise(spec) || error("StochLSTM: ar_phi colours the emission noise; emission = :none has none")
+            _lstm_target(scaling) in (:dQ, :q) ||
+                error("StochLSTM: ar_phi's warm start is defined for the targets :dQ and :q")
+            size(scaling.ar_phi, 2) == nq || error("StochLSTM: ar_phi has $(size(scaling.ar_phi, 2)) columns, N_Q = $nq")
+            ar = ar_state(scaling.ar_phi)
+        end
+        pl = nothing
+        if any(k -> hasproperty(scaling, k), (:scale_beta, :scale_qref, :scale_qclip))
+            all(k -> hasproperty(scaling, k), (:scale_beta, :scale_qref, :scale_qclip)) ||
+                error("StochLSTM: scaling has only some of scale_beta, scale_qref, scale_qclip")
+            emission_noise(spec) || error("StochLSTM: a power-law scale needs emission noise")
+            beta, qref = Vector{Float64}(vec(scaling.scale_beta)), Vector{Float64}(vec(scaling.scale_qref))
+            qclip = Matrix{Float64}(scaling.scale_qclip)
+            length(beta) == nq && length(qref) == nq && size(qclip) == (nq, 2) ||
+                error("StochLSTM: power-law scale sizes do not match N_Q = $nq")
+            all(>(0), qref) && all(>(0), qclip) && all(qclip[:, 1] .<= qclip[:, 2]) ||
+                error("StochLSTM: q_ref and the clip range must be positive and ordered")
+            pl = (; beta, qref, qclip)
+        end
         new{T,typeof(scaling)}(spec, weights, scaling, LSTMState(spec, T),
                                HistoryBuffer(spec.hist, T), spinnup_data, zeros(Int, 1), rng,
                                Float64(gate), stochastic, zeros(T, spec.hist.n_qoi),
                                zeros(T, n_input(spec), W), zeros(T, spec.n_latent, W), zeros(Int, 1),
-                               tie_noise, zeros(T, spec.hist.n_qoi))
+                               tie_noise, zeros(T, spec.hist.n_qoi), ar, pl)
     end
 end
 
@@ -185,6 +226,10 @@ end
 # latent draw. Leaves the last step's output in `m.state`.
 function _replay_window!(m::StochLSTM)
     reset!(m.state)
+    if is_cnn(m.spec)
+        cnn_window!(m.state, m.weights, m.spec, view(m.xwin, :, 1:m.nwin[]))
+        return m
+    end
     if is_dense(m.spec)
         dense_window!(m.state, m.weights, m.spec, view(m.xwin, :, 1:m.nwin[]), view(m.ewin, :, 1:m.nwin[]))
         return m
@@ -256,6 +301,53 @@ function _push_scaled!(m::StochLSTM{T}, q, q_star) where {T}
 end
 
 """
+    _ar_warm!(m::StochLSTM, q_star, dQ)
+
+Warm start of `scaling.ar_phi`'s state: the realised residual of a replayed step, the recorded `dQ` in
+the target's standardised units minus the network's mean `m.state.y` for that step (computed without a
+draw), divided by `f(q*)` with a power-law scale, pushed into the AR state (as `LinReg`'s
+`ar_warm_residual!`).
+"""
+function _ar_warm!(m::StochLSTM, q_star, dQ)
+    tgt = _lstm_target(m.scaling)
+    lev = vec(scale_input(tgt === :dQ ? collect(dQ) : collect(q_star .+ dQ), m.scaling.out_scaling))
+    zw = Float64.(lev) .- Float64.(m.state.y)
+    m.pl === nothing || (zw = zw ./ powerlaw_factor(Float64.(q_star), m.pl.beta, m.pl.qref, m.pl.qclip))
+    ar_push!(m.ar, zw)
+    m.ar.nz[] = min(m.ar.nz[] + 1, size(m.ar.z, 2))
+    return m
+end
+
+"""
+    _shared_noise!(m::StochLSTM, q_star)
+
+Apply `scaling.ar_phi` and `scaling.scale_*` to the emission just drawn into `m.scratch`: its noise
+`e = scratch - y` is the AR innovation (the state burnt in first if the warm start filled fewer than
+`p` lags), then multiplied by `f(q*)`; `scratch = y + noise`.
+"""
+function _shared_noise!(m::StochLSTM{T}, q_star) where {T}
+    e = Float64.(m.scratch) .- Float64.(m.state.y)
+    if m.ar !== nothing
+        p = size(m.ar.z, 2)
+        if m.ar.nz[] < p                          # fallback: approximately stationary state
+            m.ar.z .= 0
+            tmp = similar(m.scratch)
+            for _ in 1:AR_BURNIN
+                sample_emission!(tmp, m.state, m.weights, m.spec, m.rng)
+                ar_advance!(m.ar, Float64.(tmp) .- Float64.(m.state.y))
+            end
+            m.ar.nz[] = p
+        end
+        e = ar_advance!(m.ar, e)
+    end
+    m.pl === nothing || (e = e .* powerlaw_factor(Float64.(q_star), m.pl.beta, m.pl.qref, m.pl.qclip))
+    @inbounds for k in eachindex(m.scratch)
+        m.scratch[k] = m.state.y[k] + T(e[k])
+    end
+    return m
+end
+
+"""
     get_next_item_timeseries(m::StochLSTM, q_star)
 
 One solver step. Returns `dQ`.
@@ -292,6 +384,15 @@ function get_next_item_timeseries(m::StochLSTM{T}, q_star) where {T}
         end
         m.counter[] += 1
         dQ = m.spinnup_data[1:nq, m.counter[]]
+        # AR warm start (`scaling.ar_phi`): the last p replayed steps whose lag window is full
+        if m.ar !== nothing
+            j, p = m.counter[], size(m.ar.z, 2)
+            if j > nwarm(m) - p && j > m.spec.hist.h
+                # the network's mean for this step, no draw (persistent mode: the step just taken)
+                windowed && _replay_window!(m)
+                _ar_warm!(m, qs_host, dQ)
+            end
+        end
         _push_scaled!(m, qs_host .+ dQ, qs_host)
         return dQ
     end
@@ -341,6 +442,8 @@ function get_next_item_timeseries(m::StochLSTM{T}, q_star) where {T}
                 m.scratch[k] = m.state.y[k] + ec
             end
         end
+        # the shared noise options (`scaling.ar_phi`, `scaling.scale_*`; see the docstring)
+        (m.ar !== nothing || m.pl !== nothing) && _shared_noise!(m, qs_host)
     else
         copyto!(m.scratch, m.state.y)
     end

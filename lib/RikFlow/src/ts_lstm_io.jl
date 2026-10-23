@@ -30,10 +30,10 @@ function save_stochlstm(path::AbstractString, spec::LSTMSpec, weights::LSTMWeigh
               emission = spec.emission,
               arch = spec.arch, uclip = spec.uclip, skip = spec.skip, window = spec.window,
               posterior = spec.posterior, prior = spec.prior, n_layers = spec.n_layers,
-              n_in = spec.n_in)
+              n_in = spec.n_in, n_conv = spec.n_conv, kernel = spec.kernel)
     wnt = (; weights.Wx, weights.Wh, weights.b, weights.We, weights.be,
            weights.Bmu, weights.Bsig, weights.V1, weights.V2, weights.cdec,
-           weights.Wd, weights.bd, weights.LR, weights.Ws, weights.P)
+           weights.Wd, weights.bd, weights.LR, weights.Ws, weights.P, weights.Cv)
     mkpath(dirname(path))
     jldsave(path; spec = specnt, weights = wnt, scaling, version = 1, extras = (; extras...))
     return path
@@ -72,12 +72,15 @@ function load_stochlstm(path::AbstractString)
         posterior = hasproperty(s, :posterior) ? s.posterior : :x,
         prior = hasproperty(s, :prior) ? s.prior : :standard,
         n_layers = hasproperty(s, :n_layers) ? s.n_layers : 2,      # absent before 2026-10-22 = 2
-        n_in = hasproperty(s, :n_in) ? s.n_in : 0)                  # absent = the regressor width
+        n_in = hasproperty(s, :n_in) ? s.n_in : 0,                  # absent = the regressor width
+        n_conv = hasproperty(s, :n_conv) ? s.n_conv : 0,            # absent before 2026-10-23 = no CNN
+        kernel = hasproperty(s, :kernel) ? s.kernel : 0)
     w = d["weights"]
     T = eltype(w.Wx)
     weights = LSTMWeights{T}(w.Wx, w.Wh, w.b, w.We, w.be, w.Bmu, w.Bsig,
                              w.V1, w.V2, w.cdec, w.Wd, w.bd, w.LR,
-                             hasproperty(w, :Ws) ? w.Ws : nothing, hasproperty(w, :P) ? w.P : nothing)
+                             hasproperty(w, :Ws) ? w.Ws : nothing, hasproperty(w, :P) ? w.P : nothing,
+                             hasproperty(w, :Cv) ? w.Cv : nothing)
     check_shapes(weights, spec)
     return (; spec, weights, scaling = d["scaling"], extras = d["extras"])
 end
