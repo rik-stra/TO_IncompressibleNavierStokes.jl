@@ -3496,3 +3496,56 @@ PAPER_FIG_DIR=<dir> julia --project=analysis analysis/net_noise_residual.jl LinR
 # the loss comparison (numbers only): NETNOISE_NOFIG=1 ... net_noise_residual.jl LinReg1=lrs:LinReg1 RMSE_nt=... (36c)
 ```
 Logs: `output/TO_LSTM/step3/net_noise_residual.log`, `net_noise_sweep.log`, `net_noise_losses.log`.
+
+## 37. Step 3c online: LinReg1_nt and CNN_rmse_nt, the means trained with their own noise (2026-10-26, Snellius + laptop; Rik asked)
+
+Card `analysis/cards/step3n.md` (n1 = LinReg1_nt against LinReg1, n2 = CNN_rmse_nt against a1); the closures and their
+offline basis in §34 and §36. Snellius @ `2287bdeb`, gpu_a100: training hindcasts 28588678 / 28588679, n2's long-run
+smoke 28588688, full hindcasts 28590706 / 28590712 (arrays 1-10), long runs 28590707–11 / 28590713–17. Everything
+copied to the laptop and checked (900 files per hindcast, counts and bytes equal; the 10 long runs' sha256 equal).
+
+**GATE 3 and the training hindcasts.** n2's 0.5 TU long-run smoke PASS; both training hindcasts 50 / 50 warm-up
+bit-identical, 0 diverged, no defect (spread–skill ≤ 0.5 TU / partner's: n1 0.74–0.78, n2 0.58–0.82). Already there
+the ensembles were NARROWER than the partners' (0.67–0.91 ×), the card had expected wider.
+
+**Scores** (as Table `tab: res s3a`; hindcast 90 ICs × 10, long runs 5 × 100 TU):
+
+| | CRPS_0.5 | CRPS_3 | e_0.5 | cal. | b_0.5 | b_2.5 | guard | b | D | D range | CRPS_100 | e_100 | SS ratio | guard |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| LinReg1 | 0.221 | 0.390 | 0.455 | 28 | −2.9 | −5.9 | 0.42 | −7.3 | 0.84 | 0.59–1.01 | 0.387 | 0.649 | 1.53 | 1.13 |
+| n1 LinReg1_nt | 0.236 | 0.402 | 0.469 | 15 | −2.0 | −4.0 | 0.03 | −5.1 | 0.76 | 0.54–0.88 | **0.380** | 0.679 | 1.25 | 0.04 |
+| LinReg7 | 0.263 | 0.408 | 0.498 | 5 | −4.0 | −5.1 | 0 | −4.9 | 0.65 | 0.54–0.91 | 0.386 | 0.691 | 0.99 | 0 |
+| a1 CNN (RMSE) + MVG | 0.278 | 0.428 | 0.551 | 11 | −2.3 | −8.3 | 0.40 | −8.8 | 0.98 | 0.73–1.26 | 0.448 | 0.756 | 1.39 | 0.50 |
+| n2 CNN_rmse_nt | 0.266 | 0.514 | 0.516 | 9 | −2.6 | −10.0 | 0.25 | −10.8 | 1.34 | 1.23–1.53 | 0.511 | 0.898 | 1.16 | 0.28 |
+
+Paired (90 % IC-block bootstrap, % of the comparator): n1 vs LinReg1 CRPS_0.5 +7.0 [+2.3, +11.9], CRPS_3 +2.8
+[+0.4, +5.6], e_0.5 +2.9 [−1.4, +7.2], count −13 [−19, −3], G pass (0.54–0.88 ≤ 0.91) → **does not improve**. n2 vs
+LinReg1 CRPS_0.5 +20.7 [+12.7, +29.0], count −19 [−25, −8], G FAIL → does not improve. n2 vs a1 (partner, the paper's
+rule) CRPS_0.5 −4.0 [−11.9, +3.4], CRPS_3 +20.0 [+14.6, +26.5], δ₀.₅ −6.9 [−13.3, −0.4], count −2 [−12, +4], G against
+a1 passes → no. Not matched: n1 vs a1 CRPS_0.5 −14.9 [−23.5, −6.9]. Own-member CRPS_3 of n1 from its pairing with a1
+(LinReg1 has 3 diverged members): 0.40157.
+
+**What it shows.**
+- **The feedback goes, and with it most of the spread.** n1's ensembles are 0.71–0.78 × LinReg1's at every lead
+  although it draws up to 3.2 × LinReg1's sd (§34, §36): LinReg1's spread comes mostly from its mean's response to its
+  own draws (gain up to 2.4). The error of n1's ensemble mean up to 0.5 TU is 0.98–1.03 × LinReg1's.
+- **Calibration flips.** Up to 0.5 TU n1 is too narrow (r 0.61–0.74 against 0.82–0.95) and loses those cells; beyond
+  0.5 TU, where LinReg1 is too wide (1.27–1.40), n1 is close to 1 (1.01–1.08). The count falls 28 → 15 because most
+  cells are short leads.
+- **Fewer excursions.** n1: guard 0.03 % of hindcast steps (LinReg1 0.42 %), 0 diverged (3), member steps below the
+  training range 0.9–1.5 % (2.7–3.4 %), bias at 2.5 TU −4.0 % (−5.9 %).
+- **The best long runs so far.** n1 is closer to the reference than LinReg1 in every long-run measure and has the
+  lowest long-run CRPS of all closures (0.380; LinReg1 0.387, LinReg7 0.386).
+- **The network gains nothing.** n2 is narrower than a1 too (0.78–0.86 × up to 1 TU, 0.87–0.96 at 2.5 TU) and more accurate up to 0.5 TU (δ₀.₅ −6.9 %),
+  but drifts lower beyond (bias −10.0 % at 2.5 TU; CRPS_3 +20 %), and its long runs are worse (D 1.34, CRPS_100 0.511).
+  Its out-of-range drift dominates, and §36 found the noise training adds extrapolation error in the small scales.
+- **The early under-dispersion fits §36.** Along their own draws the noise-trained residuals are positively correlated
+  (ρ1 0.25–0.61 for LinReg1_nt, 10–100 TU), which their white draw does not reproduce: the ensembles spread too slowly
+  at short leads. An AR on the deployed residual is the consistent noise model (§36d); not built.
+
+Reproduce (from `lib/RikFlow`, `--project=analysis`): `score_d6.jl --compare exp_square_HIT/output/D6_LinReg1_nt
+exp_square_HIT/output/D6_LinReg1` (and `D6_CNN_rmse_nt` against `D6_LinReg1`, `D6_CNN_rmse_mvg`; `D6_LinReg1_nt`
+against `D6_CNN_rmse_mvg` for its own CRPS_3); `train_hindcast.jl --full LinReg1 LinReg1_nt CNN_rmse_mvg CNN_rmse_nt`;
+`longrun_stats.jl LinReg1 LinReg7 LinReg1_nt ../TO_LSTM/step3/closures/CNN_rmse_mvg ../TO_LSTM/step3/closures/CNN_rmse_nt`;
+`gate_census.jl LinReg1_nt ../TO_LSTM/step3/closures/CNN_rmse_nt`. Logs: scratch `scores3a/*nt*` of the 2026-10-26
+session.
