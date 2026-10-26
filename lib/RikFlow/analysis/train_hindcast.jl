@@ -49,7 +49,9 @@ const PARTNER = Dict("LinReg7_ar2n" => "LinReg7", "LinReg7_ar1ls" => "LinReg7", 
                      # step 3a (analysis/cards/step3a.md, added 2026-10-23)
                      "CNN_rmse_mvg" => "LinReg1", "CNN_crps_mvg" => "CNN_rmse_mvg",
                      "CNN_crps_head" => "CNN_crps_mvg", "CNN_crps_headcorr" => "CNN_crps_mvg",
-                     "CNN_rmse_ar2n" => "CNN_rmse_mvg", "CNN_rmse_pl" => "CNN_rmse_mvg")
+                     "CNN_rmse_ar2n" => "CNN_rmse_mvg", "CNN_rmse_pl" => "CNN_rmse_mvg",
+                     # step 3c, trained with their own noise (analysis/cards/step3n.md, added 2026-10-26)
+                     "LinReg1_nt" => "LinReg1", "CNN_rmse_nt" => "CNN_rmse_mvg")
 
 function diagnose(name; truth = load_truth(), prefix = "D6train_")
     dir = joinpath(OUTD, prefix * name)

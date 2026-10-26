@@ -66,6 +66,7 @@ using JLD2, Printf, Statistics, LinearAlgebra, Random
 const RF = RikFlow
 include(joinpath(@__DIR__, "step3_data.jl"))        # record, target, input map, checks, LS floor
 FEAT === :dqinc || error("the CNN reads the dqinc input (q*, dQ and Dq* per step); got FEAT = $FEAT")
+include(joinpath(@__DIR__, "step3_innoise.jl"))     # the closure's noise in the training window (INNOISE, PROBE)
 
 envc(k, d) = (v = strip(get(ENV, "RIKFLOW_CNN_" * k, "")); isempty(v) ? d : v)
 envcv(k, d, U) = parse.(U, strip.(split(envc(k, d), ",")))
@@ -238,6 +239,108 @@ const Aho_d, Qho_d = DEVF(Aho), DEVF(Qho)
 # REFIT: the 1-10 TU rows in record order (the fit rows, then the validation rows), on the device
 const Aall_d, Qall_d, Yall_d = DEVF(cat(Atr, Ava; dims = 3)), DEVF(hcat(Qtr, Qva)), DEVF(hcat(Ytr32, Yva32))
 
+# RIKFLOW_CNN_PROBE = <run dir under TO_LSTM> (2026-10-26, Rik: input-noise training): does a network pass
+# the closure's own noise into its mean more than least squares does? The run's refitted networks and LinReg1
+# (least squares on all 1-10 TU, h = 5), on 1-10 and 10-100 TU, clean and with the window noise of a closure
+# drawing from each model's own MVG (its residual on 1-10 TU, about zero), the same standard normals for
+# both. Per QoI: the rms one-step error clean and noisy, and the gain, rms(noisy - clean prediction) / sd(η).
+# Also the LINEAR ANALOGUE of input-noise training: least squares on the same rows with the window noise of
+# LinReg1's own MVG, in closed form -- E|y - C'(x + dx)|^2 = |y - C'x|^2 + tr(C' S_dx C), so
+# C = (X X' + N S_dx) \ X Y', S_dx = E[dx dx'] exact from the linear map eta -> dx: a ridge with the closure's
+# noise as its penalty (the bias is not penalised). Scores only; no fit.
+const CPROBE = envc("PROBE", "")
+if !isempty(CPROBE)
+    F = load(joinpath(TO_folder, CPROBE, "fits.jld2"))
+    (F["K"], F["D"], F["input"], F["seq"], F["act"]) == (K, D, CINPUT, CSEQ, CACT) ||
+        error("PROBE: $CPROBE was fitted with K, D, input, seq, act = $((F["K"], F["D"], F["input"], F["seq"], F["act"]))")
+    cfg.h == 5 || error("PROBE compares against LinReg1 (h = 5)")
+    rows10 = findall(n -> cfg.train_range[1] <= n <= cfg.train_range[2], cols)
+    X10, Y10 = Float64.(dat.Xc), Float64.(dat.Yc)
+    Cls10 = X10' \ Y10'                                          # LinReg1: least squares on all 1-10 TU
+    "E[dx dx'] of the window noise for corrections of covariance L L' (standardised target units)."
+    function window_cov(L)
+        M = zeros(nreg, nq * cfg.h)
+        for j in 1:cfg.h, i in 1:nq
+            e = zeros(nq, cfg.h, 1)
+            e[i, j, 1] = 1
+            M[:, (j - 1) * nq + i] = window_noise(e)[:, 1]          # dx per unit raw eta
+        end
+        Sraw = Diagonal(so) * (L * L') * Diagonal(so)
+        return M * kron(Matrix(1.0I, cfg.h, cfg.h), Sraw) * M'
+    end
+    lsmodel(Cm) = (rows, dx) -> Cm' * (Xr64[:, rows] .+ dx)
+    res10(f) = Yf[:, rows10] .- f(rows10, zeros(nreg, length(rows10)))   # residual on the 1-10 TU columns
+    Lls = cov_factor(mom0(res10(lsmodel(Cls10))))
+    Cnt = (X10 * X10' .+ size(X10, 2) .* window_cov(Lls)) \ (X10 * Y10')   # LinReg1 trained with its own window noise
+    Lnt = cov_factor(mom0(res10(lsmodel(Cnt))))
+    nrep = parse(Int, envc("PROBE_REPS", "3"))
+    fmtp(v) = join((@sprintf("%.3f", x) for x in v), " ")
+    for ((C, lr, wd, seed), r) in sort(collect(F["res"]); by = first)
+        haskey(r, :refit) || continue
+        model = mkmodel(C)
+        nnmean(Z) = (AQ = lagtensor(Z); Float64.(first(model(modelin(AQ...), r.refit.ps.net, r.refit.st))))
+        nn = (rows, dx) -> nnmean(Xf[:, rows] .+ P * dx)
+        Lnn = cov_factor(mom0(res10(nn)))
+        models = (("CNN", nn, Lnn), ("LinReg1", lsmodel(Cls10), Lls), ("LinReg1 + noise", lsmodel(Cnt), Lnt))
+        @printf("\nPROBE %s: C %d lr %.0e wd %.0e seed %d, the refitted network; each model with the noise of its own MVG\n",
+                CPROBE, C, lr, wd, seed)
+        for (nm, _, L) in models
+            @printf("  sd(eta) / sd(target) %-16s %s\n", nm, fmtp(sqrt.(diag(L * L'))))
+        end
+        for (wl, rows) in (("1-10 TU", rows10), ("10-100 TU", HO))
+            N = length(rows)
+            Es = [randn(Xoshiro(1000seed + rep), nq, cfg.h * N) for rep in 1:nrep]   # common to every model
+            @printf("  %s: rms clean | rms noisy | noisy / clean | gain = rms(noisy - clean mean) / sd(eta)\n", wl)
+            for (nm, f, L) in models
+                yc = f(rows, zeros(nreg, N))
+                ec = rmsq(Yf[:, rows] .- yc)
+                mn, g = zeros(nq), zeros(nq)
+                for E in Es
+                    yn = f(rows, window_noise(eta_from(L, E)))
+                    mn .+= rmsq(Yf[:, rows] .- yn) .^ 2 ./ nrep
+                    g .+= rmsq(yn .- yc) .^ 2 ./ nrep
+                end
+                @printf("    %-16s %s | %s | %s | %s\n", nm, fmtp(ec), fmtp(sqrt.(mn)), fmtp(sqrt.(mn) ./ ec),
+                        fmtp(sqrt.(g) ./ sqrt.(diag(L * L'))))
+            end
+        end
+    end
+    exit()
+end
+
+# RIKFLOW_CNN_INNOISE = none (default) | fixed (2026-10-26, Rik: "the noise-trained CNN (RMSE, fixed Σ with the
+# outer loop)"): every training window carries the noise of a closure drawing from a FIXED Σ (tools/
+# step3_innoise.jl: one η per correction, the levels the running sum anchored at the prediction step), fresh
+# draws every update from the noise's own stream (the shuffle stays the clean run's). Σ, in the standardised
+# target units, from RIKFLOW_CNN_INNOISE_SIGMA = ls (least squares' residual on the fit rows, about zero) |
+# <run dir under TO_LSTM>: the Σ that run deploys -- `S_deploy` in its pred.jld2 (a noise-trained run: the
+# residual of its refitted network on 1-10 TU under its own injected noise, about zero, 4 draws), else the
+# second moment of its refitted network's clean residual on 1-10 TU (a clean run: its MVG, as the export's
+# `mvg`). The OUTER LOOP is run by hand: run 1 from a clean run's Σ, run 2 from run 1's S_deploy, until
+# S_deploy / Σ stops moving (printed). The validation loss (early stopping) and the noisy scores use one fixed
+# draw; the clean scores are printed beside them.
+const CINN = Symbol(envc("INNOISE", "none"))
+CINN in (:none, :fixed) || error("RIKFLOW_CNN_INNOISE must be none or fixed; got $CINN")
+const CINN_SRC = envc("INNOISE_SIGMA", "ls")
+"The Σ (standardised target units) a run under TO_LSTM deploys, for seed `seed` (see INNOISE above)."
+function run_sigma(run, seed)
+    pr = load(joinpath(TO_folder, run, "pred.jld2"))
+    pick(dct) = haskey(dct, seed) ? dct[seed] : only(values(dct))
+    haskey(pr, "S_deploy") && return pick(pr["S_deploy"]), "S_deploy of $run"
+    pr["cols"] == cols || error("$run's pred.jld2 is on other record columns")
+    rows = findall(n -> cfg.train_range[1] <= n <= cfg.train_range[2], cols)
+    r = (rec.q[:, cols[rows] .+ 1] .- rec.q_star[:, cols[rows]] .- pick(pr["pred3"])[:, rows]) ./ so
+    return mom0(r), "the clean residual of $(run)'s refitted network on 1-10 TU, about zero"
+end
+"The injected Σ for seed `seed` and where it came from; `nothing` without input noise."
+inj_sigma(seed) = CINN === :none ? (nothing, "none") :
+                  CINN_SRC == "ls" ? (mom0(Rls), "least squares' residual on the fit rows, about zero") :
+                  run_sigma(CINN_SRC, seed)
+"The network's input (A, Q) for mapped columns `Z` (nin x B) with the window noise `eta` added (host)."
+noisy_tensor(Z, eta) = lagtensor(Float64.(Z) .+ P * window_noise(eta))
+const LLS_INJ = cov_factor(mom0(Rls))                   # least squares' own noise, for its noisy comparator
+CINN === :none || @info "input noise" CINN CINN_SRC
+
 function fit_cnn(C, lr, wd, seed)
     rng = Xoshiro(seed)
     model = mkmodel(C)
@@ -254,7 +357,13 @@ function fit_cnn(C, lr, wd, seed)
     loss(p, A, Q, Y) = CLOSS === :mse ? T(0.5) * sum(abs2, out(p, A, Q) .- Y) / size(Y, 2) :
                        CLOSS === :rmse ? rmse_sum(out(p, A, Q), Y) :
                        CLOSS === :crps ? head_crps(p.head.bd, out(p, A, Q) .- Y) : head_nll(p.head, out(p, A, Q) .- Y)
-    vloss(p) = Float64(loss(p, Ava_d, Qva_d, Yva_d))
+    # INNOISE: the injected Σ's factor, the noise's own stream, and one fixed draw for the validation rows
+    Sinj, src = inj_sigma(seed)
+    Linj = Sinj === nothing ? nothing : cov_factor(Sinj)
+    nrng = Xoshiro(seed + 7919)
+    Ava_n, Qva_n = CINN === :none ? (Ava_d, Qva_d) :
+                   DEVF.(noisy_tensor(Xc[:, (ntr + 1):end], eta_from(Linj, randn(Xoshiro(seed + 104729), nq, cfg.h * (ncol - ntr)))))
+    vloss(p) = Float64(loss(p, Ava_n, Qva_n, Yva_d))
     best = (; val = vloss(ps), ps = deepcopy(ps), update = 0)
     hist = (; update = Int[], val = Float64[], lr = Float64[])
     cur, since_best, since_decay, upd, stop = T(lr), 0, 0, 0, :cap
@@ -263,7 +372,12 @@ function fit_cnn(C, lr, wd, seed)
         idxs = shuffle(rng, 1:ntr)
         for k in 1:nb
             c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
-            g = Zygote.gradient(p -> loss(p, Atr_d[:, :, c], Qtr_d[:, c], Ytr_d[:, c]), ps)[1]
+            g = if CINN === :none
+                Zygote.gradient(p -> loss(p, Atr_d[:, :, c], Qtr_d[:, c], Ytr_d[:, c]), ps)[1]
+            else
+                Ab, Qb = DEVF.(noisy_tensor(Xc[:, c], draw_window_eta(nrng, Linj, length(c))))
+                Zygote.gradient(p -> loss(p, Ab, Qb, Ytr_d[:, c]), ps)[1]
+            end
             opt, ps = Optimisers.update(opt, ps, g)
             upd += 1
             upd % CST.val_every == 0 || continue
@@ -300,20 +414,39 @@ function fit_cnn(C, lr, wd, seed)
             ho_ratio = rmsq(Yf[:, HO] .- pred(Aho_d, Qho_d; p = ps)) ./ ls_ho)
     crps_refit = crps_eval(rva, vec(std(rtr; dims = 2)))
     head_ratio = CLOSS in (:nll, :crps) ? head_sd(pb.head) ./ rmsq(rva) : fill(NaN, nq)
+    # INNOISE: the same scores with the window noise, the network under its injected Σ and least squares under
+    # its own (common standard normals); and the network's noisy residual on the fit rows over the injected Σ,
+    # the outer loop's fixed-point check (1 = self-consistent)
+    noisy = if CINN === :none
+        nothing
+    else
+        E = randn(Xoshiro(seed + 31), nq, cfg.h * length(HO))
+        yh = pred(DEVF.(noisy_tensor(Xf[:, HO], eta_from(Linj, E)))...)
+        lh = Cls' * (Xr64[:, HO] .+ window_noise(eta_from(LLS_INJ, E)))
+        Ev = randn(Xoshiro(seed + 104729), nq, cfg.h * (ncol - ntr))       # the validation draw
+        lv = Cls' * (Rva_ .+ window_noise(eta_from(LLS_INJ, Ev)))
+        Et = randn(Xoshiro(seed + 61), nq, cfg.h * ntr)
+        rtr_n = Ytr .- pred(DEVF.(noisy_tensor(Xc[:, 1:ntr], eta_from(Linj, Et)))...)
+        (; src, Sinj, val_half_sse = 0.5 * sum(abs2, Yva .- pred(Ava_n, Qva_n)) / size(Yva, 2),
+         ls_val_half_sse = 0.5 * sum(abs2, Yva .- lv) / size(Yva, 2),
+         ho_ratio = rmsq(Yf[:, HO] .- yh) ./ rmsq(Yf[:, HO] .- lh), sd_fit_over_inj = sqrt.(diag(mom0(rtr_n)) ./ diag(Sinj)))
+    end
     return (; ps = Lux.fmap(Array, pb), st = Lux.fmap(Array, st), device = CDEV, ho_ratio1, h = cfg.h, val_loss = best.val, val_half_sse = 0.5 * sum(abs2, rva) / size(rva, 2),
             nll_refit = gnll(rva, cov(permutedims(rtr))), crps_refit, head_ratio, ho_ratio, best_update = best.update, updates = upd,
             stop, nparams = Lux.parameterlength(model), loss = CLOSS, head = CHEAD, input = CINPUT, seq = CSEQ, act = CACT,
-            init = CINIT,
+            init = CINIT, innoise = CINN, noisy,
             hist, last)
 end
 
 """
 The second training (RIKFLOW_CNN_REFIT = 1): set up exactly as `fit_cnn` (same seed, so the same
 initialisation; same loss, head rules and weight decay), trained on all 1-10 TU rows for `nupd` updates
-at the learning rate the stage-1 history `hist` used at each update; the last iterate, on the host.
+at the learning rate the stage-1 history `hist` used at each update; the last iterate, on the host. With
+INNOISE, the same window noise (factor `Linj`, the noise's own stream) on every batch.
 """
-function refit_cnn(C, lr, wd, seed, hist, nupd)
+function refit_cnn(C, lr, wd, seed, hist, nupd; Linj = nothing)
     rng = Xoshiro(seed)
+    nrng = Xoshiro(seed + 7919)
     model = mkmodel(C)
     net, st = Lux.setup(rng, model)
     ps = todev((; net, head = (; bd = copy(HEAD0.bd), Araw = copy(HEAD0.Araw))))
@@ -340,7 +473,12 @@ function refit_cnn(C, lr, wd, seed, hist, nupd)
             l = lr_at(upd + 1)
             l == cur || (Optimisers.adjust!(opt, l); cur = l)
             c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
-            g = Zygote.gradient(p -> loss(p, Aall_d[:, :, c], Qall_d[:, c], Yall_d[:, c]), ps)[1]
+            g = if Linj === nothing
+                Zygote.gradient(p -> loss(p, Aall_d[:, :, c], Qall_d[:, c], Yall_d[:, c]), ps)[1]
+            else
+                Ab, Qb = DEVF.(noisy_tensor(Xc[:, c], draw_window_eta(nrng, Linj, length(c))))
+                Zygote.gradient(p -> loss(p, Ab, Qb, Yall_d[:, c]), ps)[1]
+            end
             opt, ps = Optimisers.update(opt, ps, g)
             upd += 1
         end
@@ -359,6 +497,7 @@ predfull(model, ps, st) = Float64.(first(model(modelin(Afull, Qfull), ps.net, st
 
 res = Dict{Tuple{Int,Float64,Float64,Int},Any}()
 pred1, pred3 = Dict{Int,Matrix{Float64}}(), Dict{Int,Matrix{Float64}}()
+Sdep, Sinjd = Dict{Int,Matrix{Float64}}(), Dict{Int,Matrix{Float64}}()        # INNOISE with REFIT
 for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
     t0 = time()
     r = fit_cnn(C, lr, wd, seed)
@@ -378,9 +517,17 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
                                                     r.hist.lr[findfirst(>=(u), r.hist.update)]) for u in cps), ", "))
     @printf("     last iterate (update %d): val loss %.4f, 0.5 SSE %.4f | 10-100 TU rms / LS %s\n", r.updates,
             r.last.val, r.last.half_sse, join((@sprintf("%.2f", x) for x in r.last.ho_ratio), " "))
+    if r.noisy !== nothing
+        @printf("     input noise (Σ: %s; sd / LS residual sd %s)\n", r.noisy.src,
+                join((@sprintf("%.3f", x) for x in sqrt.(diag(r.noisy.Sinj) ./ diag(mom0(Rls)))), " "))
+        @printf("       with the window noise: val 0.5 SSE %.4f (LS %.4f) | 10-100 TU rms / LS %s | fit rows: noisy residual sd / injected sd %s\n",
+                r.noisy.val_half_sse, r.noisy.ls_val_half_sse, join((@sprintf("%.2f", x) for x in r.noisy.ho_ratio), " "),
+                join((@sprintf("%.3f", x) for x in r.noisy.sd_fit_over_inj), " "))
+    end
     if CREFIT
         t1 = time()
-        ps3, st3, model3 = refit_cnn(C, lr, wd, seed, r.hist, r.best_update)
+        ps3, st3, model3 = refit_cnn(C, lr, wd, seed, r.hist, r.best_update;
+                                     Linj = r.noisy === nothing ? nothing : cov_factor(r.noisy.Sinj))
         y1, y3 = predfull(model3, r.ps, r.st), predfull(model3, ps3, st3)
         pred1[seed], pred3[seed] = rawq(y1), rawq(y3)
         # the refitted network on its own training window, and on 10-100 TU against LinReg1
@@ -391,18 +538,33 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
                                                                           half_sse_1_10 = sse10, ho_ratio1 = ho3)))
         @printf("     refit on 1-10 TU (%d updates, %.1f min): 0.5 SSE on 1-10 TU %.4f | 10-100 TU rms / LinReg1 %s\n",
                 r.best_update, (time() - t1) / 60, sse10, join((@sprintf("%.2f", x) for x in ho3), " "))
+        if r.noisy !== nothing
+            # the Σ this network deploys: its residual on all 1-10 TU rows under the injected noise, about zero
+            # (4 draws); S_deploy / Σ_inj -> 1 is the outer loop's fixed point
+            L = cov_factor(r.noisy.Sinj)
+            Sd = sum(1:4) do rep
+                An, Qn = noisy_tensor(Xc, eta_from(L, randn(Xoshiro(seed + 500 + rep), nq, cfg.h * ncol)))
+                mom0(Float64.(dat.Yc) .- Float64.(first(model3(modelin(An, Qn), ps3.net, st3)))) ./ 4
+            end
+            Sdep[seed], Sinjd[seed] = Sd, r.noisy.Sinj
+            @printf("     refit: S_deploy sd / injected sd %s (1 = the outer loop's fixed point)\n",
+                    join((@sprintf("%.3f", x) for x in sqrt.(diag(Sd) ./ diag(r.noisy.Sinj))), " "))
+        end
     end
     flush(stdout)
 end
 out_dir = joinpath(TO_folder, COUT)
 mkpath(out_dir)
 jldsave(joinpath(out_dir, "fits.jld2"); res, ls_val, ls_sse, ls_ho, ls_crps = LS_CRPS, settings = CST, K, D, feat = FEAT, cfg,
-        loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT)
+        loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT, innoise = CINN, innoise_sigma = CINN_SRC)
 if CREFIT
     # least squares on the same regressor and all of 1-10 TU (at h = 5: LinReg1), in the same raw units
     Cls10 = Float64.(dat.Xc)' \ Float64.(dat.Yc)'
     jldsave(joinpath(out_dir, "pred.jld2"); cols, pred1, pred3, predls = rawq(Cls10' * Xr64), seeds = CSEEDS,
             wd = only(CWDS), n_channels = only(CHS), loss = CLOSS, head = CHEAD, h = cfg.h, K, D, feat = FEAT,
-            input = CINPUT, seq = CSEQ, act = CACT, scaling)
+            input = CINPUT, seq = CSEQ, act = CACT, scaling,
+            # INNOISE: the Σ each seed's network deploys (standardised target units; `run_sigma` and the export
+            # read it) and the Σ it was trained with
+            innoise = CINN, innoise_sigma = CINN_SRC, (CINN === :none ? (;) : (; S_deploy = Sdep, Sigma_inj = Sinjd))...)
 end
 @info "written" out_dir

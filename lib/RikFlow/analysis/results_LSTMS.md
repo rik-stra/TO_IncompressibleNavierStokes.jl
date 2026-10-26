@@ -3191,3 +3191,43 @@ training ACF by up to 0.18 (E[7,15], ratio 7.7 vs AR 1.4) and the 10-100 TU colo
 
 Not done: no online runs (Snellius); the long-run script deploys via RIKFLOW_M4_MODEL_DIR (any
 model_index row with n_replicas = 5; the fit carries no `cfg`, so no cell check).
+
+## 34. Input-noise training: the noise-feedback probe, LinReg1_nt and the noise-trained CNN (2026-10-26, laptop CPU; Rik asked)
+
+Motivation (post hoc, a1's held-out fans): a1 leaves the reference from the first leads. Rik's proposal: train on
+inputs carrying the closure's own noise. 🔒 Construction (claude_memory.md standing decision; `exp_square_HIT/tools/
+step3_innoise.jl`, pairing asserted through the input map to 2e-16): every correction in the window carries one η,
+the levels the running sum, anchored at the prediction step (q^{n*} and the target are the record's).
+
+**Probe** (`cnn_mean_fit.jl`, RIKFLOW_CNN_PROBE=<run>): each model with the window noise of its own MVG, the same
+standard normals. Gain = rms(noisy − clean mean) / sd(η), per QoI Z,E[0,6] Z,E[7,15] Z,E[16,32], 10-100 TU:
+
+| model | rms clean / LinReg1's | noisy / clean | gain |
+|---|---|---|---|
+| LinReg1 | 1 | 1.31 1.32 2.57 2.48 1.39 1.59 | 0.89 0.92 2.43 2.35 1.00 1.27 |
+| a1 (CNN, RMSE) | 1.02 1.00 1.12 1.27 1.24 1.16 | 1.21 1.21 2.43 2.00 1.19 1.43 | 0.73 0.73 2.45 2.11 0.79 1.16 |
+| LinReg1 + noise, one pass (Σ = LinReg1's) | 1.06 1.06 1.28 1.25 1.02 1.08 | 1.09 1.08 1.47 1.50 1.07 1.16 | 0.46 0.44 1.11 1.14 0.39 0.61 |
+| CNN noise-trained, round 5 (below) | 1.16 1.10 2.15 2.55 1.46 1.48 | 1.07 1.06 1.15 1.18 1.03 1.07 | 0.42 0.39 0.65 0.77 0.30 0.44 |
+
+The feedback is large in both untrained means (middle band: the mean answers the window noise 2.4x as strongly as
+the noise itself), and NOT larger in a1: it does not explain a1 < LinReg1 (with noise, a1's one-step error is
+0.92-1.06 of LinReg1's). Training with the noise halves to thirds the gain at a clean-error cost -- LinReg7's
+signature (worse offline, better online).
+
+**LinReg1_nt** (`exp_square_HIT/tools/lrs_noise_variant.jl`, `output/TO_LRS/LinReg1_nt`, sha256 3bf7358d…): c' =
+(X'X + N S_dx(Σ)) \ X'Y on LinReg1's own rows (405-3999; zero noise reproduces its c to 4.9e-11), Σ = cov(y − cx) +
+c S_dx c' iterated to a fixed point (52 iterations, 1e-12). In-sample (1-10 TU), raw / LinReg1's clean rms: clean
+1.09 1.08 1.95 2.10 1.08 1.22, sd(η) 1.23 1.17 2.59 3.21 1.15 1.38, gain 0.46 0.39 0.66 0.76 0.35 0.46 (LinReg7:
+clean 1.85 1.16 7.93 11.49 1.99 2.84, gain 0.49 0.34 0.59 0.57 0.50 0.43). `--report` reproduces the file exactly.
+
+**Noise-trained CNN** (`cnn_mean_fit.jl`, RIKFLOW_CNN_INNOISE=fixed; RMSE, wd 0.3, seed 1, cap 200k, REFIT; the
+outer loop by hand, `step3/cnn_nt_rmse_wd0.3_s1_r1..r5`, round 1 from a1's MVG, round k from round k−1's
+S_deploy). S_deploy sd / injected sd per round: r1 1.14 1.14 1.73 1.77 1.12 1.24; r2 1.04 1.03 1.32 1.36 1.08 1.14;
+r3 1.00 0.99 1.06 1.13 0.96 0.99; r4 1.01 1.00 1.04 1.08 1.01 1.01; **r5 1.00 1.00 1.01 1.03 0.99 0.99**. Its Σ (sd
+/ LS residual sd) 1.18 1.14 2.65 3.26 1.26 1.53 -- LinReg1_nt's fixed point within 0.06 in the large and middle
+scales, 0.11-0.15 above it in the small scales. Refit, 10-100 TU clean rms / LinReg1: 1.15 1.10 2.16 2.53 1.46 1.46. Closure `CNN_rmse_nt`
+(`cnn_closure_export.jl ... mvgnt`, deploys S_deploy; the other noise modes refuse a noise-trained run),
+sha256 b97099e5…, translation check max 3.4e-5 sd(dQ).
+
+Not done: no card rows, no methods text, no online runs. Logs: scratch `probe_*.txt`, `lrs_noise_build.txt`,
+`outer_r*.txt`.

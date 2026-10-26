@@ -168,3 +168,33 @@ the six added):
   1.22–1.30); the ensemble mean's error ≤ 0.5 TU 0.86–0.95 of LinReg1's; bias at lead 200 −2.4 %
   (LinReg1 −6.1 %), at lead 1000 +4.5 % (+2.0 %); member steps below the training range 0.028–0.030
   (LinReg1 0.020–0.034).
+
+**2026-10-23, submitted** (code `bd8a67d3`; all six closures on Snellius, sha256 equal; budget 150 000 SBU,
+10 030 used): long-run smoke 28505236 (six closures); training hindcasts a2, a3, a3', b1, c1: array
+28505302_[1-5]. a1 production (Rik: "also submit the full hindcast and longruns for the first
+closure"), submitted while the smoke was still running: hindcast 28505405_[1-10] → `output/D6_CNN_rmse_mvg`;
+long runs r = 1…5: 28505409–13 (`-t 00:30:00`) → the closure dir.
+
+**2026-10-26, all completed and copied to the laptop** (counts and bytes equal; long runs sha256 equal):
+- Long-run smoke 28505236: `PASS: 6 closure(s)` (200 of 200 steps, warm-up bit-identical, finite, gate
+  0 / 100, the fit dir's model).
+- Training hindcasts a2, a3, a3', b1, c1: 50 / 50 `warm_identical` each, 0 diverged, `model_name` and
+  `lstm_noise` / `lstm_ar_phi` / `lstm_scale_beta` as this card. **No defect** (ratio ≤ 0.5 TU / partner's:
+  a2 0.62–0.82, a3 1.29–1.49, a3' 0.94–0.97, b1 1.00–1.02, c1 0.98–1.11). Gate: a2 2 steps (1 member), a3
+  204 (0.34 %, 6 members, ICs k = 11 and 16, first at lead 478), a3' 21, b1 17, c1 12.
+- **a1 scored** (`score_d6.jl --compare D6_CNN_rmse_mvg D6_LinReg1`, `longrun_stats.jl`, `train_hindcast.jl
+  --full`): CRPS_0.5 0.2776 against 0.2208, **+25.7 % [+18.5, +34.2]**; CRPS_all +9.8 % [+6.6, +13.1];
+  δ₀.₅ +19.7 %, e₀.₅ +20.9 %; calibrated 11 of 36 against 28 (−17 [−20, −6]). G passes (single-run D
+  0.73–1.26 against LinReg7's 0.54–0.91). S and C fail → **does not improve**, as expected; ⚠️ **not as
+  expected in size**: "a few % worse" was written, 26 % came. The ensemble mean's error / LinReg1's: 1.11–1.24
+  over 0.5 TU (1.6–1.9 in the small scales at lead 25), 1.02–1.10 over 0.5–3 TU, at the same spread
+  (0.99–1.05): r ≤ 0.5 TU 0.70–0.87 (LinReg1 0.82–0.95). On the training ICs it was 0.86–0.95 of LinReg1's.
+  Divergences 0 (LinReg1 3); gate 0.40 % of steps, 55 members (0.42 %, 35); bias at 2.5 TU −8.3 % (−5.9 %);
+  member steps below the training range 4.1–4.4 % (2.7–3.4 %). Long runs: D 0.98 (LinReg1 0.84, LinReg7
+  0.65), bias −8.8 % (−7.3 %), ratio 1.39 (1.53), CRPS_100 0.448 (0.387), e_100 0.756 (0.649), 5 of 5 stable.
+  Logs: scratch `scores3a/`.
+
+**2026-10-26, production submitted for a2, a3, a3', b1, c1** (Rik: "submit the full hindcasts and the five
+long runs for a2, a3, a3', b1 and c1 on gpu_a100, as for a1"; code `bd8a67d3`): hindcast (array 1-10) /
+long runs r = 1…5 (`-t 00:30:00`): a2 28583921 / 28583922–26; a3 28583927 / 28583928–32; a3' 28583933 /
+28583934–38; b1 28583939 / 28583940–44; c1 28583945 / 28583946–50.

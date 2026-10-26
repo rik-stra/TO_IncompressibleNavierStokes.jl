@@ -17,6 +17,9 @@
 #            φ1 ≥ 0, φ2 ≤ 0), Σ_ξ = D R D with the AR's stationary variance matched to var(Z)    (b1)
 #   pl       step 2's power-law scale, `fit_scale` of lrs_scale_variant.jl (ML per QoI, clipped to the
 #            1-10 TU range of q*), Σ_ε = Z_f'Z_f / N with Z_f = Z ./ f(q*)                   (c1)
+#   mvgnt    a NOISE-TRAINED run (cnn_mean_fit.jl, RIKFLOW_CNN_INNOISE = fixed, 2026-10-26): the MVG it
+#            deploys, `S_deploy` in its pred.jld2 -- its residual on 1-10 TU under its own injected window
+#            noise, about zero -- not the clean residual's. The other modes refuse a noise-trained run.
 # The noise model is stored in the scaling (`ar_phi`, `scale_*`) and the head (`bd`, `LR`), which
 # `StochLSTM` applies with the code `LinReg` uses (`ts_noise.jl`, `ts_scale.jl`).
 #
@@ -29,7 +32,7 @@ using Random
 
 length(ARGS) == 3 || error("usage: cnn_closure_export.jl <run> <noise> <name>")
 const XRUN, XNOISE, XNAME = ARGS[1], ARGS[2], ARGS[3]
-XNOISE in ("mvg", "head", "headcorr", "ar2n", "pl") || error("noise must be mvg, head, headcorr, ar2n or pl; got $XNOISE")
+XNOISE in ("mvg", "head", "headcorr", "ar2n", "pl", "mvgnt") || error("noise must be mvg, head, headcorr, ar2n, pl or mvgnt; got $XNOISE")
 const XTO = normpath(joinpath(@__DIR__, "..", "output", "TO_LSTM"))
 const XNWARM = 100                                   # D6's warm-up (d6_lib.jl)
 
@@ -38,6 +41,9 @@ P = load(joinpath(XTO, XRUN, "pred.jld2"))
 key, r = only(F["res"])
 C, lr, wd, seed = key
 haskey(r, :refit) || error("$XRUN has no refit (run cnn_mean_fit.jl with RIKFLOW_CNN_REFIT=1)")
+const XNT = get(P, "innoise", :none) !== :none        # a noise-trained run
+XNT == (XNOISE == "mvgnt") || error(XNT ? "$XRUN is noise-trained: export it with noise mvgnt (its S_deploy)" :
+                                          "noise mvgnt is for a noise-trained run; $XRUN is not")
 (P["input"], P["seq"], P["act"], P["head"]) == (:full, :lags, :tanh, :identity) ||
     error("the deployed CNN is SEQ = lags, INPUT = full, ACT = tanh; $XRUN has $((P["input"], P["seq"], P["act"]))")
 h, K, D = P["h"], P["K"], P["D"]
@@ -80,6 +86,13 @@ prov = ""
 if XNOISE == "mvg"
     bd, LR = headof(S0)
     prov = "MVG refitted about zero on the network's 1-10 TU residual"
+elseif XNOISE == "mvgnt"
+    Sd = P["S_deploy"][seed]
+    bd, LR = headof(Sd)
+    prov = "S_deploy of the noise-trained run: its 1-10 TU residual under its own window noise (Sigma_inj = " *
+           "the run's input-noise Sigma), about zero"
+    @printf("  S_deploy sd / clean residual rms %s | / injected sd %s\n", fmt(sqrt.(diag(Sd) ./ diag(S0)); d = 3),
+            fmt(sqrt.(diag(Sd) ./ diag(P["Sigma_inj"][seed])); d = 3))
 elseif XNOISE == "head"
     bd = Float64.(vec(r.refit.ps.head.bd))
     LR = Matrix(1.0I, NQ, NQ)
