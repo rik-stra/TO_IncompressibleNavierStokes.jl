@@ -3331,3 +3331,168 @@ Post hoc). a1's ensemble-mean error ≤ 0.5 TU 0.86–0.95 of LinReg1's, against
   `hist_len_of` in `plot_paper_secs45.jl` now reads a network closure's h from `StochLSTM_seed1.jld2`, so its
   gated steps and the 5 after them are left out of the ACF as for LinReg). Logs: scratch `scores/` of the
   2026-10-26 write-up session (`score_s3a.sh`).
+
+## 36. Input-noise training offline: the residual, the weight decay and the loss (2026-10-26, desktop CPU + laptop; Rik asked)
+
+The offline basis for training a mean on histories that carry the closure's own noise (the locked construction,
+`claude_memory.md`; `tools/step3_innoise.jl`), in the style of Sec. 6 for the clean CNN. Branch `step3-innoise-offline`
+(from `step3-cnn-closure` @ 2287bdeb). Rules fixed before any result was read: selection only on the noisy validation
+loss; the outer-loop stop rule (36a); written to the side-session notes (`s36_offline_noise_rules.md`) at 13:55 and
+amended at 14:10, before any likelihood or CRPS fit existed.
+
+**Code.** `cnn_mean_fit.jl`: `RIKFLOW_CNN_INNOISE=head` (likelihood and CRPS only): the injected Σ is the head's current
+Σ, read before each gradient (stop-gradient), full covariance for the likelihood, sds alone for the CRPS (inject what is
+deployed); validation noise = fixed standard normals × the current head's factor; the refit follows its own head;
+pred.jld2 `S_deploy` = the refitted head's Σ, `S_noisy` the residual under it. `RIKFLOW_CNN_HEAD=inj`: the head starts at
+the injected Σ (checked to 1e-5). `RIKFLOW_CNN_SCORE=<runs>` (post hoc, any run): validation ½SE / NLL / CRPS clean,
+under the run's own noise and under one common Σ (`SCORE_COMMON`), with the constant Gaussian refitted to the fit rows
+(noisy for noisy); and the refitted network along ONE noise path of its deployed Σ over the whole record
+(`TO_LSTM/step3/innoise_scores/<run>.jld2`). Checks: fixed mode bit-identical to 2287bdeb (pred1, pred3, S_deploy of a
+300-update smoke); SCORE reproduces each noise-trained run's own noisy validation ½SE and pred.jld2's pred3.
+Analysis: `analysis/net_noise_residual.jl` (residual, colour, scale, gain), `analysis/net_noise_sweep.jl` (sweep table,
+figure).
+
+**Two residuals.** CLEAN: dQ^n − mean(x^n) on the record's own history (Secs. 5–6). DEPLOYED: along one noise path,
+dQ^n − mean(x^n + dx^n), dx^n the window noise of draws η^{n−1} … η^{n−h} of a path η^m ~ N(0, Σ) i.i.d., Σ what the
+closure deploys. Online a closure's history carries its own draws, so the deployed residual is the one it meets and Σ
+is what it draws to model it: a noise-trained closure deploys Σ = E[Rn Rnᵀ] (self-consistent); LinReg1 and the clean
+CNN deploy E[R Rᵀ] while meeting Rn. Rn = R − G, G the mean's response to its own draws (independent of the record), so
+Rn's autocovariance is R's plus an MA(h − 1) part from G. One path per seed, standard normals shared by every model of a
+seed; the LinRegs take seed 1's. Gain = rms(G) / sd(η) (the probe's, §34).
+
+### 36a. The weight decay under noise (RMSE, Σ fixed at the round-5 fixed point)
+
+`ntsw_rmse_wd<wd>_s<s>`, desktop CPU, 14 at a time, cap 200k; noisy validation scores from SCORE (Σ refitted to the noisy
+fit-row residuals). Seed means (own loss: range):
+
+| wd | own val loss (noisy) | best update | val ½SE noisy | val NLL noisy | val CRPS noisy | 1–10 TU clean rms / LinReg1, Z/E[0,6] [7,15] [16,32] | gain 10–100 TU |
+|---|---|---|---|---|---|---|---|
+| 0 | 1.718 (1.687–1.736) | 1.2–1.5k | .374 | −1.57 | .969 | 1.12 1.07 2.14 2.50 1.24 1.42 | .47 .39 .67 .78 .38 .52 |
+| 0.01 | 1.714 | 1.2–1.5k | .373 | −1.60 | .967 | 1.12 1.07 2.14 2.50 1.24 1.42 | same |
+| 0.03 | 1.707 | 1.2–1.5k | .370 | −1.66 | .963 | 1.12 1.07 2.14 2.49 1.23 1.41 | same |
+| 0.1 | 1.670 | 2.2–2.5k | .360 | −1.99 | .942 | 1.12 1.07 1.99 2.27 1.21 1.35 | .44 .38 .67 .76 .35 .50 |
+| **0.3** | **1.599 (1.567–1.632)** | 6.1–22.3k | .339 | **−2.60** | **.903** | 1.10 1.07 2.04 2.33 1.18 1.33 | .46 .39 .66 .77 .33 .47 |
+| 1 | 1.625 | 22.5–29.3k | .338 | −1.84 | .918 | 1.13 1.09 2.09 2.35 1.37 1.60 | .46 .39 .70 .80 .36 .42 |
+
+- **The rule picks wd 0.3, as on clean inputs** (Sec. 6). It also has the best noisy NLL and CRPS; on noisy ½SE it ties
+  with wd 1. Below 0.3 every seed stops at 1.2–2.5k updates (clean RMSE: 2.2–7.2k).
+- **The weight decay does not move the gain** (0.32–0.80 at every wd): the noise, not the weights, sets the response.
+  Nor does it recover the middle band: clean error 2.0–2.5× LinReg1's on the training window at every wd.
+- Colour on 10–100 TU (clean residual) ρ1 0.82–0.92 in the middle band at every wd; small-scale long-run ratio 33–92,
+  lowest at 0.3.
+- Outer loop at wd 0.3 (stop rule max |S_deploy sd / Σ sd − 1| < 0.03): seed 1's sweep fit is round 6 of §34's loop
+  (0.020); seed 2 converged at round 2 (`ntol_rmse_wd0.3_s2_r2`, 0.019), seed 3 at round 3 (`ntol_rmse_wd0.3_s3_r3`,
+  0.018). These three are "CNN_nt" below.
+
+### 36b. The residual of the noise-trained means (Figs. `nt_residual_acf`, `nt_scale`)
+
+LinReg1, LinReg1_nt (deployed file), the clean CNN (`grid_cap_rmse_wd0.3_s1..3`, a1's settings) and CNN_nt (36a, 3
+seeds). Per QoI Z,E[0,6] Z,E[7,15] Z,E[16,32]; seed means; "/ LinReg1" = over LinReg1's CLEAN rms on the same steps.
+
+| | sd(η) drawn / LinReg1 | clean 1–10 TU | clean 10–100 TU | deployed 1–10 TU | deployed sd / drawn sd | gain |
+|---|---|---|---|---|---|---|
+| LinReg1 | 1 | 1 | 1 | 1.34 1.36 2.64 2.58 1.42 1.62 | **1.34 1.36 2.64 2.58 1.42 1.62** | .89 .92 2.45 2.38 1.01 1.28 |
+| LinReg1_nt | 1.23 1.17 2.59 3.21 1.15 1.38 | 1.09 1.08 1.95 2.10 1.08 1.22 | 1.10 1.08 1.96 2.12 1.06 1.20 | 1.22 1.17 2.55 3.15 1.14 1.36 | .99 1.00 .99 .98 .99 .99 | .46 .39 .66 .76 .35 .46 |
+| CNN (clean) | 1.00 1.00 1.03 1.08 1.04 1.05 | 1.00 1.00 1.03 1.08 1.04 1.05 | 1.02 1.00 1.11 1.25 1.23 1.15 | 1.23 1.23 2.77 2.55 1.32 1.61 | 1.23 1.23 2.68 2.35 1.27 1.54 | .73 .73 2.45 2.11 .80 1.17 |
+| CNN_nt | 1.22 1.16 2.68 3.44 1.23 1.49 | 1.10 1.07 2.03 2.26 1.16 1.31 | 1.16 1.10 2.23 2.71 1.48 1.46 | 1.22 1.16 2.66 3.39 1.23 1.49 | 1.00 1.00 1.00 .99 1.00 1.00 | .45 .39 .65 .75 .33 .47 |
+| LinReg7 (ref.) | 1.85 1.16 7.93 11.5 1.99 2.84 | = drawn | 1.85 1.14 7.74 11.8 1.98 2.77 | 2.08 1.23 9.20 13.1 2.22 3.06 | 1.12 1.06 1.16 1.14 1.11 1.08 | .49 .33 .58 .57 .50 .44 |
+
+- **Self-consistency.** Along a history carrying its own draws, a noise-trained mean meets the residual it draws (0.98–
+  1.00). LinReg1 meets 1.3–2.6× what it draws, the clean CNN 1.2–2.7×, most in the middle band: their response to their
+  own draws is the excess. Seed spread of the CNNs ≤ 0.05 in every ratio.
+- **The price is the clean mean.** On the training window the noise-trained means have ~2× LinReg1's clean error in the
+  middle band and 1.1–1.3× elsewhere. On 10–100 TU LinReg1_nt keeps that profile; CNN_nt adds extrapolation error in the
+  small scales (1.48/1.46): outside the training range 2.23/1.89 against LinReg1_nt's 1.04/1.15 (inside 1.27/1.35 vs
+  1.07/1.21; 6.3 % of the steps). The noise-trained CNN gains nothing over its linear analogue; under its own noise it
+  is level in the large scales and in Z[7,15], worse in E[7,15] (3.39 vs 3.15) and the small scales.
+- **LinReg7's gain at a fraction of its cost.** Ridge at λ = 1 passes on a similar share of its noise (0.33–0.58) with a
+  clean error 1.2–11.5× LinReg1's; noise training reaches 0.33–0.76 with 1.1–2.3×.
+- **Colour (Fig. `nt_residual_acf`).** Clean residual, 10–100 TU, ρ1: LinReg1 −0.02…0.04; LinReg1_nt 0.23–0.82; CNN
+  0.04–0.35; CNN_nt 0.41–0.89 (ratio 3.6–58). The noise-trained residuals are coloured ON THE TRAINING WINDOW too (ρ1
+  0.75–0.85 in the middle band, 0.23–0.47 elsewhere): a mean that discounts its history leaves the persistent part of dQ
+  it no longer follows. Deployed residual, 10–100 TU, ρ1: **LinReg1 −0.07 −0.11 −0.47 −0.46 −0.34 −0.37** (ratio 0.4–1.4:
+  its response to its own draws over-corrects, an anticorrelated MA part); clean CNN −0.41…0.10; LinReg1_nt 0.25–0.61
+  (ratio 2.1–4.1); CNN_nt 0.41–0.69 (ratio 3.3–55). **Along its own history no mean has a white residual**: LinReg1's is
+  anticorrelated at lag one, the noise-trained ones positively correlated (ρ1 0.6–0.7 in the middle band), which their
+  white draw does not reproduce. LinReg1's whiteness is a property of the recorded history.
+- **Scale (Fig. `nt_scale`, deployed residual, first seed).** Power-law held-out gain (nats/step, summed): LinReg1 0.05
+  (its state-independent noise response swamps the scale dependence; clean 0.48), CNN 0.13 (clean 0.73), LinReg1_nt 0.16
+  (clean 0.35), CNN_nt 0.40 (clean 0.61); β of the deployed residual 0.3–1.0 for the noise-trained means, 0.2–0.6 for
+  LinReg1 and the CNN. CNN_nt's highest small-scale tenth on 10–100 TU: spread 2.4/1.8 × constant, bin mean −1.5/−0.9
+  (too large a correction outside the range, as Sec. 6's CNNs).
+
+### 36c. The loss under noise: RMSE, CRPS and likelihood, fixed Σ and the learned head
+
+Same grid {0, .01, .03, .1, .3, 1} × seeds {1, 2, 3}, cap 200k, desktop CPU. Fixed Σ (`ntsw_{crps,nll}_*`, 2287bdeb): the
+round-5 fixed point, the head started at Σ = I as in Sec. 6. Head (`ntswh_{crps,nll}_*`, 18014b85, worktree
+`/export/scratch2/rik/time_series_TO_step3n`): the noise follows the head (stop-gradient), the head started at the
+round-5 Σ (a start at I would inject noise the size of dQ itself). Weight decay of each by its own noisy validation loss
+(seed mean): **0.3 for all five** (`net_noise_sweep.log`; head likelihood 0.1 a near tie, −3.236 vs −3.276). Below 0.3 the
+first training stops at 1.2–6.5k updates for every loss and mode, except the head likelihood at 0.1 (12–21k). Outer loop at 0.3 (fixed Σ only): CRPS seed 1 converged in
+the sweep fit (0.013), seeds 2–3 at round 2 (≤ 0.023); likelihood all seeds at round 2 (≤ 0.022) (`ntol_{crps,nll}_*_r2`).
+
+At the chosen wd. Validation (8.2–10 TU) under the COMMON Σ (the round-5 fixed point; like for like across modes);
+10–100 TU of the refitted networks at their fixed points (`net_noise_losses.log`, seed means; head modes need no loop):
+
+| loss, noise | val ½SE | val NLL | val CRPS | clean 10–100 TU / LinReg1, Z/E [0,6] [7,15] [16,32] | outside range, small | deployed / drawn sd | deployed ρ1 middle, small | power-law gain (deployed) |
+|---|---|---|---|---|---|---|---|---|
+| RMSE, fixed | .339 | −2.60 | .903 | 1.16 1.10 2.23 2.71 1.48 1.46 | 2.23 1.89 | 0.99–1.00 | .65 .69, .60 .54 | 0.40 |
+| CRPS, fixed | .346 | −2.57 | .909 | 1.18 1.11 2.25 2.75 1.52 1.48 | 2.32 1.92 | 1.00 | .66 .69, .62 .55 | 0.41 |
+| likelihood, fixed | **.332** | **−3.18** | **.894** | 1.16 1.10 2.31 2.78 1.60 1.63 | 2.79 2.55 | 0.99–1.00 | .66 .69, .64 .62 | 0.52 |
+| CRPS, head | .349 | −2.36 | .918 | 1.15 1.07 **1.95 2.51 1.39 1.40** | 2.06 1.82 | **1.00–1.05** | .61 .66, .53 .47 | 0.37 |
+| likelihood, head | .335 | −3.14 | .899 | 1.16 1.10 2.31 2.85 1.66 1.66 | 2.95 2.65 | 0.98–1.00 | .66 .70, .67 .63 | 0.60 |
+
+(The val ½SE / NLL / CRPS columns are the sweep fits, all trained at the common Σ except the head modes.)
+
+- **On validation the likelihood wins**, as on clean inputs (Sec. 6, Table net-loss): lowest ½SE, NLL and CRPS under
+  the common noise, with a fixed Σ (and level with the head). The CRPS-trained networks lose on their own score.
+- **The loss hardly matters for what noise training is for.** Every variant passes on the same share of its noise
+  (gain 0.31–0.76 for all five, against LinReg1's up to 2.45), is coloured alike along its own draws (ρ1 0.6–0.7 in the
+  middle band), and the four that inject what they deploy as a full covariance (RMSE, CRPS, likelihood fixed; likelihood
+  head) are self-consistent within 2 %.
+- **The CRPS head is narrower**, as on clean inputs (Sec. 30: 7–11 %): its residual under its own noise is 1.00–1.05 × its
+  head, so it injects less noise in the middle band (sd 2.27 / 3.21 × LinReg1's against 2.68–2.81 / 3.44–3.60) and keeps
+  more of the clean mean there (in sample 1.80 / 2.13 against 2.03–2.14 / 2.26–2.46). It is the one variant not at its
+  fixed point.
+- **10–100 TU (held out, not for selection) reverses the validation ranking**, as in Sec. 6: the likelihood networks
+  extrapolate worst in the small scales (outside the training range 2.8–3.0 × LinReg1's, the RMSE network 2.2 / 1.9,
+  LinReg1_nt 1.0 / 1.2).
+- **Head mode adds a feedback the weight decay can feed.** A wider head injects more noise, which shrinks the mean and
+  widens the residual the head fits. At wd 1 the likelihood head ends 1.6 / 3.3–4.6 × LinReg1's sd (round-5 Σ 1.2 /
+  2.7–3.4) and its common-noise validation ½SE is .540 (fixed Σ: .354). At the chosen wd it stays within 11 % of the
+  fixed point (head / LS sd 1.24 1.17 2.87 3.73 1.25 1.52, seed 1).
+- No variant passes the offline check (clean validation NLL −3.1 … −4.3 against least squares' −6.95).
+
+### 36d. What this says, and what it does not
+
+- The deployed residual of every untrained mean is far larger than what it draws (LinReg1 1.3–2.6 ×), and noise training
+  closes that gap at ~2 × the clean error in the middle band. Neither the weight decay nor the loss changes this trade:
+  it is set by the noise. A network adds nothing over the closed-form linear analogue offline, and extrapolates worse.
+- Along its own draws no mean has a white residual. For the noise-trained means the colour is positive and strong (ρ1
+  0.4–0.7, long-run ratio 3–80): a white draw from Σ is the wrong noise model for them, by the same argument as Sec. 5's
+  for ridge. An AR fitted to the DEPLOYED residual (one noise path, or its expectation) would be the consistent choice;
+  not built.
+- Caveat on the premise: for a correctly specified linear model the clean fit is already consistent, and the history's
+  deviations ARE its innovations; noise training then attenuates real dynamics (regression dilution). It is justified
+  only insofar as the closure's own draws carry none of the information that the record's corrections carry. The
+  offline evidence cannot decide this; the coupled runs of n1/n2 (§37, another session; not read here) do.
+- Not done: the outer loop is per seed; the head-mode CRPS was not driven to self-consistency; no AR or power law on the
+  deployed residual; the LinReg1_nt validation-window analogue (its closed form on 1–8.2 TU) for the loss table.
+
+**Reproduce** (from `lib/RikFlow`; desktop: `/export/scratch2/rik/tmp/nt_job.sh` (main checkout, 2287bdeb) and
+`nt_job_wt.sh` (worktree, 18014b85), job lists `ntsw_rmse.jobs`, `ntsw_fixed.jobs`, `ntswh.jobs`, `ntol*_r*.jobs`, logs
+copied to `output/TO_LSTM/step3/ntsw_logs/`):
+```bash
+# one sweep fit (fixed Σ; head: RIKFLOW_CNN_INNOISE=head RIKFLOW_CNN_HEAD=inj), desktop: wrap in script -qfec
+RIKFLOW_CNN_REFIT=1 RIKFLOW_CNN_MAXUPD=200000 RIKFLOW_CNN_LOSS=nll RIKFLOW_CNN_INNOISE=fixed \
+  RIKFLOW_CNN_INNOISE_SIGMA=step3/cnn_nt_rmse_wd0.3_s1_r5 RIKFLOW_CNN_WDS=0.3 RIKFLOW_CNN_SEEDS=1 \
+  RIKFLOW_CNN_OUT=step3/ntsw_nll_wd0.3_s1 julia --startup-file=no --project=training exp_square_HIT/tools/cnn_mean_fit.jl
+# outer-loop round k+1: RIKFLOW_CNN_INNOISE_SIGMA=<round k's run of the same seed>
+# scores (any runs): RIKFLOW_CNN_SCORE=<run,...> RIKFLOW_CNN_SCORE_COMMON=step3/cnn_nt_rmse_wd0.3_s1_r5 ... cnn_mean_fit.jl
+PAPER_FIG_DIR=<dir> NTSWEEP_FIG=rmse/fixed,nll/fixed,nll/head julia --project=analysis analysis/net_noise_sweep.jl
+PAPER_FIG_DIR=<dir> julia --project=analysis analysis/net_noise_residual.jl LinReg1=lrs:LinReg1 LinReg1_nt=lrs:LinReg1_nt \
+  CNN=step3/grid_cap_rmse_wd0.3_s1,step3/grid_cap_rmse_wd0.3_s2,step3/grid_cap_rmse_wd0.3_s3 \
+  CNN_nt=step3/ntsw_rmse_wd0.3_s1,step3/ntol_rmse_wd0.3_s2_r2,step3/ntol_rmse_wd0.3_s3_r3
+# the loss comparison (numbers only): NETNOISE_NOFIG=1 ... net_noise_residual.jl LinReg1=lrs:LinReg1 RMSE_nt=... (36c)
+```
+Logs: `output/TO_LSTM/step3/net_noise_residual.log`, `net_noise_sweep.log`, `net_noise_losses.log`.
