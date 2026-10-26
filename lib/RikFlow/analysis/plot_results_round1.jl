@@ -11,7 +11,8 @@
 #
 # 🔑 `--step <tag>` (2026-10-16) picks the closure in the third column and the file names
 # results_<tag>_*.pdf: s11 (default) = LinReg7 + AR(2); s2 = LinReg1 + power-law scale (Sec. 7.2).
-# `--step s1` (2026-10-21) draws the three figures of Sec. 7.1 as a whole instead (fig_s1_*).
+# `--step s1` (2026-10-21) draws the three figures of Sec. 7.1 as a whole instead (fig_s1_*); `--step s2all`
+# those of Sec. 7.2 (fig_s2_*), `--step s3a` those of Sec. 7.3, the CNN closures (fig_s3a_*, 2026-10-26).
 
 include(joinpath(@__DIR__, "plot_paper_secs45.jl"))
 
@@ -19,6 +20,7 @@ const STEPS = Dict("s11" => ("LinReg7_ar2n", "LinReg7 + AR(2)"),
                    "s1ar1" => ("LinReg7_ar1ls", "LinReg7 + AR(1)"),     # Sec. 7.1.1 since 2026-10-20 (AR(1) first)
                    "s1" => ("Splice1_E0x7_ar2n", "LinReg^E + AR(2)"),   # step 1 as a whole, Figs 13-15 (below)
                    "s2all" => ("Splice1_E0x7_ar2n_pl", "LinReg^E + AR(2) + power-law scale"),   # step 2, Figs 17-18
+                   "s3a" => ("CNN_rmse_mvg", "CNN (RMSE) + MVG"),       # step 3a, Sec. 7.3 (below)
                    "s2" => ("LinReg1_pl", "LinReg1 + power-law scale"))
 const STEP = let i = findfirst(==("--step"), ARGS)
     i === nothing ? "s11" : ARGS[i + 1]
@@ -204,18 +206,22 @@ function fig_s1_fans()
                 map(s1col, cl), "results_s1_fans.pdf")
 end
 
-"The correction's ACF in the long runs, as Fig. 6 but the mean of the five runs per closure."
+"""
+The correction's ACF in the long runs, as Fig. 6 but the mean of the five runs per closure. `table`,
+`disp`, `file` and `tag` default to step 1's (step 3a, 2026-10-26).
+"""
 function fig_s1_dqacf(; L = 200, cl = ("LinReg7", "LinReg7 + AR(1)", "LinReg7 + AR(2)", "LinReg^E",
-                                          "LinReg^E + AR(2)"))
+                                          "LinReg^E + AR(2)"),
+                      table = S1_SETS, disp = s1disp, file = "results_s1_dqacf.pdf", tag = "s1")
     lags = 1:L
-    sets = [s for k in cl for s in S1_SETS if s[1] == k]
+    sets = [s for k in cl for s in table if s[1] == k]
     dqref = REC["q"][:, 2:end] .- REC["q_star"]
     A = Dict{String,Any}()
     for (k, dir, _) in sets
         rs = longruns(dir)
         kp = [gate_keep(dq_of(r), hist_len_of(dir))[101:end] for r in rs]      # as Fig. 6
         A[k] = [reduce(hcat, [autocorr_masked(dq_of(r)[i, 101:end], m, L) for (r, m) in zip(rs, kp)]) for i in 1:NQ]
-        @printf("s1 dqacf: %-16s steps left out per run (firing + %d after): %s\n", k, hist_len_of(dir),
+        @printf("%s dqacf: %-16s steps left out per run (firing + %d after): %s\n", tag, k, hist_len_of(dir),
                 join((count(!, m) for m in kp), " "))
     end
     fig = Figure(size = (W, 250), figure_padding = (2, 6, 2, 2))
@@ -226,8 +232,8 @@ function fig_s1_dqacf(; L = 200, cl = ("LinReg7", "LinReg7 + AR(1)", "LinReg7 + 
         hlines!(ax, [0.0]; color = :gray70, linewidth = 0.5)
         for (k, _, col) in sets
             am = vec(mean(A[k][i]; dims = 2))
-            @printf("s1 dqacf: %-8s %-16s lag1 %.2f (record %.2f), lag 10 / 50 %.2f / %.2f (record %.2f / %.2f), max |mean - record| %.2f, max |run - mean| %.2f\n",
-                    LABELS[i], k, am[2], ar[2], am[11], am[51], ar[11], ar[51], maximum(abs, am[2:end] .- ar[2:end]),
+            @printf("%s dqacf: %-8s %-16s lag1 %.2f (record %.2f), lag 10 / 50 %.2f / %.2f (record %.2f / %.2f), max |mean - record| %.2f, max |run - mean| %.2f\n",
+                    tag, LABELS[i], k, am[2], ar[2], am[11], am[51], ar[11], ar[51], maximum(abs, am[2:end] .- ar[2:end]),
                     maximum(abs, A[k][i][2:end, :] .- am[2:end]))
             lines!(ax, lags, am[2:end]; color = col, linewidth = 1.0)
         end
@@ -238,9 +244,9 @@ function fig_s1_dqacf(; L = 200, cl = ("LinReg7", "LinReg7 + AR(1)", "LinReg7 + 
         xlims!(ax, 1, L); ylims!(ax, -0.3, 1.02)
     end
     Legend(fig[3, 1:3], [[LineElement(color = C_REF, linestyle = :dash)]; [LineElement(color = c) for (_, _, c) in sets]],
-           ["tracked record"; [s1disp(k) for (k, _, _) in sets]]; orientation = :horizontal, nbanks = 2)
+           ["tracked record"; [disp(k) for (k, _, _) in sets]]; orientation = :horizontal, nbanks = 2)
     rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
-    savefig("results_s1_dqacf.pdf", fig)
+    savefig(file, fig)
 end
 
 function fig_s1_traj()
@@ -283,6 +289,41 @@ fig_s2_traj() = fig_r1_traj("LinReg^E + AR(2) + power-law scale";
                             runs_label = rich("LinReg", superscript("E"), " + AR(2) + power-law scale (5 runs)"),
                             styles = S2_STYLE, nbanks = 2)
 
+# --------------------------------------------------------------------------------------------------
+# 🔑 `--step s3a` (2026-10-26): Sec. 7.3, the CNN mean of step 3a (card analysis/cards/step3a.md). The
+# network-path closures keep their hindcasts in D6_<name> and their long runs in
+# TO_LSTM/step3/closures/<name>. One colour per closure in all three figures: LinReg1's blue, then
+# Okabe-Ito and the violet and wine of Figs res-s1-*/res-s2-* (validate_palette.js --pairs all over
+# LinReg1, LinReg7 and the six: every check passes; pink-green at deutan dE 7.6, in the floor band,
+# relieved by the titles and legends; orange, pink and sky blue below 3:1 on white, as in step 1).
+#   results_s3a_fans.pdf    hindcast fans: LinReg1 | CNN (RMSE) + MVG | CNN (CRPS) + MVG | + learned head
+#   results_s3a_traj.pdf    long runs of CNN (RMSE) + MVG; distributions of LinReg1 and the CRPS closures
+#   results_s3a_dqacf.pdf   correction ACF in the long runs, mean of the five runs per closure
+# --------------------------------------------------------------------------------------------------
+const S3_DIR = "TO_LSTM/step3/closures/"
+const S3_SETS = (("LinReg1", "TO_LRS/LinReg1", COL["LinReg1"]),
+                 ("LinReg7", "TO_LRS/LinReg7", COL["LinReg7"]),
+                 ("CNN (RMSE) + MVG", S3_DIR * "CNN_rmse_mvg", to_color("#009E73")),
+                 ("CNN (CRPS) + MVG", S3_DIR * "CNN_crps_mvg", to_color("#E69F00")),
+                 ("CNN (CRPS) + learned head", S3_DIR * "CNN_crps_head", to_color("#CC79A7")),
+                 ("CNN (CRPS) + learned scales", S3_DIR * "CNN_crps_headcorr", to_color("#882255")),
+                 ("CNN (RMSE) + AR(2)", S3_DIR * "CNN_rmse_ar2n", to_color("#56B4E9")),
+                 ("CNN (RMSE) + power-law scale", S3_DIR * "CNN_rmse_pl", to_color("#5B3A9E")))
+s3col(k) = only(c for (l, _, c) in S3_SETS if l == k)
+s3d6(k) = basename(only(d for (l, d, _) in S3_SETS if l == k))     # the hindcast is D6_<basename>
+
+function fig_s3a_fans(; cl = ("LinReg1", "CNN (RMSE) + MVG", "CNN (CRPS) + MVG", "CNN (CRPS) + learned head"))
+    fans_figure(map(s3d6, cl), replace.(cl, "CNN (CRPS) + learned head" => "+ learned head"), map(s3col, cl),
+                "results_s3a_fans.pdf")
+end
+
+fig_s3a_traj() = fig_r1_traj("CNN (RMSE) + MVG"; others = ("LinReg1", "CNN (CRPS) + MVG", "CNN (CRPS) + learned head"),
+                             file = "results_s3a_traj.pdf", table = S3_SETS, nbanks = 2)
+
+fig_s3a_dqacf() = fig_s1_dqacf(; cl = ("LinReg1", "CNN (RMSE) + MVG", "CNN (CRPS) + MVG", "CNN (CRPS) + learned head",
+                                       "CNN (RMSE) + AR(2)"),
+                               table = S3_SETS, disp = identity, file = "results_s3a_dqacf.pdf", tag = "s3a")
+
 """
 The correction's ACF in the long runs, as Fig. 6, for LinReg1, LinReg7 and the step's closure against the
 record (s11: also LinReg7 + AR(1)).
@@ -309,6 +350,13 @@ if abspath(PROGRAM_FILE) == @__FILE__
         want = isempty(args) ? ["fans", "traj"] : args
         "fans" in want && fig_s2_fans()
         "traj" in want && fig_s2_traj()
+        exit()
+    end
+    if STEP == "s3a"
+        want = isempty(args) ? ["fans", "traj", "dqacf"] : args
+        "fans" in want && fig_s3a_fans()
+        "traj" in want && fig_s3a_traj()
+        "dqacf" in want && fig_s3a_dqacf()
         exit()
     end
     want = isempty(args) ? ["fans", "longrun", "dqacf"] : args

@@ -97,8 +97,15 @@ end
 "`dQ` of a long run cut at the run's own length: past a divergence stop it is uninitialised memory."
 dq_of(r) = r.dQ[:, 1:(size(r.q, 2) - 1)]
 
-"The closure's history length (0 for the DDN, which has no history and no gate)."
-hist_len_of(dir) = (f = joinpath(OUTD, replace(dir, "_nogate" => ""), "LinReg.jld2"); isfile(f) ? Int(load(f, "hist_len")) : 0)
+"""
+The closure's history length (0 for the DDN, which has no history and no gate); a network-path closure
+(step 3, `TO_LSTM/...`) has no `LinReg.jld2` and takes `h` from its `StochLSTM_seed1.jld2` spec.
+"""
+function hist_len_of(dir)
+    d = joinpath(OUTD, replace(dir, "_nogate" => ""))
+    f, g = joinpath(d, "LinReg.jld2"), joinpath(d, "StochLSTM_seed1.jld2")
+    return isfile(f) ? Int(load(f, "hist_len")) : isfile(g) ? Int(load(g, "spec").h) : 0
+end
 
 "Long free runs (q, dQ per replica) of a closure directory under exp_square_HIT/output."
 function longruns(dir; pat = r"^(DDN_)?data_online_tsim100\.0_replica\d\.jld2$")

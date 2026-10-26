@@ -3231,3 +3231,103 @@ sha256 b97099e5…, translation check max 3.4e-5 sd(dQ).
 
 Not done: no card rows, no methods text, no online runs. Logs: scratch `probe_*.txt`, `lrs_noise_build.txt`,
 `outer_r*.txt`.
+
+## 35. Step 3a online: the six CNN closures, full hindcast and long runs (2026-10-23/26, Snellius + laptop; Rik asked)
+
+(§36 and §37 are reserved for the input-noise work of step 3c, from parallel sessions.) Card
+`analysis/cards/step3a.md` (Rik saw it 2026-10-23; its Post hoc records the jobs, the copies and the first
+scoring); closures §33; runs on gpu_a100 from Snellius @ `bd8a67d3` (a1 2026-10-23, the other five 2026-10-26).
+Every number below was re-run on 2026-10-26 in the worktree `code_base_step3a_results` (branch
+`step3a-results`); the commands are under "Reproduce". Seed 1, wd 0.3 for every network.
+
+**Against LinReg1** (criterion; G against LinReg7's single-run D 0.54–0.91). None improves:
+
+| | closure | CRPS_0.5 (90 % CI) | calibrated (LinReg1 28) | e_0.5 | single-run D: G | verdict |
+|---|---|---|---|---|---|---|
+| a1 | CNN (RMSE) + MVG | +25.7 % [+18.5, +34.2] | 11, −17 [−20, −6] | +20.9 % | 0.73–1.26: pass | no |
+| b1 | CNN (RMSE) + AR(2) | +25.1 % [+17.9, +33.6] | 12, −16 [−18, −4] | +20.8 % | 0.76–1.11: pass | no |
+| c1 | CNN (RMSE) + power law | +26.9 % [+19.6, +35.5] | 10, −18 [−20, −7] | +22.2 % | 0.82–1.31: pass | no |
+| a2 | CNN (CRPS) + MVG | +28.3 % [+19.8, +37.6] | 12, −16 [−18, −5] | +23.9 % | 1.12–1.77: FAIL | no |
+| a3 | CNN (CRPS) + learned head | +22.3 % [+14.2, +31.3] | 17, −11 [−13, −1] | +21.4 % | 1.37–1.54: FAIL | no |
+| a3' | CNN (CRPS) + learned sds | +29.7 % [+21.0, +39.3] | 11, −17 [−19, −7] | +24.7 % | 1.20–1.54: FAIL | no |
+
+CRPS_3 against LinReg1 +9.5 to +11.0 % (RMSE networks), +22.3 to +24.5 % (CRPS networks). No member diverges
+(LinReg1 3). Own-member values (paper Table `tab: res s3a`), in the order a1 b1 c1 a2 a3 a3': CRPS_0.5 0.2776
+0.2762 0.2801 0.2832 0.2700 0.2864; CRPS_3 0.4285 0.4271 0.4335 0.4776 0.4860 0.4778; e_0.5 0.551 0.550 0.557
+0.564 0.553 0.568; b_0.5 / b_2.5 −2.3 / −8.3, −2.2 / −7.9, −2.6 / −9.0, −2.0 / −11.1, −1.8 / −11.0, −2.0 / −11.0 %
+(LinReg1 −2.9 / −5.9); hindcast guard 0.40 0.31 0.33 0.74 0.94 0.68 % of the forecast steps (LinReg1 0.42),
+55 48 50 124 161 118 members (35), none in leads 1–200. Long runs (5 of 5 stable each): b −8.8 −8.3 −9.8 −11.7
+−10.9 −11.6 % (LinReg1 −7.3, LinReg7 −4.9); D 0.98 0.97 1.13 1.35 1.45 1.33 (0.84, 0.65); CRPS_100 0.448 0.441
+0.455 0.504 0.507 0.496 (0.387, 0.386); e_100 0.756 0.761 0.784 0.860 0.824 0.858 (0.649); ratio 1.39 1.41 1.36
+1.41 1.56 1.39 (1.53, 0.99); guard 0.50 0.83 0.77 1.12 1.74 1.10 % (1.13, 0).
+
+**Against the matched partner** (paper Sec. `sec:criterion`: the partner in place of BOTH baselines, so G
+against the partner's single-run D):
+
+| pair | CRPS_0.5 | count | e_0.5 | CRPS_3 | G vs partner | verdict |
+|---|---|---|---|---|---|---|
+| b1 vs a1 (AR(2)) | −0.5 % [−0.9, −0.1] | 12 vs 11, +1 [−1, +5] | −0.1 % [−0.5, +0.2] | −0.3 % | pass | **improves** |
+| c1 vs a1 (power law) | +0.9 % [+0.0, +1.9] | 10 vs 11 | +1.1 % [+0.4, +1.8] | +1.2 % | pass | no |
+| a2 vs a1 (the loss) | +2.0 % [−2.4, +6.4] | 12 vs 11 | +2.5 % [−1.4, +6.3] | **+11.5 % [+7.7, +14.9]** | pass | no |
+| a3 vs a2 (learned head) | −4.7 % [−8.2, −1.3] | 17 vs 12, +5 [−2, +11] | −2.0 % [−5.2, +1.2] | +1.8 % | pass (1.37–1.54 vs 1.12–1.77) | **improves** |
+| a3' vs a2 (learned sds) | +1.1 % [+0.9, +1.4] | 11 vs 12 | +0.7 % [+0.5, +0.9] | +0.05 % | pass | no |
+| a3 vs a3' (not a pair) | −5.7 % [−9.3, −2.4] | +6 [+0, +13] | −2.7 % [−5.9, +0.5] | +1.7 % | – | – |
+
+The card's Post hoc first applied G against LinReg7 to the partner comparisons ("G as above") and so read a3 vs
+a2 as "no". Rik, 2026-10-26: keep the paper's rule, so a3 improves on a2 (dated entry added to the card's Post hoc).
+
+**Offline (Sec. 6) against coupled** (`train_hindcast.jl --full`, `step3a_extras.jl`):
+- One-step error vs ensemble-mean error. Offline (Table `net-loss`, RMSE network, 10–100 TU) 1.02 / 1.00, 1.11 /
+  1.25, 1.23 / 1.15 × LinReg1's. Coupled, a1's ensemble-mean error / LinReg1's at lead 25: 1.28 1.06 1.15 1.30 1.90
+  1.61; over ≤ 0.5 TU 1.24 1.11 1.21 1.20 1.23 1.23 (Z[0,6] as far behind as the small scales); 0.5–3 TU 1.02–1.10.
+  The spread stays LinReg1's (≤ 0.5 TU 0.99–1.05), so r ≤ 0.5 TU 0.70–0.87 against 0.82–0.95: calibrated cells at
+  leads 25–200 5 of 24 against 22; at leads 400 and 1000 6 against 6.
+- The range of the training window (an IC is "outside" if the reference leaves the q* range of 1–10 TU,
+  LinReg1_pl's `scale_qclip`, within leads 1–200): 14 of 90 ICs, 12 above and 2 below. a1 there +42.1 % [+21.4,
+  +65.8] (LinReg1's CRPS_0.5 there 0.313), small-scale error at lead 25 4.3 / 3.9 × LinReg1's; inside (76 ICs)
+  +21.1 % [+14.5, +28.5], error over ≤ 0.5 TU 1.13–1.19 in every QoI. The outside ICs carry 0.36 of the summed
+  difference. All six split alike (outside +38 to +46 %, inside +18 to +25 %, share 0.34–0.38). So the
+  out-of-range error seen offline is there, strongly, but most of the coupled gap lies inside the range, where
+  offline the networks are ~1.1 × LinReg1's in the middle and small scales only.
+- Drift: member steps at leads 201–1200 below the training range 4.1–4.4 % (a1), 7.4–8.2 % (a2), 7.4–9.9 % (a3),
+  7.0–7.9 % (a3'), 3.9–4.2 % (b1), 3.6–4.0 % (c1), against LinReg1 2.7–3.4 % and the reference 0–0.3 %.
+- Colour. Offline the residual is coloured on 10–100 TU (ρ1 0.2–0.5, middle and small) but nearly white on 1–10
+  TU, where the noise is fitted (§33). Long-run correction ACF (`plot_results_round1.jl --step s3a dqacf`, gated
+  steps + 5 out): lag one as the record's in every QoI (a1 0.96 0.75 0.97 0.99 1.00 0.99; record 0.96 0.74 0.98
+  0.99 1.00 1.00) — the white draw does not take the persistence out, unlike LinReg7's. Lag 50 record / LinReg1 /
+  a1 / a2: Z[0,6] 0.31 / 0.36 / 0.47 / 0.57; Z[7,15] 0.11 / 0.25 / 0.18 / 0.38; E[7,15] 0.14 / 0.23 / 0.18 / 0.33;
+  small scales 0.83–0.84 / 0.82 / 0.79 / 0.81. b1 within ~0.03 of a1 at the printed lags.
+- Long-run distributions (`--step s3a traj`): pooled KS per QoI a1 0.17 0.17 0.16 0.16 0.16 0.16, a2 0.23 0.20
+  0.23 0.25 0.22 0.22, a3 0.25 0.18 0.26 0.27 0.25 0.25 (LinReg1 0.14 0.11 0.15 0.15 0.14 0.14); pooled b_i of a1
+  lower than LinReg1's in every QoI.
+
+**Partner effects in the hindcast** (`train_hindcast.jl --full`, closure / partner):
+- b1: spread ≤ 0.5 TU 0.99–1.02 (1.14 in E[7,15] at lead 25), error 0.99–1.00; φ1 ≤ 0.16 (§33). Guard: hindcast
+  0.31 vs 0.40 %, long runs 0.83 vs 0.50 %.
+- c1: spread 0.95–0.96 beyond 0.5 TU, error 1.00–1.03; below-range 3.6–4.0 vs 4.1–4.4 %; long runs D 1.13, b −9.8 %.
+- a2: 1–3 TU spread 1.11–1.16, error 1.09–1.21; the CRPS network drifts low (b_2.5 −11.1 vs −8.3 %; long runs
+  b −11.7 %). Not predicted offline (Table `net-loss`: RMSE and CRPS networks equal within the seeds).
+- a3: deployed sds 0.96 0.97 0.92 0.94 0.93 0.93 of a2's, no correlation; the refitted covariance has corr(Z, E)
+  0.93 / 0.82 / 0.86 per band, every other pair ≤ 0.10 (`step3a_extras.jl` Sec. 2; ⚠️ the card's "0.89–0.94" is
+  not reproduced by the deployed files). Spread ≤ 0.5 TU 1.05–1.26, 0.5–1 TU 1.20–1.27, 1–3 TU 1.13–1.21, error
+  0.98–1.00 (≤ 0.5 TU): wider, not narrower as the card expected. r ≤ 0.5 TU 0.71–1.07 (a2 0.66–0.84), 0.5–3 TU
+  1.42–1.58 (1.25–1.39). Guard 0.94 % hindcast, 1.74 % long runs: the most of all closures.
+- a3': spread ≤ 0.5 TU 0.97–0.98, error 1.00–1.01. So the missing correlation, not the smaller sds, widens a3.
+
+**Training hindcast** (in-sample, 5 ICs, no clause; `train_hindcast.jl LinReg1 <six>`): no defect for any (card
+Post hoc). a1's ensemble-mean error ≤ 0.5 TU 0.86–0.95 of LinReg1's, against 1.11–1.24 held out.
+
+- Paper (branch `step3a-results`, worktree `paper_step3a_results`): Sec. 7.3 `sec:res-net` (subsections
+  `sec:res-net-mean`, `sec:res-net-resid`, `sec:res-net-crps`), Table `tab: res s3a`, Figs.
+  `results_s3a_{fans,traj,dqacf}.pdf` (`fig:res-s3a-fans`, `fig:res-s3a-longrun`, `fig:res-s3a-dqacf`).
+- **Reproduce** (from `lib/RikFlow`, `--project=analysis`; each reprints the numbers above):
+  `score_d6.jl --compare <out>/D6_<closure> <out>/D6_LinReg1` and `... <out>/D6_<partner>` (CRPS, e_0.5,
+  counts, clauses); `train_hindcast.jl --full LinReg1 CNN_rmse_mvg CNN_crps_mvg CNN_crps_head CNN_crps_headcorr
+  CNN_rmse_ar2n CNN_rmse_pl` (spread / error by lead against the partner, r per lead, bias, below-range share;
+  the partners are its PARTNER table) and without `--full` (training hindcast); `longrun_stats.jl LinReg1 LinReg7
+  ../TO_LSTM/step3/closures/<closure> ...` (b, D, ratio, CRPS_100, e_100); `gate_census.jl <closures>` (hindcast)
+  and `gate_census.jl ../TO_LSTM/step3/closures/<closure> ...` (long runs); `step3a_extras.jl` (new: the range
+  split and the deployed heads); `plot_results_round1.jl --step s3a [fans] [traj] [dqacf]` (new step tag;
+  `hist_len_of` in `plot_paper_secs45.jl` now reads a network closure's h from `StochLSTM_seed1.jld2`, so its
+  gated steps and the 5 after them are left out of the ACF as for LinReg). Logs: scratch `scores/` of the
+  2026-10-26 write-up session (`score_s3a.sh`).
