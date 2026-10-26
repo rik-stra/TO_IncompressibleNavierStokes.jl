@@ -128,3 +128,63 @@ From `exp_square_HIT` on Snellius:
 - Cost ≈ 2 × 775 SBU + training hindcasts ~75 + smoke ~10; storage ≈ 3.2 GB (home ~29 GiB free on 2026-10-23).
 
 ## Post hoc
+
+**2026-10-26, training hindcasts submitted** (Rik: "agreed run the training hindcasts", after the list of the two
+closure setups; code `2287bdeb`, both closures on Snellius with sha256 equal): n1 `run_d6_train.sh LinReg1_nt`
+job 28588678 → `output/D6train_LinReg1_nt`; n2 `run_d6_train_lstm.sh step3/closures/CNN_rmse_nt` job 28588679 →
+`output/D6train_CNN_rmse_nt`. Then (Rik: "and smoke long runs") n2's long-run smoke `smoke_online_lstm.sh
+step3/closures/CNN_rmse_nt` job 28588688. n1 has no short long-run smoke: `6_online_TO_LRS.jl` hard-codes
+tsim = 100; none is run (Rik: "Skip it; LinReg1_nt uses LinReg1's long-run path unchanged").
+
+**2026-10-26, GATE 3 and the training hindcasts** (Rik: "also inspect the training hindcasts for the noise runs";
+jobs 28588678 (18 min), 28588679 (17 min), 28588688 (2 min), all COMPLETED; 50 files each and the logs copied to
+the laptop; `train_hindcast.jl LinReg1 LinReg1_nt CNN_rmse_mvg CNN_rmse_nt`, scratch `scores3a/train_nt.txt`):
+- GATE 3: n2's long-run smoke `PASS` (200 of 200 steps, warm-up bit-identical, finite, gate 0 / 100, the fit dir's
+  model; log: `Deploying StochLSTM2` arch cnn, `Emission noise` none). Both training hindcasts: 50 / 50
+  `warm_identical`, 0 diverged, `model_name` LinReg1_nt / step3/closures/CNN_rmse_nt, n2's `lstm_noise` white.
+- Defect rule: **no defect** (spread–skill ≤ 0.5 TU / partner's: n1 0.74–0.78 vs LinReg1, n2 0.58–0.82 vs a1).
+- Gate firings: n1 0 of 60 000 steps (LinReg1 246, 2 members); n2 16 steps, 3 members (a1 261, 2 members).
+  Member steps below the training range: n1 0.1–1.5 % (LinReg1 2.0–3.4 %), n2 2.2–2.6 % (a1 2.8–3.0 %).
+- ⚠️ **Not as expected: the ensembles are NARROWER, not wider.** Spread / partner's at every lead: n1 0.70–0.88,
+  n2 0.67–0.91, although both draw a larger Σ (sd up to 3.2–3.3 × in the middle band). The partner's spread
+  comes mostly from its mean answering its own draws (gain up to 2.4); cutting that feedback removes more spread
+  than the larger draw adds. So r ≤ 0.5 TU falls: n1 0.45–0.61 (LinReg1 0.61–0.78), n2 0.47–0.74 (a1 0.77–0.91);
+  0.5–3 TU n1 1.08–1.20 (LinReg1 1.22–1.30), n2 1.12–1.20 (a1 1.13–1.17).
+- Error of the ensemble mean / partner's: n1 0.99–1.05 up to 0.5 TU, **0.83–0.87 at 1–3 TU**; n2 0.99–1.39 up to
+  0.5 TU (E[0,6] 1.39), 0.77–0.91 at 1–3 TU. Bias at 2.5 TU: n1 +1.9 % (LinReg1 +2.0 %), n2 −5.5 % (a1 +4.5 %).
+- In-sample (the 5 training ICs inside 1–10 TU), no clause; the expectations above are left as written.
+
+**2026-10-26, production submitted** (Rik: "submit the full hindcasts and the five long runs for LinReg1_nt and
+CNN_rmse_nt on gpu_a100, as in the step3n card's production plan"; code `2287bdeb`; budget 150 000 SBU, 11 076
+used): n1 hindcast 28590706 (array 1-10) → `output/D6_LinReg1_nt`, long runs r = 1…5 28590707–11
+(`lrsdeploy`, `-t 00:30:00`) → `TO_LRS/LinReg1_nt`; n2 hindcast 28590712 → `output/D6_CNN_rmse_nt`, long runs
+28590713–17 (`lstm 2 <r>`, `-t 00:30:00`) → the closure dir.
+
+**2026-10-26, n1 and n2 scored** (all jobs completed; 900 files per hindcast, counts and bytes equal; the 10 long
+runs' sha256 equal; logs beside the results; `score_d6.jl --compare`, `longrun_stats.jl`, `train_hindcast.jl
+--full`, scratch `scores3a/*nt*`):
+
+| | CRPS_0.5 vs LinReg1 | calibrated (LinReg1 28) | G: single-run D (LinReg7 ≤ 0.91) | verdict vs LinReg1 |
+|---|---|---|---|---|
+| n1 LinReg1_nt | +7.0 % [+2.3, +11.9] | 15 (−13 [−19, −3]) | 0.54–0.88: pass | does not improve |
+| n2 CNN_rmse_nt | +20.7 % [+12.7, +29.0] | 9 (−19 [−25, −8]) | 1.23–1.53: **FAIL** | does not improve |
+
+Verdicts as expected. Against expectations otherwise:
+- **n1:** CRPS_0.5 +7 % (expected "a few to ~15 %, less than LinReg7's +19 %"), as expected; CRPS_all +2.8 % [+0.4,
+  +5.6]; δ₀.₅ +1.2 %, e₀.₅ +2.9 %, not resolved. ⚠️ Not as expected: **narrower**, not wider (spread 0.71–0.78 ×
+  LinReg1's at every lead), so the calibration is reversed from the card: worse up to 0.5 TU (r 0.61–0.74 against
+  0.82–0.95) and much better beyond (r 1.01–1.08 against 1.27–1.40); the count falls because the short-lead cells
+  are lost. Divergences 0 (LinReg1 3); gate firings 0.03 % of steps, 4 members (0.42 %, 35); member steps below
+  the training range 0.9–1.5 % (2.7–3.4 %); bias at 2.5 TU −4.0 % (−5.9 %). **Long runs better than LinReg1 on
+  every measure** (as expected: summed KS between LinReg7's and LinReg1's): D 0.76 (LinReg1 0.84, LinReg7 0.65),
+  bias −5.1 % (−7.3 %, −4.9 %), ratio 1.25 (1.53, 0.99), CRPS_100 **0.380** (0.387, 0.386, the lowest of all
+  closures so far), e_100 0.679 (0.649, 0.691); 5 of 5 stable.
+- **n2 vs a1 (partner):** CRPS_0.5 −4.0 % [−11.9, +3.4], not resolved; δ₀.₅ −6.9 % [−13.3, −0.4] (lower error up to
+  0.5 TU: 0.90–1.01 × a1's); count 9 vs 11 (−2 [−12, +4]); G against the partner (single-run D 1.23–1.53 against
+  a1's 0.73–1.26) passes under the paper's rule, so no on S and C. ⚠️ Not as expected: **narrower** (spread
+  0.78–0.86 × a1's), not wider; worse at longer leads: CRPS_all +20.0 % [+14.6, +26.5], error 1.15–1.20 × a1's at
+  0.5–1 TU, bias at 2.5 TU −10.0 % (−8.3 %); long runs worse (D 1.34, bias −10.8 %, CRPS_100 0.511). Gate firings
+  0.25 % (0.40 %).
+- Reading: the noise training removes the feedback in both, which makes the ensembles narrower (the partner's
+  spread came mostly from it) and the long-lead and long-run statistics better for the linear mean. The CNN's mean
+  keeps its out-of-range drift, which the noise does not touch.

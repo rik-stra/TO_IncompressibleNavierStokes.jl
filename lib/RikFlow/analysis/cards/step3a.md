@@ -198,3 +198,51 @@ long runs r = 1…5: 28505409–13 (`-t 00:30:00`) → the closure dir.
 long runs for a2, a3, a3', b1 and c1 on gpu_a100, as for a1"; code `bd8a67d3`): hindcast (array 1-10) /
 long runs r = 1…5 (`-t 00:30:00`): a2 28583921 / 28583922–26; a3 28583927 / 28583928–32; a3' 28583933 /
 28583934–38; b1 28583939 / 28583940–44; c1 28583945 / 28583946–50.
+
+**2026-10-26, a2, a3, a3', b1, c1 scored** (Rik: "do both" — the stale smoke dirs on Snellius deleted, the runs
+copied and scored; all 30 jobs completed; 900 files per hindcast and 25 long runs on the laptop, counts, bytes
+and the long runs' sha256 equal; logs beside the results; scores in scratch `scores3a/`):
+
+| | CRPS_0.5 vs LinReg1 (90 % CI) | calibrated (LinReg1 28) | G: single-run D (LinReg7 ≤ 0.91) | verdict vs LinReg1 |
+|---|---|---|---|---|
+| a1 | +25.7 % [+18.5, +34.2] | 11 | 0.73–1.26: pass | does not improve |
+| a2 | +28.3 % [+19.8, +37.6] | 12 | 1.12–1.77: **FAIL** | does not improve |
+| a3 | +22.3 % [+14.2, +31.3] | 17 | 1.37–1.54: **FAIL** | does not improve |
+| a3' | +29.7 % [+21.0, +39.3] | 11 | 1.20–1.54: **FAIL** | does not improve |
+| b1 | +25.1 % [+17.9, +33.6] | 12 | 0.76–1.11: pass | does not improve |
+| c1 | +26.9 % [+19.6, +35.5] | 10 | 0.82–1.31: pass | does not improve |
+
+All as expected in the verdict; ⚠️ not in size ("a few %" was written for a1; every network closure is 22–30 %
+behind LinReg1, and none diverges: 0 members each, LinReg1 3).
+
+Against the matched partner (same rules, G as above):
+- **a2 vs a1** (the loss): CRPS_0.5 +2.0 % [−2.4, +6.4], not resolved; count 12 vs 11. ⚠️ Not as expected at long
+  leads ("alike" was written): CRPS_all +11.5 % [+7.7, +14.9]; bias at 2.5 TU −11.1 % (a1 −8.3 %); member steps
+  below the training range 7.4–8.2 % (a1 4.1–4.4 %); gate firings 0.74 % of steps, 124 members (a1 0.40 %, 55);
+  long runs D 1.35 (a1 0.98), bias −11.7 % (−8.8 %), CRPS_100 0.504 (0.448). The CRPS network drifts lower.
+- **a3 vs a2** (the learned head, no correlation): CRPS_0.5 **−4.7 % [−8.2, −1.3]**, S passes, but G fails → no;
+  count 17 vs 12 (+5 [−2, +11]). ⚠️ Not as expected: WIDER ensembles, not narrower (r ≤ 0.5 TU 0.71–1.07 against
+  0.66–0.84; 0.5–3 TU 1.42–1.58 against 1.25–1.39); gate firings 0.94 %, 161 members; long runs D 1.45, ratio
+  1.56. The uncorrelated draws (Z and E of a band are 0.89–0.94 correlated in the residual) spread the coupled
+  ensemble more than the correlated MVG does, at 3–8 % smaller marginal sds.
+- **a3' vs a2** (learned sds, refitted correlation): CRPS_0.5 +1.1 % [+0.9, +1.4], count 11 vs 12: the 3–8 % narrower
+  draw, as expected; a3' and a3 differ in the correlation only, so the correlation is what widens a3.
+- **b1 vs a1** (AR(2)): CRPS_0.5 **−0.5 % [−0.9, −0.1]**, S passes and G passes → **improves on a1** by the rule, by
+  0.5 %, as expected "no difference to speak of" (φ ≤ 0.16); count 12 vs 11; gate 0.31 % (a1 0.40 %); long runs D
+  0.97, CRPS_100 0.441 (0.448).
+- **c1 vs a1** (power-law scale): CRPS_0.5 +0.9 % [+0.0, +1.9]; count 10 vs 11; fewer gate firings (0.33 %, 50
+  members) and fewer steps below the range (3.6–4.0 %), as expected; long runs worse (D 1.13, bias −9.8 %).
+
+Reported, all six: divergences 0; gate firings a1 0.40, a2 0.74, a3 0.94, a3' 0.68, b1 0.31, c1 0.33 % of steps;
+long-run bias −8.3 to −11.7 % (LinReg1 −7.3, LinReg7 −4.9); long-run CRPS_100 0.441–0.507 (LinReg1 0.387); every
+long run stable (5 of 5).
+
+2026-10-26, Rik: the partner comparisons keep the rule of the paper (Sec. `sec:criterion`): against a matched
+partner, the partner replaces both baselines, so G is judged against the partner's single-run D, not LinReg7's.
+By that rule **a3 improves on a2** (CRPS_0.5 −4.7 % [−8.2, −1.3]; D 1.37–1.54 against a2's 1.12–1.77), which
+replaces the "G fails → no" above. The other partner verdicts do not change (b1 improves on a1; c1, a2, a3' do not).
+
+2026-10-26, correction (found by the step-3a write-up, `results_LSTMS.md` §35): the residual's Z–E correlation per
+band is **0.93, 0.82 and 0.86** (Z/E[0,6], [7,15], [16,32], the deployed closure files), not "0.89–0.94" as in the
+expectation for a3 above and in the a3 entry of 2026-10-26. The reading does not change: uncorrelated draws for
+strongly correlated QoIs widen the coupled ensemble.
