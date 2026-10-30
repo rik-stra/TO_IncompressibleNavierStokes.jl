@@ -2333,7 +2333,7 @@ per band, training || 10–100 TU; LRV = 1 + 2 Σ_{k≤200} ρ_k:
 LRV per band (training): paper 3 at 0.03 gives 0.5/0.9 | 2.8/3.5 | **11.2**/2.7 — by ρ1 the middle
 band is the most coloured, by LRV Z[16,32]. Residual sd, LinReg7 / LinReg1 (training): 1.85 / 1.16 /
 7.93 / 11.49 / 1.99 / 2.84. **h = 7 vs h = 5**, one-step RMSE / sd(dQ) on 8.2–10 TU (fits on
-1–8.2 TU): within 1 % in every QoI (E[0,6] 0.5818 vs 0.5819, Z[7,15] 0.1015 vs 0.1005 the largest change).
+1–8.2 TU): within 1 % in every QoI (E[0,6] 0.5818 vs 0.5819, Z[7,15] 0.1015 vs 0.1005 the largest change). **On Sec. 5's split** (2026-10-30, Rik: fits on 1-10 TU, error on 10-100 TU; `colour_tables.jl` prints it): h = 7 / h = 5 one-step RMSE 1.0047 1.0054 0.9994 0.9974 1.0037 1.0026 (within 0.6 %, worse in four QoIs); in-sample on 1-10 TU 0.987-0.995 (nested fits: can only fall).
 
 **Recheck of the Sec. 4 hindcast claims on the 87 paired ICs** (2026-10-06, score_d6.jl functions,
 `rank_histogram_by_lead` with `Xoshiro(SEED)`): median spread–skill ratio LinReg1 0.98, LinReg7
@@ -3549,3 +3549,54 @@ against `D6_CNN_rmse_mvg` for its own CRPS_3); `train_hindcast.jl --full LinReg1
 `longrun_stats.jl LinReg1 LinReg7 LinReg1_nt ../TO_LSTM/step3/closures/CNN_rmse_mvg ../TO_LSTM/step3/closures/CNN_rmse_nt`;
 `gate_census.jl LinReg1_nt ../TO_LSTM/step3/closures/CNN_rmse_nt`. Logs: scratch `scores3a/*nt*` of the 2026-10-26
 session.
+
+## 38. The regularized baseline trained with its noise, and every own-draw measure held out (2026-10-30, laptop; Rik asked)
+
+For the paper's Sec. 5.3 table (Rik: both baselines, fitted on the recorded and on the noisy history; columns the error
+on the recorded history and the residual met online / drawn noise; every column on 10-100 TU).
+
+- **LinReg7_nt** (`exp_square_HIT/output/TO_LRS/LinReg7_nt`, offline only, not deployed): `lrs_noise_variant.jl`
+  extended to a ridge source, c' = (X'X + λ P + N S_dx(Σ)) \ X'Y, P = I with the bias unpenalised, λ from the source's
+  `parameters.lambda` (1 for LinReg7). Checks: at λ = 0 `--report` reproduces LinReg1_nt exactly (c, Σ rel. 0);
+  with no noise the ridge solve reproduces LinReg7's c to 6.3e-15 on rows 405-3999. Σ self-consistent in 15
+  iterations; sd(η) / LinReg7's 1.06-1.11; max |c - c_LinReg7| / max |c_LinReg7| = 0.074. Log: `LinReg7_nt/build.log`
+  (`--project=.`: the `training` env fails on the laptop, its Manifest lacks cuDNN).
+- **Held-out residual met online**: `net_noise_residual.jl` prints the deployed residual sd / drawn sd on 10-100 TU
+  too. Six means (log `TO_LSTM/step3/net_noise_residual_6.log`, NETNOISE_NOFIG=1); LinReg1, LinReg1_nt and the CNNs
+  reprint the 2026-10-26 numbers.
+
+10-100 TU, per QoI Z,E[0,6] Z,E[7,15] Z,E[16,32]:
+
+| | clean error / LinReg1's | residual met online / drawn sd | gain (response / draw) |
+|---|---|---|---|
+| LinReg1 | 1 | 1.37 1.41 2.66 2.60 1.43 1.63 | .89 .92 2.45 2.38 1.01 1.28 |
+| LinReg1_nt | 1.10 1.08 1.96 2.12 1.06 1.20 | 1.04 1.06 1.02 1.02 1.02 1.00 | .46 .39 .66 .76 .35 .46 |
+| LinReg7 | 1.85 1.14 7.74 11.84 1.98 2.77 | 1.16 1.10 1.16 1.20 1.15 1.09 | .49 .33 .58 .57 .50 .44 |
+| LinReg7_nt | 1.88 1.19 7.56 11.83 2.01 2.78 | 1.04 1.04 1.00 1.06 1.03 1.00 | .40 .26 .43 .44 .36 .34 |
+| CNN (3 seeds) | 1.02 1.00 1.11 1.25 1.23 1.15 | 1.29 1.30 2.69 2.43 1.45 1.63 | .73 .73 2.45 2.11 .80 1.17 |
+| CNN_nt (3 seeds) | 1.16 1.10 2.23 2.71 1.48 1.46 | 1.09 1.09 1.07 1.11 1.29 1.12 | .45 .39 .65 .75 .33 .47 |
+
+- Ridge at λ = 1 already meets 1.1-1.2× what it draws (its draws are large); noise training brings it to 1.00-1.06
+  at no cost in clean error (within 4 %), where LinReg1 pays ~2× in the middle band.
+- Held out, the noise-trained CNN meets up to 1.29× its draws (Z[16,32]); the linear ones within 6 %.
+
+**38b. One unit for the table (2026-10-30, laptop; Rik: "replace the second column by the error on noisy inputs
+divided by the error of linreg1 without noise", then the fitted noise in the same unit).** `net_noise_residual.jl`
+prints sd(η) / LinReg1's clean rms on 10-100 TU too (`sd(eta) / LinReg1 rms (10-100 TU)`); rerun of the six means
+into the same log, every other number reprinted. Paper Sec. 5.3 table and step 3c's: error on the recorded history |
+error on noisy inputs | fitted noise, all / LinReg1's clean rms on 10-100 TU. Noisy error / fitted noise reproduces
+the column above (e.g. LinReg1 Z[7,15] 2.59 / 0.97 = 2.66).
+
+| | error on noisy inputs / LinReg1 clean | fitted noise / LinReg1 clean |
+|---|---|---|
+| LinReg1 | 1.31 1.32 2.59 2.51 1.39 1.58 | 0.96 0.94 0.97 0.96 0.97 0.97 |
+| LinReg1_nt | 1.22 1.16 2.56 3.15 1.13 1.35 | 1.18 1.10 2.51 3.10 1.12 1.34 |
+| LinReg7 | 2.05 1.20 8.95 13.34 2.21 3.02 | 1.77 1.09 7.72 11.09 1.93 2.76 |
+| LinReg7_nt | 2.04 1.23 8.38 12.97 2.14 2.95 | 1.96 1.18 8.36 12.26 2.08 2.94 |
+| CNN (3 seeds) | 1.24 1.22 2.71 2.54 1.47 1.65 | 0.96 0.94 1.00 1.04 1.01 1.02 |
+| CNN_nt (3 seeds) | 1.28 1.18 2.79 3.69 1.53 1.61 | 1.17 1.09 2.60 3.32 1.19 1.44 |
+
+- The noise-trained means do not lower the error on noisy inputs (LinReg1_nt E[7,15] 3.15 against LinReg1's 2.51):
+  each row's inputs carry its own, larger, fitted noise. What training buys is that the noise model fits.
+- Paper tables rounded to one decimal (Rik, 2026-10-30) from the log's unrounded `table:` lines (three decimals,
+  same rerun); rounding script in the session scratchpad (round half up).

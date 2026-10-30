@@ -137,13 +137,23 @@ function report_error(L1)
     rtr, rho = rmsq(b, tr), rmsq(b, ho)
     for m in MODELS
         @printf("error: %-12s (%d seeds) sd(eta) / LinReg1 rms (1-10 TU) %s\n", m.label, length(m.seeds), pr(smean(v -> v.seta ./ rtr, m)))
+        # the same over LinReg1's held-out rms, the unit of the clean and deployed errors on 10-100 TU (paper Sec. 5.3
+        # table, Rik 2026-10-30: error on the recorded history | on noisy inputs | fitted noise, one unit)
+        @printf("error: %-12s sd(eta) / LinReg1 rms (10-100 TU) %s\n", m.label, pr(smean(v -> v.seta ./ rho, m)))
         @printf("error: %-12s 1-10 TU clean %s | deployed %s | gain %s\n", m.label, pr(smean(v -> rmsq(v.R, tr) ./ rtr, m)),
                 pr(smean(v -> rmsq(v.Rn, tr) ./ rtr, m)), pr(smean(v -> rmsq(v.G, tr) ./ v.seta, m)))
         @printf("error: %-12s 10-100 TU clean %s | deployed %s | gain %s\n", m.label, pr(smean(v -> rmsq(v.R, ho) ./ rho, m)),
                 pr(smean(v -> rmsq(v.Rn, ho) ./ rho, m)), pr(smean(v -> rmsq(v.G, ho) ./ v.seta, m)))
+        # the paper tables' three blocks unrounded, rounded there (Rik 2026-10-30: one decimal)
+        @printf("table: %-12s 10-100 TU clean %s | deployed %s | sd(eta) %s\n", m.label,
+                pr(smean(v -> rmsq(v.R, ho) ./ rho, m); f = "%.3f"), pr(smean(v -> rmsq(v.Rn, ho) ./ rho, m); f = "%.3f"),
+                pr(smean(v -> v.seta ./ rho, m); f = "%.3f"))
         # self-consistency: the deployed residual's sd on 1-10 TU over the sd the closure draws
         @printf("error: %-12s deployed residual sd (1-10 TU, about zero) / drawn sd %s\n", m.label,
                 pr(smean(v -> sqrt.(vec(mean(abs2, v.Rn[tr, :]; dims = 1))) ./ v.seta, m); f = "%.3f"))
+        # the same held out (paper Sec. 5.3 table, Rik 2026-10-30: every column on 10-100 TU)
+        @printf("error: %-12s deployed residual sd (10-100 TU, about zero) / drawn sd %s\n", m.label,
+                pr(smean(v -> sqrt.(vec(mean(abs2, v.Rn[ho, :]; dims = 1))) ./ v.seta, m); f = "%.3f"))
         length(m.seeds) > 1 && @printf("error: %-12s per seed, 10-100 TU clean: %s\n", m.label,
                                        join((pr(rmsq(m.seeds[s].R, ho) ./ rho) for s in sort(collect(keys(m.seeds)))), " / "))
     end

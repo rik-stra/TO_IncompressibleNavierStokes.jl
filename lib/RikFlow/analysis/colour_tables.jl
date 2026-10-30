@@ -157,6 +157,18 @@ for h in (5, 7)
             join((@sprintf("%s %.4f", LAB[i], sqrt(mean(abs2, E[:, i])) / sdq[i]) for i in 1:NQ), "  "),
             n + 1, size(X, 1), size(X, 1))
 end
+# the same on the section's split (Rik, 2026-10-30: Sec. 5 fits on 1-10 TU and measures on 10-100 TU): the
+# deployed-style fits, error on the training rows (in-sample) and on 10-100 TU, and h = 7 over h = 5
+println("\nOne-step error, fits on 1-10 TU, RMSE / sd(dQ): training (1-10 TU) || 10-100 TU")
+let E = Dict(h => residuals(fits[h == 5 ? "h = 5, λ = 0 (LinReg1)" : "h = 7, λ = 0"], h) for h in (5, 7))
+    rmse(R) = [sqrt(mean(abs2, R[:, i])) / sdq[i] for i in 1:NQ]
+    for h in (5, 7)
+        @printf("  h = %d: %s  ||  %s\n", h, fmtp(rmse(E[h][1])), fmtp(rmse(E[h][2])))
+    end
+    f4(v) = join((@sprintf("%s %.4f", LAB[i], v[i]) for i in 1:NQ), "  ")
+    @printf("  h = 7 / h = 5, training: %s\n  h = 7 / h = 5, 10-100 TU: %s\n", f4(rmse(E[7][1]) ./ rmse(E[5][1])),
+            f4(rmse(E[7][2]) ./ rmse(E[5][2])))
+end
 
 # Paper Fig. colour-sweep (2026-10-12, Rik: "can table 5 be replaced by plots of the auto-correlation
 # function?"): the residual ACF of every row, lags 0-KMAX, on the training rows and on 10-100 TU, for

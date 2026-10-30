@@ -22,6 +22,11 @@
 # `fit(MvNormal, ...)`. Only `c` and `stoch_distr` change; every other key of the source's LinReg.jld2 is
 # copied and `noise_*` keys are added, with a copy of `parameters.jld2`.
 # Fit rows: the source's own, found by reproducing its `c` with no noise (asserted). 🔒 Nothing past 10 TU.
+#
+# A RIDGE source (Rik, 2026-10-30: the regularized baseline trained with its noise, paper Sec. 5.3 table) keeps
+# its own penalty next to the noise's: c' = (X'X + λ P + N S_dx(Σ)) \ X'Y, P = I with the bias unpenalised, λ the
+# source's `parameters.lambda`, as `5_train_LinReg.jl` (colour_tables.jl `ridge`). Its fit rows are found by
+# reproducing its `c` with that ridge and no noise; at λ = 0 every step is the least-squares one above.
 
 include(normpath(joinpath(@__DIR__, "..", "..", "analysis", "m0c_ridge.jl")))   # design, guard, steps_of, LRS, NQ, ...
 using Dates
@@ -60,10 +65,20 @@ end
 "S_dx = E[dx dx'] for corrections of covariance Σ (scaled output units)."
 window_cov(M, Sig, osg, h) = M * kron(Matrix(1.0I, h, h), Diagonal(osg) * Sig * Diagonal(osg)) * M'
 
-"The fixed point (c', μ_η, Σ) of the noise-trained least squares, from Σ0 (see the header)."
-function fit_noise(d, M, Sig0, h; tol = 1e-12, maxit = 1000)
+"The ridge penalty λ P of the source, P = I with the bias (last column) unpenalised."
+ridge_pen(lam, nc) = lam .* Diagonal([ones(nc - 1); 0.0])
+
+"The source's fit with no noise: least squares at λ = 0, else the augmented ridge solve of `5_train_LinReg.jl`."
+function ridge_ls(d, lam)
+    lam == 0 && return d.Xs \ d.Ys
+    nc = size(d.Xs, 2)
+    return [d.Xs; Matrix(ridge_pen(sqrt(lam), nc))] \ [d.Ys; zeros(nc, size(d.Ys, 2))]
+end
+
+"The fixed point (c', μ_η, Σ) of the noise-trained least squares (ridge λ kept), from Σ0 (see the header)."
+function fit_noise(d, M, Sig0, h; lam = 0.0, tol = 1e-12, maxit = 1000)
     N = size(d.Xs, 1)
-    XtX, XtY = d.Xs' * d.Xs, d.Xs' * d.Ys
+    XtX, XtY = d.Xs' * d.Xs .+ ridge_pen(lam, size(d.Xs, 2)), d.Xs' * d.Ys
     Sig, steps = Matrix{Float64}(Sig0), Float64[]
     for it in 1:maxit
         Sdx = window_cov(M, Sig, d.osg, h)
@@ -107,13 +122,18 @@ function build_noise(src; io = stdout, report_only = false)
     isnothing(get(m, "ar_phi", nothing)) && isnothing(get(m, "scale_beta", nothing)) ||
         error("$src carries an AR or a scale; the noise-trained fit is for white LinRegs")
     h = m["hist_len"]
-    # the source's own fit rows: the window whose least squares IS its c
+    p = load(joinpath(LRS, src, "parameters.jld2"))["parameters"]
+    lam = hasproperty(p, :lambda) ? p.lambda : 0.0
+    lam isa Real || error("$src: λ is not one number; the noise-trained fit takes a single ridge λ")
+    lam = float(lam)
+    @printf(io, "  %s: ridge λ = %g (bias unpenalised)\n", src, lam)
+    # the source's own fit rows: the window whose (ridge) least squares IS its c
     c0 = Matrix(m["c"])
     found = nothing
     for r in (405:3999, steps_of(1, 10), 400:3999, 405:4000)
         d = scaled_design(m, r)
-        e = maximum(abs, (d.Xs \ d.Ys)' .- c0) / maximum(abs, c0)
-        @printf(io, "  rows %d-%d: least squares vs %s's c, max rel. diff %.1e\n", first(r), last(r), src, e)
+        e = maximum(abs, ridge_ls(d, lam)' .- c0) / maximum(abs, c0)
+        @printf(io, "  rows %d-%d: ridge λ = %g vs %s's c, max rel. diff %.1e\n", first(r), last(r), lam, src, e)
         e < 1e-8 && (found = (r, d); break)
     end
     found === nothing && error("no candidate window reproduces $(src)'s c; its fit rows are unknown")
@@ -128,7 +148,7 @@ function build_noise(src; io = stdout, report_only = false)
             maximum(abs, mean(sd0) .- vec(mean(r0; dims = 1))),
             maximum(abs, Matrix(cov(sd0)) .- cov(r0; corrected = false)) / maximum(diag(Matrix(cov(sd0)))))
     M = window_map(h, d.isg)
-    f = fit_noise(d, M, Matrix(cov(sd0)), h)
+    f = fit_noise(d, M, Matrix(cov(sd0)), h; lam)
     println(io, "\n==== $dst: $src trained with its own window noise, rows $(first(fitr))-$(last(fitr)) (1-10 TU)")
     @printf(io, "  self-consistent Σ in %d iterations (changes %s)\n", f.iterations,
             join((@sprintf("%.1e", s) for s in f.steps[unique([1, 2, 3, 5, 10, length(f.steps)] ∩ eachindex(f.steps))]), ", "))
@@ -138,6 +158,7 @@ function build_noise(src; io = stdout, report_only = false)
     ref = vec(sqrt.(mean(abs2, r0; dims = 1))) .* d.osg
     noise_report(src, c0, Matrix(cov(sd0)), d, M, h; ref, io)
     for o in ("LinReg7",)
+        o == src && continue
         isfile(joinpath(LRS, o, "LinReg.jld2")) || continue
         mo = load(joinpath(LRS, o, "LinReg.jld2"))
         mo["hist_len"] == h || continue
@@ -160,8 +181,8 @@ function build_noise(src; io = stdout, report_only = false)
     b["stoch_distr"] = RF.Distributions.MvNormal(f.mu, f.Sig)
     b["noise_sigma_dx"] = f.Sdx
     b["noise_fit_rows"] = (first(fitr), last(fitr))
-    b["noise_provenance"] = (; source = src,
-        form = "c' = (X'X + N S_dx(Sigma)) \\ X'Y, S_dx = M (I_h kron D Sigma D) M'; Sigma = cov(y - c x) + c S_dx c' (fixed point)",
+    b["noise_provenance"] = (; source = src, lambda = lam,
+        form = "c' = (X'X + lambda P + N S_dx(Sigma)) \\ X'Y, P = I (bias unpenalised), S_dx = M (I_h kron D Sigma D) M'; Sigma = cov(y - c x) + c S_dx c' (fixed point)",
         noise = "the closure's window noise, anchored at the prediction step (tools/step3_innoise.jl)",
         iterations = f.iterations, units = "scaled (in/out_scaling of the source)",
         record = "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2",
