@@ -33,17 +33,20 @@
         return s
     end
 
-    "Random weights in the Lux parameter layout `cnn_weights` reads."
-    function weights(sp = spec(); seed = 1)
+    "Random weights in the Lux parameter layout `cnn_weights` reads (`zero_out`: the output layer at zero, as
+    `cnn_mean_fit.jl` starts a skip fit; `Ws`: the skip, step 4)."
+    function weights(sp = spec(); seed = 1, Ws = nothing, T = Float32, zero_out = false)
         rng = Xoshiro(seed)
+        o = (; weight = randn(rng, NQ, D) ./ 3, bias = randn(rng, NQ) ./ 3)
+        zero_out && (o = (; weight = zero(o.weight), bias = zero(o.bias)))
         net = (; layer_1 = (; layer_1 = (; layer_1 = (; weight = randn(rng, K, 3NQ, C) ./ 3, bias = randn(rng, C) ./ 3),
                                            layer_2 = (; weight = randn(rng, K, C, C) ./ 3, bias = randn(rng, C) ./ 3),
                                            layer_3 = (;)), layer_2 = (;)),
                layer_2 = (; weight = randn(rng, D, n_cell_input(sp)) ./ 3, bias = randn(rng, D) ./ 3),
                layer_3 = (; weight = randn(rng, D, D) ./ 3, bias = randn(rng, D) ./ 3),
-               layer_4 = (; weight = randn(rng, NQ, D) ./ 3, bias = randn(rng, NQ) ./ 3))
+               layer_4 = o)
         return cnn_weights(net, sp; seq_index = seq_index(), q_index = 1:NQ, bd = fill(-1.0, NQ),
-                           LR = Matrix(cholesky([1 0.5 0.2; 0.5 1 0.3; 0.2 0.3 1.0]).L))
+                           LR = Matrix(cholesky([1 0.5 0.2; 0.5 1 0.3; 0.2 0.3 1.0]).L), Ws, T)
     end
 
     function scaling(; extra...)
@@ -179,4 +182,85 @@ end
     z1 = copy(m.ar.z)
     CnnFix.get_next_item_timeseries(m, fill(3.0, 3))
     @test m.ar.z != z1
+end
+
+# Step 4 (2026-11-06): the CNN on a frozen LinReg, `y = g(z) + Ws z` (paper Eq. skip net).
+
+@testitem "V95 arch = :cnn takes a skip; the weights must carry Ws exactly when the spec asks" default_imports = false setup = [CnnFix] begin
+    using Test
+    using .CnnFix
+    using .CnnFix: NQ, NIN, check_shapes
+    sp = CnnFix.spec(skip = true)
+    @test sp.skip
+    @test_throws ErrorException CnnFix.weights(sp)                              # skip without Ws
+    @test_throws ErrorException CnnFix.weights(; Ws = zeros(NQ, NIN))          # Ws without skip
+    @test_throws ErrorException CnnFix.weights(sp; Ws = zeros(NQ, NIN - 1))    # N_Q x n_in, n_in the mapped width
+    @test check_shapes(CnnFix.weights(sp; Ws = randn(NQ, NIN)), sp)
+    @test_throws ErrorException CnnFix.spec(skip = true, n_latent = 1)
+end
+
+@testitem "V95 the deployed CNN with a skip is the network plus Ws times the mapped input, step by step" default_imports = false setup = [CnnFix] begin
+    using Test
+    using Random
+    using .CnnFix
+    using .CnnFix: NQ, NIN, StochLSTM, LSTMState, cnn_window!, get_next_item_timeseries
+    Ws = randn(Xoshiro(3), NQ, NIN) ./ 5
+    sp, sp0 = CnnFix.spec(skip = true), CnnFix.spec()
+    for T in (Float32, Float64)
+        w, w0 = CnnFix.weights(sp; Ws, T), CnnFix.weights(sp0; T)
+        q_star, warm = CnnFix.stream()
+        m = StochLSTM(sp, w, CnnFix.scaling(); spinnup_data = warm, rng = Xoshiro(5), gate = 0.0, stochastic = false)
+        @test eltype(m.state.y) == T
+        for k in 1:16
+            get_next_item_timeseries(m, q_star[:, k])
+            k <= 6 && continue
+            st = LSTMState(sp0, T)
+            cnn_window!(st, w0, sp0, m.xwin[:, 1:1])                          # the network alone, same input
+            @test m.state.y ≈ st.y .+ T.(Ws) * m.xwin[:, 1] rtol = (T === Float32 ? 1e-5 : 1e-12)
+        end
+    end
+end
+
+@testitem "V95 linreg_skip_map: with the network at zero, the Float64 closure IS the frozen LinReg" default_imports = false setup = [CnnFix] begin
+    using Test
+    using Random
+    using LinearAlgebra
+    using .CnnFix
+    using .CnnFix: NQ, H, NREG, NIN, HIST, StochLSTM, get_next_item_timeseries, linreg_skip_map
+    rng = Xoshiro(11)
+    # the network's scalings: an input map whose regressor block is NOT the identity (as FEAT = dqinc's),
+    # a nonzero target mean; the LinReg's own in- and out-scalings differ from them and from each other
+    P0 = Matrix{Float64}(I, NREG, NREG) .+ 0.1 .* randn(rng, NREG, NREG)
+    P = vcat(P0, randn(rng, H * NQ, NREG) ./ 4)
+    mo = reshape([0.01, -0.02, 0.005], NQ, 1)
+    sc = merge(CnnFix.scaling(), (; input_map = P, out_scaling = (; mu = mo, sigma = reshape([0.3, 0.2, 0.1], NQ, 1))))
+    lin = (; in_scaling = (; mu = reshape([0.2, 0.25, 0.35], NQ, 1), sigma = reshape([1.5, 1.8, 2.2], NQ, 1)),
+           out_scaling = (; mu = reshape([0.15, 0.3, 0.2], NQ, 1), sigma = reshape([1.4, 1.9, 2.0], NQ, 1)))
+    c = hcat(Matrix{Float64}(I, NQ, NQ), zeros(NQ, NREG - NQ)) .+ 0.05 .* randn(rng, NQ, NREG)
+    Ws = linreg_skip_map(c, lin, sc, HIST)
+    @test size(Ws) == (NQ, NIN)
+    @test all(iszero, Ws[:, (NREG + 1):end])                                   # the extra rows are not read
+    sp = CnnFix.spec(skip = true)
+    m = StochLSTM(sp, CnnFix.weights(sp; Ws, T = Float64, zero_out = true), sc; spinnup_data = CnnFix.stream()[2],
+                  rng = Xoshiro(5), gate = 0.0, stochastic = false)
+    q_star, warm = CnnFix.stream()
+    # the LinReg by hand: x_L = [q*^n; q^{n-1}; q*^{n-1}; ...; q^{n-h}; q*^{n-h}; 1] in its own in-scaling, the level
+    # (c x_L) in its out-scaling; the closure adds the network target's mean mo to the correction
+    s(v) = (v .- vec(lin.in_scaling.mu)) ./ vec(lin.in_scaling.sigma)
+    q = similar(q_star)
+    errs = Float64[]
+    for k in 1:16
+        dQ = get_next_item_timeseries(m, q_star[:, k])
+        if k <= 6
+            q[:, k] = q_star[:, k] .+ warm[:, k]
+            continue
+        end
+        x = vcat(s(q_star[:, k]), reduce(vcat, [vcat(s(q[:, k - j]), s(q_star[:, k - j])) for j in 1:H]), 1.0)
+        lev = (c * x) .* vec(lin.out_scaling.sigma) .+ vec(lin.out_scaling.mu)
+        ref = lev .- q_star[:, k] .+ vec(mo)
+        push!(errs, maximum(abs, dQ .- ref) / maximum(abs, ref))
+        q[:, k] = q_star[:, k] .+ ref
+    end
+    @test length(errs) == 10 && maximum(errs) < 1e-12
+    @test_throws ErrorException linreg_skip_map(c[:, 1:(end - 1)], lin, sc, HIST)  # a LinReg of another width
 end

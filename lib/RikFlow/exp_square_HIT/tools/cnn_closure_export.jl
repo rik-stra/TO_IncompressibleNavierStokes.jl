@@ -4,7 +4,15 @@
 # `d6_lib.jl` resolves for D6_MODEL = step3/closures/<name>, and checks it.
 #
 #     julia --startup-file=no --project=training exp_square_HIT/tools/cnn_closure_export.jl \
-#           <run> <noise> <name>
+#           <run> <noise> <name> [skip=<LinReg>]
+#
+# `skip=<LinReg>` (step 4, 2026-11-06; paper Eq. skip net): the run was trained on a FROZEN LinReg under
+# output/TO_LRS (`cnn_mean_fit.jl` with RIKFLOW_MLP_SKIP=<LinReg>; the fit files do not record which, so it is
+# given here, and the translation check fails on a wrong one). The closure deploys that LinReg's mean model as
+# the linear skip `Ws` (`RF.linreg_skip_map`, checked against the LinReg's own predictions on the record) plus
+# the network, and is exported in FLOAT64: the least-squares skip's coefficients reach ~1e4 target sd, and
+# StochLSTM's Float32 lag window alone would put it ~5e-3 sd off (scratch probe, 2026-11-06). Its unit below,
+# the target sd, is then the sd of what the LinReg misses.
 #
 # `<run>`: a refitted CNN under output/TO_LSTM, one seed (`cnn_mean_fit.jl` with RIKFLOW_CNN_REFIT=1, e.g.
 # step3/grid_cap_rmse_wd0.3_s1); its `fits.jld2` gives the network trained again on 1-10 TU and its
@@ -19,7 +27,12 @@
 #            1-10 TU range of q*), Σ_ε = Z_f'Z_f / N with Z_f = Z ./ f(q*)                   (c1)
 #   mvgnt    a NOISE-TRAINED run (cnn_mean_fit.jl, RIKFLOW_CNN_INNOISE = fixed, 2026-10-26): the MVG it
 #            deploys, `S_deploy` in its pred.jld2 -- its residual on 1-10 TU under its own injected window
-#            noise, about zero -- not the clean residual's. The other modes refuse a noise-trained run.
+#            noise, about zero -- not the clean residual's. INNOISE = head (2026-11-03): `S_deploy` is the
+#            refitted head's Σ, the noise it trained with -- for the CRPS diagonal: the head as trained (k1b, k2b).
+#   headcorrnt  a noise-trained CRPS run in head mode (2026-11-06, step 4): the learned sds (the refitted
+#            head) with the correlation of `S_noisy`, its 1-10 TU residual under its own (diagonal) window
+#            noise, about zero (k1a, k2a; the noise-trained analogue of headcorr).
+# mvgnt and headcorrnt are for noise-trained runs only; the other modes refuse them.
 # The noise model is stored in the scaling (`ar_phi`, `scale_*`) and the head (`bd`, `LR`), which
 # `StochLSTM` applies with the code `LinReg` uses (`ts_noise.jl`, `ts_scale.jl`).
 #
@@ -30,9 +43,13 @@
 include(joinpath(@__DIR__, "lrs_scale_variant.jl"))   # fit_ar, fit_scale (and RF, REF, NQ, DT); main guarded
 using Random
 
-length(ARGS) == 3 || error("usage: cnn_closure_export.jl <run> <noise> <name>")
+length(ARGS) in (3, 4) || error("usage: cnn_closure_export.jl <run> <noise> <name> [skip=<LinReg>]")
 const XRUN, XNOISE, XNAME = ARGS[1], ARGS[2], ARGS[3]
-XNOISE in ("mvg", "head", "headcorr", "ar2n", "pl", "mvgnt") || error("noise must be mvg, head, headcorr, ar2n, pl or mvgnt; got $XNOISE")
+const XSKIP = length(ARGS) == 4 ? (startswith(ARGS[4], "skip=") ? ARGS[4][6:end] :
+                                   error("the 4th argument is skip=<LinReg>; got $(ARGS[4])")) : ""
+const XNT_MODES = ("mvgnt", "headcorrnt")
+XNOISE in ("mvg", "head", "headcorr", "ar2n", "pl", XNT_MODES...) ||
+    error("noise must be mvg, head, headcorr, ar2n, pl, mvgnt or headcorrnt; got $XNOISE")
 const XTO = normpath(joinpath(@__DIR__, "..", "output", "TO_LSTM"))
 const XNWARM = 100                                   # D6's warm-up (d6_lib.jl)
 
@@ -41,10 +58,14 @@ P = load(joinpath(XTO, XRUN, "pred.jld2"))
 key, r = only(F["res"])
 C, lr, wd, seed = key
 haskey(r, :refit) || error("$XRUN has no refit (run cnn_mean_fit.jl with RIKFLOW_CNN_REFIT=1)")
-const XNT = get(P, "innoise", :none) !== :none        # a noise-trained run
-XNT == (XNOISE == "mvgnt") || error(XNT ? "$XRUN is noise-trained: export it with noise mvgnt (its S_deploy)" :
-                                          "noise mvgnt is for a noise-trained run; $XRUN is not")
-(P["input"], P["seq"], P["act"], P["head"]) == (:full, :lags, :tanh, :identity) ||
+const XINN = get(P, "innoise", :none)
+const XNT = XINN !== :none                           # a noise-trained run
+XNT == (XNOISE in XNT_MODES) || error(XNT ? "$XRUN is noise-trained: export it with noise $(join(XNT_MODES, " or "))" :
+                                            "noise $XNOISE is for a noise-trained run; $XRUN is not")
+XNOISE == "headcorrnt" && !(XINN === :head && P["loss"] === :crps) &&
+    error("headcorrnt is for a CRPS run in head mode (INNOISE = head); $XRUN has $(XINN), loss $(P["loss"])")
+# the head's START (HEAD = identity | inj) does not enter the deployed closure
+(P["input"], P["seq"], P["act"]) == (:full, :lags, :tanh) && P["head"] in (:identity, :inj) ||
     error("the deployed CNN is SEQ = lags, INPUT = full, ACT = tanh; $XRUN has $((P["input"], P["seq"], P["act"]))")
 h, K, D = P["h"], P["K"], P["D"]
 scaling = P["scaling"]
@@ -57,7 +78,7 @@ pred3 = only(values(P["pred3"]))                    # raw dQ of the refitted net
 hist = RF.HistorySpec(; h, n_qoi = NQ, hist_var = :q_star_q, include_predictor = true)
 RF.nfeatures(hist) == nreg || error("regressor width $(RF.nfeatures(hist)), the input map reads $nreg")
 spec = RF.LSTMSpec(; hist, n_hidden = D, n_latent = 0, n_encoder = 0, arch = :cnn, emission = :constant,
-                   window = 1, n_in = nin, n_conv = C, kernel = K)
+                   window = 1, n_in = nin, n_conv = C, kernel = K, skip = !isempty(XSKIP))
 lagq(k) = (NQ + 2(k - 1) * NQ + 1):(NQ + (2k - 1) * NQ)
 seq_index = zeros(Int, h, 3NQ)
 for (t, k) in enumerate(h:-1:1)                      # oldest first
@@ -74,6 +95,41 @@ qs = permutedims(REF["q_star"][:, cols[tr]])
 @printf("%s, %s noise: residual on 1-10 TU (%d steps), mean / rms %s\n", XRUN, XNOISE, size(Z, 1),
         fmt(vec(mean(Z; dims = 1)) ./ sqrt.(vec(mean(abs2, Z; dims = 1)))))
 
+# SKIP: the frozen LinReg as `Ws` on the mapped input, checked on every record step of `cols` against the LinReg's
+# own predicted correction (its regressor built in its own scaling, as step3_data.jl's `skipq`), in Float64
+Ws = nothing
+if !isempty(XSKIP)
+    lc, lsc, lhl = load(joinpath(XTO, "..", "TO_LRS", XSKIP, "LinReg.jld2"), "c", "scaling", "hist_len")
+    lhl == h || error("skip $XSKIP: history $lhl, the network's $h")
+    Ws = RF.linreg_skip_map(lc, lsc, scaling, hist)
+    a0, b0 = 400, size(REF["q_star"], 2)
+    cols[1] - a0 + 1 >= 1 || error("the record columns start before step $a0")
+    function xr(s)                                                    # nreg x steps, and the record columns
+        X, _, st = RF.build_history(hist, RF.scale_input(REF["q_star"][:, a0:b0], s), RF.scale_input(REF["q"][:, a0:(b0 + 1)], s))
+        cs = (a0 - 1) .+ st
+        cs == cs[1]:cs[end] || error("the regressor's steps are not contiguous")
+        return permutedims(Float64.(X)), cs
+    end
+    (XL, csl), (XN, csn) = xr(lsc.in_scaling), xr(scaling.in_scaling)
+    csl == csn || error("the two regressors cover different steps")
+    jc = cols .- csl[1] .+ 1                                          # column of `cols` in XL / XN
+    all(1 .<= jc .<= size(XL, 2)) || error("the record columns fall outside the regressor")
+    mul, sgl = vec(lsc.in_scaling.mu), vec(lsc.in_scaling.sigma)
+    lev = (Float64.(lc) * XL[:, jc]) .* vec(lsc.out_scaling.sigma) .+ vec(lsc.out_scaling.mu)
+    qsn = XL[1:NQ, jc] .* sgl .+ mul
+    maximum(abs, qsn .- REF["q_star"][:, cols]) < 1e-9 * maximum(abs, REF["q_star"]) ||
+        error("skip $XSKIP: the regressor's first rows are not q^{n*} at the record columns")
+    skq = (lev .- qsn) ./ so                                          # the LinReg's correction, target units
+    e = maximum(abs, Ws * (Float64.(scaling.input_map) * XN[:, jc]) .- skq) / maximum(abs, skq)
+    @printf("skip %s: |Ws| max %.3g target sd per input; Ws z against the LinReg's own correction on %d record steps, max rel. diff %.1e\n",
+            XSKIP, maximum(abs, Ws), length(cols), e)
+    e < 1e-9 || error("skip $XSKIP: Ws differs from the LinReg's predictions by $e (relative)")
+    # what is left for the network: the residual of the skip alone on 1-10 TU, against the closure's (Z)
+    @printf("  rms on 1-10 TU, target sd: LinReg alone %s | LinReg + network %s\n",
+            fmt(sqrt.(vec(mean(abs2, (dq[:, tr] ./ so) .- skq[:, tr]; dims = 2)))), fmt(sqrt.(vec(mean(abs2, Z; dims = 1)))))
+end
+const XT = isempty(XSKIP) ? Float32 : Float64       # the closure's precision (see the header)
+
 "bd (log sd) and LR (lower Cholesky factor of the correlation) of a covariance S."
 function headof(S)
     s = sqrt.(diag(S))
@@ -89,10 +145,30 @@ if XNOISE == "mvg"
 elseif XNOISE == "mvgnt"
     Sd = P["S_deploy"][seed]
     bd, LR = headof(Sd)
-    prov = "S_deploy of the noise-trained run: its 1-10 TU residual under its own window noise (Sigma_inj = " *
+    prov = XINN === :head ?
+           "S_deploy of the noise-trained run in head mode: the refitted head's Sigma, the noise it trained with" *
+           (P["loss"] === :crps ? " (CRPS: diagonal)" : "") :
+           "S_deploy of the noise-trained run: its 1-10 TU residual under its own window noise (Sigma_inj = " *
            "the run's input-noise Sigma), about zero"
     @printf("  S_deploy sd / clean residual rms %s | / injected sd %s\n", fmt(sqrt.(diag(Sd) ./ diag(S0)); d = 3),
             fmt(sqrt.(diag(Sd) ./ diag(P["Sigma_inj"][seed])); d = 3))
+    if XINN === :head && P["loss"] === :crps                # the head as trained: its own sds, no correlation
+        e = maximum(abs, exp.(Float64.(vec(r.refit.ps.head.bd))) ./ sqrt.(diag(Sd)) .- 1)
+        e < 1e-5 && maximum(abs, Sd .- Diagonal(diag(Sd))) == 0 ||
+            error("S_deploy is not the refitted CRPS head's diagonal Sigma (sd rel. diff $e)")
+    end
+    haskey(P, "S_noisy") && @printf("  residual under its own noise, sd / deployed sd %s\n",
+                                    fmt(sqrt.(diag(P["S_noisy"][seed]) ./ diag(Sd)); d = 3))
+elseif XNOISE == "headcorrnt"
+    bd = Float64.(vec(r.refit.ps.head.bd))
+    Sn = P["S_noisy"][seed]
+    LR = headof(Sn)[2]
+    prov = "the learned sds (the refitted CRPS head, the noise it trained with) with the correlation of S_noisy, " *
+           "its 1-10 TU residual under that noise, about zero"
+    e = maximum(abs, exp.(bd) ./ sqrt.(diag(P["S_deploy"][seed])) .- 1)
+    e < 1e-5 || error("the refitted head's sds differ from S_deploy's by $e")
+    @printf("  learned sd / sd of the residual under its own noise %s; that residual's correlation, max |off-diagonal| %.3f\n",
+            fmt(exp.(bd) ./ sqrt.(diag(Sn)); d = 3), maximum(abs, LR * LR' - I))
 elseif XNOISE == "head"
     bd = Float64.(vec(r.refit.ps.head.bd))
     LR = Matrix(1.0I, NQ, NQ)
@@ -122,13 +198,14 @@ elseif XNOISE == "pl"
     prov = "fit_scale (lrs_scale_variant.jl): RF.fit_powerlaw_scale per QoI, clipped to the 1-10 TU range; Sigma_eps = Z_f'Z_f/N"
     @printf("  power law: beta %s\n", fmt(f.beta))
 end
-w = RF.cnn_weights(r.refit.ps.net, spec; seq_index, q_index = 1:NQ, bd, LR)
+w = RF.cnn_weights(r.refit.ps.net, spec; seq_index, q_index = 1:NQ, bd, LR, Ws, T = XT)
 sc = merge(scaling, extra)
 dir = joinpath(XTO, "step3", "closures", XNAME)
 isdir(dir) && error("$dir exists; refusing to overwrite")
 file = joinpath(dir, "StochLSTM_seed$(seed).jld2")
 RF.save_stochlstm(file, spec, w, sc; run = XRUN, noise = XNOISE, provenance = prov, seed, C, lr, wd,
-                  loss = P["loss"], train_steps = (400, 4000), made = string(now()))
+                  loss = P["loss"], train_steps = (400, 4000), made = string(now()),
+                  skip = isempty(XSKIP) ? "none" : XSKIP, precision = string(XT), innoise = string(XINN))
 @printf("wrote %s\n", file)
 
 # the translation check
@@ -148,10 +225,13 @@ for (j, i) in enumerate(picks)
     dQ = RF.get_next_item_timeseries(m, REF["q_star"][:, n])
     err[:, j] = (dQ .- pred3[:, i]) ./ so
 end
-@printf("translation check, %d steps (%d in 1-10 TU): max |deployed - Lux| / sd(dQ) %.1e, rms %.1e\n",
-        length(picks), count(i -> cols[i] <= 4000, picks), maximum(abs, err), sqrt(mean(abs2, err)))
+@printf("translation check (%s), %d steps (%d in 1-10 TU): max |deployed - Lux%s| / target sd %.1e, rms %.1e\n",
+        XT, length(picks), count(i -> cols[i] <= 4000, picks), isempty(XSKIP) ? "" : " - skip", maximum(abs, err),
+        sqrt(mean(abs2, err)))
 # The deployed closure keeps its lag window in Float32 (`StochLSTM`'s `_push_scaled!`, by design), and the
 # mapped input forms dQ^{n-k} = q^{n-k} - q^{n-k*} from it: a difference of nearly equal values, so the
 # inputs carry ~1e-4 relative error that the training (Float64 map, then Float32) does not. First export
 # (a1, 2026-10-23): max 8.9e-5, rms 7.5e-6 sd(dQ), against a residual of 0.05-0.6 sd. Tolerance 1e-3 sd.
+# The target sd is sd(dQ) without a skip, and the sd of what the LinReg misses with one (a stricter unit);
+# a skip closure runs in Float64 (header), so its check tests the translation, not the rounding.
 maximum(abs, err) < 1e-3 || error("the deployed CNN differs from the trained one by $(maximum(abs, err)) sd")

@@ -52,6 +52,11 @@ predicted level is cast **up** to `eltype(q*)` before `dQ = qhat - q*` is formed
 returns the solver's precision whatever `T` and the `Scaling` happen to be. The lag window is
 stored in `T` (`_push_scaled!`), which is the model's own state, not an output.
 
+`T` is the weights' element type. 🔑 A CNN on a frozen least-squares skip (step 4, 2026-11-06) is exported
+with Float64 weights, so its lag window, input map and network run in Float64: the skip's coefficients reach
+~1e4 target sd on the mapped input, and the Float32 window alone would put it ~5e-3 sd off the LinReg it
+freezes (`linreg_skip_map`). The draws are Float64 `randn` cast to `T` in either case.
+
 ⚠️ Do not let promotion do this implicitly. It gives the right answer while the `Scaling` is
 Float64 and quietly stops as soon as one fitted on a Float32 record is loaded -- the same shape of
 trap as the Float32 `Re` that used to win a `params_track` splat (`claude_memory.md` #57).

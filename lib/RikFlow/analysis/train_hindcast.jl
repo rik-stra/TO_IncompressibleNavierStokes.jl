@@ -51,7 +51,16 @@ const PARTNER = Dict("LinReg7_ar2n" => "LinReg7", "LinReg7_ar1ls" => "LinReg7", 
                      "CNN_crps_head" => "CNN_crps_mvg", "CNN_crps_headcorr" => "CNN_crps_mvg",
                      "CNN_rmse_ar2n" => "CNN_rmse_mvg", "CNN_rmse_pl" => "CNN_rmse_mvg",
                      # step 3c, trained with their own noise (analysis/cards/step3n.md, added 2026-10-26)
-                     "LinReg1_nt" => "LinReg1", "CNN_rmse_nt" => "CNN_rmse_mvg")
+                     "LinReg1_nt" => "LinReg1", "CNN_rmse_nt" => "CNN_rmse_mvg",
+                     # step 2b, more (analysis/cards/step2b_more.md, added 2026-11-04)
+                     "LinReg7_nt" => "LinReg7", "LinReg1_nt_ar2nw" => "LinReg1_nt", "LinReg7_nt_ar2nw" => "LinReg7_nt",
+                     # step 3a without weight decay (analysis/cards/step3a_nowd.md, added 2026-11-04)
+                     "CNN_rmse_nowd" => "CNN_rmse_mvg", "CNN_crps_nowd" => "CNN_crps_mvg", "CNN_nll_nowd" => "CNN_rmse_nowd",
+                     # step 4, the CNN on a frozen LinReg, trained with its noise (analysis/cards/step4.md, added 2026-11-06)
+                     "LinReg1_nt_CNN_crps_nt_headcorr" => "LinReg1_nt",
+                     "LinReg1_nt_CNN_crps_nt_head" => "LinReg1_nt_CNN_crps_nt_headcorr",
+                     "LinReg7_CNN_crps_nt_headcorr" => "LinReg7",
+                     "LinReg7_CNN_crps_nt_head" => "LinReg7_CNN_crps_nt_headcorr")
 
 function diagnose(name; truth = load_truth(), prefix = "D6train_")
     dir = joinpath(OUTD, prefix * name)

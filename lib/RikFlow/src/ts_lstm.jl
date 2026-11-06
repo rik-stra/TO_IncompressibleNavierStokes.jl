@@ -85,7 +85,8 @@ Shape and architecture of an M4 model.
   Same device, and the same reason, as [`JointModel`](@ref)'s `uclip`: `d_i = exp(u_i)` grows
   exponentially once the input leaves the training range, and the fraction of steps on which the
   clip activates is a diagnostic that the trajectory has left the regime the head was fitted on.
-- `skip`: a linear skip `y += Ws x` from the regressor to the output.
+- `skip`: a linear skip `y += Ws x` from the regressor to the output. For `arch = :cnn` (2026-11-06, step 4)
+  it is the FROZEN linear mean model of a LinReg, read from the mapped input; see [`linreg_skip_map`](@ref).
 - `window`: `0` (default) carries the recurrent state across solver steps. `W > 0` resets it for
   every prediction and replays the last `W` inputs -- see [`StochLSTM`](@ref).
 - `n_layers`: the number of hidden layers of `arch = :dense` (default 2); see [`is_dense`](@ref).
@@ -175,8 +176,9 @@ Base.@kwdef struct LSTMSpec
         if arch === :cnn
             window == 1 || error("LSTMSpec: arch = :cnn reads one regressor row (its lags are the " *
                                  "sequence) -- it needs window = 1; got $window")
-            n_latent == 0 && n_encoder == 0 && posterior === :x && prior === :standard && !skip ||
-                error("LSTMSpec: arch = :cnn has no latent path, encoder or skip")
+            # `skip` is allowed (2026-11-06, step 4: the CNN on a frozen LinReg, paper Eq. skip net)
+            n_latent == 0 && n_encoder == 0 && posterior === :x && prior === :standard ||
+                error("LSTMSpec: arch = :cnn has no latent path or encoder")
             emission !== :none || error("LSTMSpec: arch = :cnn is a deterministic mean -- it needs an " *
                                         "emission head for its noise")
             n_in > 0 || error("LSTMSpec: arch = :cnn reads the mapped input (scaling.input_map): n_in > 0")
@@ -285,7 +287,8 @@ convolutions (kernel `spec.kernel`, `spec.n_conv` channels, no padding), flatten
 predictor `x[Cv.q_index]` appended; then `:dense`'s two hidden layers (`Wx`, `Wh`, `b`) and the linear
 output `V1 h + cdec` -- `cnn_mean_fit.jl`'s `mkmodel` (SEQ = lags, ACT = tanh) exactly, see
 [`cnn_features`](@ref). No latent path; its noise is the emission head (and the emission options of
-`StochLSTM`).
+`StochLSTM`). With `spec.skip` (step 4) the output also carries `Ws x`, a frozen LinReg's predicted
+correction on the same mapped input ([`linreg_skip_map`](@ref)).
 """
 is_cnn(spec::LSTMSpec) = spec.arch === :cnn
 
@@ -810,15 +813,18 @@ end
 
 `arch = :cnn`, deployed: the output for the last (only) column of the window `xwin` (`n_input x 1`),
 written to `st.y` and `st.logd` as `dense_window!` writes them: `cnn_features`, then the two hidden
-layers (`dense_hidden`, shared with `:dense` and the training side) and `V1 h + cdec`.
+layers (`dense_hidden`, shared with `:dense` and the training side) and `V1 h + cdec`; with `spec.skip`
+plus the frozen linear map `Ws x` of the same column (step 4), as `dense_window!` adds its skip.
 """
 function cnn_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin::AbstractMatrix) where {T}
     H = spec.n_hidden
-    F = cnn_features(w, spec, view(xwin, :, size(xwin, 2)))
+    x = view(xwin, :, size(xwin, 2))
+    F = cnn_features(w, spec, x)
     h1 = tanh.(w.Wx * F .+ w.b[1:H])
     h2 = dense_hidden(spec.n_layers, w.Wh, w.b, h1, H)
     st.h .= h2
     st.y .= w.V1 * h2 .+ w.cdec
+    spec.skip && (st.y .+= w.Ws * T.(x))
     st.logd .= w.Wd * h2 .+ w.bd
     spec.uclip !== nothing && (st.logd .= clamp.(st.logd, T(spec.uclip[1]), T(spec.uclip[2])))
     return st.y, st.logd
@@ -831,12 +837,15 @@ end
 `Chain(Parallel(vcat, Chain(Conv, Conv, FlattenLayer()), NoOpLayer()), Dense, Dense, Dense)` as plain
 arrays (`layer_1.layer_1.layer_{1,2}` the convolutions, `layer_{2,3}` the hidden dense layers,
 `layer_4` the output); `bd` (log sd) and `LR` (lower Cholesky factor of the correlation) the constant
-emission head. Plain arrays in, plain arrays out: no Lux here.
+emission head; `Ws` the frozen linear skip (`spec.skip` only, step 4; [`linreg_skip_map`](@ref)). Plain
+arrays in, plain arrays out: no Lux here.
 """
 function cnn_weights(net, spec::LSTMSpec; seq_index::AbstractMatrix{<:Integer},
                      q_index::AbstractVector{<:Integer}, bd::AbstractVector, LR::AbstractMatrix,
-                     T::Type = Float32)
+                     Ws::Union{Nothing,AbstractMatrix} = nothing, T::Type = Float32)
     is_cnn(spec) || error("cnn_weights: spec.arch is $(spec.arch), not :cnn")
+    spec.skip == (Ws !== nothing) || error("cnn_weights: spec.skip is $(spec.skip) but Ws is " *
+                                           (Ws === nothing ? "nothing" : "given"))
     c1, c2 = net.layer_1.layer_1.layer_1, net.layer_1.layer_1.layer_2
     d1, d2, o = net.layer_2, net.layer_3, net.layer_4
     H, nq = spec.n_hidden, n_output(spec)
@@ -844,9 +853,65 @@ function cnn_weights(net, spec::LSTMSpec; seq_index::AbstractMatrix{<:Integer},
           b2 = Vector{T}(vec(c2.bias)), seq_index = Matrix{Int}(seq_index), q_index = Vector{Int}(q_index))
     w = LSTMWeights{T}(Matrix{T}(d1.weight), Matrix{T}(d2.weight), Vector{T}(vcat(vec(d1.bias), vec(d2.bias))),
                        nothing, nothing, zeros(T, 0, 0), zeros(T, 0, 0), Matrix{T}(o.weight), nothing,
-                       Vector{T}(vec(o.bias)), zeros(T, nq, H), Vector{T}(bd), Matrix{T}(LR), nothing, nothing, Cv)
+                       Vector{T}(vec(o.bias)), zeros(T, nq, H), Vector{T}(bd), Matrix{T}(LR),
+                       Ws === nothing ? nothing : Matrix{T}(Ws), nothing, Cv)
     check_shapes(w, spec)
     return w
+end
+
+"""
+    linreg_skip_map(c, lin_scaling, scaling, hist) -> Ws
+
+Step 4 (2026-11-06; paper Eq. skip net): a frozen LinReg's predicted correction as a linear map `Ws`
+(`N_Q x n_in`) on a network's MAPPED input `z = P x`, in the network's standardised target, so that the
+deployed output `y = g(z) + Ws z` gives `dQ = y .* so .+ mo` = the network's part plus the LinReg's
+`q^n - q^{n*}` (what `step3_data.jl`'s `skipq` adds to the trained network's predictions).
+
+- `c`: the LinReg's level map, `N_Q x nreg` (`LinReg.jld2`'s `c`): `q^n` scaled = `c x_L`, `x_L` its
+  regressor in its own `in_scaling`, bias last.
+- `lin_scaling`: the LinReg's `(; in_scaling, out_scaling)` (`mu`, `sigma` per QoI).
+- `scaling`: the network's (`in_scaling`, `out_scaling`, and `input_map = P`, `n_in x nreg`, if any).
+- `hist`: the regressor layout, `[q^{n*}; q^{n-1}; q^{n-1*}; ...; q^{n-h}; q^{n-h*}; 1]`, every state entry
+  in the same per-QoI scaling (`:q_star_q` with the predictor).
+
+`x_L = A x` (affine: per-QoI rescaling plus a bias column), the correction `Dout c x_L + mu_out - (Din x_L[1:N_Q]
++ mu_in)` (raw), divided by the network's `so`; then on `z`: `Wx P0^{-1}` on the first `nreg` rows of `z`
+(`P0 = P[1:nreg, :]`, invertible: the regressor itself, re-expressed) and zero on any extra rows. `Ws P = Wx`
+is checked. 🔴 Exported in Float64 for a least-squares LinReg (LinReg1_nt: entries up to ~1e4 target sd, so
+the Float32 lag window alone is off by ~5e-3 sd; `cnn_closure_export.jl`).
+"""
+function linreg_skip_map(c::AbstractMatrix, lin_scaling, scaling, hist::HistorySpec)
+    hist.hist_var === :q_star_q && hist.include_predictor ||
+        error("linreg_skip_map: the layout is :q_star_q with the predictor")
+    nq, nreg = hist.n_qoi, nfeatures(hist)
+    nreg == (2hist.h + 1) * nq + 1 || error("linreg_skip_map: regressor width $nreg, expected $((2hist.h + 1) * nq + 1)")
+    size(c) == (nq, nreg) || error("linreg_skip_map: c is $(size(c)), expected $((nq, nreg))")
+    v(a) = Float64.(vec(a))
+    mud, sgd = v(scaling.in_scaling.mu), v(scaling.in_scaling.sigma)        # the network's input scaling
+    mul, sgl = v(lin_scaling.in_scaling.mu), v(lin_scaling.in_scaling.sigma) # the LinReg's
+    muo, sgo = v(lin_scaling.out_scaling.mu), v(lin_scaling.out_scaling.sigma)
+    so = v(scaling.out_scaling.sigma)
+    A = zeros(nreg, nreg)                                    # x_L = A x
+    for j in 0:(2hist.h), i in 1:nq
+        r = j * nq + i
+        A[r, r] = sgd[i] / sgl[i]
+        A[r, nreg] = (mud[i] - mul[i]) / sgl[i]
+    end
+    A[nreg, nreg] = 1
+    E1 = zeros(nq, nreg)
+    for i in 1:nq
+        E1[i, i] = 1                                         # q^{n*}, the first N_Q entries
+    end
+    Wx = (Diagonal(sgo) * Float64.(c) .- Diagonal(sgl) * E1) * A
+    Wx[:, nreg] .+= muo .- mul                               # the constant of level minus predictor
+    Wx = Diagonal(1 ./ so) * Wx
+    hasproperty(scaling, :input_map) || return Wx
+    Pm = Float64.(scaling.input_map)
+    size(Pm, 2) == nreg && size(Pm, 1) >= nreg || error("linreg_skip_map: input_map is $(size(Pm))")
+    Ws = hcat(Wx / Pm[1:nreg, :], zeros(nq, size(Pm, 1) - nreg))
+    e = maximum(abs, Ws * Pm .- Wx) / maximum(abs, Wx)
+    e < 1e-9 || error("linreg_skip_map: Ws P differs from the map on the regressor by $e (relative)")
+    return Ws
 end
 
 # ---------------------------------------------------------------------------------------------
