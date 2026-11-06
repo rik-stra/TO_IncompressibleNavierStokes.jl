@@ -2333,7 +2333,7 @@ per band, training || 10–100 TU; LRV = 1 + 2 Σ_{k≤200} ρ_k:
 LRV per band (training): paper 3 at 0.03 gives 0.5/0.9 | 2.8/3.5 | **11.2**/2.7 — by ρ1 the middle
 band is the most coloured, by LRV Z[16,32]. Residual sd, LinReg7 / LinReg1 (training): 1.85 / 1.16 /
 7.93 / 11.49 / 1.99 / 2.84. **h = 7 vs h = 5**, one-step RMSE / sd(dQ) on 8.2–10 TU (fits on
-1–8.2 TU): within 1 % in every QoI (E[0,6] 0.5818 vs 0.5819, Z[7,15] 0.1015 vs 0.1005 the largest change). **On Sec. 5's split** (2026-10-30, Rik: fits on 1-10 TU, error on 10-100 TU; `colour_tables.jl` prints it): h = 7 / h = 5 one-step RMSE 1.0047 1.0054 0.9994 0.9974 1.0037 1.0026 (within 0.6 %, worse in four QoIs); in-sample on 1-10 TU 0.987-0.995 (nested fits: can only fall).
+1–8.2 TU): within 1 % in every QoI (E[0,6] 0.5818 vs 0.5819, Z[7,15] 0.1015 vs 0.1005 the largest change). **On Sec. 5's split** (2026-10-30, Rik: fits on 1-10 TU, error on 10-100 TU; `colour_tables.jl` prints it): h = 7 / h = 5 one-step RMSE 1.0047 1.0054 0.9994 0.9974 1.0037 1.0026 (within 0.6 %, worse in four QoIs); in-sample on 1-10 TU 0.987-0.995 (nested fits: can only fall). Each QoI's share of LinReg1's squared error on 8.2-10 TU, in units of sd(dQ) (net_sweep.jl's 1/2 SE; half the sum 0.2048 = its 0.2050): E[0,6] 82.7 %, Z[0,6] 11.7 %, middle and small 5.6 % (paper step 3a, "about 80 %").
 
 **Recheck of the Sec. 4 hindcast claims on the 87 paired ICs** (2026-10-06, score_d6.jl functions,
 `rank_histogram_by_lead` with `Xoshiro(SEED)`): median spread–skill ratio LinReg1 0.98, LinReg7
@@ -3600,3 +3600,348 @@ the column above (e.g. LinReg1 Z[7,15] 2.59 / 0.97 = 2.66).
   each row's inputs carry its own, larger, fitted noise. What training buys is that the noise model fits.
 - Paper tables rounded to one decimal (Rik, 2026-10-30) from the log's unrounded `table:` lines (three decimals,
   same rerun); rounding script in the session scratchpad (round half up).
+
+**38c. Two readings made visible for the paper (2026-11-02, laptop; Rik: "Add both", story.md rule B3).**
+- *Training-window hindcast* (D6train_<closure>, 5 ICs inside 1-10 TU, M = 10, own members; score_d6.jl's
+  unpaired window scores, scratch `train_window_scores.jl`, which reproduces the held-out Table tab: res s3a to
+  the last digit). CRPS_0.5 / e_0.5, training window || held out: LinReg1 0.263 / 0.553 || 0.221 / 0.455;
+  LinReg7 0.267 / 0.584 || 0.263 / 0.498; CNN (RMSE) + MVG 0.238 / 0.486, + AR(2) 0.239 / 0.492, + pl
+  0.236 / 0.477; CNN (CRPS) + MVG 0.334 / 0.656, + head 0.269 / 0.557, + learned scales 0.345 / 0.665;
+  LinReg1_nt 0.272 / 0.575; CNN_rmse_nt 0.282 / 0.550. The RMSE networks beat LinReg1 in the training window
+  and lose after it; the CRPS networks do not beat it there either. New paper Table tab: res s3a train.
+- *Spread-skill by lead, LinReg1 against LinReg1_nt* (`plot_results_round1.jl --step s3c spread`, new
+  Fig. res-s3c-spread, as Fig. base-spread): r up to 0.5 TU 0.57-0.84 against 0.78-1.07, beyond 0.85-1.19
+  against 1.14-1.48, long run 1.23-1.28 against 1.49-1.59; calibrated cells 15 against 28.
+
+**38d. Table tab: net-loss on 10-100 TU after fits on 1-10 TU (2026-11-02, laptop; Rik: "Can we also fill columns
+3-8 with data based on training on 1-10 TU? Then the comparison with linreg is fairer").** The refitted networks
+(`pred3` of `step3/grid_cap_*` at the chosen wd, 3 seeds; nll wd 0.1 and crps wd 0.3 s2-3 copied from the desktop)
+and LinReg1 (`predls`), residuals ÷ out_scaling.sigma, scored as `cnn_mean_fit.jl` scores the validation window:
+summed per-QoI RMSE (the RMSE loss), Gaussian NLL with the 1-10 TU residuals' covariance, CRPS with their sds
+(scratch `net_loss_10_100.jl`, log `net_loss_10_100.log`). Seed means, RMSE / NLL / CRPS: LinReg1 1.181 / -7.11 /
+0.655; likelihood 1.256 / -5.73 / 0.682; CRPS 1.239 / -5.38 / 0.678; RMSE 1.234 / -5.43 / 0.677 (NLL about zero
+the same to 0.01). Per-QoI rms ratios reproduce the table's columns 6-8 exactly. On held-out data every network
+loses to LinReg1 in every score, also in its own loss. The old columns 3-5 (8.2-10 TU) favoured the networks: their
+early stopping and wd were chosen on that window. Check: stage-1 0.5 SSE recomputed from `pred1` on 8.2-10 TU is
+0.0004-0.0006 above fits.jld2's `val_half_sse` (rows or precision; the new columns do not use it).
+Target scaling (Rik asked): z-score per QoI on 1-10 TU (`:normal`), not min-max; 1-10 TU range -4.0..+4.2,
+70 % within ±1; 10-100 TU -6.3..+5.4. Linear output layer, tanh hidden layers.
+
+**38e. Does the CNN fit its training data better without weight decay? (2026-11-02, Snellius; Rik: "Without
+weight decay do the CNNs fit better on 1-10 TU?", "make sure training uses the GPU on snellius").** The sweep's
+wd-0 networks are early-stopped (best at 2.2-6.8k updates; refit on 1-10 TU for that many) and fit 1-10 TU no
+better than LinReg1 (RMSE 1.00 0.99 1.12 1.29 1.08 1.10, `net_sweep_cap.log`). New run: RMSE loss, wd 0,
+RIKFLOW_CNN_NOSTOP=1 (lr still decays on the validation plateaus, to 1e-4 by ~10k), 100k updates, seeds 1-3,
+`RIKFLOW_CNN_DEVICE=gpu` (H100, three processes on one GPU, 4.9-5.0 ms per update; the 2k smoke's 37 ms was
+compilation). `cnn_mean_fit.jl` now records the fit rows' (1-8.2 TU) 0.5 SSE at each validation and prints the
+fit rows' rms against least squares on the same rows (`ls_fit`). `batch_scripts/run_cnn_fitrows.sh`; jobs
+28844249 (smoke) and 28844250, Snellius @ 2287bdeb + the edited tool as untracked `tools/cnn_mean_fit_fitrows.jl`;
+outputs `step3/fitrows_rmse_wd0_s<seed>` there. The training env there got the desktop's `training/Manifest.toml`
+(cuDNN; old one `Manifest.toml.bak_2026-11-02`).
+
+| seed | fit-row 0.5 SSE at 1k / 5k / 10k / 20k / 50k / 100k (LS 0.2370) | val loss at the same (best) | fit rows rms / LS, best iterate | last iterate (100k) |
+|---|---|---|---|---|
+| 1 | 0.246 / 0.205 / 0.185 / 0.170 / 0.125 / 0.071 | 1.24 / 1.23 / 1.28 / 1.38 / 1.73 / 2.15 (1.19 @ 2.2k) | 0.99 0.99 1.09 1.28 1.09 1.12 | 0.56 0.53 0.85 0.93 0.87 0.87 |
+| 2 | 0.245 / 0.211 / 0.176 / 0.159 / 0.114 / 0.065 | 1.25 / 1.28 / 1.40 / 1.48 / 1.74 / 2.05 (1.21 @ 2.9k) | 0.98 0.98 1.06 1.34 1.10 1.11 | 0.54 0.50 0.84 1.01 0.88 0.90 |
+| 3 | 0.243 / 0.204 / 0.181 / 0.164 / 0.115 / 0.063 | 1.24 / 1.27 / 1.33 / 1.42 / 1.74 / 2.26 (1.20 @ 2.4k) | 0.98 0.97 1.11 1.33 1.06 1.10 | 0.54 0.49 0.86 0.99 0.89 0.91 |
+
+- **Yes, given the updates**: the training error passes least squares' by 5k updates and ends at 27-30 % of it,
+  half its rms in the large scales, 0.84-1.01 in the middle and the small. The validation loss rises from 2-3k
+  updates on; at 100k the 10-100 TU rms is 1.8-3.1 x least squares'. Memorisation, not structure.
+- At the validation optimum (the network the protocol keeps) the network has matched least squares only in the
+  large scales; in the middle and the small it is still 6-34 % above it on its own training rows. It starts to
+  overfit the large scales before it has learned the middle and the small. (Interpretation: a linear path, as in
+  step 4's LinReg1 + CNN, would remove the need to learn the linear part through tanh units.)
+
+**38f. All three losses at wd 0, without early stopping, refit on 1-10 TU for all updates (2026-11-03, Snellius;
+Rik: "can you add this as row", "I also want the other losses added without weightdecay").** `cnn_mean_fit.jl`
+gains RIKFLOW_CNN_REFIT_UPD = last (the refit runs the whole stage-1 schedule, 100k updates). Jobs 28845486 (RMSE,
+GPU, 4.9 ms/update), 28845496 (likelihood, GPU, 6.5 ms), 28845551 (CRPS on the CPU, 3.5 ms: the CRPS loss refuses
+the GPU, "norm_cdf is a scalar series"); outputs `step3/fitrows_<loss>_wd0_refit_s<seed>` (copied to the laptop).
+Scored with scratch `net_loss_10_100.jl` (now also the summed RMSE on 1-10 TU; log `net_loss_10_100_wd0.log`), seed
+means, RMSE 1-10 TU | 10-100 TU RMSE / NLL / CRPS | per-QoI ratios:
+LinReg1 1.121 | 1.181 / -7.11 / 0.655; protocol networks (wd 0.1 / 0.3 / 0.3) 1.134 / 1.135 / 1.136 | as 38d;
+wd 0: likelihood 1.092 | 1.376 / -0.13 / 0.739 | 1.08 1.02 1.42 1.75 1.68 1.60; CRPS 0.765 | 2.063 / 5.08 / 1.225 |
+1.70 1.62 1.80 2.56 2.26 2.01; RMSE 0.831 | 1.912 / 3.01 / 1.101 | 1.60 1.48 1.72 2.49 2.03 1.87.
+- The protocol networks fit their training window slightly WORSE than least squares (1.134-1.136 against 1.121);
+  without wd and early stopping all three fit it better and all three lose far more held out. The likelihood
+  network memorises least (1-8.2 TU last iterate: 0.98 in the large scales, 0.87-0.89 elsewhere).
+- Curves of all three: scratch `plot_fitrows_curves.jl` -> `fitrows_curves.pdf/png`.
+- Paper: Table tab: net-loss rewritten on this split with the wd-0 rows (old table: paper
+  sections/cut/results_netloss_2026-11-03.tex).
+
+**38g. The table for the means trained with noise on their inputs (2026-11-03, Snellius CPU + laptop; Rik: "the same
+table for these models fitted with noise on the inputs (so with and without weight decay)").** New: wd 0 without
+early stopping, INNOISE = fixed at the noise sweep's Σ (`cnn_nt_rmse_wd0.3_s1_r5`, copied to Snellius), refit on
+1-10 TU for all 100k updates, then the tool's SCORE pass (`batch_scripts/run_cnn_fitrows.sh` INNOISE=fixed; jobs
+28858748 crps, 28858764 rmse, 28858765 nll, all on the CPU, 3.7-3.9 ms per update; outputs
+`step3/fitrows_nt_<loss>_wd0_refit_s<seed>` and `innoise_scores/` copied to the laptop). wd 0.3 rows: the fixed
+points of 36a/36c. Scored with scratch `net_loss_noise.jl` (net_noise_residual.jl's loaders; log
+`net_loss_noise.log`): summed RMSE 1-10 TU | 10-100 TU RMSE / NLL / CRPS | per-QoI rms over LinReg1's (same block),
+seed means.
+
+| | clean inputs | own draws (one path of the deployed Σ) |
+|---|---|---|
+| LinReg1 | 1.121 \| 1.181 / −7.11 / 0.655 | 1.717 \| 1.763 / −3.81 / 0.990 |
+| LinReg1_nt | 1.354 \| 1.425 / −4.86 / 0.792 \| 1.10 1.08 1.96 2.12 1.06 1.20 | 1.564 \| 1.636 / −3.67 / 0.915 \| .93 .88 .99 1.25 .81 .85 |
+| CNN_nt likelihood, wd 0.3 | 1.416 \| 1.584 / −3.13 / 0.857 | 1.623 \| 1.782 / −2.35 / 0.979 \| .97 .89 1.12 1.49 1.19 1.11 |
+| CNN_nt CRPS, wd 0.3 | 1.380 \| 1.570 / −2.74 / 0.860 | 1.592 \| 1.768 / −1.96 / 0.979 \| .98 .90 1.09 1.49 1.13 1.03 |
+| CNN_nt RMSE, wd 0.3 | 1.377 \| 1.551 / −2.92 / 0.849 | 1.591 \| 1.752 / −2.11 / 0.971 \| .97 .89 1.08 1.47 1.10 1.01 |
+| CNN_nt likelihood, wd 0 | 1.267 \| 2.180 / 17.3 / 1.216 \| 1.66 1.26 3.43 5.28 2.54 2.72 | 1.391 \| 2.251 / 12.4 / 1.252 |
+| CNN_nt CRPS, wd 0 | 0.881 \| 3.257 / 24.5 / 2.071 \| 2.41 2.13 5.24 7.10 3.04 3.06 | 0.975 \| 3.274 / 17.2 / 2.056 |
+| CNN_nt RMSE, wd 0 | 0.918 \| 3.152 / 21.1 / 1.983 \| 2.31 2.03 4.99 6.87 3.19 3.21 | 1.017 \| 3.169 / 14.8 / 1.968 |
+
+- **Noise training is no substitute for the weight decay.** Without it and without early stopping, the noise-trained
+  networks memorise as the clean ones do (1-10 TU 0.88-1.27, clean) and extrapolate worse than them (held out 2.18-3.26
+  against 1.38-2.06 clean-trained, per QoI up to 7 x LinReg1's in E[7,15]). Best iterates at 1.2-3.8k updates.
+- At wd 0.3 every noise-trained network loses to LinReg1_nt, its linear analogue, on clean inputs AND along its own
+  draws (1.75-1.78 against 1.64), and is worse than LinReg1 along their own draws too in the middle and the small scales.
+- Caveat: the wd-0 runs inject the sweep's fixed Σ, not their own (no outer loop): not self-consistent; their
+  "own draws" use their S_deploy.
+
+**38h. Step 4 offline: the CNN on a FROZEN LinReg1 (2026-11-03, Snellius CPU + laptop; Rik: "frozen but immediatly do
+both baselines").** `RIKFLOW_MLP_SKIP` (step3_data.jl, cnn_mean_fit.jl): target = dQ minus the deployed LinReg's
+predicted correction, standardised on its own sd; output layer zero-initialised; predictions written as skip +
+network. Check fixed on the way: the mapped-input least-squares check divided by ~0 with SKIP = LinReg1 (its own
+residual is orthogonal to the regressor); now relative to the target's size too. `batch_scripts/run_cnn_skip.sh`
+(63 fits per base, 16 at a time, CPU): smoke 28859256 + full 28859257 (13.9 min). Weight decay by the protocol (own
+validation loss, seed mean): likelihood wd 1 (5.730; 6.135 at wd 0, monotone); RMSE and CRPS: EVERY wd ties, best
+iterate at update 0 for every seed (the network never improves the validation loss: the closure is LinReg1).
+Scored (scratch `net_loss_10_100.jl`, now one standardisation for every row; log `net_loss_skip_LinReg1.log`),
+seed means, summed RMSE 1-10 TU | 10-100 TU RMSE / NLL / CRPS | per-QoI rms / LinReg1:
+LinReg1 (least squares, 1-10 TU) 1.121 | 1.181 / -7.11 / 0.655;
+LinReg1 + CNN, likelihood wd 1: 1.113 | 1.185 / -7.09 / 0.657 | 1.00 x 6; RMSE and CRPS (update 0): 1.124 | 1.184 /
+-6.92 / 0.657 | 1.00 x 6 (the deployed LinReg1's coefficients against the exact least-squares refit: 0.2-0.3 %);
+wd 0 without early stopping: likelihood 1.000 | 1.309 / 304 / 0.735 | 1.09-1.15; CRPS 0.439 | 1.903 / 30.6 / 1.281 |
+1.59-1.63; RMSE 0.391 | 1.936 / 47.1 / 1.316 | 1.58-1.66.
+- On LinReg1 the network finds nothing that carries beyond the training rows: the validation optimum is the linear
+  model itself; trained on, it memorises (training error to a third) and loses 9-66 % held out.
+
+**38i. Step 4 offline: the CNN on a FROZEN LinReg7 (2026-11-03, Snellius CPU + laptop).** Job 28859259 (63 fits,
+22.6 min). Weight decay by the protocol: likelihood 0.1 (-0.930), CRPS 0.3 (1.422), RMSE 0.3 (2.532), the same choices
+as the plain CNN; below 0.1 every fit stops at 1.1-10k updates, at 0.1-0.3 the best iterates lie at 33-74k. Scored as
+38h (log `net_loss_skip_LinReg7.log`; LinReg7 alone from `net_loss_noise.jl`'s clean block), seed means, summed RMSE
+1-10 TU | 10-100 TU RMSE / NLL / CRPS | per-QoI rms / LinReg1:
+LinReg7 alone 2.773 | 2.873 / 2.39 / 1.596 | 1.85 1.14 7.74 11.84 1.98 2.77;
+LinReg7 + CNN, likelihood wd 0.1: 1.137 | 1.195 / -6.67 / 0.662 | 1.01 1.00 1.03 1.07 1.02 1.03;
+CRPS wd 0.3: 1.141 | 1.202 / -5.62 / 0.667 | 1.01 1.00 1.08 1.12 1.05 1.07; RMSE wd 0.3: 1.139 | 1.200 / -5.64 / 0.665 |
+1.01 1.00 1.06 1.13 1.05 1.06; wd 0 without early stopping: likelihood 1.104 | 1.282 / 2.14 / 0.704 | 1.04 1.02 1.35 1.59
+1.09 1.13; CRPS 0.692 | 2.101 / 8.66 / 1.319 | 1.66-2.47; RMSE 0.697 | 2.028 / 7.70 / 1.264 | 1.63-2.44.
+- The network rebuilds what the ridge removed: from 2.87 to 1.20 held out, within 1-13 % of LinReg1 per QoI, and closer
+  to LinReg1 than the plain CNN (1.23-1.26, up to 1.27 per QoI) -- but no row beats LinReg1. Without early stopping it
+  memorises as on LinReg1.
+- Open: whether LinReg7 + CNN also rebuilds LinReg1's response to its own draws (Sec. 5 tab: own-draws; LinReg7's reason
+  for being in the story). Needs the noise pass to perturb the skip's inputs too (SCORE with SKIP: not built).
+
+**38j. LinReg7 + CNN along its own draws (2026-11-03, Snellius CPU + laptop; Rik: "Yes, build it for linreg 7").**
+SCORE pass of the 18 LinReg7-skip runs with RIKFLOW_MLP_SKIP=LinReg7 (job 28861449, 1.3 min; `innoise_scores/skip_LinReg7_*`
+copied): the network along one path of the run's deployed Σ (its clean residual on 1-10 TU about zero), the skip's
+prediction clean. Scratch `net_loss_skipnoise.jl` adds the skip's own response to the same path exactly (LinReg7's
+coefficients, as `load_lrs`; η = chol(Σ_raw) E, which is the tool's so .* (L E)); log `net_loss_skipnoise.log`.
+Summed RMSE 10-100 TU clean | own draws; gain = rms(response) / sd(η) per QoI, 10-100 TU (response = clean minus noisy
+prediction):
+
+| | clean | own draws | gain Z/E [0,6] [7,15] [16,32] | sd(η) / LinReg1's |
+|---|---|---|---|---|
+| LinReg1 | 1.181 | 1.763 | .89 .92 2.45 2.38 1.01 1.28 | 1 |
+| LinReg7 | 2.873 | 3.182 | .49 .33 .58 .57 .50 .44 | 1.85 1.16 7.93 11.5 1.99 2.84 |
+| CNN (RMSE, wd 0.3) | 1.234 | 1.697 | .73 .73 2.45 2.11 .80 1.17 | 1.00-1.08 |
+| LinReg7 + CNN, likelihood wd 0.1 | 1.195 | **1.608** | .67 .67 2.31 1.99 .69 1.02 | 1.01-1.03 |
+| LinReg7 + CNN, CRPS wd 0.3 | 1.202 | 1.682 | .75 .73 2.44 2.06 .76 1.21 | 1.01-1.08 |
+| LinReg7 + CNN, RMSE wd 0.3 | 1.200 | 1.675 | .73 .72 2.49 2.05 .73 1.21 | 1.01-1.09 |
+| LinReg7 + CNN, wd 0 no stop (lik. / CRPS / RMSE) | 1.28 / 2.10 / 2.03 | 1.64 / 2.39 / 2.33 | lik. .70-2.19; CRPS, RMSE 1.5-2.6 | lik. ~1; CRPS, RMSE .52-1.16 |
+
+- **Yes: rebuilding LinReg1's mean rebuilds its response to its own draws.** In the middle band the gain returns from
+  LinReg7's 0.57-0.58 to 2.0-2.5 (LinReg1 2.4), as large as the plain CNN's. The skip alone answers 0.33-0.84; the
+  network adds the rest.
+- In the large and small scales the response stays below LinReg1's (0.67-0.75 against 0.89-0.92; 0.69-1.21 against
+  1.01-1.28), and along its own draws the likelihood variant has the lowest error of all (1.61 against LinReg1's 1.76,
+  the plain CNN's 1.70; per QoI 0.88-0.97 of LinReg1's). The own-draws residual is the one a closure meets online;
+  whether this shows in coupled runs is open.
+
+**38k. Step 4 under noise: the CNN on a FROZEN LinReg1_nt, trained with its noise (2026-11-03, Snellius CPU + laptop;
+Rik: "LinReg1_nt skip", "Yes, continue").** Code: the skip reads the same noisy history (step3_data.jl `SKIPK`,
+`skip_dy`: its exact linear response, subtracted from the target at every noisy site of cnn_mean_fit.jl: training
+batches, refit, validation, post-fit noisy scores, S_deploy, SCORE; checked against the skip's own predictions to
+8e-14); `INNOISE_SIGMA=lrs:<LinReg>` starts at a deployed LinReg's own Σ. Smoke 28863119: the skip alone (best at update
+0) deploys 0.994-1.009 of the injected sd (LinReg1_nt is its own fixed point). Sweep 28863577 (63 fits, 16.3 min).
+Weight decay by the noisy validation loss: wd 1 for all three losses (likelihood 7.219, CRPS 4.063, RMSE 7.225 seed
+means; RMSE at every wd essentially update 0). At wd 1 every seed is within 2 % of its fixed point (S_deploy / injected
+sd 0.981-1.009): no outer-loop round. SCORE 28864904 (consistent: reproduces the training-time noisy validation).
+Scored with scratch `net_loss_skipnoise.jl` (log `net_loss_skipnt.log`): summed RMSE 10-100 TU clean | own draws | gain:
+LinReg1 1.181 | 1.763 | .89 .92 2.45 2.38 1.01 1.28; LinReg1_nt 1.425 | 1.636 | .46 .39 .66 .76 .35 .46;
+LinReg1_nt + CNN_nt wd 1: likelihood 1.430 | 1.639, CRPS 1.445 | 1.644, RMSE 1.433 | 1.644, gain identical to LinReg1_nt's;
+wd 0 without early stopping: 1-10 TU clean 0.77-0.98 (memorised), held out 2.04-2.57 | 2.11-2.60, gain .34-.72.
+- **Under noise the network adds nothing to LinReg1_nt**, as without noise it adds nothing to LinReg1 (38h). The one
+  network gain remains LinReg7 + CNN along its own draws (1.608), with LinReg1's middle-band response (gain ~2).
+- Noise training does not stop the memorisation without weight decay and early stopping (as 38g).
+
+**38l. Too little data, or nothing to learn: the CNN fitted on 1-80 TU (2026-11-03, Snellius CPU + laptop; Rik: "I do
+want to add train on 1-50 TU ... But I suggest we train on even more data 1-80 TU").** `RIKFLOW_MLP_TEND` (step3_data.jl:
+the end of the training window; stage 1 on its first 80 %, validation on the rest, refit on all of it, HO = TEND-100
+TU). `batch_scripts/run_cnn_tend.sh`; smoke 28864153, sweep 28864155 (54 fits, 29.4 min): the plain CNN, every loss x
+wd {0, .01, .03, .1, .3, 1} x seeds 1-3, cap 200k. The protocol picks wd 0.03 for all three losses (1-10 TU: 0.1-0.3);
+best iterates at 25-57k updates (1-10 TU at wd 0: 2-7k). Every model scored on the SAME held-out window, 80-100 TU (8000
+steps; scratch `net_loss_tend.jl`, log `net_loss_tend.log`), one standardisation; summed RMSE fit | 80-100 TU RMSE /
+NLL / CRPS | per QoI over least squares of the same window:
+LS 1-10 TU 1.121 | 1.139 / -7.50 / 0.635; CNN 1-10 TU (lik. wd .1 / CRPS .3 / RMSE .3) 1.134-1.135 | 1.177-1.189 /
+-6.12..-6.68 / 0.650-0.651 | 1.00-1.01 1.00 1.08-1.10 1.13-1.16 1.21-1.33 1.15-1.26;
+LS 1-80 TU 1.174 | 1.127 / -7.54 / 0.629 (per QoI 0.99 x LS 1-10); CNN 1-80 TU (wd .03, all three) 1.177-1.179 | 1.135 /
+-7.16..-7.40 / 0.633 | 1.00 1.00 1.02-1.03 1.03-1.04 1.02 1.02 (over LS 1-10: 0.99 0.99 1.01-1.02 1.02-1.04 1.00-1.01 1.01).
+- **Mostly too little data, but no more than linear to learn.** Eight times the data closes most of the CNN's gap to
+  least squares (middle and small scales from 8-33 % to 2-4 %; summed 3-4 % -> 0.7 %), the weight decay the protocol
+  picks falls to 0.03 and the networks train ten times longer before they overfit. But the CNN still does not reach
+  least squares on the same data, held out or on its own training window (1.177 against 1.174), and least squares
+  itself gains only 1 % from the extra data. The structure the history carries about dQ is, at this size, linear.
+
+**38m. Did the CNN learn the linear map? (2026-11-03, laptop; Rik: "can we check that the CNNs on 1-80 TU learned the
+same linear map as linreg 1?")** In prediction space (scratch `net_linear_check.jl`, log `net_linear_check.log`): the
+CNN's predictions projected on LinReg1's regressor (least squares on the run's training rows) give its linear part; the
+rest is its nonlinear part. Per QoI Z/E [0,6] [7,15] [16,32], rms over least squares' residual rms on the same rows,
+seed means, 80-100 TU (training window within 0.02 unless noted):
+- CNN 1-80 TU (RMSE / likelihood / CRPS): CNN - LS(1-80) 0.07-0.11 in the large scales, 0.22-0.34 in the middle and
+  the small; nonlinear part 0.04-0.07 / 0.17-0.23; linear part - LS(1-80) 0.05-0.07 / 0.11-0.24; linear part - LinReg1
+  0.14-0.15 / 0.18-0.31; corr(CNN - LS, LS residual) 0.01-0.05 held out (0.01-0.10 on the training window).
+- CNN 1-10 TU (RMSE, likelihood): CNN - LS 0.11-0.18 / 0.43-0.91 held out (0.12-0.17 / 0.26-0.50 on the training
+  window): the nonlinear part grows outside the window (0.31-0.85 held out against 0.16-0.31); linear part - LS 0.09-0.12
+  / 0.18-0.39; correlation with LS's residual 0.01-0.08.
+- For scale: LS(1-80) - LinReg1 0.12-0.15 in every QoI.
+- **Yes, nearly: with 80 TU the CNN learns the linear map of its own data**, closer to least squares on 1-80 TU than to
+  LinReg1 (which least squares on 1-80 TU itself differs from by 12-15 %). What it does differently, a slightly other
+  linear map and a small nonlinear part, does not predict least squares' residual (correlation <= 0.05 held out): fitting
+  error, not structure. On 1-10 TU the departure is larger and its nonlinear part grows outside the training window.
+
+**38n. The maps in the POD basis of the regressor (2026-11-03, laptop; Rik: "maybe the more sound way to compare these
+is based on a pod basis?").** Scratch `net_pod_check.jl` (log `net_pod_check.log`, figure `pod_gains.pdf/png`): POD of
+LinReg1's scaled regressor (bias dropped, centred) on 1-80 TU, 66 modes; modes 1-5 carry 99.97 % of its variance, λ_1/λ_66
+= 2.8e12. Each map's predicted correction projected on the (uncorrelated) mode scores, so every mode's gain is
+estimated on its own and the conditioning does not enter; the difference to least squares on 1-80 TU splits exactly
+over the modes. Its rms over least squares' residual rms, by modes 1-5 | 6-15 | 16-35 | 36-66, per QoI Z/E [0,6] [7,15]
+[16,32]:
+- LinReg1 (LS on 1-10 TU): .03-.05 | .04-.06 | .05-.09 | .07-.12.
+- CNN 1-80 TU (RMSE, linear part): .02-.13 | .02-.07 | .01-.04 | .04-.15.
+- CNN 1-10 TU (RMSE, linear part): .05-.24 | .06-.30 | .08-.23 | .06-.30.
+- LinReg1_nt: .02-.18 | .10-.32 | .23-1.17 | .13-1.41 (middle band 0.9-1.4 from mode 16 on).
+- LinReg7: .09-2.40 | .37-5.74 | .42-9.60 | .08-2.77 (middle band 3.7-9.6 in modes 6-35).
+- **The CNN on 1-80 TU has least squares' map in every group of modes, the poorly determined low-energy ones included**
+  (as close as LinReg1, from 1-10 TU, is). Ridge (LinReg7) shrinks the middle band's gains in modes 6-35 and noise
+  training (LinReg1_nt) changes them from mode 16 on: the regularisation acts on the low-energy modes that carry the
+  middle band's information, and that is where both lose clean accuracy and gain noise robustness.
+
+**38o. LinReg7 + CNN trained with its own noise, likelihood and CRPS in head mode (2026-11-03/04, Snellius CPU +
+laptop; Rik: "please switch to head mode").** Frozen LinReg7 skip, INNOISE = head, HEAD = inj (the head starts at the
+Σ of the clean `skip_LinReg7_nll_wd0.1_s1`); jobs 28873400/01/03 (fits, 15 min), SCORE pass 28877438; tags
+`skipnth_LinReg7_<loss>_wd<w>_s<s>`; scratch `net_loss_skipnoise.jl`, log `net_loss_skipnth.log`.
+- Weight decay by the seed-mean noisy validation loss: likelihood 0 4.50 | 0.01 4.31 | 0.03 3.99 | **0.1 2.63** | 0.3
+  3.29 | 1 5.55; CRPS 0 1.994 | 0.01 1.992 | 0.03 1.987 | 0.1 1.971 | **0.3 1.891** | 1 1.974. Below the chosen wd the
+  best iterate comes early (CRPS 900-1,900 updates, likelihood 5-8k). Self-consistency of the refitted head (residual
+  under its noise, sd / head sd): likelihood wd 0.1 0.99-1.01 in every QoI; CRPS wd 0.3 1.00-1.06 (Z[16,32] 1.06).
+- Summed RMSE 1-10 | 10-100 TU, NLL, CRPS, clean inputs: likelihood 1.433 | 1.528, -3.69, 0.849; CRPS 1.336 | 1.469,
+  -2.44, 0.814 (LinReg1_nt 1.354 | 1.425, -4.86, 0.792; LinReg1 1.121 | 1.181; clean-trained L7 + CNN likelihood 1.137 |
+  1.195). Own draws, 10-100 TU: likelihood 1.710, CRPS 1.645 (LinReg1_nt 1.636, LinReg1_nt + CNN 1.639, clean-trained
+  L7 + CNN likelihood 1.608, LinReg1 1.763). wd 0, no stop: clean 1.747 / 2.390, own draws 1.850 / 2.432.
+- Gain per QoI, 10-100 TU: likelihood 0.40 0.33 0.64 0.72 0.33 0.45, CRPS 0.47 0.38 0.63 0.72 0.31 0.45 (LinReg1_nt 0.46
+  0.39 0.66 0.76 0.35 0.46; clean L7 + CNN 0.67 0.67 2.31 1.99 0.69 1.02); deployed sd(η) / LinReg1's 1.27 1.23 2.62 3.31
+  1.18 1.43 and 1.21 1.13 2.23 3.21 1.07 1.33 (LinReg1_nt 1.23 1.17 2.58 3.21 1.15 1.38).
+- **Trained with its noise, LinReg7 + CNN lands on LinReg1_nt's fixed point**: the same gain, the same deployed Σ, the
+  same per-QoI pattern, but a worse clean fit (1.47-1.53 against 1.425) and no better on its own draws (1.645-1.710
+  against 1.636). From the ridge start or from the least-squares start, noise training reaches the same low-gain,
+  large-Σ closure, and the network adds nothing to it.
+- **RMSE, fixed Σ with the outer loop (desktop CPU, `skipnt_LinReg7_rmse_wd0.3_r<k>`, wd 0.3 from round 1;
+  `/export/scratch2/rik/tmp/skipnt7_rmse_loop.sh`, log `skipnt7_rmse_loop.txt`).** Max |S_deploy sd / injected sd - 1|
+  per round, middle band the last to settle: r2 0.48, r3 0.25, r4 0.09, r5 0.095, r6 0.035, **r7 0.013** (stop). Best
+  iterates early in every round (r7: 2,100-2,200 updates). Round 7 scored (SCORE log `skipnt_LinReg7_rmse_r7_score.log`,
+  scratch log `net_loss_skipnt7_rmse.log`): clean 1.413 | 1.610, NLL -1.51, CRPS 0.892; own draws 1.801 (LinReg1_nt
+  1.636, LinReg1_nt + CNN RMSE 1.644, clean-trained L7 + CNN RMSE 1.675); gain 0.45 0.38 0.62 0.69 0.30 0.47; deployed
+  sd(η) / LinReg1's 1.22 1.17 2.77 3.76 1.21 1.61. The same low-gain fixed point as the head-mode runs and LinReg1_nt,
+  with a larger Σ in the middle and small bands and the worst scores of the three losses, clean and on its own draws.
+
+**38p. Step 4, the 2x2: {LinReg1, LinReg7} skip x {clean, trained with its noise} (2026-11-04, Snellius CPU +
+laptop; Rik: "Yes, build it").** One scoring run (scratch `net_loss_skipnoise.jl`, log `net_loss_step4_2x2.log`; the
+LinReg1-skip SCORE pass ran now, job 28888569, `skip_LinReg1_score.log`). Noise-trained LinReg1 cell = the CNN on a
+frozen LinReg1_nt, trained with LinReg1_nt's Σ (fixed, already at its fixed point, 38k); noise-trained LinReg7 cell =
+38o (likelihood and CRPS in head mode, RMSE fixed Σ at round 7). wd per the protocol. Seed means; summed RMSE 10-100 TU,
+clean | own draws; gain and deployed sd(η) / LinReg1's in the middle band Z/E [7,15]:
+
+| skip | training | loss | clean | own draws | gain mid Z/E | sd(η) mid Z/E |
+|---|---|---|---|---|---|---|
+| — | LinReg1 | | 1.181 | 1.763 | 2.45/2.38 | 1/1 |
+| — | LinReg1_nt | | 1.425 | 1.636 | 0.66/0.76 | 2.58/3.21 |
+| — | LinReg7 | | 2.873 | 3.182 | 0.58/0.57 | 7.93/11.49 |
+| — | LinReg7_nt | | 2.895 | 3.118 | 0.43/0.44 | 8.60/12.70 |
+| LinReg1 | clean | likelihood / CRPS / RMSE | 1.185 / 1.184 / 1.184 | 1.758 / 1.781 / 1.781 | 2.46-2.49/2.37-2.42 | 0.99-1.00 |
+| LinReg1_nt | noise | likelihood / CRPS / RMSE | 1.430 / 1.445 / 1.433 | 1.639 / 1.644 / 1.644 | 0.64-0.66/0.74-0.76 | 2.55-2.59/3.17-3.21 |
+| LinReg7 | clean | likelihood / CRPS / RMSE | 1.195 / 1.202 / 1.200 | **1.608** / 1.682 / 1.675 | 2.31-2.49/1.99-2.06 | 1.02-1.06/1.03-1.09 |
+| LinReg7 | noise | likelihood / CRPS / RMSE | 1.528 / 1.469 / 1.610 | 1.710 / 1.645 / 1.801 | 0.62-0.64/0.69-0.72 | 2.23-2.77/3.21-3.76 |
+
+- **Clean, the base decides nothing**: on LinReg1 the network stays LinReg1 (RMSE and CRPS at update 0); on LinReg7 it
+  rebuilds LinReg1 (1.195-1.202 against 2.873), its gain and its Σ. Both end where least squares is.
+- **Under noise, the noise decides everything**: on either base the closure lands on LinReg1_nt's fixed point (gain
+  0.6-0.8 in the middle band, Σ 2.2-3.8x LinReg1's) and is no better than LinReg1_nt, clean or on its own draws
+  (1.639-1.801 against 1.636); from LinReg7 it is worse clean (1.47-1.61 against 1.43).
+- The one cell that beats LinReg1_nt on its own draws is the clean-trained LinReg7 + CNN, likelihood (1.608, 2 %), and
+  it does so with LinReg1's high gain and small Σ, not with robustness to its noise. No cell improves on the best linear
+  closure for its training: the network adds nothing that carries to 10-100 TU.
+- Caveat: the noise-trained LinReg1 cell's likelihood and CRPS fits use the fixed Σ of LinReg1_nt (at its fixed point,
+  38k), the LinReg7 cell's the learned head; not rerun in head mode.
+
+**38q. Which linear closure each step-4 map ends at (2026-11-04, laptop; Rik: "show me the setups we tried and whether
+they converge to linreg1 or linreg7").** Scratch `step4_converge.jl` (log `step4_converge.log`): each map's clean
+predicted correction on 10-100 TU against LinReg1's, LinReg7's and LinReg1_nt's, rms(map - ref) per QoI over
+rms(LinReg7 - LinReg1), and t, its coordinate on the line LinReg1 (0) -> LinReg7 (1); per band [0,6] [7,15] [16,32],
+mean of Z and E, seed means.
+- LinReg1_nt itself: t 0.39 / 0.10 / 0.14, distance to LinReg1 0.50 / 0.19 / 0.25 (mostly on LinReg1's side, the large
+  scales least); LinReg7_nt: at LinReg7 (0.14-0.19).
+- Clean, any skip, chosen wd: **at LinReg1**. On LinReg1 0.01-0.08 from it; on LinReg7 0.04-0.18 from LinReg1 and
+  0.92-0.99 from LinReg7 (t 0.04-0.10 / 0.01 / 0.05): the network undoes the ridge. The CNN alone: 0.07-0.46 from
+  LinReg1.
+- Noise-trained on LinReg1_nt: **at LinReg1_nt** (0.03-0.11).
+- Noise-trained on LinReg7: **between LinReg1_nt and LinReg7, nearer LinReg1_nt**: 0.11-0.41 from LinReg1_nt, 0.50-0.88
+  from LinReg7; t 0.43-0.62 / 0.13-0.18 / 0.21-0.32, so more of LinReg7 kept than LinReg1_nt has (0.39 / 0.10 / 0.14),
+  most in the large scales (likelihood t 0.62).
+- wd 0 without stopping: off every linear closure (1.2-1.8 in the large band).
+- No map stays at LinReg7. Two kinds of map: the clean ones take LinReg1's mean and its high gain (2.3-2.5 in the middle
+  band); the noise-trained ones take a mean near LinReg1_nt's and a LinReg7-like low gain (0.62-0.76 against LinReg7's
+  0.57), with far better accuracy than LinReg7 (clean 1.43-1.61 against 2.87, own draws 1.64-1.80 against 3.18).
+
+**38r. The noise-trained LinReg1_nt cell in head mode (2026-11-04, Snellius gpu_a100 CPU + laptop; Rik: "I suggest we
+do rerun this").** Removes 38p's caveat: likelihood and CRPS as the LinReg7 cell, INNOISE = head, HEAD = inj, the head
+starting at LinReg1_nt's own Σ (`INNOISE_SIGMA=lrs:LinReg1_nt`); jobs 28889018 (smoke) / 19 (nll, 17 min) / 20 (crps,
+19 min), SCORE 28889885; tags `skipnth_LinReg1_nt_<loss>_wd<w>_s<s>`; scratch log `net_loss_skipnth1.log`,
+`step4_converge.log`.
+- Smoke with 1 update (the skip alone under its head): residual sd / head sd 0.99-1.01, LinReg1_nt is self-consistent
+  under the learned head as under its fixed Σ.
+- Likelihood: best iterate at update 0-100 for every wd (one seed 3,200 at wd 1); seed-mean validation losses tie
+  (7.183-7.188), wd 1 lowest; head 0.99-1.01. The network stays at 0: **= LinReg1_nt** (clean 1.427, own draws 1.639,
+  0.01-0.06 from LinReg1_nt).
+- CRPS: wd 1 (3.896; 0.3 3.911, 0 3.953); best iterates 15-28k; head 1.01-1.06. Clean 1-10 | 10-100 TU 1.318 | **1.403**,
+  NLL -3.98, CRPS **0.779**; own draws **1.587**, NLL -2.81, CRPS **0.886** (LinReg1_nt 1.425 / -4.86 / 0.792 and 1.636 /
+  -3.67 / 0.915; the fixed-Σ CRPS fit 1.445 and 1.644). Per QoI the gain is in Z[7,15] (clean 1.76 against 1.96 x
+  LinReg1's; own draws 0.85 against 0.99). Gain the same as LinReg1_nt (0.65/0.76 middle band); the deployed (diagonal)
+  Σ smaller in Z[7,15] and the small scales (sd(η) / LinReg1's 2.13 3.08, 1.04 1.26 against 2.58 3.21, 1.15 1.38).
+  Its map: 0.21 / 0.08 / 0.12 from LinReg1_nt (fixed-Σ CRPS 0.11 / 0.05 / 0.07), t 0.40 / 0.09 / 0.11.
+- wd 0 without stopping: likelihood 1.695 clean / 1.788 own draws, CRPS 2.200 / 2.238 (memorise; the likelihood less).
+- **The 2x2's noise-trained LinReg1_nt cell, both cells now in head mode: likelihood stays LinReg1_nt; CRPS improves on
+  it, the only step-4 map to do so on both clean inputs (1.403 against 1.425) and its own draws (1.587 against 1.636; the
+  best own-draw score of every closure, the clean-trained LinReg7 + CNN likelihood 1.608 included), at a worse NLL
+  (-3.98 against -4.86).** Part of the own-draw gain is its smaller self-consistent Σ in the middle and small bands.
+
+### 38s. Step 3a without weight decay, coupled: closures built and submitted (2026-11-04)
+
+Card `analysis/cards/step3a_nowd.md` (Rik: "Do run the overfitted networks now ... except the overfitted [likelihood]
+one"). `cnn_closure_export.jl step3/fitrows_<loss>_wd0_refit_s1 mvg CNN_<loss>_nowd` on the desktop (local Julia
+copy): residual mean / rms on 1-10 TU at most 0.06; translation check max 9.1e-5 / 9.2e-5 / 1.1e-4 sd(dQ). Partners:
+CNN_rmse_mvg, CNN_crps_mvg, and CNN_rmse_nowd for the likelihood network. Snellius jobs 28900281 (training hindcast),
+28900284 (long-run smoke), hindcasts 28900286 / 28900301 / 28900313, long runs 28900288-28900323. No numbers yet.
+
+### 38t. Scores of step 2b-more and step 3a without weight decay (2026-11-06)
+
+Cards `step2b_more.md`, `step3a_nowd.md` (Post hoc, with the tables); paper Tables `tab: res s2b`, `tab: res s3a`.
+- LinReg7_nt ≈ LinReg7 coupled. The AR(2) fitted to the noisy-history residual restores the short-lead spread the noise
+  training removed: LinReg1_nt + AR(2) CRPS_0.5 0.222 (LinReg1 0.221, LinReg1_nt 0.236), 27 calibrated; LinReg7_nt +
+  AR(2) 0.235, **34 of 36 calibrated** (LinReg7_nt 0.267, 6). Both improve on their partners; neither on LinReg1. Their
+  long runs lose the noise training's gain (D 1.00 / 0.90, CRPS_100 0.431 / 0.420 against 0.76 / 0.69, 0.380 / 0.384).
+- The three CNNs without weight decay: CRPS_0.5 0.438 (RMSE) / 0.424 (CRPS) / 0.343 (likelihood), +50-98 % against their
+  partners and LinReg1; in the training window 0.238 / 0.333 / 0.225 (LinReg1 0.263). The RMSE one fires the guard on
+  5.4 % of hindcast and 14.3 % of long-run steps. The CRPS one is flagged by the defect rule (its partner too narrow);
+  Rik, 2026-11-06: "Yes, keep it".

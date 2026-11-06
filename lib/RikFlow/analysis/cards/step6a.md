@@ -1,0 +1,174 @@
+# Card: step 6a — stochastic CNN (paper `sec:lever-stoch`), opened 2026-10-29
+
+WORKFLOW.md Stage 0. Methods text: `sections/closures_stoch_cnn.tex`, `\input` in `closures.tex`
+§Step 6 (**draft 2026-10-29 for Rik**, paper worktree `paper_tighten/`, branch `paper-tighten`,
+uncommitted); Eq. `eq: stochastic CNN`. Step 6 now has two forms: 6a (this card) and 6b, the stochastic
+LSTM, which follows step 3b.
+
+Origin: Rik, 2026-10-29: *"Instead of learning a stochastic LSTM we could learn a 'stochastic CNN' that has
+a similar architecture to the CNN from the non linear mean, but adds white noise samples as input streams.
+This could then be trained with CRPS/likelihood loss."* Proposed after steps 3a and 3c were scored
+(sequential design, paper Sec. 3.5); no evaluation-window result of a 6a network exists.
+
+🔒 **Once any full-hindcast number of this closure exists, nothing above "Post hoc" changes.**
+
+- [x] Rik has seen this card (2026-10-29; quote: "Accept defaults")
+- [x] D1–D9 decided at the defaults in **bold** (Rik, 2026-10-29, "Accept defaults"; for D9: a failed
+  offline check is reported and the closure is still run, as in step 3a); D10 decided the same day (g2
+  optional)
+- **GATE 0:** methods text written (draft, paper worktree `paper_tighten/`, uncommitted) and the card seen
+  and decided. Next: Stage 1 (implementation and tests); nothing is built yet.
+
+## Closure
+
+| run | closure | the one change | matched partner | artefact |
+|---|---|---|---|---|
+| g1 | stochastic CNN (`CNN_crps_gen`, name provisional) | the residual learned inside the network, from noise inputs, instead of a constant Gaussian | a2 = CNN (CRPS) + MVG (`CNN_crps_mvg` ef1a774c…, `D6_CNN_crps_mvg`, its long runs; reused) | not built |
+| g2 (**optional**, Rik 2026-10-29) | stochastic CNN trained with its noise, 6a_nt (`CNN_crps_gen_nt`) | training histories carry the generator's own draws (step 3c's construction) | g1 | not built; run after g1, if time allows |
+
+Model (Eq. `eq: stochastic CNN`): q̂ⁿ = q^{n*} + f_θ(q̲_h, εⁿ), εⁿ ~ N(0, I₆) i.i.d. in time. f_θ = step 3a's CNN
+(input map 97 → sequence of 5 steps × 18 channels; two Conv1D, kernel 2, 16 ch, tanh; flatten; [·; q^{n*}; εⁿ]
+→ Dense 64 tanh → Dense 64 tanh → Dense 6), 9 190 + 384 weights. No additive noise at the output; no Σ.
+
+## Design choices for Rik (defaults in bold, with the reason)
+
+**D1 Loss.** **Σ over the QoIs of the fair CRPS (Eq. `eq: fair crps`) of the standardized correction** |
+the same + a variogram-score term (p = 0.5) for the correlation | the energy score.
+- Why the default: it is a2's score (a2 evaluates it in closed form for a Gaussian of constant width), so
+  the pair differs only in the residual model; it is also the evaluation's score per QoI.
+- Its gap: it scores the marginals, not the correlation between the QoIs. The samples' correlation comes out
+  of the network unconstrained (FGN [P†] reports joint structure emerging from marginal CRPS, without
+  guarantee). Step 3a shows the correlation matters: drawn without it, a3's ensembles were 5–26 % wider
+  than a2's up to 0.5 TU and CRPS₀.₅ −4.7 % [−8.2, −1.3]; with the refitted correlation (a3') +1.1 %.
+- The alternatives: the energy score is weak at detecting correlation errors (Scheuerer & Hamill 2015
+  [P]); the variogram score sees them but is blind to a common bias, so it is added to the CRPS, not
+  used alone. It brings a weight, which needs a rule fixed before training (e.g. 1 on the standardized
+  scale). Both break the "same score as a2" pairing.
+- Default plan: train on the marginal CRPS, report the samples' correlation against a2's refitted R
+  offline (before the card is closed for GATE 2). If it misses R badly, Rik decides on a variant before
+  any coupled run.
+
+**D2 Samples per training step.** **M = 4, pure fair CRPS** | M = 2 | M = 8–10; almost-fair (α = 0.95).
+- The fair CRPS of i.i.d. samples is unbiased for every M ≥ 2; M only sets the gradient noise. Cost ×M
+  forward passes of a ~9.6k-weight net: negligible.
+- Pacchiardi et al. 2024 [P]: 2–3 samples suffice for scoring-rule generators; AIFS-CRPS [P†] uses 4.
+- Pure fair over almost-fair: the degeneracy that almost-fair guards against (one member unconstrained
+  when the others sit on y) concerns ensembles whose members can coordinate; a generator's samples are
+  i.i.d. draws, so it does not arise (Claude's reasoning, not from a source).
+- Validation: the same score with one fixed set of M = 4 draws per step (fixed seed), so the early-stopping
+  curve changes only with the network.
+
+**D3 Where the noise enters.** **Deviates of the current step, first dense layer, beside q^{n*}** | noise
+streams over the five lags (shifted with the window) | noise at the output layer only.
+- Past-lag deviates: under one-step training the history is the recorded one, so deviates "of earlier
+  steps" are independent of the history and of the target; the network learns to ignore them. They carry
+  information only if the history was generated by them: rollout training, or a latent model with
+  inference (VAE / state space). Both are much more work; parked. Any part of the residual that the
+  recorded history predicts (its colour) is learned through the history the CNN already reads.
+- First dense layer: the noise then passes through two nonlinear layers together with the history
+  features, so the residual can depend on the state and depart from a Gaussian.
+- Output layer only: q̂ = μ(·) + A(·)ε with A linear in ε is a Gaussian with state-dependent covariance,
+  i.e. the head of steps 5/6b. That is the only form in which "likelihood" training (Rik's alternative)
+  is possible, so 6a is CRPS-only by construction (D6).
+
+**D4 Noise dimension.** **N_Q = 6** | more (e.g. 16).
+- 6 deviates per step from the member stream before the guard = the same random numbers as LinReg1 and
+  a2 (standing rule since 2026-10-13, `crn_check.jl`), so the paired CIs stay as tight as for the other
+  closures. Six dimensions can carry a full-rank residual in six QoIs.
+- More dimensions break that pairing (paired by IC only, wider CIs) for no clear gain.
+
+**D5 LinReg1's linear map in the mean.** **No** (as a2) | yes, after step 4, as a variant whose partner is
+step 4 + MVG. Step 3a's gap is two-thirds inside the training range (+21 % on the 76 in-range ICs), so the
+map may matter; step 4 tests that first.
+
+**D6 Likelihood.** Not available: the density of q̂ has no closed form (Pacchiardi et al. 2024 [P]: the log
+score is not usable for implicit generators). See D3 for the Gaussian-head form, which is 6b / step 5.
+
+**D7 Initialization and seeds.** **Random, seeds 1–3, coupled runs seed 1** (the rule of every network) |
+warm start from a2's weights (faster, but the pair then shares a fit, and the noise weights start at 0).
+
+**D8 Settings (all by the rules of `sec:closures-training`).** Adam, lr 1e-3, plateau schedule as the CNNs,
+batch 256; weight decay from {0, 0.01, 0.03, 0.1, 0.3, 1} by the validation CRPS averaged over the three
+seeds (a2 got 0.3; 6a is chosen afresh); early stop on 8.2–10 TU, then the second training on 1–10 TU for the
+chosen number of updates. Float32, network path (StochLSTM `arch = :cnn`), as step 3a.
+
+**D9 Offline check and its pass rule.** **CRPS on 8.2–10 TU (after 1–8.2 TU) against least squares with its
+constant Gaussian (Table `tab: net-loss` CRPS column, 3 seeds: LS 0.6158; the CRPS CNN 0.6231); passes when it reaches it, no
+margin** (mirrors the likelihood check). ⚠️ None of the step-3a CNNs reached LS in CRPS, so 6a will likely
+fail it; for step 3a a failed check was reported and the closures were run. Rik: same here?
+Reported beside it: the samples' sd / rms error per QoI (does the network use the noise? the SSE-trained M4
+decoder ignored its latent, results_LSTMS §7f); the samples' sd per tenth of the level (as Fig.
+`colour-scale`); the samples' correlation against a2's refitted R (D1); the error of the samples' mean
+against a2's (is the mean part as good as a2's?).
+
+**D10 Own-draw feedback.** **Decided (Rik, 2026-10-29: "Add 6a_nt variant; but mark it as optional"):** g1
+is trained on recorded histories, like a1/a2, so the pair g1–a2 differs in the residual model only. The
+**optional** variant g2 = 6a_nt adds step 3c's noise training; partner g1, so the pair isolates the noise
+training on a generator, as n2–a1 did on a deterministic CNN. Its construction (methods text):
+- The draws are placed as in Eq. `eq: window noise` (3c's anchored construction, locked 2026-10-26).
+- The draw at an earlier step n−k is the **generator's own**: sample the current network M times on the
+  recorded history of step n−k (stop-gradient), take one sample minus the mean of the M, scaled by
+  √(M/(M−1)) (Var(s₁ − s̄) = (1 − 1/M)σ², so the scale restores the samples' covariance exactly).
+  State-dependent and non-Gaussian like the residual; no fixed Gaussian Σ.
+- No outer loop: the CRPS sets the samples' width given the noisy histories, which is what n1/n2 needed a
+  fixed point for. The draws move with the network during training (a moving target); n1 (52 iterations)
+  and n2 (5 rounds) converged, so convergence is expected but not shown — check the training curve.
+- Approximation, as in 3c: the lagged draws are computed on the recorded (clean) history of their step,
+  not on a history that itself carries earlier draws; the solver's damping over a step is not modelled.
+- Settings: g1's, **not re-selected** (as n2 kept a1's); validation on noisy histories with fixed deviates
+  at every step (the draws still change with the network). Disclose on the card.
+- Optional alternative (not default): a fixed Gaussian Σ with n2's outer loop (reuses `step3_innoise.jl`),
+  simpler to build, but the draws are then not the generator's own.
+
+## Expected, and why
+
+- **Offline:** CRPS a little below a2's (a more flexible residual on the same architecture); sample spread
+  growing with the level, as the power law of step 2 (β 0.5 large, 1.3–1.9 middle/small scales); the mean
+  part about a2's, so still short of least squares.
+- **Coupled vs a2:** the mean is the same architecture on the same data, so a2's gap to LinReg1 (CRPS₀.₅
+  +28.3 % [+19.8, +37.6], 12 calibrated, G fails against LinReg7) carries over. Step 2 (a fixed
+  state-dependent scale: no hindcast score moved on five bases) and step 3a (learned constant scales: +1.1 %
+  against the refitted Gaussian) suggest small, possibly unresolved changes in CRPS₀.₅; the calibrated count
+  moves with the sample correlation (D1).
+- **Expected verdict vs LinReg1: does not improve.** The case for running it is the story (does learning the
+  residual inside the network change the coupled result?), not an expected improvement.
+- **g2 vs g1 (optional), from step 3c:** the response to its own draws largely removed; narrower ensembles
+  (n1 0.71–0.78 × LinReg1's spread, n2 0.78–0.86 × a1's); under-dispersed up to 0.5 TU and better calibrated
+  beyond; better long runs for a mean whose drift is not out-of-range error (n1 CRPS₁₀₀ 0.380, best of all;
+  n2 worse: D 1.34, CRPS_all +20 % vs a1). A CRPS-learned width is one-step calibrated, as n1's
+  self-consistent Σ was, so the short-lead narrowing is expected to stay. The mean's out-of-range error is
+  untouched (n2 kept it). Expected verdict vs LinReg1: does not improve.
+
+## Clauses (fixed: paper Sec. 3.5 `sec:criterion`; as `step3a.md`)
+
+Hindcast K = 90, M = 10, 100 + 1200 steps; CRPS₀.₅ (steps 1–200), CRPS_all (1–1200); e₀.₅; r, calibrated
+count and rank histograms per lead (36 cells); lead-wise divergence rule; long runs 5 × 100 TU.
+- **G** KS guard against **LinReg7**: FAIL iff all 5 single-run summed KS lie above all 5 of LinReg7's.
+- **S** CRPS₀.₅ paired difference against LinReg1: 90 % CI upper end < 0.
+- **C** calibrated cells against LinReg1: paired CI of the count difference > 0, AND the CRPS₀.₅ CI upper end
+  < +10 %.
+- **Verdict:** IMPROVES iff G passes and (S or C). Against the partner a2 (the mechanism, secondary): the same
+  rules with a2 in place of both baselines.
+
+Reported, no clause: as `step3a.md` (CRPS_all, e₀.₅, b, rank histograms, long-run bias, D, spread–skill,
+CRPS₁₀₀, e₁₀₀, divergences, guard firings, member steps below the training range) plus the offline numbers
+of D9.
+
+## Implementation (Stage 1, after GATE 0) — what has to be built
+
+- `cnn_mean_fit.jl`: `RIKFLOW_CNN_LOSS=crps_gen` (name provisional): noise inputs in the first dense layer,
+  M draws per window, the sample fair CRPS; fixed validation draws; the second training as now.
+- `StochLSTM` (`arch = :cnn`): an emission mode in which the 6 deviates are drawn from the member's rng
+  **before** the forward pass and fed to the network, nothing added after; `cnn_features` appends εⁿ.
+  The old modes bit-identical (RNG stream included).
+- `cnn_closure_export.jl`: export the generator; translation check fit vs deployed with the same εⁿ.
+- g2 only (optional): in the same tool, `RIKFLOW_CNN_INNOISE=self` (name provisional): per window, M
+  stop-gradient samples at each of the h earlier steps on their recorded histories, the scaled draw, placed
+  through the existing window map of `step3_innoise.jl`; fixed validation deviates. Deployment = g1's.
+- Tests (next free V-number: grep the branch first, #74): the sample CRPS against `crps_ensemble(fair =
+  true)`; deployment draws exactly 6 deviates per step from the member stream before the guard (CRN with
+  LinReg1 on the same seed); zero noise weights reproduce a deterministic CNN.
+
+## Post hoc
+
+(empty)
