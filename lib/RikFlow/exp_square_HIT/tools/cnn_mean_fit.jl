@@ -126,8 +126,23 @@ const ACTF = CACT === :relu ? relu : tanh
 const CINIT = Symbol(envc("INIT", "glorot"))
 CINIT in (:glorot, :he) || error("RIKFLOW_CNN_INIT must be glorot or he; got $CINIT")
 const WINIT = CINIT === :he ? kaiming_normal : glorot_uniform
-# SKIP (step3_data.jl): the output layer starts at zero (its bias is zero by default), so a fit starts at the LinReg
+# SKIP (step3_data.jl): the output layer's WEIGHTS start at zero (OUTINIT) and, after `Lux.setup`, its BIAS too
+# (`skip_start!`), so a fit starts exactly at the LinReg. 🔴 Lux 1.x's `Dense` bias default is PyTorch's uniform
+# ±1/sqrt(fan_in), not zero: every skip fit before 2026-11-06 started at the LinReg plus a random constant of up to
+# 0.125 target sd per QoI (found by the step-5 session; seed 1: up to 0.110). The bias is zeroed AFTER setup, not by
+# `init_bias = zeros32`, so that setup draws the same random numbers and the batch shuffle that follows is the old
+# one: a rerun differs from the old fit by the start bias alone. RIKFLOW_CNN_SKIPBIAS = zero (default) | lux (the
+# pre-2026-11-06 start, to reproduce those fits).
 const OUTINIT = isempty(SKIP) ? glorot_uniform : zeros32
+const CSKIPB = Symbol(envc("SKIPBIAS", "zero"))
+CSKIPB in (:zero, :lux) || error("RIKFLOW_CNN_SKIPBIAS must be zero or lux; got $CSKIPB")
+"With SKIP (and SKIPBIAS = zero), zero the output layer's bias (`layer_4` of `mkmodel`'s chain): the fit starts at the LinReg."
+function skip_start!(net)
+    (isempty(SKIP) || CSKIPB === :lux) && return net
+    all(iszero, net.layer_4.weight) || error("skip_start!: layer_4 is not the zero-initialised output layer")
+    fill!(net.layer_4.bias, 0)
+    return net
+end
 # RIKFLOW_CNN_HEAD = identity (default: the head starts at Sigma = I, the plain likelihood; Rik,
 # 2026-10-22: "I am not sure if I like the preset likelihood loss", then made it the default) | ls (it
 # starts at least squares' residual covariance, `LS_HEAD`; within seed noise of identity, 3 seeds each) |
@@ -485,6 +500,7 @@ function fit_cnn(C, lr, wd, seed)
     rng = Xoshiro(seed)
     model = mkmodel(C)
     net, st = Lux.setup(rng, model)
+    skip_start!(net)
     ps = todev((; net, head = head_init(seed)))
     st = todev(st)
     rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
@@ -608,6 +624,7 @@ function refit_cnn(C, lr, wd, seed, hist, nupd; Linj = nothing)
     nrng = Xoshiro(seed + 7919)
     model = mkmodel(C)
     net, st = Lux.setup(rng, model)
+    skip_start!(net)
     ps = todev((; net, head = head_init(seed)))
     st = todev(st)
     rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))

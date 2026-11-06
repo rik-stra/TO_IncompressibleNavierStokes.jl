@@ -35,7 +35,8 @@ nreg == (2cfg.h + 1) * nq + 1 || error("regressor width $nreg, expected $((2cfg.
 # 2026-11-03: "frozen but immediatly do both baselines"; closures.tex Eq. skip net). The network learns what that
 # LinReg's mean model misses: the target is dQ^n minus the LinReg's predicted correction (`skipq`), standardised
 # by its own mean and sd on 1-10 TU, and every prediction the tools write (pred1, pred3, predls) is the full
-# correction, skip + network; cnn_mean_fit.jl starts the output layer at zero, so every fit starts at the
+# correction, skip + network; cnn_mean_fit.jl starts the output layer at zero (weights and, since 2026-11-06, the
+# bias: `skip_start!`; before, Lux's random bias put the start up to 0.125 target sd off), so every fit starts at the
 # LinReg. The LS floor is unchanged: least squares on the residual of a linear skip on the same regressor is least
 # squares on dQ minus the skip (checked below at h = 5). The LinReg is fitted on all of 1-10 TU, so stage 1's
 # validation rows (8.2-10 TU) lie in the skip's own training window. Not with input noise (the skip is computed

@@ -43,7 +43,10 @@ INNOISE=${INNOISE:-none}
 INNOISE_SIGMA=${INNOISE_SIGMA:-ls}
 HEAD=${HEAD:-identity}
 LOSSES=${LOSSES:-nll crps rmse}
-case "$INNOISE" in none) PFX=skip_${BASE};; head) PFX=skipnth_${BASE};; *) PFX=skipnt_${BASE};; esac
+# ZTAG=<tag> (2026-11-06): appended to the tag stem (skip<ZTAG>_..., skipnth<ZTAG>_...), so a rerun lands beside the
+# old fits: the zero-bias start (cnn_mean_fit.jl `skip_start!`) is rerun as ZTAG=z0; RIKFLOW_CNN_SKIPBIAS passes through.
+ZTAG=${ZTAG:-}
+case "$INNOISE" in none) PFX=skip${ZTAG}_${BASE};; head) PFX=skipnth${ZTAG}_${BASE};; *) PFX=skipnt${ZTAG}_${BASE};; esac
 L1=${LOSSES%% *}
 SCRIPT=${CNN_SCRIPT:-exp_square_HIT/tools/cnn_mean_fit.jl}
 LOGD=exp_square_HIT/output/TO_LSTM/step3
@@ -61,7 +64,7 @@ if [ "$MODE" = smoke ]; then
         echo "${PFX}_smoke0 $NZ RIKFLOW_CNN_LOSS=$L1 RIKFLOW_CNN_WDS=0.3 RIKFLOW_CNN_SEEDS=1 RIKFLOW_CNN_MAXUPD=1 RIKFLOW_CNN_REFIT=1" >> "$JOBS"
 elif [ "$MODE" = round ]; then
     for s in 1 2 3; do
-        echo "${ROUND_FROM}_r${ROUND}_s$s RIKFLOW_CNN_INNOISE=$INNOISE RIKFLOW_CNN_INNOISE_SIGMA=step3/${ROUND_FROM}_s$s RIKFLOW_CNN_LOSS=$LOSS RIKFLOW_CNN_WDS=$WD RIKFLOW_CNN_SEEDS=$s RIKFLOW_CNN_MAXUPD=200000 RIKFLOW_CNN_REFIT=1" >> "$JOBS"
+        echo "${ROUND_FROM}_r${ROUND}${ZTAG}_s$s RIKFLOW_CNN_INNOISE=$INNOISE RIKFLOW_CNN_INNOISE_SIGMA=step3/${ROUND_FROM}_s$s RIKFLOW_CNN_LOSS=$LOSS RIKFLOW_CNN_WDS=$WD RIKFLOW_CNN_SEEDS=$s RIKFLOW_CNN_MAXUPD=200000 RIKFLOW_CNN_REFIT=1" >> "$JOBS"
     done
 else
     for l in $LOSSES; do
