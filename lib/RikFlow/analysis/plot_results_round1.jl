@@ -21,6 +21,7 @@ const STEPS = Dict("s11" => ("LinReg7_ar2n", "LinReg7 + AR(2)"),
                    "s1" => ("Splice1_E0x7_ar2n", "LinReg^E + AR(2)"),   # step 1 as a whole, Figs 13-15 (below)
                    "s2all" => ("Splice1_E0x7_ar2n_pl", "LinReg^E + AR(2) + power-law scale"),   # step 2, Figs 17-18
                    "s3a" => ("CNN_rmse_mvg", "CNN (RMSE) + MVG"),       # step 3a, Sec. 7.3 (below)
+                   "s3c" => ("LinReg1_nt", "LinReg1 trained with its noise"),   # step 3c, Fig. res-s3c-spread
                    "s2" => ("LinReg1_pl", "LinReg1 + power-law scale"))
 const STEP = let i = findfirst(==("--step"), ARGS)
     i === nothing ? "s11" : ARGS[i + 1]
@@ -199,6 +200,18 @@ const S1_SETS = (("LinReg1", "TO_LRS/LinReg1", COL["LinReg1"]),
 const S1_DISP = Dict("LinReg^E" => L"\mathrm{LinReg}^E", "LinReg^E + AR(2)" => L"\mathrm{LinReg}^E + \mathrm{AR(2)}")
 s1disp(k) = get(S1_DISP, k, k)
 s1col(k) = only(c for (l, _, c) in S1_SETS if l == k)
+# The paper's names (story.md S9; Rik, 2026-10-30, on Fig. res-s1-dqacf: "also add the unregularized baseline"),
+# for the legends; the fans keep s1disp, whose column titles would not fit the longer names.
+const S1_NAME = Dict("LinReg1" => "unregularized baseline", "LinReg7" => "regularized baseline",
+                     "LinReg7 + AR(1)" => "regularized baseline + AR(1)",
+                     "LinReg7 + AR(2)" => "regularized baseline + AR(2)")
+s1name(k) = get(S1_NAME, k, s1disp(k))
+# Fig. res-s1-dqacf (Rik, 2026-10-30: "the colors ... cant be differentiated that well"): colour by the mean
+# model (the two baselines' blue and vermillion, LinReg^E's violet of Fig. 6; dataviz validator: all checks pass,
+# worst CVD dE 9.2), line style by the residual (white solid, AR(1) dotted, AR(2) dashed)
+s1family(k) = startswith(k, "LinReg^E") ? to_color("#5B3A9E") : startswith(k, "LinReg7") ? COL["LinReg7"] :
+              k == "LinReg1" ? COL["LinReg1"] : nothing
+s1style(k) = endswith(k, "AR(1)") ? :dot : endswith(k, "AR(2)") ? :dash : :solid
 
 function fig_s1_fans()
     cl = ("LinReg7", "LinReg7 + AR(1)", "LinReg^E", "LinReg^E + AR(2)")
@@ -210,11 +223,14 @@ end
 The correction's ACF in the long runs, as Fig. 6 but the mean of the five runs per closure. `table`,
 `disp`, `file` and `tag` default to step 1's (step 3a, 2026-10-26).
 """
-function fig_s1_dqacf(; L = 200, cl = ("LinReg7", "LinReg7 + AR(1)", "LinReg7 + AR(2)", "LinReg^E",
+function fig_s1_dqacf(; L = 200, cl = ("LinReg1", "LinReg7", "LinReg7 + AR(1)", "LinReg7 + AR(2)", "LinReg^E",
                                           "LinReg^E + AR(2)"),
-                      table = S1_SETS, disp = s1disp, file = "results_s1_dqacf.pdf", tag = "s1")
+                      table = S1_SETS, disp = s1name, file = "results_s1_dqacf.pdf", tag = "s1", nbanks = 3,
+                      colour = s1family, style = s1style, ref_under = true)
     lags = 1:L
-    sets = [s for k in cl for s in table if s[1] == k]
+    sets = [(k, dir, something(colour(k), col)) for (k, dir, col) in (s for k in cl for s in table if s[1] == k)]
+    # the record: a wide grey line under the closures where line styles carry the residual (step 1), else dashed
+    refkw = ref_under ? (color = :gray72, linewidth = 2.6, linestyle = :solid) : (color = C_REF, linewidth = 1.1, linestyle = :dash)
     dqref = REC["q"][:, 2:end] .- REC["q_star"]
     A = Dict{String,Any}()
     for (k, dir, _) in sets
@@ -230,21 +246,22 @@ function fig_s1_dqacf(; L = 200, cl = ("LinReg7", "LinReg7 + AR(1)", "LinReg7 + 
         ar = autocorr(collect(dqref[i, :]), L)
         ax = axs[i]
         hlines!(ax, [0.0]; color = :gray70, linewidth = 0.5)
+        ref_under && lines!(ax, lags, ar[2:end]; refkw...)
         for (k, _, col) in sets
             am = vec(mean(A[k][i]; dims = 2))
             @printf("%s dqacf: %-8s %-16s lag1 %.2f (record %.2f), lag 10 / 50 %.2f / %.2f (record %.2f / %.2f), max |mean - record| %.2f, max |run - mean| %.2f\n",
                     tag, LABELS[i], k, am[2], ar[2], am[11], am[51], ar[11], ar[51], maximum(abs, am[2:end] .- ar[2:end]),
                     maximum(abs, A[k][i][2:end, :] .- am[2:end]))
-            lines!(ax, lags, am[2:end]; color = col, linewidth = 1.0)
+            lines!(ax, lags, am[2:end]; color = col, linewidth = 1.1, linestyle = style(k))
         end
-        lines!(ax, lags, ar[2:end]; color = C_REF, linewidth = 1.1, linestyle = :dash)
+        ref_under || lines!(ax, lags, ar[2:end]; refkw...)
         r, cc = pos(i)
         r == 2 ? (ax.xlabel = "lag (steps)") : (ax.xticklabelsvisible = false)
         cc == 1 ? (ax.ylabel = "autocorrelation") : (ax.yticklabelsvisible = false)
         xlims!(ax, 1, L); ylims!(ax, -0.3, 1.02)
     end
-    Legend(fig[3, 1:3], [[LineElement(color = C_REF, linestyle = :dash)]; [LineElement(color = c) for (_, _, c) in sets]],
-           ["tracked record"; [disp(k) for (k, _, _) in sets]]; orientation = :horizontal, nbanks = 2)
+    Legend(fig[3, 1:3], [[LineElement(; refkw...)]; [LineElement(color = c, linestyle = style(k)) for (k, _, c) in sets]],
+           ["tracked record"; [disp(k) for (k, _, _) in sets]]; orientation = :horizontal, nbanks)
     rowgap!(fig.layout, 3); colgap!(fig.layout, 10)
     savefig(file, fig)
 end
@@ -322,7 +339,8 @@ fig_s3a_traj() = fig_r1_traj("CNN (RMSE) + MVG"; others = ("LinReg1", "CNN (CRPS
 
 fig_s3a_dqacf() = fig_s1_dqacf(; cl = ("LinReg1", "CNN (RMSE) + MVG", "CNN (CRPS) + MVG", "CNN (CRPS) + learned head",
                                        "CNN (RMSE) + AR(2)"),
-                               table = S3_SETS, disp = identity, file = "results_s3a_dqacf.pdf", tag = "s3a")
+                               table = S3_SETS, disp = identity, file = "results_s3a_dqacf.pdf", tag = "s3a",
+                               nbanks = 2, colour = k -> nothing, style = k -> :solid, ref_under = false)
 
 """
 The correction's ACF in the long runs, as Fig. 6, for LinReg1, LinReg7 and the step's closure against the
@@ -334,6 +352,78 @@ function fig_r1_dqacf(; L = 200)
     end
     mv(joinpath(FIGDIR, "colour_dq_acf.pdf"), joinpath(FIGDIR, "results_$(STEP)_dqacf.pdf"); force = true)
     fig_dqacf(; L, linrege = true)       # restore Fig. 6 (colour_dq_acf.pdf) as the paper has it
+end
+
+
+# --------------------------------------------------------------------------------------------------
+# Step 3c (Rik, 2026-11-02: "Add both"; story.md rule B3, every reading visible): the spread-skill ratio by
+# lead of the unregularized baseline and of it trained with its own noise, as Fig. base-spread (Sec. 4.1):
+# per (QoI, lead) cell on the held-out hindcast with a 90 % IC-block interval, and the long-run ratio at the
+# right. Joint mask: a member that diverged in either closure is left out of both. Sky blue is below 3:1 on
+# white (dataviz validator), so the noise-trained closure is also dashed, with diamond markers.
+#   results_s3c_spread.pdf
+# --------------------------------------------------------------------------------------------------
+const S3C_SPREAD = (("LinReg1", "D6_LinReg1", "TO_LRS/LinReg1", COL["LinReg1"], :solid, :circle),
+                    ("LinReg1_nt", "D6_LinReg1_nt", "TO_LRS/LinReg1_nt", to_color("#56B4E9"), :dash, :diamond))
+const S3C_NAME = Dict("LinReg1" => "unregularized baseline", "LinReg1_nt" => "trained with its noise")
+
+"Long-run spread-skill per QoI of the runs in `dir` (`longrun_ratio`, by directory)."
+function longrun_ratio_dir(dir)
+    rs = longruns(dir)
+    K = min(minimum(size(r.q, 2) for r in rs), size(TRUTH.q, 2))
+    arr = Array{Float64}(undef, K, NQ, length(rs))
+    for (j, r) in enumerate(rs)
+        arr[:, :, j] .= transpose(r.q[:, 1:K])
+    end
+    return spread_skill(arr, transpose(TRUTH.q[:, 1:K]))
+end
+
+function fig_s3c_spread()
+    ens = Dict(s[1] => load_members(joinpath(OUTD, s[2])) for s in S3C_SPREAD)
+    ks = sort(intersect((e.ks for e in values(ens))...))
+    grid = filter(<=(minimum(e.nlead for e in values(ens))), LEADS)
+    asm = Dict(c => (restrict(ens[c], ks), assemble(restrict(ens[c], ks), TRUTH, grid)...) for c in keys(ens))
+    mask_joint!([asm[s[1]][2] for s in S3C_SPREAD])
+    t = asm["LinReg1"][1].t
+    x = grid .* DT
+    xl = 6.0
+    fig = Figure(size = (W, 250), figure_padding = (2, 6, 2, 2))
+    axs = qoi_axes(fig; xscale = log10, yscale = log10,
+                   xticks = ([x[[1, 3, 5, 6]]; xl], [[@sprintf("%g", v) for v in x[[1, 3, 5, 6]]]; "long"]),
+                   yticks = [0.25, 0.5, 0.8, 1.25, 2], ytickformat = vs -> [@sprintf("%g", v) for v in vs])
+    for (c, _, ld, col, ls, mk) in S3C_SPREAD
+        _, fc, tr = asm[c]
+        mom = cell_moments(fc, tr)
+        r = cell_ratios(mom)
+        lo, hi = ratio_ci(mom, t)
+        lr = longrun_ratio_dir(ld)
+        @printf("s3c spread: %-10s calibrated %2d / 36; r <= 0.5 TU %s; r > 0.5 TU %s; long run %s\n", c,
+                calibrated_count(r), join((@sprintf("%.2f", v) for v in vec(r[:, x .<= 0.5])), " "),
+                join((@sprintf("%.2f", v) for v in vec(r[:, x .> 0.5])), " "),
+                join((@sprintf("%.2f", v) for v in lr.per_qoi), " "))
+        for i in 1:NQ
+            ax = axs[i]
+            band!(ax, x, lo[i, :], hi[i, :]; color = (col, 0.18))
+            lines!(ax, x, r[i, :]; color = col, linewidth = 1.1, linestyle = ls)
+            scatter!(ax, x, r[i, :]; color = col, marker = mk, markersize = 4)
+            scatter!(ax, [xl], [lr.per_qoi[i]]; color = col, marker = mk, markersize = 5)
+        end
+    end
+    for (i, ax) in enumerate(axs)
+        hspan!(ax, CAL_BAND...; color = (:gray50, 0.13))
+        vlines!(ax, [sqrt(x[end] * xl)]; color = :gray60, linewidth = 0.5, linestyle = :dot)
+        xlims!(ax, x[1] / 1.4, xl * 1.4)
+        ylims!(ax, 0.3, 2.6)
+        r, cc = pos(i)
+        r == 2 && (ax.xlabel = "lead (TU)")
+        r == 1 && (ax.xticklabelsvisible = false)
+        cc == 1 ? (ax.ylabel = "spread-skill ratio") : (ax.yticklabelsvisible = false)
+    end
+    Legend(fig[3, 1:3], [[LineElement(color = col, linestyle = ls), MarkerElement(color = col, marker = mk, markersize = 4)]
+                         for (_, _, _, col, ls, mk) in S3C_SPREAD], [S3C_NAME[s[1]] for s in S3C_SPREAD];
+           orientation = :horizontal, tellheight = true)
+    rowgap!(fig.layout, 3); colgap!(fig.layout, 4)
+    savefig("results_s3c_spread.pdf", fig)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
@@ -350,6 +440,11 @@ if abspath(PROGRAM_FILE) == @__FILE__
         want = isempty(args) ? ["fans", "traj"] : args
         "fans" in want && fig_s2_fans()
         "traj" in want && fig_s2_traj()
+        exit()
+    end
+    if STEP == "s3c"
+        want = isempty(args) ? ["spread"] : args
+        "spread" in want && fig_s3c_spread()
         exit()
     end
     if STEP == "s3a"

@@ -156,6 +156,12 @@ for h in (5, 7)
     @printf("  h = %d: %s   (rows %d-%d of %d)\n", h,
             join((@sprintf("%s %.4f", LAB[i], sqrt(mean(abs2, E[:, i])) / sdq[i]) for i in 1:NQ), "  "),
             n + 1, size(X, 1), size(X, 1))
+    # each QoI's share of the summed squared error in units of sd(dQ), the units of net_sweep.jl's 1/2 SE (half
+    # the sum reproduces its LinReg row, 0.2050; paper Results step 3a: "E[0,6] carries about ... of it" on the
+    # validation window, Rik 2026-10-30)
+    se = vec(mean(abs2, E; dims = 1)) ./ sdq .^ 2
+    @printf("         1/2 SE summed %.4f; shares %s\n", sum(se) / 2,
+            join((@sprintf("%s %.1f %%", LAB[i], 100 * se[i] / sum(se)) for i in 1:NQ), "  "))
 end
 # the same on the section's split (Rik, 2026-10-30: Sec. 5 fits on 1-10 TU and measures on 10-100 TU): the
 # deployed-style fits, error on the training rows (in-sample) and on 10-100 TU, and h = 7 over h = 5

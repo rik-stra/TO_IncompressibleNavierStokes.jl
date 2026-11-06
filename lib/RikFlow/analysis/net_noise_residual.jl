@@ -212,7 +212,15 @@ function report_scale()
     end
 end
 
+# NETNOISE_FIG_LABELS = <label,...>: draw only these models (each keeps its colour, the colour of its place in the
+# arguments, so a model looks the same in every figure); NETNOISE_FIG_NAMES = <name;...>: their legend names (same
+# order); NETNOISE_FIG_FILE: the file (default nt_residual_acf.pdf). Rik, 2026-11-03 (claim_maps/step2b.md D1): the
+# figure split into the linear means (step 2b) and the networks (step 3c).
 function fig_acf()
+    want = split(get(ENV, "NETNOISE_FIG_LABELS", join((m.label for m in MODELS), ",")), ",")
+    drawn = [(j, m) for (j, m) in enumerate(MODELS) if m.label in want]
+    names = haskey(ENV, "NETNOISE_FIG_NAMES") ? split(ENV["NETNOISE_FIG_NAMES"], ";") : [m.label for (_, m) in drawn]
+    length(names) == length(drawn) || error("NETNOISE_FIG_NAMES: $(length(names)) names for $(length(drawn)) models")
     dqr = (; R = permutedims(REC["q"][:, 2:end] .- REC["q_star"]), ho = findall(k -> 10 < k * DT <= 100, 1:size(REC["q_star"], 2)))
     lags = 1:KMAX
     fig = Figure(size = (W, 470), figure_padding = (2, 6, 2, 2))
@@ -224,7 +232,7 @@ function fig_acf()
             ax = axs[i]
             hlines!(ax, [0.0]; color = :gray70, linewidth = 0.5)
             lines!(ax, lags, acf_ho(dqr, i)[2:end]; color = C_REF, linestyle = :dash, linewidth = 1.0)
-            for (j, m) in enumerate(MODELS), (k, s) in enumerate(sort(collect(keys(m.seeds))))
+            for (j, m) in drawn, (k, s) in enumerate(sort(collect(keys(m.seeds))))
                 a = acf_rows(getfield(m.seeds[s], f), rows_ho(m), i)
                 lines!(ax, lags, a[2:end]; color = NN_COL[j], linewidth = k == 1 ? 1.1 : 0.5)
             end
@@ -235,10 +243,10 @@ function fig_acf()
         end
         rowgap!(g, 3); colgap!(g, 10)
     end
-    els = Any[LineElement(color = C_REF, linestyle = :dash); [LineElement(color = NN_COL[j], linewidth = 1.1) for j in eachindex(MODELS)]]
-    Legend(fig[3, 1], els, [L"dQ"; [m.label for m in MODELS]]; orientation = :horizontal)
+    els = Any[LineElement(color = C_REF, linestyle = :dash); [LineElement(color = NN_COL[j], linewidth = 1.1) for (j, _) in drawn]]
+    Legend(fig[3, 1], els, [L"dQ"; names]; orientation = :horizontal)
     rowgap!(fig.layout, 4)
-    savefig("nt_residual_acf.pdf", fig)
+    savefig(get(ENV, "NETNOISE_FIG_FILE", "nt_residual_acf.pdf"), fig)
 end
 
 "As net_residual.jl's `fig_scale`, for the DEPLOYED residual of every model (first seed)."
@@ -297,6 +305,6 @@ if NN_MAIN
     # NETNOISE_NOFIG=1: numbers only (any number of models; the figures take at most six)
     if get(ENV, "NETNOISE_NOFIG", "0") != "1"
         fig_acf()
-        fig_scale()
+        get(ENV, "NETNOISE_ACF_ONLY", "0") == "1" || fig_scale()
     end
 end
