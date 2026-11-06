@@ -58,7 +58,13 @@ LinReg1_nt's residual in Z[7,15]); k2 0.59 0.92 0.22 0.19 0.54 0.43 (it rebuilds
   1.01 1.02 1.03 1.01 1.06 1.05 (self-consistent within 6 %); that residual's correlation up to 0.87.
 - k2: learned sd / clean residual rms 1.11 1.06 1.26 1.46 1.00 1.07; residual under its noise / learned sd 1.01 1.02 1.02
   1.01 1.06 1.03; correlation up to 0.82.
-BUILD (desktop, at Rik's commit): to be filled; sha256 per artefact.
+**Built 2026-11-06 on the LAPTOP** (Rik: "Build on the laptop"; the desktop unreachable, ssh timed out), code `cd759ad3`
+(the export and `src/` as `a38aec13`), Julia 1.12.7, `--project=.` (the export needs no Lux); log
+`TO_LSTM/step3/closures/export_step4_build.log`. Every number as in the dry run above. Artefacts
+(`StochLSTM_seed1.jld2`, 160 906 bytes each, sha256): k1a `5a974de9…58294de94`, k1b `b8d54227…a49cadb59`, k2a
+`8879ba67…dac875cf`, k2b `f964242d…2f31bf`. Skips: `TO_LRS/LinReg1_nt/LinReg.jld2` `3bf7358d…3a70f5ec26`,
+`TO_LRS/LinReg7/LinReg.jld2` `c9054f70…d673b779` (the translation check against `pred3`, written on Snellius, ties
+them to the files the fits used).
 
 ## Expected, and why (Table `tab: skip-offline`, seed means; results_LSTMS.md §38o, §38q, §38r)
 
@@ -104,4 +110,24 @@ From `exp_square_HIT/` on Snellius, at a commit holding `src/ts_lstm.jl`'s CNN s
 
 ## Post hoc
 
-(empty)
+- 2026-11-06: Snellius pulled `2287bdeb` -> `cd759ad3` (`--ff-only`; Rik: "Yes, go ahead"); the three untracked
+  `run_cnn_*.sh` there were byte-identical to the committed ones (git hash-object), moved aside for the pull, compared
+  after it and removed. The four artefacts copied laptop -> Snellius, sha256 equal; the LinReg1_nt and LinReg7 skip files
+  there equal the laptop's. Home 78.2 % of 200 GiB before the runs.
+- Jobs (gpu_a100): training hindcast array 28939903 (tasks 1-4: k1a, k1b, k2a, k2b); long-run smoke 28939904. Nothing
+  chained: production waits for the defect rule and Rik.
+- Long-run smoke 28939904 COMPLETED (2:30, code `cd759ad3`): `PASS: 4 closure(s)`, the guard fired 0 / 100 steps after
+  the warm-up for each.
+- ⚠️ **Production submitted BEFORE the defect rule** (Rik, 2026-11-06: "start in the full hindcasts", "also start the
+  full runs"; the training hindcast was then half run, tasks 1-2 running, 3-4 pending). At `cd759ad3`, gpu_a100, not
+  chained. Full hindcasts (`run_d6_packed.sh`, array 1-10): k1a 28940364, k1b 28940370, k2a 28940376, k2b 28940383. Long
+  runs (`run_online.sh lstm 2 <r>`, `-t 00:30:00`, r = 1-5): k1a 28940365-69, k1b 28940371-75, k2a 28940377, 78, 80, 81,
+  82, k2b 28940384-88.
+- Training hindcast 28939903 COMPLETED (tasks 1-4); copied to the laptop, 50 files per closure, summed bytes equal
+  (9 882 196 / 9 882 000 / 9 882 050 / 9 881 850). **Defect rule (`train_hindcast.jl`, scratch log
+  `train_step4.log`): none flagged** — no member diverged; spread-skill ≤ 0.5 TU / partner's: k1a / LinReg1_nt 1.05 1.00
+  1.06 1.08 1.03 1.03; k1b / k1a 1.00 1.03 0.86 0.88 0.85 0.85; k2a / LinReg7 1.22 1.26 1.48 1.50 1.39 1.40; k2b / k2a 0.98
+  1.01 0.85 0.86 0.86 0.86. Own spread-skill ≤ 0.5 TU: k1a 0.48-0.63, k1b 0.47-0.53, k2a 0.49-0.59, k2b 0.48-0.55
+  (LinReg1_nt 0.45-0.61, LinReg7 0.39-0.44, LinReg1 0.61-0.78). Guard: 0 for the a runs; k1b 52, k2b 13 of 60 000
+  forecast steps (one member each). Bias at 0.5 TU −5.1 to −6.9 % (LinReg1_nt −4.5, LinReg7 −7.6), at 2.5 TU +4.9 to
+  +6.6 % (LinReg1_nt +1.9, LinReg7 +6.7).
