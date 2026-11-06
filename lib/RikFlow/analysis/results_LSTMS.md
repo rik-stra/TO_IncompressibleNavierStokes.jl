@@ -3945,3 +3945,24 @@ Cards `step2b_more.md`, `step3a_nowd.md` (Post hoc, with the tables); paper Tabl
   partners and LinReg1; in the training window 0.238 / 0.333 / 0.225 (LinReg1 0.263). The RMSE one fires the guard on
   5.4 % of hindcast and 14.3 % of long-run steps. The CRPS one is flagged by the defect rule (its partner too narrow);
   Rik, 2026-11-06: "Yes, keep it".
+
+### 38u. Step 4 coupled: the CNN on a frozen LinReg skip, trained with its noise (2026-11-06)
+
+Card `analysis/cards/step4.md` (closures, build, jobs, the full table and the paired differences in its Post hoc).
+Code `a38aec13`: `arch = :cnn` takes `skip` (`linreg_skip_map`, `Ws` on the mapped input), exported in **Float64** (the
+least-squares skip's map reaches 9.4e3 target sd; the Float32 lag window alone put LinReg1_nt 4.6e-3 sd off). Four
+closures from two fits (§38o, §38r), CRPS head, each deployed with (a) the learned sds + the correlation of the residual
+under its own noise and (b) the diagonal head as trained (Rik: "D1 a and b"): k1a/k1b on LinReg1_nt, k2a/k2b on LinReg7.
+Built on the laptop; translation check 9.1e-7 / 2.7e-6 target sd. Training hindcast: no defect. Production submitted
+before the defect rule on Rik's word. Snellius @ `cd759ad3`, gpu_a100.
+- Hindcast: CRPS_0.5 0.227 / 0.231 / 0.230 / 0.237 (LinReg1 0.221, LinReg1_nt 0.236, LinReg7 0.263); CRPS_3 0.364 /
+  0.365 / 0.387 / 0.388 (0.390 / 0.402 / 0.408); calibrated 13 / 15 / 12 / 12 of 36 (28 / 15 / 5); bias at 0.5 TU −0.4 /
+  −0.3 / −3.2 / −3.1 %. No member diverged; guard ≤ 0.05 % of steps, none in leads 1–200.
+- Verdicts: k1a vs LinReg1_nt does not improve (CRPS_0.5 −3.7 % [−8.3, +0.6]; CRPS_3 −9.4 %, e_0.5 −5.3 %, both
+  resolved); **k2a vs LinReg7 improves** (CRPS_0.5 −12.4 % [−16.4, −8.5]); the b runs do not improve on the a runs (k2b
+  +3.0 % [+1.0, +5.2], worse); none improves on LinReg1 (calibration −14 to −16 cells, resolved).
+- **Long runs, the closest to the reference of every closure in the paper**: D 0.32 / 0.29 / 0.33 / 0.37 (ranges
+  0.17–0.59; lowest before LinReg^E 0.53, LinReg7 0.65, LinReg1_nt 0.76), mean bias −3.3 / −2.6 / −3.2 / −3.4 % (−4.9 to
+  −7.3 for the baselines), CRPS_100 0.369 / **0.333** / 0.375 / 0.379 (lowest before 0.360), e_100 0.655 / **0.581** /
+  0.667 / 0.669 (LinReg1 0.649), ratio 1.12–1.27; guard ≤ 0.10 %. The network on the frozen linear mean model, trained
+  with its noise, keeps the hindcast of step 2b and removes much of the long-run drift. One seed (the paper's rule).

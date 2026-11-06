@@ -131,3 +131,47 @@ From `exp_square_HIT/` on Snellius, at a commit holding `src/ts_lstm.jl`'s CNN s
   (LinReg1_nt 0.45-0.61, LinReg7 0.39-0.44, LinReg1 0.61-0.78). Guard: 0 for the a runs; k1b 52, k2b 13 of 60 000
   forecast steps (one member each). Bias at 0.5 TU −5.1 to −6.9 % (LinReg1_nt −4.5, LinReg7 −7.6), at 2.5 TU +4.9 to
   +6.6 % (LinReg1_nt +1.9, LinReg7 +6.7).
+- **2026-11-06, scored.** All 60 job records COMPLETED (4 x 10 hindcast tasks, 20 long runs). Copied to the laptop: 900
+  files per hindcast, summed bytes equal (177 880 710 / 177 877 110 / 177 878 010 / 177 874 410); the 20 replicas'
+  sha256 equal. No member diverged; five stable long runs each. Scratch logs `score_step4.log` (driver
+  `score_step4.jl`, `paired_compare` x 10), `full_step4.log` (`train_hindcast.jl --full`), `longrun_step4.log`,
+  `gate_hind_step4.log`, `gate_long_step4.log`. Snellius home 81.3 % after the runs.
+
+  | closure | CRPS_0.5 | CRPS_3 | e_0.5 | cal. | b_0.5 | b_2.5 | guard | b | D | D range | CRPS_100 | e_100 | SS ratio | guard |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | LinReg1 (λ = 0) | 0.221 | 0.390 | 0.455 | 28 | −2.9 | −5.9 | 0.42 | −7.3 | 0.84 | 0.59–1.01 | 0.387 | 0.649 | 1.53 | 1.13 |
+  | LinReg1_nt | 0.236 | 0.402 | 0.469 | 15 | −2.0 | −4.0 | 0.03 | −5.1 | 0.76 | 0.54–0.88 | 0.380 | 0.679 | 1.25 | 0.04 |
+  | k1a LinReg1_nt + CNN (CRPS), learned sds + refitted corr. | 0.227 | 0.364 | 0.444 | 13 | −0.4 | −2.5 | 0.02 | −3.3 | 0.32 | 0.17–0.51 | 0.369 | 0.655 | 1.12 | <0.01 |
+  | k1b the same, learned head | 0.231 | 0.365 | 0.446 | 15 | −0.3 | −2.3 | 0.02 | −2.6 | 0.29 | 0.19–0.38 | 0.333 | 0.581 | 1.27 | 0.01 |
+  | LinReg7 (λ = 1) | 0.263 | 0.408 | 0.498 | 5 | −4.0 | −5.1 | 0 | −4.9 | 0.65 | 0.54–0.91 | 0.386 | 0.691 | 0.99 | 0 |
+  | k2a LinReg7 + CNN (CRPS), with its noise, learned sds + refitted corr. | 0.230 | 0.387 | 0.456 | 12 | −3.2 | −3.0 | 0.05 | −3.2 | 0.33 | 0.30–0.58 | 0.375 | 0.667 | 1.18 | 0.01 |
+  | k2b the same, learned head | 0.237 | 0.388 | 0.460 | 12 | −3.1 | −2.7 | 0.03 | −3.4 | 0.37 | 0.26–0.59 | 0.379 | 0.669 | 1.24 | 0.10 |
+
+  Six digits: CRPS_0.5 0.22742 / 0.23139 / 0.23040 / 0.23742; CRPS_3 (own members, paired with the partner, which does
+  not diverge) 0.36383 / 0.36490 / 0.38668 / 0.38831; e_0.5 0.4438 / 0.4461 / 0.4562 / 0.4603. Guard: hindcast 166 / 255
+  / 499 / 287 of 1 080 000 steps (2 / 2 / 9 / 7 members, none in leads 1–200); long runs 3 / 10 / 24 / 201 of 199 500.
+  Calibrated count from the pairing with the partner (none diverges); against LinReg1, k1b 14.
+
+  Paired differences (90 % IC-block bootstrap, 10 000 resamples; % of the comparator). G: every closure's single-run
+  D range overlaps the comparator's (LinReg7 0.54–0.91 for the criterion; the partner's otherwise): G passes throughout.
+  | A vs B | CRPS_0.5 | CRPS_3 | e_0.5 | cal. A − B | S | C | verdict |
+  |---|---|---|---|---|---|---|---|
+  | k1a vs LinReg1_nt (partner) | −3.7 [−8.3, +0.6] | −9.4, resolved | −5.3, resolved | −2 [−5, +4] | fail | fail | **does not improve** |
+  | k1a vs LinReg1 (criterion) | +3.0 [−0.9, +6.8] | −7.0, resolved | −2.6, n.r. | −15 [−20, −4] | fail | fail | **does not improve** |
+  | k1b vs k1a (partner) | +1.7 [−0.0, +3.5] | +0.3, n.r. | +0.5, n.r. | +2 [−4, +4] | fail | fail | **does not improve** |
+  | k1b vs LinReg1 (criterion) | +4.8 [−0.1, +9.6] | −6.7, resolved | −2.0, n.r. | −14 [−20, −4] | fail | fail | **does not improve** |
+  | k1b vs LinReg1_nt (reported) | −2.0 [−7.3, +3.0] | −9.1, resolved | −4.8, n.r. | 0 [−5, +4] | fail | fail | no |
+  | k2a vs LinReg7 (partner) | **−12.4 [−16.4, −8.5]** | −5.3, resolved | −8.5, resolved | +7 [+0, +12] | PASS | fail | **improves** |
+  | k2a vs LinReg1 (criterion) | +4.4 [−0.1, +9.0] | −1.1, n.r. | +0.2, n.r. | −16 [−22, −5] | fail | fail | **does not improve** |
+  | k2b vs k2a (partner) | +3.0 [+1.0, +5.2] (worse) | +0.4, n.r. | +0.9, n.r. | 0 [−5, +2] | fail | fail | **does not improve** |
+  | k2b vs LinReg1 (criterion) | +7.5 [+2.1, +13.3] (worse) | −0.6, n.r. | +1.1, n.r. | −16 [−23, −6] | fail | fail | **does not improve** |
+  | k2b vs LinReg7 (reported) | −9.7 [−13.7, −5.8] | −4.9, resolved | −7.7, resolved | +7 [+0, +11] | PASS | fail | improves |
+
+  Against "Expected": as expected, k1 does not improve on LinReg1_nt, k2 improves on LinReg7, none on LinReg1. Not as
+  expected: (1) **the long runs**, expected close to the partners, are the closest to the reference of every closure in
+  the paper's results tables — D 0.29–0.37 against the lowest there, LinReg^E's 0.53 (LinReg7 0.65, LinReg1_nt 0.76),
+  mean bias −2.6 to −3.4 % against −4.9 / −5.1 %; k1b's CRPS_100 0.333 and e_100 0.581 are below every row there (lowest
+  0.360, LinReg^E + AR(2) λ = 1; 0.649, LinReg1). (2) The 3-TU hindcast:
+  k1 CRPS_3 −9 % against LinReg1_nt, resolved, and the bias at 0.5 / 2.5 TU near zero for k1 (−0.4 / −2.5 % against
+  −2.0 / −4.0 %). (3) b vs a went the other way from step 3a: the diagonal head is not better at 0.5 TU (k2b worse,
+  resolved); for k1 it gives the better long runs. Calibration stays below LinReg1's (12–15 of 36 against 28).
