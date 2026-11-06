@@ -92,6 +92,11 @@ const COUT = envc("OUT", "step3/CNN_step3")
 # predictions of every seed on every step of the record (raw dQ), and least squares on 1-10 TU (at h = 5,
 # LinReg1), in the layout `analysis/net_residual.jl` reads. One (C, lr, wd) setting per run.
 const CREFIT = envc("REFIT", "0") == "1"
+# RIKFLOW_CNN_REFIT_UPD = best (default, the protocol) | last: refit for as many updates as stage 1 ran in all,
+# its whole schedule replayed (with NOSTOP: the network trained to MAXUPD without early stopping, on 1-10 TU;
+# Rik, 2026-11-02, the wd-0 row of Table tab: net-loss).
+const CREFIT_UPD = Symbol(envc("REFIT_UPD", "best"))
+CREFIT_UPD in (:best, :last) || error("RIKFLOW_CNN_REFIT_UPD must be best or last; got $CREFIT_UPD")
 const CDEV = Symbol(envc("DEVICE", "cpu"))
 CDEV in (:cpu, :gpu) || error("RIKFLOW_CNN_DEVICE must be cpu or gpu; got $CDEV")
 CDEV === :gpu && @eval using cuDNN                          # NNlib's cuDNN extension: Lux's Conv on CuArrays
@@ -121,6 +126,8 @@ const ACTF = CACT === :relu ? relu : tanh
 const CINIT = Symbol(envc("INIT", "glorot"))
 CINIT in (:glorot, :he) || error("RIKFLOW_CNN_INIT must be glorot or he; got $CINIT")
 const WINIT = CINIT === :he ? kaiming_normal : glorot_uniform
+# SKIP (step3_data.jl): the output layer starts at zero (its bias is zero by default), so a fit starts at the LinReg
+const OUTINIT = isempty(SKIP) ? glorot_uniform : zeros32
 # RIKFLOW_CNN_HEAD = identity (default: the head starts at Sigma = I, the plain likelihood; Rik,
 # 2026-10-22: "I am not sure if I like the preset likelihood loss", then made it the default) | ls (it
 # starts at least squares' residual covariance, `LS_HEAD`; within seed noise of identity, 3 seeds each) |
@@ -173,9 +180,9 @@ function mkmodel(C)
     nflat = (NSTEP - 2(K - 1)) * C
     CSEQ === :full &&                                       # q^{n*} is in the sequence
         return Chain(conv, Dense(nflat => D, ACTF; init_weight = WINIT), Dense(D => D, ACTF; init_weight = WINIT),
-                     Dense(D => nq))
+                     Dense(D => nq; init_weight = OUTINIT))
     return Chain(Parallel(vcat, conv, NoOpLayer()), Dense(nflat + nq => D, ACTF; init_weight = WINIT),
-                 Dense(D => D, ACTF; init_weight = WINIT), Dense(D => nq))
+                 Dense(D => D, ACTF; init_weight = WINIT), Dense(D => nq; init_weight = OUTINIT))
 end
 "The model's input: the sequence alone (SEQ = full), or the sequence and q^{n*} (SEQ = lags, fullq)."
 modelin(A, Q) = CSEQ === :full ? A : (A, Q)
@@ -191,7 +198,7 @@ end
 Ava, Qva = lagtensor(Float64.(Xc[:, (ntr + 1):end]))
 Aho, Qho = lagtensor(Xf[:, HO])
 Ytr32, Yva32 = T.(Ytr), T.(Yva)
-@info "CNN probe" CHS LRS CWDS CSEEDS K D CLOSS CHEAD CINPUT CSEQ CACT CINIT NSTEP NCH CST.max_updates fit_rows = ntr val_rows = ncol - ntr
+@info "CNN probe" SKIP CHS LRS CWDS CSEEDS K D CLOSS CHEAD CINPUT CSEQ CACT CINIT NSTEP NCH CST.max_updates fit_rows = ntr val_rows = ncol - ntr
 
 # the likelihood's head, as the library's: Sigma = D R D, D = diag(exp(bd)), R^{-1} = A'A with A lower
 # triangular from Araw (strict lower part, exp of the diagonal); the strict-lower mask is a constant
@@ -234,6 +241,10 @@ function head_sd(hd)
     return exp.(Float64.(Array(hd.bd))) .* sqrt.(diag(inv(A' * A)))
 end
 const LS_CRPS = crps_eval(Yva .- Cls' * Rva_, vec(std(Rls; dims = 2)))
+# The LS floor's rms on its own fit rows (1-8.2 TU), per QoI: below it, the network fits its training data
+# better than any linear mean model of the regressor (Rik, 2026-11-02: "Without weight decay do the CNNs fit
+# better on 1-10 TU?"; run with WDS = 0 and NOSTOP = 1).
+const ls_fit = rmsq(Ytr .- Cls' * Rtr_)
 # the arrays the fits read, on the device
 const Atr_d, Qtr_d, Ytr_d = DEVF(Atr), DEVF(Qtr), DEVF(Ytr32)
 const Ava_d, Qva_d, Yva_d = DEVF(Ava), DEVF(Qva), DEVF(Yva32)
@@ -336,6 +347,14 @@ CHEAD === :inj && CINN === :none && error("HEAD = inj starts the head at the inj
 const CINN_SRC = envc("INNOISE_SIGMA", "ls")
 "The Σ (standardised target units) a run under TO_LSTM deploys, for seed `seed` (see INNOISE above)."
 function run_sigma(run, seed)
+    # `lrs:<name>`: a deployed LinReg's own Σ (stoch_distr, its scaled level units) in this run's standardised target
+    # (SKIP = LinReg1_nt with INNOISE_SIGMA = lrs:LinReg1_nt starts at that closure's own fixed point)
+    if startswith(run, "lrs:")
+        m = load(joinpath(TO_folder, "..", "TO_LRS", run[5:end], "LinReg.jld2"), "scaling", "stoch_distr")
+        sgl = vec(m[1].in_scaling.sigma)
+        Sl = Matrix{Float64}(hasproperty(m[2].Σ, :mat) ? m[2].Σ.mat : m[2].Σ)
+        return Diagonal(sgl ./ so) * Sl * Diagonal(sgl ./ so), "the deployed covariance of $(run[5:end])"
+    end
     pr = load(joinpath(TO_folder, run, "pred.jld2"))
     pick(dct) = haskey(dct, seed) ? dct[seed] : only(values(dct))
     haskey(pr, "S_deploy") && return pick(pr["S_deploy"]), "S_deploy of $run"
@@ -397,7 +416,7 @@ if !isempty(CSCORE)
     sout = joinpath(TO_folder, envc("SCORE_OUT", "step3/innoise_scores"))
     mkpath(sout)
     m0 = cols[1] - cfg.h                                    # the path's first record step
-    raw(y) = y .* so .+ mo                                  # standardised -> raw dQ
+    raw(y) = y .* so .+ mo .+ skipq(cols)                   # standardised -> raw dQ (with SKIP: + the skip)
     for run in split(CSCORE, ",")
         F = load(joinpath(TO_folder, run, "fits.jld2"))
         Pr = load(joinpath(TO_folder, run, "pred.jld2"))
@@ -416,15 +435,20 @@ if !isempty(CSCORE)
             L1 = cov_factor(S1)
             Eva = randn(Xoshiro(seed + 104729), nq, cfg.h * (ncol - ntr))
             Et = randn(Xoshiro(seed + 61), nq, cfg.h * ntr)
-            rva_n = Yva .- prd(Float64.(Xc[:, (ntr + 1):end]) .+ P * window_noise(eta_from(L1, Eva)), r.ps, r.st)
-            rtr_n = Ytr .- prd(Float64.(Xc[:, 1:ntr]) .+ P * window_noise(eta_from(L1, Et)), r.ps, r.st)
+            # SKIP: minus the skip's response to the same window noise (skip_dy); pred3n below stays the network's alone
+            rva_n = Yva .- prd(Float64.(Xc[:, (ntr + 1):end]) .+ P * window_noise(eta_from(L1, Eva)), r.ps, r.st) .-
+                    skip_dy(window_noise(eta_from(L1, Eva)))
+            rtr_n = Ytr .- prd(Float64.(Xc[:, 1:ntr]) .+ P * window_noise(eta_from(L1, Et)), r.ps, r.st) .-
+                    skip_dy(window_noise(eta_from(L1, Et)))
             hs(x) = 0.5 * sum(abs2, x) / size(x, 2)
             # and under one COMMON Σ for every run (RIKFLOW_CNN_SCORE_COMMON = <run>, its seed-1 deployed Σ; the same
             # draws), so that networks trained under different noise compare under the same noise
             Sc = isempty(CSCORE_COMMON) ? S1 : first(run_sigma(CSCORE_COMMON, 1))
             Lc = cov_factor(Sc)
-            rva_c = Yva .- prd(Float64.(Xc[:, (ntr + 1):end]) .+ P * window_noise(eta_from(Lc, Eva)), r.ps, r.st)
-            rtr_c = Ytr .- prd(Float64.(Xc[:, 1:ntr]) .+ P * window_noise(eta_from(Lc, Et)), r.ps, r.st)
+            rva_c = Yva .- prd(Float64.(Xc[:, (ntr + 1):end]) .+ P * window_noise(eta_from(Lc, Eva)), r.ps, r.st) .-
+                    skip_dy(window_noise(eta_from(Lc, Eva)))
+            rtr_c = Ytr .- prd(Float64.(Xc[:, 1:ntr]) .+ P * window_noise(eta_from(Lc, Et)), r.ps, r.st) .-
+                    skip_dy(window_noise(eta_from(Lc, Et)))
             val = (; half_sse = hs(rva), nll = gnll(rva, cov(permutedims(rtr))), crps = crps_eval(rva, vec(std(rtr; dims = 2))),
                    half_sse_n = hs(rva_n), nll_n = gnll(rva_n, cov(permutedims(rtr_n))),
                    crps_n = crps_eval(rva_n, vec(std(rtr_n; dims = 2))), Sigma1 = S1, val_loss = r.val_loss,
@@ -442,7 +466,7 @@ if !isempty(CSCORE)
                 eta[:, j, b] = path[:, n - j - m0 + 1]
             end
             y3 = prd(Xf, r.refit.ps, r.refit.st)
-            y3n = prd(Xf .+ P * window_noise(eta), r.refit.ps, r.refit.st)
+            y3n = prd(Xf .+ P * window_noise(eta), r.refit.ps, r.refit.st)   # SKIP: the skip's response NOT included
             maximum(abs, raw(y3) .- Pr["pred3"][seed]) < 1e-5 * maximum(abs, Pr["pred3"][seed]) ||
                 error("SCORE $run seed $seed: the refitted network does not reproduce pred.jld2's pred3")
             out[seed] = (; val, Sigma = Sd, sigma_src = srcd, E, pred3n = raw(y3n), wd, lr, C)
@@ -480,10 +504,14 @@ function fit_cnn(C, lr, wd, seed)
     Linj = Sinj === nothing ? nothing : cov_factor(Sinj)
     nrng = Xoshiro(seed + 7919)
     Eva = randn(Xoshiro(seed + 104729), nq, cfg.h * (ncol - ntr))
-    val_in(p) = CINN === :none ? (Ava_d, Qva_d) : DEVF.(noisy_tensor(Xc[:, (ntr + 1):end], eta_from(inj_factor(p, Linj), Eva)))
-    vloss(p) = Float64(loss(p, val_in(p)..., Yva_d))
+    val_eta(p) = eta_from(inj_factor(p, Linj), Eva)
+    val_in(p) = CINN === :none ? (Ava_d, Qva_d) : DEVF.(noisy_tensor(Xc[:, (ntr + 1):end], val_eta(p)))
+    # SKIP under noise: the target minus the skip's response to the same window noise
+    val_y(p) = CINN === :none || SKIPK === nothing ? Yva_d : DEVF(T.(Yva .- skip_dy(window_noise(val_eta(p)))))
+    vloss(p) = Float64(loss(p, val_in(p)..., val_y(p)))
     best = (; val = vloss(ps), ps = deepcopy(ps), update = 0)
-    hist = (; update = Int[], val = Float64[], lr = Float64[])
+    # fit: 0.5 SSE on the clean fit rows at each validation, the training curve next to the validation one
+    hist = (; update = Int[], val = Float64[], lr = Float64[], fit = Float64[])
     cur, since_best, since_decay, upd, stop = T(lr), 0, 0, 0, :cap
     nb = fld(ntr, CST.batch)
     while upd < CST.max_updates
@@ -494,14 +522,17 @@ function fit_cnn(C, lr, wd, seed)
                 Zygote.gradient(p -> loss(p, Atr_d[:, :, c], Qtr_d[:, c], Ytr_d[:, c]), ps)[1]
             else
                 # the noisy batch is built before the gradient: a constant to it (stop-gradient for INNOISE = head)
-                Ab, Qb = DEVF.(noisy_tensor(Xc[:, c], draw_window_eta(nrng, inj_factor(ps, Linj), length(c))))
-                Zygote.gradient(p -> loss(p, Ab, Qb, Ytr_d[:, c]), ps)[1]
+                eb = draw_window_eta(nrng, inj_factor(ps, Linj), length(c))
+                Ab, Qb = DEVF.(noisy_tensor(Xc[:, c], eb))
+                Yb = SKIPK === nothing ? Ytr_d[:, c] : DEVF(T.(Ytr[:, c] .- skip_dy(window_noise(eb))))
+                Zygote.gradient(p -> loss(p, Ab, Qb, Yb), ps)[1]
             end
             opt, ps = Optimisers.update(opt, ps, g)
             upd += 1
             upd % CST.val_every == 0 || continue
             v = vloss(ps)
             push!(hist.update, upd); push!(hist.val, v); push!(hist.lr, cur)
+            push!(hist.fit, 0.5 * sum(abs2, Ytr .- Float64.(Array(out(ps, Atr_d, Qtr_d)))) / ntr)
             if v < best.val
                 best = (; val = v, ps = deepcopy(ps), update = upd)
                 since_best, since_decay = 0, 0
@@ -530,7 +561,9 @@ function fit_cnn(C, lr, wd, seed)
     # the last iterate too: with NOSTOP the best and the last can be far apart
     rva_last = Yva .- pred(Ava_d, Qva_d; p = ps)
     last = (; val = vloss(ps), half_sse = 0.5 * sum(abs2, rva_last) / size(rva_last, 2),
-            ho_ratio = rmsq(Yf[:, HO] .- pred(Aho_d, Qho_d; p = ps)) ./ ls_ho)
+            ho_ratio = rmsq(Yf[:, HO] .- pred(Aho_d, Qho_d; p = ps)) ./ ls_ho,
+            fit_ratio = rmsq(Ytr .- pred(Atr_d, Qtr_d; p = ps)) ./ ls_fit)
+    fit_ratio = rmsq(rtr) ./ ls_fit                                   # the best iterate on its fit rows
     crps_refit = crps_eval(rva, vec(std(rtr; dims = 2)))
     head_ratio = CLOSS in (:nll, :crps) ? head_sd(pb.head) ./ rmsq(rva) : fill(NaN, nq)
     # INNOISE: the same scores with the window noise, the network under its injected Σ (INNOISE = head: its best
@@ -543,12 +576,14 @@ function fit_cnn(C, lr, wd, seed)
         Lb = inj_factor(pb, Linj)
         Sb = CINN === :head ? Lb * Lb' : Sinj               # fixed: Σ as given, so the refit draws as before
         E = randn(Xoshiro(seed + 31), nq, cfg.h * length(HO))
-        yh = pred(DEVF.(noisy_tensor(Xf[:, HO], eta_from(Lb, E)))...)
-        lh = Cls' * (Xr64[:, HO] .+ window_noise(eta_from(LLS_INJ, E)))
-        lv = Cls' * (Rva_ .+ window_noise(eta_from(LLS_INJ, Eva)))
+        # SKIP: every noisy prediction plus the skip's response to its window noise (least squares' too: the full
+        # least-squares model is the skip plus Cls)
+        yh = pred(DEVF.(noisy_tensor(Xf[:, HO], eta_from(Lb, E)))...) .+ skip_dy(window_noise(eta_from(Lb, E)))
+        lh = Cls' * (Xr64[:, HO] .+ window_noise(eta_from(LLS_INJ, E))) .+ skip_dy(window_noise(eta_from(LLS_INJ, E)))
+        lv = Cls' * (Rva_ .+ window_noise(eta_from(LLS_INJ, Eva))) .+ skip_dy(window_noise(eta_from(LLS_INJ, Eva)))
         Et = randn(Xoshiro(seed + 61), nq, cfg.h * ntr)
-        rtr_n = Ytr .- pred(DEVF.(noisy_tensor(Xc[:, 1:ntr], eta_from(Lb, Et)))...)
-        rva_n = Yva .- pred(val_in(pb)...)
+        rtr_n = Ytr .- pred(DEVF.(noisy_tensor(Xc[:, 1:ntr], eta_from(Lb, Et)))...) .- skip_dy(window_noise(eta_from(Lb, Et)))
+        rva_n = (SKIPK === nothing ? Yva : Yva .- skip_dy(window_noise(val_eta(pb)))) .- pred(val_in(pb)...)
         (; src, Sinj = Sb, val_half_sse = 0.5 * sum(abs2, rva_n) / size(Yva, 2),
          ls_val_half_sse = 0.5 * sum(abs2, Yva .- lv) / size(Yva, 2),
          nll_refit = gnll(rva_n, cov(permutedims(rtr_n))), crps_refit = crps_eval(rva_n, vec(std(rtr_n; dims = 2))),
@@ -557,7 +592,7 @@ function fit_cnn(C, lr, wd, seed)
     return (; ps = Lux.fmap(Array, pb), st = Lux.fmap(Array, st), device = CDEV, ho_ratio1, h = cfg.h, val_loss = best.val, val_half_sse = 0.5 * sum(abs2, rva) / size(rva, 2),
             nll_refit = gnll(rva, cov(permutedims(rtr))), crps_refit, head_ratio, ho_ratio, best_update = best.update, updates = upd,
             stop, nparams = Lux.parameterlength(model), loss = CLOSS, head = CHEAD, input = CINPUT, seq = CSEQ, act = CACT,
-            init = CINIT, innoise = CINN, noisy,
+            init = CINIT, innoise = CINN, noisy, fit_ratio,
             hist, last)
 end
 
@@ -600,8 +635,10 @@ function refit_cnn(C, lr, wd, seed, hist, nupd; Linj = nothing)
             g = if CINN === :none
                 Zygote.gradient(p -> loss(p, Aall_d[:, :, c], Qall_d[:, c], Yall_d[:, c]), ps)[1]
             else
-                Ab, Qb = DEVF.(noisy_tensor(Xc[:, c], draw_window_eta(nrng, inj_factor(ps, Linj), length(c))))
-                Zygote.gradient(p -> loss(p, Ab, Qb, Yall_d[:, c]), ps)[1]
+                eb = draw_window_eta(nrng, inj_factor(ps, Linj), length(c))
+                Ab, Qb = DEVF.(noisy_tensor(Xc[:, c], eb))
+                Yb = SKIPK === nothing ? Yall_d[:, c] : DEVF(T.(Float64.(dat.Yc[:, c]) .- skip_dy(window_noise(eb))))
+                Zygote.gradient(p -> loss(p, Ab, Qb, Yb), ps)[1]
             end
             opt, ps = Optimisers.update(opt, ps, g)
             upd += 1
@@ -615,7 +652,7 @@ if CREFIT
 end
 # the whole record as the network reads it (host), and the standardised -> raw map of the target
 const Afull, Qfull = CREFIT ? lagtensor(Xf) : (zeros(T, 0, 0, 0), zeros(T, 0, 0))
-rawq(y) = y .* so .+ mo
+rawq(y) = y .* so .+ mo .+ skipq(cols)                     # with SKIP: + the skip's correction
 "The network's standardised prediction on the whole record, on the host."
 predfull(model, ps, st) = Float64.(first(model(modelin(Afull, Qfull), ps.net, st)))
 
@@ -641,6 +678,10 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
                                                     r.hist.lr[findfirst(>=(u), r.hist.update)]) for u in cps), ", "))
     @printf("     last iterate (update %d): val loss %.4f, 0.5 SSE %.4f | 10-100 TU rms / LS %s\n", r.updates,
             r.last.val, r.last.half_sse, join((@sprintf("%.2f", x) for x in r.last.ho_ratio), " "))
+    @printf("     fit rows (1-8.2 TU) 0.5 SSE at %s (LS %.4f)\n", join((@sprintf("%dk: %.4f", u ÷ 1000,
+            r.hist.fit[findfirst(>=(u), r.hist.update)]) for u in cps), ", "), 0.5 * sum(abs2, ls_fit))
+    @printf("     fit rows (1-8.2 TU) rms / LS: best iterate %s | last iterate %s\n",
+            join((@sprintf("%.3f", x) for x in r.fit_ratio), " "), join((@sprintf("%.3f", x) for x in r.last.fit_ratio), " "))
     if r.noisy !== nothing
         @printf("     input noise (Σ: %s; sd / LS residual sd %s)\n", r.noisy.src,
                 join((@sprintf("%.3f", x) for x in sqrt.(diag(r.noisy.Sinj) ./ diag(mom0(Rls)))), " "))
@@ -652,7 +693,7 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
     end
     if CREFIT
         t1 = time()
-        ps3, st3, model3 = refit_cnn(C, lr, wd, seed, r.hist, r.best_update;
+        ps3, st3, model3 = refit_cnn(C, lr, wd, seed, r.hist, CREFIT_UPD === :last ? r.updates : r.best_update;
                                      Linj = r.noisy === nothing ? nothing : cov_factor(r.noisy.Sinj))
         y1, y3 = predfull(model3, r.ps, r.st), predfull(model3, ps3, st3)
         pred1[seed], pred3[seed] = rawq(y1), rawq(y3)
@@ -663,15 +704,16 @@ for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
         res[(C, lr, wd, seed)] = merge(res[(C, lr, wd, seed)], (; refit = (; ps = ps3, st = st3, updates = r.best_update,
                                                                           half_sse_1_10 = sse10, ho_ratio1 = ho3)))
         @printf("     refit on 1-10 TU (%d updates, %.1f min): 0.5 SSE on 1-10 TU %.4f | 10-100 TU rms / LinReg1 %s\n",
-                r.best_update, (time() - t1) / 60, sse10, join((@sprintf("%.2f", x) for x in ho3), " "))
+                CREFIT_UPD === :last ? r.updates : r.best_update, (time() - t1) / 60, sse10, join((@sprintf("%.2f", x) for x in ho3), " "))
         if r.noisy !== nothing
             # the Σ this network deploys: its residual on all 1-10 TU rows under the injected noise, about zero
             # (4 draws); S_deploy / Σ_inj -> 1 is the outer loop's fixed point. INNOISE = head: the refitted
             # head's Σ is deployed and injected; the residual under it (S_noisy) is the check
             L = CINN === :head ? head_factor(ps3.head) : cov_factor(r.noisy.Sinj)
             Sd = sum(1:4) do rep
-                An, Qn = noisy_tensor(Xc, eta_from(L, randn(Xoshiro(seed + 500 + rep), nq, cfg.h * ncol)))
-                mom0(Float64.(dat.Yc) .- Float64.(first(model3(modelin(An, Qn), ps3.net, st3)))) ./ 4
+                en = eta_from(L, randn(Xoshiro(seed + 500 + rep), nq, cfg.h * ncol))
+                An, Qn = noisy_tensor(Xc, en)
+                mom0(Float64.(dat.Yc) .- Float64.(first(model3(modelin(An, Qn), ps3.net, st3))) .- skip_dy(window_noise(en))) ./ 4
             end
             if CINN === :head
                 Sdep[seed], Sinjd[seed], Snoisy[seed] = L * L', L * L', Sd

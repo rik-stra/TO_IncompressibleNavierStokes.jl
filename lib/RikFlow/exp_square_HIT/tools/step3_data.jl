@@ -13,10 +13,16 @@ const DT = 2.5e-3
 const T = Float32
 
 base = load(joinpath(TO_folder, "inputs_lstm.jld2"), "inputs")[2]
+# RIKFLOW_MLP_TEND = the end of the training window in TU (default 10, the closures' 1-10 TU; Rik, 2026-11-03: train
+# on 1-80 TU "to separate too little data from nothing to learn"). Stage 1 then fits the first 80 % of 1-TEND TU and
+# validates on the rest, the refit takes all of it, and HO (the tools' held-out score) is TEND-100 TU. The labels
+# "1-10 TU" and "10-100 TU" in the tools' comments and prints mean these windows.
+const TEND = parse(Float64, envs("TEND", "10"))
 cfg = merge(base, (; arch = :dense, n_latent = 0, n_encoder = 0, emission = :constant,
                    h = parse(Int, envs("H", "5")), hist_var = :q_star_q, include_predictor = true,
-                   train_range = (base.train_range[1], round(Int, 10 / DT))))
-cfg.train_range == (400, 4000) || error("training range $(cfg.train_range), expected (400, 4000) = 1-10 TU")
+                   train_range = (base.train_range[1], round(Int, TEND / DT))))
+cfg.train_range == (400, round(Int, TEND / DT)) || error("training range $(cfg.train_range), expected 1-$TEND TU")
+@info "training window" TEND train_range = cfg.train_range
 
 rec = load_m4_qois(; track_file = joinpath(TO_folder, "..",
                                            "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3.jld2"))
@@ -24,6 +30,38 @@ nq = size(rec.q, 1)
 hist = RF.HistorySpec(; h = cfg.h, n_qoi = nq, cfg.hist_var, cfg.include_predictor)
 nreg = RF.nfeatures(hist)                                   # LinReg1's regressor, bias last
 nreg == (2cfg.h + 1) * nq + 1 || error("regressor width $nreg, expected $((2cfg.h + 1) * nq + 1)")
+
+# 🔑 STEP 4, a FROZEN linear skip (RIKFLOW_MLP_SKIP = <a deployed LinReg under TO_LRS>, LinReg1 or LinReg7; Rik,
+# 2026-11-03: "frozen but immediatly do both baselines"; closures.tex Eq. skip net). The network learns what that
+# LinReg's mean model misses: the target is dQ^n minus the LinReg's predicted correction (`skipq`), standardised
+# by its own mean and sd on 1-10 TU, and every prediction the tools write (pred1, pred3, predls) is the full
+# correction, skip + network; cnn_mean_fit.jl starts the output layer at zero, so every fit starts at the
+# LinReg. The LS floor is unchanged: least squares on the residual of a linear skip on the same regressor is least
+# squares on dQ minus the skip (checked below at h = 5). The LinReg is fitted on all of 1-10 TU, so stage 1's
+# validation rows (8.2-10 TU) lie in the skip's own training window. Not with input noise (the skip is computed
+# on the clean record).
+const SKIP = envs("SKIP", "")
+const SKIPQ = isempty(SKIP) ? nothing : let
+    c, sc, hl = load(joinpath(TO_folder, "..", "TO_LRS", SKIP, "LinReg.jld2"), "c", "scaling", "hist_len")
+    s = sc.in_scaling
+    mu, sg = vec(s.mu), vec(s.sigma)
+    hs = RF.HistorySpec(; h = hl, n_qoi = nq, hist_var = :q_star_q, include_predictor = true)
+    a0, b0 = cfg.train_range[1], size(rec.q_star, 2)
+    X, _, st = RF.build_history(hs, RF.scale_input(rec.q_star[:, a0:b0], s), RF.scale_input(rec.q[:, a0:(b0 + 1)], s))
+    X = Float64.(X)
+    cs = (a0 - 1) .+ st
+    cs == cs[1]:cs[end] || error("SKIP $SKIP: the steps are not contiguous")
+    # the level-to-correction step assumes q^{n*} in the first nq columns, in the levels' scaling
+    maximum(abs, X[1, 1:nq] .- (rec.q_star[:, cs[1]] .- mu) ./ sg) < 1e-9 || error("SKIP $SKIP: regressor layout")
+    Cm = permutedims(Matrix{Float64}(c))                                           # nreg x nq
+    pred = permutedims((X * Cm .- X[:, 1:nq]) .* sg')                                # nq x N, raw dQ
+    @info "frozen linear skip" SKIP hist_len = hl steps = (cs[1], cs[end])
+    (; name = SKIP, pred, first = cs[1], last = cs[end], C = Cm, sg, hl)
+end
+"The skip's predicted correction q^n - q^{n*} (raw) at record columns `c`, nq x length(c); zero without a skip."
+skipq(c) = SKIPQ === nothing ? zeros(nq, length(c)) :
+           (all(x -> SKIPQ.first <= x <= SKIPQ.last, c) || error("SKIP: columns outside the skip's steps");
+            SKIPQ.pred[:, c .- SKIPQ.first .+ 1])
 
 dat0 = m4_training_data(rec, cfg, hist; target = :dQ)
 # 🔴 THE TARGET is dQ^n = q^n - q^{n*} computed from the record's levels (paper notation: column n + 1
@@ -33,11 +71,23 @@ dat0 = m4_training_data(rec, cfg, hist; target = :dQ)
 # (found by the analysis dry run, 2026-10-22). With this target, least squares on the MLP's input is
 # LinReg1's fit exactly (LinReg1 predicts the level q^n from the same regressor, and q^{n*} is in it).
 let cols = (cfg.train_range[1] - 1) .+ dat0.steps
-    D = rec.q[:, cols .+ 1] .- rec.q_star[:, cols]
+    D = rec.q[:, cols .+ 1] .- rec.q_star[:, cols] .- skipq(cols)     # SKIP: what the LinReg misses
     Dn, out_scaling = RikFlow._normalise(D; normalization = cfg.normalization)
     global dat = merge(dat0, (; Yc = Dn, scaling = (; dat0.scaling.in_scaling, out_scaling, target = :dQ)))
 end
 ncol = size(dat.Xc, 2)
+# SKIP under input noise (Rik, 2026-11-03: "LinReg1_nt skip"): the skip reads the same noisy history as the network.
+# It is linear, so its response is exact: `SKIPK` (nq x nreg) maps a perturbation dx of the regressor in `dat`'s
+# scaling (`window_noise`) to the raw change of its predicted correction (q^{n*} is never perturbed);
+# `skip_dy(dx)` is that change in the standardised target, to subtract from the target wherever the input is noisy.
+# Checked below against the skip's own predictions on pairs of record steps.
+const SKIPK = SKIPQ === nothing ? nothing : let
+    SKIPQ.hl == cfg.h || error("SKIP $SKIP: history $(SKIPQ.hl), the network's $(cfg.h)")
+    size(SKIPQ.C, 1) == nreg || error("SKIP $SKIP: regressor width $(size(SKIPQ.C, 1)), expected $nreg")
+    sgd = vec(dat.scaling.in_scaling.sigma)
+    fsd, fss = vcat(repeat(sgd, 2cfg.h + 1), 1.0), vcat(repeat(SKIPQ.sg, 2cfg.h + 1), 1.0)
+    Diagonal(SKIPQ.sg) * permutedims(SKIPQ.C) * Diagonal(fsd ./ fss)
+end
 ntr = floor(Int, (1 - cfg.val_frac) * ncol)                 # the library's split (val_frac = 0.2)
 tu(k) = (cfg.train_range[1] - 1 + dat.steps[k]) * DT
 
@@ -97,7 +147,9 @@ cond_range(A) = (s = svdvals(A); s[1] / s[findlast(>(s[1] * 1e-10), s)])
 # P x in Float32, as every M4 fit reads its input -- that rounding is checked entry by entry below.
 let X64 = Float64.(dat.Xc), Z64 = P * X64, Y = Float64.(dat.Yc)
     yx = (X64' \ Y')' * X64
-    err = maximum(abs, yx .- (pinv(Z64') * Y')' * Z64) / maximum(abs, yx)
+    # relative to the target's size too: with SKIP = LinReg1 the target is LinReg1's own residual, orthogonal to
+    # the regressor on these rows, so least squares predicts ~0 and round-off alone would fail a ratio to it
+    err = maximum(abs, yx .- (pinv(Z64') * Y')' * Z64) / max(maximum(abs, yx), maximum(abs, Y))
     err < 1e-8 || error("least squares on the mapped input differs from LinReg1's regressor by $err")
     @info "input" FEAT nreg nin ls_rel_diff = err rank = rank(Z64) cond_raw = cond(X64) cond_input_range = cond_range(Z64)
 end
@@ -134,7 +186,7 @@ let w64 = check_input(P * Float64.(dat.Xc), cols_tr), w32 = check_input(Float64.
     w64 < 1e-9 || error("the input differs from the record by $w64 (Float64)")
     # the target: q^n - q^{n*} at step n (columns n + 1 of q, n of q_star), standardised
     so_, mo_ = vec(dat.scaling.out_scaling.sigma), vec(dat.scaling.out_scaling.mu)
-    wy = maximum(abs, Float64.(dat.Yc) .- (rec.q[:, cols_tr .+ 1] .- rec.q_star[:, cols_tr] .- mo_) ./ so_)
+    wy = maximum(abs, Float64.(dat.Yc) .- (rec.q[:, cols_tr .+ 1] .- rec.q_star[:, cols_tr] .- skipq(cols_tr) .- mo_) ./ so_)
     wy < 1e-9 || error("the target differs from q^n - q^{n*} by $wy")
     @info "input checked entry by entry against the record (1-10 TU rows)" max_abs_diff_float64 = w64 max_abs_diff_float32 = w32 target_max_abs_diff = wy
 end
@@ -173,9 +225,20 @@ Xf = P * Xr64                                               # the same input map
 cols = (a - 1) .+ stepsf                                    # record column n of q*^n
 (wf = check_input(Xf, cols)) < 1e-9 || error("the whole-record input differs from the record by $wf")
 mo, so = vec(dat.scaling.out_scaling.mu), vec(dat.scaling.out_scaling.sigma)
-Yf = (rec.q[:, cols .+ 1] .- rec.q_star[:, cols] .- mo) ./ so   # the target, standardised
-HO = findall(n -> 10 < n * DT <= 100, cols)
+Yf = (rec.q[:, cols .+ 1] .- rec.q_star[:, cols] .- skipq(cols) .- mo) ./ so   # the target, standardised
+HO = findall(n -> TEND < n * DT <= 100, cols)
 rmsq(r) = vec(sqrt.(mean(abs2, r; dims = 2)))
+"The skip's response to a regressor perturbation `dx` (nreg x B, `dat`'s scaling), standardised target; 0 without SKIP."
+skip_dy(dx) = SKIPK === nothing ? zeros(nq, size(dx, 2)) : (SKIPK * dx) ./ so
+# the check: differences of the skip's predicted correction between record steps equal SKIPK times the differences
+# of the regressor, minus those of q^{n*} (the level map is affine, the correction is the level minus q^{n*})
+SKIPK === nothing || let ra = 1:200, rb = 1001:1200, ca = cols_tr[ra], cb = cols_tr[rb]
+    lhs = skipq(ca) .- skipq(cb)
+    rhs = SKIPK * (Float64.(dat.Xc[:, ra]) .- Float64.(dat.Xc[:, rb])) .- (rec.q_star[:, ca] .- rec.q_star[:, cb])
+    e = maximum(abs, lhs .- rhs) / maximum(abs, lhs)
+    e < 1e-8 || error("SKIP $SKIP: the linear response differs from the skip's predictions by $e")
+    @info "SKIP: linear response checked against the skip's predictions" SKIP max_rel_diff = e
+end
 # the comparator: least squares fitted on the same 1-8.2 TU rows as the stage-1 networks
 ls_ho = rmsq(Yf[:, HO] .- Cls' * Xr64[:, HO])
 
@@ -194,6 +257,9 @@ ls1_sse = 0.5 * sum(abs2, Y5[:, val5] .- C5' * X5[:, val5]) / length(val5)
 ls1_ho = rmsq(Y5[:, ho5] .- C5' * X5[:, ho5])
 cfg.h == 5 && (maximum(abs, ls1_ho .- ls_ho) < 1e-10 || error("the LinReg1 reference differs from the h = 5 floor"))
 @info "LinReg1 reference (h = 5, fit on the same 1-8.2 TU columns)" h = cfg.h val_half_sse = ls1_sse
+# SKIP: least squares on the residual target over 1-10 TU predicts ~0 for the LinReg's own fit (LinReg1), and
+# LinReg1 minus the skip otherwise (LinReg7): the size of what is linearly left to learn, per QoI
+SKIPQ === nothing || @info "SKIP: least squares on the residual target, 1-10 TU, rms prediction (standardised)" SKIP rms = rmsq((Float64.(dat.Xc)' \ Float64.(dat.Yc)')' * Float64.(dat.Xc))
 
 """
 The constant Gaussian head of the residuals `r` (nq x N, standardised target units), in the library's
