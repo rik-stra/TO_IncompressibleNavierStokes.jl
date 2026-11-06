@@ -10,6 +10,10 @@
 # `LinReg7_ar1ls`, the AR(1) fitted as the AR(2) is, by LS on the residual ACF at lags 1-20 (`ar1_ls`;
 # 2026-10-15, the AR(1) of paper Fig. colour-resacf-ar1); plain `1` stays φ = ρ̂(1). `--report`
 # re-prints the tables for existing variants (checking the file holds exactly the refit) and writes nothing.
+# `2nw` (a noise-trained
+# source, `<src>_nt` of `lrs_noise_variant.jl`) writes `<src>_ar2nw`: the restricted AR(2) fitted to the residual
+# GIVEN THE NOISY HISTORY, exactly, its marginal variance the source's self-consistent Σ (`fit_ar_noisy`;
+# Rik, 2026-11-04: "run the both noise trained linear models with AR(2) coupled", fitted "the same way" as their MVG).
 #
 # The new directory holds a byte copy of `<src>/LinReg.jld2` with three keys ADDED (`ar_phi`,
 # `ar_sigma_xi`, `ar_provenance`) -- the mean, Σ, scaling and every other key are untouched -- and a
@@ -110,6 +114,82 @@ function fit_ar(Z, p; lag1 = false, nonneg = false, eyw = false, ls = false)
     D = Diagonal(sqrt.(sxi2))
     S = Matrix(Symmetric(D * R * D))
     return (; phi, p1, p2, S, R, Xi, s2, sxi2)
+end
+
+"""
+    window_map(h, isg) -> M
+
+As `lrs_noise_variant.jl`'s: dx in the regressor's scaled units (`[q*^n; q^{n-1}, q^{n-1*}; ...; 1]`, input
+sds `isg`) per unit RAW η^{n-j} of QoI i, column (j - 1) NQ + i.
+"""
+function window_map(h, isg)
+    M = zeros(NQ * (2h + 1) + 1, NQ * h)
+    for j in 1:h, i in 1:NQ, k in 1:h
+        q = NQ + 2(k - 1) * NQ + i
+        k >= j + 1 && (M[q, (j - 1) * NQ + i] = -1 / isg[i])
+        k >= j && (M[q + NQ, (j - 1) * NQ + i] = -1 / isg[i])
+    end
+    return M
+end
+
+"""
+    fit_ar_noisy(d, p; nonneg, L = 20)
+
+The AR of a NOISE-TRAINED source (`lrs_noise_variant.jl`, `<src>_nt`) fitted to its residual GIVEN THE NOISY
+HISTORY, as its MVG's Σ is (Rik, 2026-11-04: "Yes, same way"). Exact, no draws: with z_t the clean scaled
+residual (minus μ_η) and the closure's white window noise of covariance Σ (the source's self-consistent
+`stoch_distr`), the residual is z_t - C' M w_t, w_t = [η^{t-1}; ...; η^{t-h}] (raw), and its lagged covariances
+are
+
+    Γ_k = (1/N) Σ_t z_t z_{t-k}'  +  C' M (S_k ⊗ D Σ D) M' C,   S_k[j, j'] = 1 if j - j' = k (k < h),
+
+the noise of consecutive windows overlapping in h - k draws; Γ_0 is the self-consistent Σ (asserted). Per QoI
+the AR's φ by `ar2_ls` on ρ_k = Γ_k[i,i] / Γ_0[i,i], k = 1..L (`nonneg` the AR(2) rule); Σ_ξ = D R D with R the
+correlation of the exact innovation covariance E[ξ ξ'] (ξ_t = z_t - Φ1 z_{t-1} - Φ2 z_{t-2}, Φ diagonal) and D
+matching the AR's marginal variance to diag Σ. The mean model was trained with WHITE draws; the closure draws
+the AR, so the fit is the residual under white draws (an approximation, not iterated).
+"""
+function fit_ar_noisy(d, p; nonneg = false, L = 20)
+    @assert p == 2 "the noisy-residual fit is the AR(2)"
+    m = d.m
+    haskey(m, "noise_provenance") || error("not a noise-trained LinReg (no noise_provenance key)")
+    h = m["hist_len"]
+    isg, osg = vec(m["scaling"].in_scaling.sigma), vec(m["scaling"].out_scaling.sigma)
+    Ct = Matrix(Matrix(m["c"])')                       # scaled regressor -> scaled output
+    Sig = Matrix(cov(m["stoch_distr"]))
+    M = window_map(h, isg)
+    B = Diagonal(osg) * Sig * Diagonal(osg)            # raw η covariance
+    Z = d.Z
+    N = size(Z, 1)
+    G = map(0:L) do k
+        Gd = Z[(k + 1):end, :]' * Z[1:(end - k), :] ./ N
+        k >= h && return Gd
+        Sk = zeros(h, h)
+        for jp in 1:(h - k)
+            Sk[jp + k, jp] = 1.0
+        end
+        Gd .+ Ct' * M * kron(Sk, B) * M' * Ct
+    end
+    e0 = maximum(abs, Symmetric(G[1]) .- Sig) / maximum(diag(Sig))
+    e0 < 1e-8 || error(@sprintf("Γ_0 is not the source's self-consistent Σ (rel. %.1e): wrong rows or units", e0))
+    racf = [G[k + 1][i, i] / G[1][i, i] for k in 0:L, i in 1:NQ]
+    racf_clean = [Z[(k + 1):end, i]' * Z[1:(end - k), i] / (Z[:, i]' * Z[:, i]) for k in 0:L, i in 1:NQ]
+    phi = zeros(2, NQ)
+    for i in 1:NQ
+        phi[:, i] .= ar2_ls(racf[:, i]; L, nonneg)
+    end
+    p1, p2 = phi[1, :], phi[2, :]
+    F1, F2 = Diagonal(p1), Diagonal(p2)
+    G0, G1, G2 = G[1], G[2], G[3]
+    Cxi = G0 .+ F1 * G0 * F1 .+ F2 * G0 * F2 .- G1 * F1 .- F1 * G1' .- G2 * F2 .- F2 * G2' .+ F1 * G1 * F2 .+
+          F2 * G1' * F1
+    sd = sqrt.(diag(Cxi))
+    R = Matrix(Symmetric(Cxi ./ (sd * sd')))
+    s2 = diag(G0)
+    sxi2 = [ar_innovation_var(s2[i], p1[i], p2[i]) for i in 1:NQ]
+    D = Diagonal(sqrt.(sxi2))
+    S = Matrix(Symmetric(D * R * D))
+    return (; phi, p1, p2, S, R, s2, sxi2, racf, racf_clean, e0)
 end
 
 "Simulate the diagonal AR with innovation covariance S (NQ x n, after burn-in)."
@@ -213,28 +293,43 @@ function offline_sanity(file, name, f; io, seed = 1)
     return (; werr, rows)
 end
 
-function build(src, p; io = stdout, report_only = false, lag1 = false, nonneg = false, eyw = false, ls = false)
+function build(src, p; io = stdout, report_only = false, lag1 = false, nonneg = false, eyw = false, ls = false,
+               noisy = false)
     @assert (!lag1 && !nonneg && !eyw) || p == 2
     @assert !ls || p == 1
-    dst = "$(src)_ar$(p)" * (lag1 ? "c" : "") * (eyw ? "e" : "") * (nonneg ? "n" : "") * (ls ? "ls" : "")
+    @assert !noisy || (p == 2 && nonneg && !lag1 && !eyw) "the noisy-residual fit is the restricted AR(2), 2nw"
+    dst = "$(src)_ar$(p)" * (lag1 ? "c" : "") * (eyw ? "e" : "") * (nonneg ? "n" : "") * (ls ? "ls" : "") *
+          (noisy ? "w" : "")
     ddir = joinpath(LRS, dst)
     report_only || !isdir(ddir) || error("$ddir exists; refusing to overwrite (--report re-prints it)")
-    fitr = guard(steps_of(1, 10))
+    # a noise-trained source: its own fit rows, those of its self-consistent Σ
+    fitr = noisy ? guard(range(load(joinpath(LRS, src, "LinReg.jld2"), "noise_fit_rows")...)) : guard(steps_of(1, 10))
     d = scaled_resid(src, fitr)
-    f = fit_ar(d.Z, p; lag1, nonneg, eyw, ls)
+    f = noisy ? fit_ar_noisy(d, p; nonneg) : fit_ar(d.Z, p; lag1, nonneg, eyw, ls)
     Sw = Matrix(cov(d.m["stoch_distr"]))
-    println(io, "\n==== $dst: AR($p) on $(src)'s scaled residual, steps $(first(fitr))-$(last(fitr)) (1-10 TU)")
-    @printf(io, "  %-9s %7s %7s %7s | %13s | %9s %9s %11s\n", "QoI", "rho1", "phi1", "phi2", "|poles|",
-            "var(z)", "Σ_white", "σ_ξ/sd(z)")
+    println(io, "\n==== $dst: AR($p) on $(src)'s scaled residual", noisy ? " GIVEN THE NOISY HISTORY (exact)" : "",
+            ", steps $(first(fitr))-$(last(fitr)) (1-10 TU)")
+    noisy && @printf(io, "  Γ_0 against the source's self-consistent Σ: rel. %.1e\n", f.e0)
+    @printf(io, "  %-9s %7s %7s %7s %7s | %13s | %9s %9s %11s\n", "QoI", "rho1", noisy ? "clean" : "", "phi1", "phi2",
+            "|poles|", "var(z)", "Σ_white", "σ_ξ/sd(z)")
     for i in 1:NQ
-        r = acf(d.Z[:, i], 1:2)
+        r1 = noisy ? f.racf[2, i] : acf(d.Z[:, i], 1:2)[1]
+        rc = noisy ? @sprintf("%7.3f", f.racf_clean[2, i]) : " "^7
         pl = ar_poles(f.p1[i], f.p2[i])
-        @printf(io, "  %-9s %7.3f %7.3f %7.3f | %6.3f %6.3f | %9.3e %9.3e %11.3f\n", LABELS[i], r[1], f.p1[i],
+        @printf(io, "  %-9s %7.3f %s %7.3f %7.3f | %6.3f %6.3f | %9.3e %9.3e %11.3f\n", LABELS[i], r1, rc, f.p1[i],
                 f.p2[i], pl..., f.s2[i], Sw[i, i], sqrt(f.sxi2[i] / f.s2[i]))
+    end
+    if noisy
+        lags = (1, 2, 5, 10, 20)
+        println(io, "  ACF at lags ", join(lags, " "), ": the residual given the noisy history | the fitted AR | the clean residual")
+        for i in 1:NQ
+            @printf(io, "  %-9s %s | %s | %s\n", LABELS[i], fmt(f.racf[[l + 1 for l in lags], i]),
+                    fmt(ar_acf(f.p1[i], f.p2[i], 20)[[l + 1 for l in lags]]), fmt(f.racf_clean[[l + 1 for l in lags], i]))
+        end
     end
     @printf(io, "  innovation lag-0 correlation (off-diagonal range) %.2f .. %.2f\n",
             extrema(f.R[i, j] for i in 1:NQ, j in 1:NQ if i != j)...)
-    pw = power_report(d.Z, f, Sw, vec(d.m["scaling"].out_scaling.sigma); io)
+    pw = noisy ? nothing : power_report(d.Z, f, Sw, vec(d.m["scaling"].out_scaling.sigma); io)
     if report_only
         phi2, S2 = load(joinpath(ddir, "LinReg.jld2"), "ar_phi", "ar_sigma_xi")
         @assert phi2 == f.phi && S2 == f.S "the file's AR differs from a refit"
@@ -253,7 +348,11 @@ function build(src, p; io = stdout, report_only = false, lag1 = false, nonneg = 
                      nonneg ? "ar2_ls on residual ACF lags 1-20, restricted to phi1 >= 0, phi2 <= 0" :
                      p == 2 ? "ar2_ls on residual ACF lags 1-20" :
                      ls ? "ar1_ls: AR(1) by LS on residual ACF lags 1-20, phi in [0, 1)" : "AR(1) at residual lag 1",
-            sigma = "innovation lag-0 correlation, marginal variance matched to var(z)",
+            residual = noisy ? "GIVEN THE NOISY HISTORY: exact lagged covariances, the clean residual's plus the " *
+                               "response to the white window noise of the self-consistent Sigma (fit_ar_noisy)" :
+                               "the recorded history",
+            sigma = noisy ? "exact innovation covariance's correlation, marginal variance matched to diag Sigma (self-consistent)" :
+                            "innovation lag-0 correlation, marginal variance matched to var(z)",
             fit_steps = (first(fitr), last(fitr)), units = "scaled (out_scaling), minus mean(stoch_distr)",
             record = "data_track_dns512_les64_Re2000.0_tsim100.0_f64_lmwray3_qois.jld2",
             built = string(Dates.now()), script = "exp_square_HIT/tools/lrs_ar_variant.jl")
@@ -285,8 +384,8 @@ if abspath(PROGRAM_FILE) == @__FILE__
     # Yule-Walker (`ar2_eyw`), "2en" the same restricted; "1ls" = AR(1) by `ar1_ls`
     for p in ps
         flags = lstrip(p, collect('0':'9'))
-        @assert flags in ("", "c", "n", "e", "en", "ls") "unknown variant $p"
+        @assert flags in ("", "c", "n", "e", "en", "ls", "nw") "unknown variant $p"
         build(src, parse(Int, p[1:(end - length(flags))]); report_only, lag1 = 'c' in flags,
-              nonneg = 'n' in flags, eyw = 'e' in flags, ls = flags == "ls")
+              nonneg = 'n' in flags, eyw = 'e' in flags, ls = flags == "ls", noisy = 'w' in flags)
     end
 end
