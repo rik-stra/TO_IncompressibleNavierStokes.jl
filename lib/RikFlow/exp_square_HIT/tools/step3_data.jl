@@ -74,6 +74,18 @@ dat0 = m4_training_data(rec, cfg, hist; target = :dQ)
 let cols = (cfg.train_range[1] - 1) .+ dat0.steps
     D = rec.q[:, cols .+ 1] .- rec.q_star[:, cols] .- skipq(cols)     # SKIP: what the LinReg misses
     Dn, out_scaling = RikFlow._normalise(D; normalization = cfg.normalization)
+    # RIKFLOW_MLP_SKIP_CENTER = data (default: the mean on 1-10 TU, as above) | mvg (step 5, 2026-11-06): with
+    # SKIP, centre the target at the skip LinReg's MVG mean instead (raw: its out-scaling sd times the MVG mean),
+    # the sd unchanged, so that a network whose output starts at zero, with the LinReg's Σ as its noise, starts
+    # as that LinReg + MVG exactly (the data mean differs from it by ~1e-3 sd: other rows than the LinReg's fit)
+    if strip(get(ENV, "RIKFLOW_MLP_SKIP_CENTER", "data")) == "mvg"
+        SKIPQ === nothing && error("RIKFLOW_MLP_SKIP_CENTER = mvg needs RIKFLOW_MLP_SKIP")
+        d, sc_ = load(joinpath(TO_folder, "..", "TO_LRS", SKIP, "LinReg.jld2"), "stoch_distr", "scaling")
+        mu_raw = vec(sc_.out_scaling.sigma) .* Vector{Float64}(d.μ)
+        out_scaling = (; mu = reshape(mu_raw, :, 1), sigma = out_scaling.sigma)
+        Dn = (D .- out_scaling.mu) ./ out_scaling.sigma
+        @info "SKIP_CENTER = mvg: the target centred at the skip's MVG mean" SKIP data_mean_over_sd = vec(mean(D; dims = 2) .- mu_raw) ./ vec(out_scaling.sigma)
+    end
     global dat = merge(dat0, (; Yc = Dn, scaling = (; dat0.scaling.in_scaling, out_scaling, target = :dQ)))
 end
 ncol = size(dat.Xc, 2)

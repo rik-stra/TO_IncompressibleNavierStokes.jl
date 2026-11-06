@@ -118,6 +118,13 @@ The emission draw `e = D LR ε` (the head) is the innovation, in the network's s
 
 Both act after `noise_scale` / `emission_scale` / `eta_ar` (which `ar_phi` excludes), on the draw only:
 one draw of `N_Q` normals per step either way, and the gate censors `dQ` after the state is advanced.
+
+# The generator (`emission = :generator`, 2026-11-06, step 5; [`is_generator`](@ref))
+
+The step's `N_Q` standard normals `ε` are drawn from `rng` BEFORE the forward pass (one scalar `randn` per
+QoI, as `sample_emission!` and LinReg + MVG draw them, so the member's stream is common with LinReg1) and fed
+to the network and its noise skip `L`; the output is the sample. None of the options above (nor `dq_offset`)
+is allowed with it: nothing is added after the network. The warm-up draws nothing; the gate acts after.
 """
 struct StochLSTM{T,S}
     spec::LSTMSpec
@@ -172,6 +179,14 @@ struct StochLSTM{T,S}
                 "StochLSTM: the warm-up is $(size(spinnup_data, 2)) steps but the lag window " *
                 "needs $(spec.hist.h). The history would still be part zero at the first " *
                 "prediction.")
+        end
+        # the generator (step 5): its noise is inside the network, so no noise option may act after it
+        if is_generator(spec)
+            for k in (:ar_phi, :eta_ar, :scale_beta, :scale_qref, :scale_qclip, :noise_scale, :emission_scale,
+                      :dq_offset, :offset_ref)
+                hasproperty(scaling, k) &&
+                    error("StochLSTM: emission = :generator adds nothing after the network; scaling has $k")
+            end
         end
         ar = nothing
         if hasproperty(scaling, :ar_phi)
@@ -402,7 +417,19 @@ function get_next_item_timeseries(m::StochLSTM{T}, q_star) where {T}
         return dQ
     end
 
-    if windowed
+    if is_generator(m.spec)
+        # 🔑 Step 5 (2026-11-06, paper Eq. stochastic net): the step's N_Q standard normals ε, drawn from the
+        # member's stream BEFORE the forward pass -- one scalar `randn` per QoI, the count and order of LinReg +
+        # MVG's draw (common random numbers) -- feed the network and the noise skip L; the network's output IS
+        # the sample, nothing is added after it. `stochastic = false`: ε = 0, nothing drawn.
+        _push_window!(m, x, nothing)
+        @inbounds for k in 1:nq
+            m.eprev[k] = m.stochastic ? T(randn(m.rng)) : zero(T)
+        end
+        reset!(m.state)
+        cnn_window!(m.state, m.weights, m.spec, view(m.xwin, :, 1:m.nwin[]); eps = m.eprev)
+        copyto!(m.scratch, m.state.y)
+    elseif windowed
         # 🔴 This step's latent draw is taken ONCE, here, and stored with its input; the W - 1
         # later windows that replay this step reuse it (see "Window mode" above). Scalar draws in
         # the order `lstm_step!` makes them, so the rng is consumed identically in both modes.
@@ -423,7 +450,9 @@ function get_next_item_timeseries(m::StochLSTM{T}, q_star) where {T}
     else
         lstm_step!(m.state, m.weights, m.spec, x; rng = m.rng, sample_latent = true)
     end
-    if m.stochastic
+    if is_generator(m.spec)
+        # the sample is already in `m.scratch` (above)
+    elseif m.stochastic
         sample_emission!(m.scratch, m.state, m.weights, m.spec, m.rng)
         # `scaling.emission_scale` (per QoI, window mode) multiplies the EMISSION noise on top of
         # `noise_scale` -- whiter corrections in chosen bands without touching the shared latent

@@ -37,6 +37,8 @@
 # not see the correlations). Every fit, whatever its loss, also prints the validation CRPS with the
 # diagonal of Sigma refitted to the fit rows' residuals (least squares' beside it) and its own head's
 # marginal sd over the validation rms per QoI (1 = calibrated one step ahead; mse/rmse have no head).
+# STEP 5 (2026-11-06): RIKFLOW_CNN_LOSS = crps_gen, the stochastic skip network (paper Eq. stochastic net, card
+# analysis/cards/step5.md); see the block "STEP 5" below `refit_cnn`.
 # RIKFLOW_CNN_INPUT = full (default: q*, dQ
 # and Dq* per step) | nodiff (q* and dQ per step: the kernel spans neighbouring steps and can form the
 # predictor increments itself, Rik: "the CNN might not need the inputs that were subtracted").
@@ -104,8 +106,10 @@ CDEV === :gpu && @eval using cuDNN                          # NNlib's cuDNN exte
 const DEVF = CDEV === :gpu ? RF.m4_device("cuda") : identity
 todev(x) = Lux.fmap(DEVF, x)
 const CLOSS = Symbol(envc("LOSS", "nll"))
-CLOSS in (:mse, :rmse, :nll, :crps) || error("RIKFLOW_CNN_LOSS must be mse, rmse, nll or crps; got $CLOSS")
+CLOSS in (:mse, :rmse, :nll, :crps, :crps_gen) ||
+    error("RIKFLOW_CNN_LOSS must be mse, rmse, nll, crps or crps_gen; got $CLOSS")
 CLOSS === :crps && CDEV === :gpu && error("LOSS = crps is written for the CPU (norm_cdf is a scalar series)")
+CLOSS === :crps_gen && CDEV === :gpu && error("LOSS = crps_gen (step 5) is written for the CPU")
 const CINPUT = Symbol(envc("INPUT", "full"))
 CINPUT in (:full, :nodiff, :rel) || error("RIKFLOW_CNN_INPUT must be full, nodiff or rel; got $CINPUT")
 # INPUT = rel (Rik, 2026-10-22): per step [(q^{n-k*} - q^{n*}) / s_k, dQ^{n-k}] -- the predictor RELATIVE TO
@@ -662,6 +666,387 @@ function refit_cnn(C, lr, wd, seed, hist, nupd; Linj = nothing)
         end
     end
     return Lux.fmap(Array, ps), Lux.fmap(Array, st), model
+end
+
+# ==================================================================================================
+# 🔑 STEP 5 (2026-11-06; paper Eq. stochastic net, closures.tex sec:lever-stoch; card analysis/cards/step5.md):
+# RIKFLOW_CNN_LOSS = crps_gen, the STOCHASTIC SKIP NETWORK
+#
+#     y = g_θ(z, q*, ε) + L ε,   ε ~ N(0, I_6) fresh per sample,   in the target of SKIP (what the LinReg misses)
+#
+# g_θ is step 3a's CNN with ε joining q^{n*} in the first dense layer (Parallel(vcat, conv, NoOp, NoOp), 6 x D
+# more weights; the deployed `cnn_window!` with emission = :generator reads the same order), its output layer at
+# zero (OUTINIT with SKIP); L is lower triangular, starts at the Cholesky factor of the skip LinReg's Σ in the
+# target units (diag(σ_out / so) chol Σ), FULLY learnable, no weight decay (Rik: "keep it and make L fully
+# learnable"). With RIKFLOW_MLP_SKIP_CENTER = mvg (required) the fit starts as that LinReg + MVG exactly.
+# Loss (RIKFLOW_CNN_GEN_SCORE): energy (default; Rik at GATE 1, 2026-11-06: "Energy score, rerun") = the fair
+# energy score of RIKFLOW_CNN_GEN_M (default 4) samples of the six-QoI vector per window (`RF.energy_fair_samples`),
+# which sees the dependence between the QoIs | crps = the fair CRPS per QoI summed over the QoIs
+# (`RF.crps_fair_samples`; card (b) as first decided: its grid, 2026-11-06, coupled the bands); fresh draws per update from the noise's own stream (the shuffle stays the
+# clean run's); the validation loss uses ONE fixed set of RIKFLOW_CNN_GEN_MVAL (default 16) draws per validation
+# row. Weight decay on the network (the noise weights included), not on L. The schedule, early stopping,
+# weight-decay grid and the refit (REFIT = 1, one setting per run) are the protocol's (fit_cnn / refit_cnn,
+# written out again here so that the other modes stay untouched). Nothing is fitted after training.
+#
+# Printed per fit (stage 1, 8.2-10 TU, its best iterate) -- the card's offline check and what is reported beside
+# it: the CRPS of RIKFLOW_CNN_GEN_MCHK (default 256) fixed draws per row against LinReg1 + MVG on the same rows (the
+# PASS reference, Rik at GATE 0), estimated with the SAME draws through the start model (g = 0, L = L0, which IS
+# LinReg1 + MVG): a paired comparison free of Monte Carlo noise; its closed form beside it, which differs from any
+# sample estimate by that noise (0.5 % at M = 64 on the 720 rows in the smoke), and
+# against least squares refitted on 1-8.2 TU with its sds (`LS_CRPS`); per QoI the samples' sd over the error of
+# their mean, the error of their mean over LinReg1's, the share of the sample variance from L ε and from the
+# network's response to ε, and the samples' correlation against Σ's (and L L''s). With REFIT, `pred.jld2` holds per
+# seed the stage-1 and refitted networks' sample mean (raw dQ, skip included), sample sd and the sd of the
+# network's part alone (target units) on every record step from RIKFLOW_CNN_GEN_MREC (default 32) fixed draws, the
+# pooled correlations, and a translation check set for the export (300 steps of 10-100 TU, one fixed ε each).
+# ==================================================================================================
+const GEN = CLOSS === :crps_gen
+if GEN
+    isempty(SKIP) && error("LOSS = crps_gen needs RIKFLOW_MLP_SKIP (the frozen LinReg; card (a): LinReg1)")
+    strip(get(ENV, "RIKFLOW_MLP_SKIP_CENTER", "data")) == "mvg" ||
+        error("LOSS = crps_gen: set RIKFLOW_MLP_SKIP_CENTER = mvg, so that the fit starts as the LinReg + MVG")
+    CINN === :none || error("LOSS = crps_gen is trained on the recorded history (INNOISE = none); s5_nt is not built")
+    CSEQ === :lags || error("LOSS = crps_gen is defined for SEQ = lags")
+    const GEN_M = parse(Int, envc("GEN_M", "4"))
+    const GEN_MVAL = parse(Int, envc("GEN_MVAL", "16"))
+    const GEN_MCHK = parse(Int, envc("GEN_MCHK", "256"))
+    const GEN_MREC = parse(Int, envc("GEN_MREC", "32"))
+    const GEN_SCORE = Symbol(envc("GEN_SCORE", "energy"))
+    GEN_SCORE in (:energy, :crps) || error("RIKFLOW_CNN_GEN_SCORE must be energy or crps; got $GEN_SCORE")
+    "The generator's training and validation score of samples `X` (N_Q x B x M) against `Y`."
+    gen_score(X, Y) = GEN_SCORE === :energy ? RF.energy_fair_samples(X, Y) : RF.crps_fair_samples(X, Y)
+    GEN_M >= 2 && GEN_MVAL >= 2 && GEN_MCHK >= 2 && GEN_MREC >= 2 || error("GEN_M, GEN_MVAL, GEN_MCHK, GEN_MREC must be >= 2")
+    # Σ of the skip LinReg in the network's standardised target (its draw is σ_out ⊙ (μ + chol(Σ) ε) raw, and
+    # the target is (raw - mo) / so with mo = σ_out ⊙ μ)
+    const GEN_SIGMA = let ds = load(joinpath(TO_folder, "..", "TO_LRS", SKIP, "LinReg.jld2"), "stoch_distr", "scaling")
+        d, sc_ = ds
+        sgo = vec(sc_.out_scaling.sigma)
+        S = Matrix{Float64}(hasproperty(d.Σ, :mat) ? d.Σ.mat : d.Σ)
+        Diagonal(sgo ./ so) * S * Diagonal(sgo ./ so)
+    end
+    const GEN_L0 = T.(Matrix(cholesky(Symmetric(GEN_SIGMA)).L))
+    const LTRI = T[i >= j for i in 1:nq, j in 1:nq]
+    # RIKFLOW_CNN_GEN_STAGE1 = skip (default: stage 1 on the frozen skip, as above) | heldout (Rik at GATE 1,
+    # 2026-11-06: "please try this: Held-out early stop"): the skip LinReg is fitted on all of 1-10 TU, so the
+    # early-stopping rows (8.2-10 TU) lie in its training window and any mean the network learns on 1-8.2 TU scores
+    # worse there (least squares on the fit rows: CRPS +2.6 % on 8.2-10 TU). With heldout, STAGE 1 (settings, early
+    # stop, the offline check) uses as its skip the skip LinReg PLUS least squares of its residual on the fit rows
+    # (`Cls`: together, least squares on 1-8.2 TU) -- its target is that model's residual, and L starts at the Cholesky
+    # factor of its residual's covariance on the fit rows (about zero) -- so stage 1 starts as least squares on 1-8.2
+    # TU + its MVG and the early stop is held out. The REFIT (stage 2) is unchanged: the skip LinReg, its target, L0.
+    const GEN_HELD = envc("GEN_STAGE1", "skip") == "heldout"
+    envc("GEN_STAGE1", "skip") in ("skip", "heldout") || error("RIKFLOW_CNN_GEN_STAGE1 must be skip or heldout")
+    const GEN_SIGMA_S = GEN_HELD ? mom0(Rls) : GEN_SIGMA              # stage 1's start Σ (target units)
+    const GEN_L0S = T.(Matrix(cholesky(Symmetric(GEN_SIGMA_S)).L))
+    const Ytr_g32 = GEN_HELD ? T.(Ytr .- Cls' * Rtr_) : Ytr32          # stage 1's target
+    const Yva_g = GEN_HELD ? Yva .- Cls' * Rva_ : Yva
+    const Yva_g32 = T.(Yva_g)
+    "Stage 1's skip beyond the skip LinReg, on the whole record (standardised target): Cls' x, or 0."
+    gen_s1_offset() = GEN_HELD ? Cls' * Xr64 : zeros(nq, size(Xr64, 2))
+    GEN_HELD && @info "stage 1 held out: skip + least squares on the fit rows" ls_sd_over_skip_sd = sqrt.(diag(GEN_SIGMA_S) ./ diag(GEN_SIGMA))
+    # RIKFLOW_CNN_GEN_OUTINIT = zero (default: the output layer's weights and bias start at zero, so the fit starts at
+    # the LinReg + MVG) | random (Rik, 2026-11-06: "If that does not work; try using random intialization instead of
+    # 0"): Glorot-uniform output weights (the bias stays zero), so the network starts away from the LinReg and the
+    # gradient reaches its hidden layers from the first update; the start check is then skipped
+    const GEN_OUTRAND = envc("GEN_OUTINIT", "zero") == "random"
+    envc("GEN_OUTINIT", "zero") in ("zero", "random") || error("RIKFLOW_CNN_GEN_OUTINIT must be zero or random")
+    @info "step 5 generator" SKIP GEN_M GEN_MVAL GEN_MCHK GEN_MREC sd_L0 = sqrt.(diag(GEN_SIGMA)) sd_val_target = vec(std(Yva; dims = 2))
+end
+
+function mkmodel_gen(C)
+    conv = Chain(Conv((K,), NCH => C, ACTF; init_weight = WINIT), Conv((K,), C => C, ACTF; init_weight = WINIT),
+                 FlattenLayer())
+    nflat = (NSTEP - 2(K - 1)) * C
+    # 🔴 the output BIAS starts at zero too: Lux's Dense default (`init_bias = nothing`) is PyTorch's uniform
+    # ±1/sqrt(fan_in), so OUTINIT alone left a constant offset of up to 0.125 target sd (smoke, 2026-11-06)
+    return Chain(Parallel(vcat, conv, NoOpLayer(), NoOpLayer()), Dense(nflat + 2nq => D, ACTF; init_weight = WINIT),
+                 Dense(D => D, ACTF; init_weight = WINIT),
+                 Dense(D => nq; init_weight = GEN_OUTRAND ? glorot_uniform : OUTINIT, init_bias = zeros32))
+end
+"The noise skip L (lower triangular) of the parameters `p`."
+gen_L(p) = p.L .* LTRI
+"""
+`M = size(E, 2) / B` samples for each of the `B` windows (A, Q): the network on [A; Q; ε] with column `b + (m - 1) B`
+of `E` the deviates of sample `m` of window `b`, plus `L ε`; returns `N_Q x B x M`.
+"""
+function gen_samples(model, p, st, A, Q, E)
+    B = size(Q, 2)
+    M = size(E, 2) ÷ B
+    M * B == size(E, 2) || error("gen_samples: E has $(size(E, 2)) columns for $B windows")
+    Y = first(model((repeat(A, 1, 1, M), repeat(Q, 1, M), E), p.net, st)) .+ gen_L(p) * E
+    return reshape(Y, nq, B, M)
+end
+"""
+Sample statistics of a generator on windows (A, Q) from `M` draws of `rng`, chunked by draw: the sample mean and
+sd and the sd of the network's part alone, without L ε (all `N_Q x N`, target units).
+"""
+function gen_stats(model, p, st, A, Q, M, rng)
+    N = size(Q, 2)
+    s1, s2, g1, g2 = zeros(nq, N), zeros(nq, N), zeros(nq, N), zeros(nq, N)
+    for _ in 1:M
+        E = randn(rng, T, nq, N)
+        g = Float64.(first(model((A, Q, E), p.net, st)))
+        y = g .+ Float64.(gen_L(p) * E)
+        s1 .+= y; s2 .+= y .^ 2; g1 .+= g; g2 .+= g .^ 2
+    end
+    mu = s1 ./ M
+    sd = sqrt.(max.(s2 ./ M .- mu .^ 2, 0) .* (M / (M - 1)))
+    sdg = sqrt.(max.(g2 ./ M .- (g1 ./ M) .^ 2, 0) .* (M / (M - 1)))
+    return (; mu, sd, sdg)
+end
+"Pooled correlation of the samples about their window's mean, from `M` draws (N_Q x N_Q)."
+function gen_corr(model, p, st, A, Q, M, rng)
+    N = size(Q, 2)
+    E = randn(rng, T, nq, N * M)
+    X = Float64.(gen_samples(model, p, st, A, Q, E))
+    R = X .- mean(X; dims = 3)
+    Cm = reshape(R, nq, :) * reshape(R, nq, :)'
+    return Cm ./ sqrt.(diag(Cm) * diag(Cm)')
+end
+corrof(S) = S ./ sqrt.(diag(S) * diag(S)')
+
+function fit_gen(C, lr, wd, seed)
+    rng = Xoshiro(seed)
+    model = mkmodel_gen(C)
+    net, st = Lux.setup(rng, model)
+    ps = (; net, L = copy(GEN_L0S))                                 # GEN_STAGE1 = heldout: least squares' Σ
+    rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
+    opt = Optimisers.setup(rule, ps)
+    wd > 0 && Optimisers.adjust!(opt.L; lambda = zero(T))          # no weight decay on L
+    loss(p, A, Q, E, Y) = gen_score(gen_samples(model, p, st, A, Q, E), Y)
+    nrng = Xoshiro(seed + 7919)                                     # the samples' own stream
+    Eva = randn(Xoshiro(seed + 104729), T, nq, size(Yva32, 2) * GEN_MVAL)   # ONE fixed set of validation draws
+    vloss(p) = Float64(loss(p, Ava, Qva, Eva, Yva_g32))
+    best = (; val = vloss(ps), ps = deepcopy(ps), update = 0)
+    val0 = best.val
+    # the start IS LinReg1 + MVG (heldout: least squares on 1-8.2 TU + its MVG): the network's output is zero, the
+    # samples are L0 ε (checked on the validation rows)
+    GEN_OUTRAND || let E0 = randn(Xoshiro(1), T, nq, size(Yva32, 2) * 2), X0 = gen_samples(model, ps, st, Ava, Qva, E0)
+        e = maximum(abs, X0 .- reshape(GEN_L0S * E0, nq, size(Yva32, 2), :))
+        e == 0 || error("the generator's start is not L0 ε: max |diff| $e")
+    end
+    hist = (; update = Int[], val = Float64[], lr = Float64[])
+    cur, since_best, since_decay, upd, stop = T(lr), 0, 0, 0, :cap
+    nb = fld(ntr, CST.batch)
+    while upd < CST.max_updates
+        idxs = shuffle(rng, 1:ntr)
+        for k in 1:nb
+            c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
+            E = randn(nrng, T, nq, length(c) * GEN_M)
+            Ab, Qb, Yb = Atr[:, :, c], Qtr[:, c], Ytr_g32[:, c]
+            g = Zygote.gradient(p -> loss(p, Ab, Qb, E, Yb), ps)[1]
+            opt, ps = Optimisers.update(opt, ps, g)
+            upd += 1
+            upd % CST.val_every == 0 || continue
+            v = vloss(ps)
+            push!(hist.update, upd); push!(hist.val, v); push!(hist.lr, cur)
+            if v < best.val
+                best = (; val = v, ps = deepcopy(ps), update = upd)
+                since_best, since_decay = 0, 0
+            else
+                since_best += 1
+                since_decay += 1
+            end
+            if !CST.nodecay && since_decay >= CST.patience && cur > CST.min_lr
+                cur = max(T(CST.min_lr), cur * T(CST.lr_decay))
+                Optimisers.adjust!(opt, cur)
+                since_decay = 0
+            end
+            if !CST.nostop && cur <= CST.min_lr && since_best >= CST.stop_patience
+                stop = :floor
+                break
+            end
+            upd >= CST.max_updates && break
+        end
+        stop === :floor && break
+    end
+    pb = best.ps
+    # --- the offline check (8.2-10 TU) and what is reported beside it ---
+    Ec = randn(Xoshiro(seed + 271), T, nq, size(Yva, 2) * GEN_MCHK)
+    Xc_ = Float64.(gen_samples(model, pb, st, Ava, Qva, Ec))
+    Xs_ = Float64.(reshape(GEN_L0S * Ec, nq, size(Yva, 2), :))                # the start: g = 0, L = L0
+    # in stage 1's frame (heldout: against its own skip); the scores equal those of the full prediction against
+    # the truth, so they compare directly with LinReg1 + MVG's closed form in LinReg1's frame
+    crps_chk = RF.crps_fair_samples(Xc_, Yva_g)
+    crps_start = RF.crps_fair_samples(Xs_, Yva_g)
+    es_chk, es_start = RF.energy_fair_samples(Xc_, Yva_g), RF.energy_fair_samples(Xs_, Yva_g)   # the joint score too
+    best.update == 0 && @info "best iterate = the start" max_abs_sample_diff = maximum(abs, Xc_ .- Xs_) crps_chk crps_start
+    crps_mvg = crps_eval(Yva, sqrt.(diag(GEN_SIGMA)))              # LinReg1 + MVG, closed form (the PASS reference)
+    s = gen_stats(model, pb, st, Ava, Qva, GEN_MCHK, Xoshiro(seed + 272))
+    err = rmsq(Yva_g .- s.mu)                                       # = the full prediction's error
+    Lb = Float64.(gen_L(pb))
+    vtot = vec(mean(s.sd .^ 2; dims = 2))
+    Rs = gen_corr(model, pb, st, Ava, Qva, GEN_MCHK, Xoshiro(seed + 273))
+    return (; ps = pb, st, val_loss = best.val, val0, best_update = best.update, updates = upd, stop, hist,
+            nparams = Lux.parameterlength(model), crps_chk, crps_start, crps_mvg, crps_ls = LS_CRPS,
+            spread_over_err = sqrt.(vtot) ./ err, err_over_lr1 = err ./ rmsq(Yva),
+            share_L = diag(Lb * Lb') ./ vtot, share_net = vec(mean(s.sdg .^ 2; dims = 2)) ./ vtot,
+            corr_samples = Rs, corr_LLt = corrof(Lb * Lb'), corr_Sigma = corrof(GEN_SIGMA), L = Lb,
+            es_chk, es_start, score = GEN_SCORE, stage1 = GEN_HELD ? :heldout : :skip,
+            crps_start_closed = crps_eval(Yva_g, sqrt.(diag(GEN_SIGMA_S))),
+            loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT, init = CINIT, M = GEN_M, Mval = GEN_MVAL)
+end
+
+"""
+The second training of a generator (REFIT = 1): set up exactly as `fit_gen` (same seed, same initialisation, the
+same noise stream), on all 1-10 TU rows for `nupd` updates at the learning rate stage 1 used at each update.
+"""
+function refit_gen(C, lr, wd, seed, hist, nupd)
+    rng = Xoshiro(seed)
+    model = mkmodel_gen(C)
+    net, st = Lux.setup(rng, model)
+    ps = (; net, L = copy(GEN_L0))
+    rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
+    opt = Optimisers.setup(rule, ps)
+    wd > 0 && Optimisers.adjust!(opt.L; lambda = zero(T))
+    loss(p, A, Q, E, Y) = gen_score(gen_samples(model, p, st, A, Q, E), Y)
+    nrng = Xoshiro(seed + 7919)
+    lr_at(u) = T(hist.lr[searchsortedfirst(hist.update, u)])
+    Aall, Qall, Yall = cat(Atr, Ava; dims = 3), hcat(Qtr, Qva), hcat(Ytr32, Yva32)
+    N = size(Yall, 2)
+    nb = fld(N, CST.batch)
+    upd, cur = 0, T(lr)
+    while upd < nupd
+        idxs = shuffle(rng, 1:N)
+        for k in 1:nb
+            upd >= nupd && break
+            l = lr_at(upd + 1)
+            l == cur || (Optimisers.adjust!(opt, l); cur = l)
+            c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
+            E = randn(nrng, T, nq, length(c) * GEN_M)
+            g = Zygote.gradient(p -> loss(p, Aall[:, :, c], Qall[:, c], E, Yall[:, c]), ps)[1]
+            opt, ps = Optimisers.update(opt, ps, g)
+            upd += 1
+        end
+    end
+    return ps, st, model
+end
+
+# RIKFLOW_CNN_GEN_TRAINLOG = <N> (Rik, 2026-11-06: "show me the training loss of the network fitted on 1-10 TU vs the
+# loss of the linreg on this data"): no grid. For each (C, lr, wd, seed), the REFIT's setup (LinReg1's skip and
+# target, L0, the same initialisation, shuffle and noise streams) trained on all 1-10 TU rows for N updates at the
+# constant rate lr -- which IS the refit for as long as its replayed schedule stayed at lr -- logging every 200 updates
+# the energy score and the summed CRPS of 16 fixed draws per row on all 1-10 TU rows (the training data) and of 4 on
+# 10-100 TU; update 0 is LinReg1 + MVG on the same draws. Lines start with "TRAINLOG"; nothing is saved.
+const GEN_TRAINLOG = GEN ? parse(Int, envc("GEN_TRAINLOG", "0")) : 0
+if GEN && GEN_TRAINLOG > 0
+    Aall_, Qall_, Yall_ = cat(Atr, Ava; dims = 3), hcat(Qtr, Qva), hcat(Ytr32, Yva32)
+    Yall64 = Float64.(dat.Yc)
+    Aho_, Qho_ = Aho, Qho
+    for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
+        rng = Xoshiro(seed)
+        model = mkmodel_gen(C)
+        net, st = Lux.setup(rng, model)
+        ps = (; net, L = copy(GEN_L0))
+        rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
+        opt = Optimisers.setup(rule, ps)
+        wd > 0 && Optimisers.adjust!(opt.L; lambda = zero(T))
+        loss(p, A, Q, E, Y) = gen_score(gen_samples(model, p, st, A, Q, E), Y)
+        nrng = Xoshiro(seed + 7919)
+        Etr = randn(Xoshiro(seed + 555), T, nq, size(Yall_, 2) * 16)
+        Eho = randn(Xoshiro(seed + 556), T, nq, length(HO) * 4)
+        function logline(p, upd)
+            Xt = Float64.(gen_samples(model, p, st, Aall_, Qall_, Etr))
+            Xh = Float64.(gen_samples(model, p, st, Aho_, Qho_, Eho))
+            @printf("TRAINLOG wd %g seed %d upd %6d | 1-10 TU: ES %.5f CRPS %.5f | 10-100 TU: ES %.5f CRPS %.5f\n", wd, seed,
+                    upd, RF.energy_fair_samples(Xt, Yall64), RF.crps_fair_samples(Xt, Yall64),
+                    RF.energy_fair_samples(Xh, Yf[:, HO]), RF.crps_fair_samples(Xh, Yf[:, HO]))
+            flush(stdout)
+        end
+        logline(ps, 0)
+        N = size(Yall_, 2)
+        nb = fld(N, CST.batch)
+        upd = 0
+        while upd < GEN_TRAINLOG
+            idxs = shuffle(rng, 1:N)
+            for k in 1:nb
+                upd >= GEN_TRAINLOG && break
+                c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
+                E = randn(nrng, T, nq, length(c) * GEN_M)
+                g = Zygote.gradient(p -> loss(p, Aall_[:, :, c], Qall_[:, c], E, Yall_[:, c]), ps)[1]
+                opt, ps = Optimisers.update(opt, ps, g)
+                upd += 1
+                upd % 200 == 0 && logline(ps, upd)
+            end
+        end
+    end
+    exit()
+end
+
+if GEN
+    fmt(v) = join((@sprintf("%.3f", x) for x in v), " ")
+    "Standardised target -> raw dQ at record columns `c` (the skip's correction included)."
+    rawg(y, c) = y .* so .+ mo .+ skipq(c)
+    resg = Dict{Tuple{Int,Float64,Float64,Int},Any}()
+    gstat = Dict{Int,Any}()
+    Arec, Qrec = CREFIT ? lagtensor(Xf) : (zeros(T, 0, 0, 0), zeros(T, 0, 0))
+    CREFIT && (length(CHS) == length(LRS) == length(CWDS) == 1 ||
+               error("RIKFLOW_CNN_REFIT = 1 takes one (C, lr, wd) setting per run"))
+    for C in CHS, lr in LRS, wd in CWDS, seed in CSEEDS
+        t0 = time()
+        r = fit_gen(C, lr, wd, seed)
+        resg[(C, lr, wd, seed)] = merge(r, (; wall = time() - t0))
+        @printf("gen  C %3d K %d D %d (%6d weights) lr %.0e wd %.0e seed %d | %5d upd, best @ %5d (%s) | val fair %s (M %d fixed) %.4f (start %.4f) | %.1f min\n",
+                C, K, D, r.nparams, lr, wd, seed, r.updates, r.best_update, r.stop,
+                GEN_SCORE === :energy ? "energy score" : "CRPS", GEN_MVAL, r.val_loss, r.val0,
+                (time() - t0) / 60)
+        @printf("     CHECK val CRPS (M %d fixed draws) %.4f | the start (%s), same draws %.4f -> %s | closed forms: the start %.4f, LinReg1 + MVG %.4f (%s) | LS refit 1-8.2 TU %.4f\n",
+                GEN_MCHK, r.crps_chk, GEN_HELD ? "LS on 1-8.2 TU + its MVG" : "LinReg1 + MVG", r.crps_start,
+                r.crps_chk <= r.crps_start ? "PASS" : "FAIL", r.crps_start_closed, r.crps_mvg,
+                r.crps_chk <= r.crps_mvg ? "below" : "above", r.crps_ls)
+        @printf("     val energy score (same %d draws) %.4f | the start %.4f (%+.2f %%)\n", GEN_MCHK, r.es_chk, r.es_start,
+                100 * (r.es_chk / r.es_start - 1))
+        @printf("     val per QoI: samples' sd / error of their mean %s | error of the mean / LinReg1's %s\n",
+                fmt(r.spread_over_err), fmt(r.err_over_lr1))
+        @printf("     share of the sample variance: L eps %s | the network's part %s (rest: their covariance)\n",
+                fmt(r.share_L), fmt(r.share_net))
+        @printf("     correlation: max |samples - Sigma| %.3f, max |L L' - Sigma| %.3f | L sd / L0 sd %s\n",
+                maximum(abs, r.corr_samples .- r.corr_Sigma), maximum(abs, r.corr_LLt .- r.corr_Sigma),
+                fmt(sqrt.(diag(r.L * r.L')) ./ sqrt.(diag(GEN_SIGMA))))
+        @printf("     %.2f ms per update (including validations and scoring)\n", 1e3 * (time() - t0) / max(r.updates, 1))
+        cps = [u for u in (1_000, 5_000, 10_000, 20_000, 50_000, 100_000, 200_000) if u <= r.updates]
+        isempty(cps) || @printf("     val loss at %s\n", join((@sprintf("%dk: %.4f (lr %.0e)", u ÷ 1000,
+                                 r.hist.val[findfirst(>=(u), r.hist.update)], r.hist.lr[findfirst(>=(u), r.hist.update)]) for u in cps), ", "))
+        if CREFIT
+            t1 = time()
+            ps3, st3, model3 = refit_gen(C, lr, wd, seed, r.hist, r.best_update)
+            # the stage-1 and refitted networks on every record step, fixed draws (common to both)
+            st1 = gen_stats(model3, r.ps, st3, Arec, Qrec, GEN_MREC, Xoshiro(20261106 + seed))
+            st3s = gen_stats(model3, ps3, st3, Arec, Qrec, GEN_MREC, Xoshiro(20261106 + seed))
+            rows10 = findall(n -> cfg.train_range[1] <= n <= cfg.train_range[2], cols)
+            corr10 = gen_corr(model3, ps3, st3, Arec[:, :, rows10], Qrec[:, rows10], 8, Xoshiro(seed + 911))
+            corrho = gen_corr(model3, ps3, st3, Arec[:, :, HO], Qrec[:, HO], 8, Xoshiro(seed + 912))
+            # the export's translation check: 300 steps of 10-100 TU, one fixed draw each, the refitted network
+            ich = HO[1:300]
+            Ech = randn(Xoshiro(seed + 2026), T, nq, length(ich))
+            ych = Float64.(dropdims(gen_samples(model3, ps3, st3, Arec[:, :, ich], Qrec[:, ich], Ech); dims = 3))
+            gstat[seed] = (; mean1 = rawg(st1.mu .+ gen_s1_offset(), cols), sd1 = st1.sd, sdg1 = st1.sdg, mean3 = rawg(st3s.mu, cols), sd3 = st3s.sd,
+                           sdg3 = st3s.sdg, corr10, corrho, L3 = Float64.(gen_L(ps3)),
+                           chk = (; cols = cols[ich], E = Float64.(Ech), y = rawg(ych, cols[ich])))
+            resg[(C, lr, wd, seed)] = merge(resg[(C, lr, wd, seed)], (; refit = (; ps = ps3, st = st3, updates = r.best_update)))
+            ho = rmsq(Yf[:, HO] .- st3s.mu[:, HO])
+            @printf("     refit on 1-10 TU (%d updates, %.1f min): 10-100 TU error of the sample mean / LinReg1's %s | sd / error %s | corr max |.-Sigma| 1-10 %.3f, 10-100 %.3f\n",
+                    r.best_update, (time() - t1) / 60, fmt(ho ./ rmsq(Yf[:, HO])),
+                    fmt(sqrt.(vec(mean(st3s.sd[:, HO] .^ 2; dims = 2))) ./ ho),
+                    maximum(abs, corr10 .- corrof(GEN_SIGMA)), maximum(abs, corrho .- corrof(GEN_SIGMA)))
+        end
+        flush(stdout)
+    end
+    out_dir = joinpath(TO_folder, COUT)
+    mkpath(out_dir)
+    jldsave(joinpath(out_dir, "fits.jld2"); res = resg, ls_crps = LS_CRPS, settings = CST, K, D, feat = FEAT, cfg,
+            loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT, innoise = CINN, innoise_sigma = CINN_SRC,
+            skip = SKIP, Sigma = GEN_SIGMA, L0 = Float64.(GEN_L0), M = GEN_M, Mval = GEN_MVAL, score = GEN_SCORE,
+            stage1 = GEN_HELD ? :heldout : :skip, Sigma_stage1 = GEN_SIGMA_S, outinit = GEN_OUTRAND ? :random : :zero)
+    if CREFIT
+        jldsave(joinpath(out_dir, "pred.jld2"); cols, gen = gstat, seeds = CSEEDS, wd = only(CWDS), n_channels = only(CHS),
+                loss = CLOSS, h = cfg.h, K, D, feat = FEAT, input = CINPUT, seq = CSEQ, act = CACT, scaling,
+                skip = SKIP, Sigma = GEN_SIGMA, Mrec = GEN_MREC, innoise = CINN, stage1 = GEN_HELD ? :heldout : :skip,
+                # the target on every step of `cols`: the skip LinReg's residual, centred at its MVG mean, / so
+                ytarget = Yf)
+    end
+    @info "written" out_dir
+    exit()
 end
 
 if CREFIT

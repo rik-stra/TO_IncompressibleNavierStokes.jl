@@ -32,6 +32,11 @@
 #   headcorrnt  a noise-trained CRPS run in head mode (2026-11-06, step 4): the learned sds (the refitted
 #            head) with the correlation of `S_noisy`, its 1-10 TU residual under its own (diagonal) window
 #            noise, about zero (k1a, k2a; the noise-trained analogue of headcorr).
+#   gen      step 5 (2026-11-06; paper Eq. stochastic net, card analysis/cards/step5.md): a STOCHASTIC SKIP NETWORK
+#            (cnn_mean_fit.jl, RIKFLOW_CNN_LOSS = crps_gen; skip=<LinReg> required, the one it was trained on):
+#            emission = :generator, the noise skip L (the refitted network's) in `LR`, bd = 0, nothing added after.
+#            Its translation check feeds the deployed closure the fit's own deviates (pred.jld2's `chk`: 300 steps
+#            of 10-100 TU, one fixed draw each) and compares the SAMPLES.
 # mvgnt and headcorrnt are for noise-trained runs only; the other modes refuse them.
 # The noise model is stored in the scaling (`ar_phi`, `scale_*`) and the head (`bd`, `LR`), which
 # `StochLSTM` applies with the code `LinReg` uses (`ts_noise.jl`, `ts_scale.jl`).
@@ -48,8 +53,8 @@ const XRUN, XNOISE, XNAME = ARGS[1], ARGS[2], ARGS[3]
 const XSKIP = length(ARGS) == 4 ? (startswith(ARGS[4], "skip=") ? ARGS[4][6:end] :
                                    error("the 4th argument is skip=<LinReg>; got $(ARGS[4])")) : ""
 const XNT_MODES = ("mvgnt", "headcorrnt")
-XNOISE in ("mvg", "head", "headcorr", "ar2n", "pl", XNT_MODES...) ||
-    error("noise must be mvg, head, headcorr, ar2n, pl, mvgnt or headcorrnt; got $XNOISE")
+XNOISE in ("mvg", "head", "headcorr", "ar2n", "pl", "gen", XNT_MODES...) ||
+    error("noise must be mvg, head, headcorr, ar2n, pl, gen, mvgnt or headcorrnt; got $XNOISE")
 const XTO = normpath(joinpath(@__DIR__, "..", "output", "TO_LSTM"))
 const XNWARM = 100                                   # D6's warm-up (d6_lib.jl)
 
@@ -58,6 +63,10 @@ P = load(joinpath(XTO, XRUN, "pred.jld2"))
 key, r = only(F["res"])
 C, lr, wd, seed = key
 haskey(r, :refit) || error("$XRUN has no refit (run cnn_mean_fit.jl with RIKFLOW_CNN_REFIT=1)")
+const XGEN = P["loss"] === :crps_gen                  # step 5's generator
+XGEN == (XNOISE == "gen") || error(XGEN ? "$XRUN is a step-5 generator (crps_gen): export it with noise gen" :
+                                          "noise gen is for a step-5 generator (crps_gen); $XRUN is not")
+XGEN && XSKIP != P["skip"] && error("$XRUN was trained on the skip $(P["skip"]); got skip=$XSKIP")
 const XINN = get(P, "innoise", :none)
 const XNT = XINN !== :none                           # a noise-trained run
 XNT == (XNOISE in XNT_MODES) || error(XNT ? "$XRUN is noise-trained: export it with noise $(join(XNT_MODES, " or "))" :
@@ -65,19 +74,21 @@ XNT == (XNOISE in XNT_MODES) || error(XNT ? "$XRUN is noise-trained: export it w
 XNOISE == "headcorrnt" && !(XINN === :head && P["loss"] === :crps) &&
     error("headcorrnt is for a CRPS run in head mode (INNOISE = head); $XRUN has $(XINN), loss $(P["loss"])")
 # the head's START (HEAD = identity | inj) does not enter the deployed closure
-(P["input"], P["seq"], P["act"]) == (:full, :lags, :tanh) && P["head"] in (:identity, :inj) ||
+(P["input"], P["seq"], P["act"]) == (:full, :lags, :tanh) && (XGEN || P["head"] in (:identity, :inj)) ||
     error("the deployed CNN is SEQ = lags, INPUT = full, ACT = tanh; $XRUN has $((P["input"], P["seq"], P["act"]))")
 h, K, D = P["h"], P["K"], P["D"]
 scaling = P["scaling"]
 nin, nreg = size(scaling.input_map)
 cols = P["cols"]
-pred3 = only(values(P["pred3"]))                    # raw dQ of the refitted network, every step of `cols`
+# raw dQ of the refitted network, every step of `cols` (the generator: its sample mean, pred.jld2's fixed draws)
+pred3 = XGEN ? P["gen"][seed].mean3 : only(values(P["pred3"]))
 
 # the spec, and the sequence the network reads from the mapped input (cnn_mean_fit.jl's `lagtensor`, from
 # step3_data.jl's `lagrows`: rows of dQ^{n-k} and q*^{n-k}; the increments after the regressor)
 hist = RF.HistorySpec(; h, n_qoi = NQ, hist_var = :q_star_q, include_predictor = true)
 RF.nfeatures(hist) == nreg || error("regressor width $(RF.nfeatures(hist)), the input map reads $nreg")
-spec = RF.LSTMSpec(; hist, n_hidden = D, n_latent = 0, n_encoder = 0, arch = :cnn, emission = :constant,
+spec = RF.LSTMSpec(; hist, n_hidden = D, n_latent = 0, n_encoder = 0, arch = :cnn,
+                   emission = XGEN ? :generator : :constant,
                    window = 1, n_in = nin, n_conv = C, kernel = K, skip = !isempty(XSKIP))
 lagq(k) = (NQ + 2(k - 1) * NQ + 1):(NQ + (2k - 1) * NQ)
 seq_index = zeros(Int, h, 3NQ)
@@ -169,6 +180,16 @@ elseif XNOISE == "headcorrnt"
     e < 1e-5 || error("the refitted head's sds differ from S_deploy's by $e")
     @printf("  learned sd / sd of the residual under its own noise %s; that residual's correlation, max |off-diagonal| %.3f\n",
             fmt(exp.(bd) ./ sqrt.(diag(Sn)); d = 3), maximum(abs, LR * LR' - I))
+elseif XNOISE == "gen"
+    bd = zeros(NQ)
+    LR = Float64.(r.refit.ps.L) .* [i >= j for i in 1:NQ, j in 1:NQ]          # the noise skip, lower triangular
+    maximum(abs, LR .- P["gen"][seed].L3) == 0 || error("the refitted L differs from pred.jld2's")
+    S = F["Sigma"]
+    prov = "step 5 generator (crps_gen): network on [features; q*; eps] + Ws z + L eps, L learned from chol of " *
+           "the skip's Sigma; nothing added after"
+    @printf("  L L' sd / skip's Sigma sd %s; corr max |L L' - Sigma| %.3f
+", fmt(sqrt.(diag(LR * LR') ./ diag(S)); d = 3),
+            maximum(abs, (LR * LR') ./ sqrt.(diag(LR * LR') * diag(LR * LR')') .- S ./ sqrt.(diag(S) * diag(S)')))
 elseif XNOISE == "head"
     bd = Float64.(vec(r.refit.ps.head.bd))
     LR = Matrix(1.0I, NQ, NQ)
@@ -210,6 +231,33 @@ RF.save_stochlstm(file, spec, w, sc; run = XRUN, noise = XNOISE, provenance = pr
 
 # the translation check
 fit = RF.load_stochlstm(file)
+"A stream that returns given standard normals (the generator's check: the fit's own deviates)."
+mutable struct FixedNormals <: Random.AbstractRNG
+    v::Vector{Float64}
+    i::Int
+end
+Random.randn(r::FixedNormals) = (r.i += 1; r.v[r.i])
+Random.randn(r::FixedNormals, ::Type{Float64}) = randn(r)
+if XGEN
+    chk = P["gen"][seed].chk
+    errg = zeros(NQ, length(chk.cols))
+    for (j, n) in enumerate(chk.cols)
+        warm = REF["q"][:, (n - XNWARM + 1):n] .- REF["q_star"][:, (n - XNWARM):(n - 1)]
+        fr = FixedNormals(chk.E[:, j], 0)
+        m = RF.StochLSTM(fit.spec, fit.weights, fit.scaling; spinnup_data = warm, rng = fr, gate = 0.0)
+        for t in 1:XNWARM
+            RF.get_next_item_timeseries(m, REF["q_star"][:, n - XNWARM + t - 1])
+        end
+        dQ = RF.get_next_item_timeseries(m, REF["q_star"][:, n])
+        fr.i == NQ || error("the deployed generator drew $(fr.i) normals, not N_Q = $NQ")
+        errg[:, j] = (dQ .- chk.y[:, j]) ./ so
+    end
+    @printf("translation check (%s, generator), %d steps of 10-100 TU, the fit's own deviates: max |deployed - Lux| / target sd %.1e, rms %.1e
+",
+            XT, length(chk.cols), maximum(abs, errg), sqrt(mean(abs2, errg)))
+    maximum(abs, errg) < 1e-3 || error("the deployed generator differs from the trained one by $(maximum(abs, errg)) sd")
+    exit()
+end
 rng = Xoshiro(1)
 picks = sort(unique(vcat(rand(rng, findall(n -> 400 + XNWARM <= n <= 4000, cols), 50),
                          rand(rng, findall(n -> 4000 < n <= 40000 - 1, cols), 250))))

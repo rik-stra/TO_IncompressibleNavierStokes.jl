@@ -428,6 +428,54 @@ function crps_ensemble(x::AbstractVector, y::Real; fair::Bool = true)
 end
 
 """
+    crps_fair_samples(X, Y)
+
+The fair CRPS of `M ≥ 2` samples, summed over the QoIs and averaged over the steps (step 5's training loss,
+2026-11-06; paper Eq. fair crps): `X` is `N_Q x B x M`, sample `m` of step `b` in `X[:, b, m]`; `Y` is `N_Q x B`.
+Per QoI and step it is `crps_ensemble(X[i, b, :], Y[i, b]; fair = true)`,
+
+    (1/M) Σ_m |x_m - y| - 1/(M(M-1)) Σ_{m<m'} |x_m - x_m'|,
+
+written with slices, broadcasts and sums only (no sorting, no mutation), so that Zygote differentiates it.
+"""
+function crps_fair_samples(X::AbstractArray{<:Real,3}, Y::AbstractMatrix)
+    nq, B, M = size(X)
+    M >= 2 || error("crps_fair_samples: the fair CRPS needs M >= 2 samples; got $M")
+    size(Y) == (nq, B) || error("crps_fair_samples: Y is $(size(Y)), expected $((nq, B))")
+    a = sum(abs.(X .- Y)) / M
+    g = zero(eltype(X))
+    for m in 1:(M - 1), mp in (m + 1):M
+        g += sum(abs.(X[:, :, m] .- X[:, :, mp]))
+    end
+    return (a - g / (M * (M - 1))) / B
+end
+
+"""
+    energy_fair_samples(X, Y)
+
+The fair ENERGY SCORE of `M ≥ 2` samples of the `N_Q`-vector, averaged over the steps (step 5's training loss
+after GATE 1, Rik 2026-11-06: "Energy score, rerun"; Gneiting & Raftery 2007): `X` is `N_Q x B x M`, `Y` `N_Q x B`.
+Per step
+
+    (1/M) Σ_m ‖x_m - y‖ - 1/(M(M-1)) Σ_{m<m'} ‖x_m - x_m'‖,
+
+the unbiased estimator of E‖X - y‖ - ½ E‖X - X'‖, a proper score of the joint distribution (unlike the summed
+marginal CRPS, it sees the dependence between the QoIs). For `N_Q = 1` it is `crps_fair_samples`. Slices,
+broadcasts and sums only, so Zygote differentiates it.
+"""
+function energy_fair_samples(X::AbstractArray{<:Real,3}, Y::AbstractMatrix)
+    nq, B, M = size(X)
+    M >= 2 || error("energy_fair_samples: the fair energy score needs M >= 2 samples; got $M")
+    size(Y) == (nq, B) || error("energy_fair_samples: Y is $(size(Y)), expected $((nq, B))")
+    a = sum(sqrt.(sum(abs2, X .- Y; dims = 1))) / M
+    g = zero(eltype(X))
+    for m in 1:(M - 1), mp in (m + 1):M
+        g += sum(sqrt.(sum(abs2, X[:, :, m] .- X[:, :, mp]; dims = 1)))
+    end
+    return (a - g / (M * (M - 1))) / B
+end
+
+"""
     crps_ensemble_mean(ens, Y; fair = true)
 
 Per-QoI mean CRPS over verification instances. `ens` is `N x N_Q x M`, `Y` is `N x N_Q`.

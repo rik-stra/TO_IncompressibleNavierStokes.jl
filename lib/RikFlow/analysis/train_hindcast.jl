@@ -60,7 +60,9 @@ const PARTNER = Dict("LinReg7_ar2n" => "LinReg7", "LinReg7_ar1ls" => "LinReg7", 
                      "LinReg1_nt_CNN_crps_nt_headcorr" => "LinReg1_nt",
                      "LinReg1_nt_CNN_crps_nt_head" => "LinReg1_nt_CNN_crps_nt_headcorr",
                      "LinReg7_CNN_crps_nt_headcorr" => "LinReg7",
-                     "LinReg7_CNN_crps_nt_head" => "LinReg7_CNN_crps_nt_headcorr")
+                     "LinReg7_CNN_crps_nt_head" => "LinReg7_CNN_crps_nt_headcorr",
+                     # step 5: the stochastic skip network on LinReg1 (analysis/cards/step5.md, added 2026-11-06)
+                     "LinReg1_CNN_gen" => "LinReg1")
 
 function diagnose(name; truth = load_truth(), prefix = "D6train_")
     dir = joinpath(OUTD, prefix * name)

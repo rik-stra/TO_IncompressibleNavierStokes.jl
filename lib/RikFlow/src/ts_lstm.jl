@@ -78,9 +78,11 @@ Shape and architecture of an M4 model.
 - `n_encoder`: width of the encoder's dense `tanh` layer. `0` drops it, giving the purely linear
   encoder the tex's equations describe. 60 in the source.
 - `arch`: one of `:lstm`, `:vaernn`, `:storn`, `:vrnn` -- see the table below.
-- `emission`: one of `:none`, `:constant`, `:state_dependent` -- see [`emission_noise`](@ref).
+- `emission`: one of `:none`, `:constant`, `:state_dependent`, `:generator` -- see [`emission_noise`](@ref).
   🔴 **`:none` by default**: the source's decoder is deterministic and `z` is its only
   stochasticity. The Gaussian head is implemented and tested but is not used by the M4 experiment.
+  `:generator` (`arch = :cnn` only; 2026-11-06, step 5, paper Eq. stochastic net): the network reads
+  `N_Q` standard normals `ε` and returns a SAMPLE, `y = g(x, ε) + Ws x + L ε`; see [`is_generator`](@ref).
 - `uclip`: `(u_min, u_max)` bounds on the emission log-scale pre-activation, or `nothing`.
   Same device, and the same reason, as [`JointModel`](@ref)'s `uclip`: `d_i = exp(u_i)` grows
   exponentially once the input leaves the training range, and the fraction of steps on which the
@@ -189,8 +191,10 @@ Base.@kwdef struct LSTMSpec
         else
             n_conv == 0 && kernel == 0 || error("LSTMSpec: n_conv and kernel are for arch = :cnn only")
         end
-        emission in (:none, :constant, :state_dependent) ||
-            error("LSTMSpec: emission must be :none, :constant or :state_dependent; got $(emission)")
+        emission in (:none, :constant, :state_dependent, :generator) ||
+            error("LSTMSpec: emission must be :none, :constant, :state_dependent or :generator; got $(emission)")
+        (emission !== :generator || arch === :cnn) ||
+            error("LSTMSpec: emission = :generator is implemented for arch = :cnn only; got $(arch)")
         (emission !== :none || arch !== :lstm) || error(
             "LSTMSpec: arch = :lstm with emission = :none is a deterministic point predictor -- " *
             "it has no stochasticity at all and cannot produce an ensemble.")
@@ -292,6 +296,19 @@ correction on the same mapped input ([`linreg_skip_map`](@ref)).
 """
 is_cnn(spec::LSTMSpec) = spec.arch === :cnn
 
+"""
+    is_generator(spec)
+
+`emission = :generator` (2026-11-06, step 5; paper Eq. stochastic net; card `analysis/cards/step5.md`): the CNN
+returns a sample of the correction directly. The step's `N_Q` standard normals `ε` join the current predictor in
+the first dense layer (`[conv features; q^{n*}; ε]`, so `Wx` has `N_Q` more columns), and the output is
+`y = V1 h + cdec (+ Ws x) + L ε` with `L = LR`, lower triangular, the noise skip; `bd` and `Wd` are zero and
+nothing is added after the network (`StochLSTM` draws `ε` from the member's stream before the forward pass,
+`N_Q` per step, as LinReg + MVG does). With the output layer at zero and `L` the Cholesky factor of a LinReg's
+covariance, the closure is that LinReg + MVG.
+"""
+is_generator(spec::LSTMSpec) = spec.emission === :generator
+
 "Number of positions left after `cnn`'s two convolutions of the `h` history steps."
 cnn_positions(spec::LSTMSpec) = spec.hist.h - 2(spec.kernel - 1)
 
@@ -355,7 +372,8 @@ Width of what the LSTM cell actually consumes: the regressor, plus `z` where the
 feeds it upstream.
 """
 n_cell_input(spec::LSTMSpec) =
-    is_cnn(spec) ? cnn_positions(spec) * spec.n_conv + n_output(spec) :     # the dense layers' input
+    is_cnn(spec) ? cnn_positions(spec) * spec.n_conv + n_output(spec) +     # the dense layers' input
+                   (is_generator(spec) ? n_output(spec) : 0) :              # (+ the deviates ε, step 5)
     is_dense(spec) ? spec.window * (n_input(spec) + spec.n_latent) :
     n_input(spec) + (latent_to_cell(spec) ? spec.n_latent : 0)
 
@@ -460,6 +478,12 @@ function check_shapes(w::LSTMWeights, spec::LSTMSpec)
         length(cv.q_index) == nout || error("q_index has $(length(cv.q_index)) entries, expected $nout")
         all(i -> 1 <= i <= nin, cv.seq_index) && all(i -> 1 <= i <= nin, cv.q_index) ||
             error("seq_index / q_index point outside the $nin inputs")
+        # the generator (step 5): L = LR is the noise skip, lower triangular; no emission scale on top
+        if is_generator(spec)
+            istril(w.LR) || error("emission = :generator: LR (the noise skip L) must be lower triangular")
+            all(iszero, w.bd) && all(iszero, w.Wd) ||
+                error("emission = :generator: bd and Wd must be zero (nothing is added after the network)")
+        end
     else
         w.Cv === nothing || error("Cv (convolution weights) is set but arch = $(spec.arch)")
     end
@@ -815,16 +839,29 @@ end
 written to `st.y` and `st.logd` as `dense_window!` writes them: `cnn_features`, then the two hidden
 layers (`dense_hidden`, shared with `:dense` and the training side) and `V1 h + cdec`; with `spec.skip`
 plus the frozen linear map `Ws x` of the same column (step 4), as `dense_window!` adds its skip.
+
+`emission = :generator` (step 5, [`is_generator`](@ref)): `eps` (`N_Q` standard normals) is required; it is
+appended to the dense layers' input and `L ε` (`L = LR`) is added to the output, so `st.y` is the SAMPLE, and
+`st.logd` is zero. Any other emission refuses an `eps`.
 """
-function cnn_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin::AbstractMatrix) where {T}
+function cnn_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin::AbstractMatrix;
+                     eps::Union{Nothing,AbstractVector} = nothing) where {T}
     H = spec.n_hidden
+    gen = is_generator(spec)
+    gen == (eps !== nothing) ||
+        error("cnn_window!: emission = $(spec.emission) " * (gen ? "needs the deviates eps" : "takes no eps"))
     x = view(xwin, :, size(xwin, 2))
-    F = cnn_features(w, spec, x)
+    F = gen ? vcat(cnn_features(w, spec, x), T.(eps)) : cnn_features(w, spec, x)
     h1 = tanh.(w.Wx * F .+ w.b[1:H])
     h2 = dense_hidden(spec.n_layers, w.Wh, w.b, h1, H)
     st.h .= h2
     st.y .= w.V1 * h2 .+ w.cdec
     spec.skip && (st.y .+= w.Ws * T.(x))
+    if gen
+        st.y .+= LowerTriangular(w.LR) * T.(eps)
+        fill!(st.logd, zero(T))
+        return st.y, st.logd
+    end
     st.logd .= w.Wd * h2 .+ w.bd
     spec.uclip !== nothing && (st.logd .= clamp.(st.logd, T(spec.uclip[1]), T(spec.uclip[2])))
     return st.y, st.logd
