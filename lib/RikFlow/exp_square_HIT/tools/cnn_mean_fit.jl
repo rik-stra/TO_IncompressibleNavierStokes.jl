@@ -703,10 +703,36 @@ end
 const GEN = CLOSS === :crps_gen
 if GEN
     isempty(SKIP) && error("LOSS = crps_gen needs RIKFLOW_MLP_SKIP (the frozen LinReg; card (a): LinReg1)")
-    strip(get(ENV, "RIKFLOW_MLP_SKIP_CENTER", "data")) == "mvg" ||
-        error("LOSS = crps_gen: set RIKFLOW_MLP_SKIP_CENTER = mvg, so that the fit starts as the LinReg + MVG")
-    CINN === :none || error("LOSS = crps_gen is trained on the recorded history (INNOISE = none); s5_nt is not built")
+    # RIKFLOW_CNN_GEN_NETSKIP = <a step-4 run dir under TO_LSTM, REFIT = 1> (B; card step5_skips.md, Rik 2026-11-11:
+    # "A2, both skips; and B"): the skip is that run's FROZEN CNN mean on top of its LinReg (RIKFLOW_MLP_SKIP = the
+    # same LinReg), in its target frame (SKIP_CENTER = data, as step 4 trained); stage 1 on its stage-1 network,
+    # the refit on its refitted one; L starts at the Cholesky factor of its deployed headcorrnt Σ (the refitted
+    # head's sds with the correlation of S_noisy), so the fit starts as that step-4 closure (k1a) exactly.
+    const GEN_NETSKIP = envc("GEN_NETSKIP", "")
+    const GEN_NET = !isempty(GEN_NETSKIP)
+    strip(get(ENV, "RIKFLOW_MLP_SKIP_CENTER", "data")) == (GEN_NET ? "data" : "mvg") ||
+        error(GEN_NET ? "LOSS = crps_gen with GEN_NETSKIP: set RIKFLOW_MLP_SKIP_CENTER = data (the step-4 run's frame)" :
+              "LOSS = crps_gen: set RIKFLOW_MLP_SKIP_CENTER = mvg, so that the fit starts as the LinReg + MVG")
+    CINN === :none || error("LOSS = crps_gen sets its history noise with RIKFLOW_CNN_GEN_HIST, not INNOISE")
     CSEQ === :lags || error("LOSS = crps_gen is defined for SEQ = lags")
+    # RIKFLOW_CNN_GEN_HIST = recorded (default: the recorded history, step 5) | own (A2; card step5_skips.md, Rik
+    # 2026-11-11: "A2, both skips; and B"): every training window carries the closure's own noise, as step 4's
+    # INNOISE = head -- η = the CURRENT noise skip L times standard normals, read before each gradient (a stop-gradient),
+    # one η per correction of the window, the levels the running sum anchored at the prediction step (`window_noise`);
+    # the frozen skip reads the same noisy history (`skip_dy`; stage 1 the refitted skip's own response), so the target
+    # is what the noisy skip misses. Only the CONSTANT part of the closure's noise (L ε) is injected, not the network's
+    # state-dependent part. The validation history is one fixed set of standard normals times the current L; the
+    # check is reported on the recorded history and under each model's own noise (the A2 PASS rule: the latter).
+    const GEN_HIST = Symbol(envc("GEN_HIST", "recorded"))
+    # | owntot (A2c; Rik 2026-11-11: "A2c, check B too"): as own, but the injected factor is that of the generator's
+    # AVERAGE TOTAL sample covariance -- the pooled covariance of its samples about each window's mean, the network's
+    # response to ε included -- on 512 fixed training rows with 8 fixed draws, refreshed at every validation (stage 1)
+    # or every val_every updates (the refit), outside the gradient. Under own the optimiser can move the noise from L
+    # into the network and so escape the injection (s5r: L collapsed to 1.4 % of L0); here it cannot. At the start
+    # (g = 0) the two coincide.
+    GEN_HIST in (:recorded, :own, :owntot) || error("RIKFLOW_CNN_GEN_HIST must be recorded, own or owntot; got $GEN_HIST")
+    const GEN_OWN = GEN_HIST in (:own, :owntot)
+    const GEN_TOT = GEN_HIST === :owntot
     const GEN_M = parse(Int, envc("GEN_M", "4"))
     const GEN_MVAL = parse(Int, envc("GEN_MVAL", "16"))
     const GEN_MCHK = parse(Int, envc("GEN_MCHK", "256"))
@@ -718,7 +744,52 @@ if GEN
     GEN_M >= 2 && GEN_MVAL >= 2 && GEN_MCHK >= 2 && GEN_MREC >= 2 || error("GEN_M, GEN_MVAL, GEN_MCHK, GEN_MREC must be >= 2")
     # Σ of the skip LinReg in the network's standardised target (its draw is σ_out ⊙ (μ + chol(Σ) ε) raw, and
     # the target is (raw - mo) / so with mo = σ_out ⊙ μ)
-    const GEN_SIGMA = let ds = load(joinpath(TO_folder, "..", "TO_LRS", SKIP, "LinReg.jld2"), "stoch_distr", "scaling")
+    # B (GEN_NETSKIP): the step-4 run, its networks (Lux, frozen) and its predictions, checked against its pred.jld2
+    const GEN_K = !GEN_NET ? nothing : let
+        Fk = load(joinpath(TO_folder, GEN_NETSKIP, "fits.jld2"))
+        Pk = load(joinpath(TO_folder, GEN_NETSKIP, "pred.jld2"))
+        (Fk["K"], Fk["D"], Fk["input"], Fk["seq"], Fk["act"]) == (K, D, CINPUT, CSEQ, CACT) ||
+            error("GEN_NETSKIP: $GEN_NETSKIP has K, D, input, seq, act = $((Fk["K"], Fk["D"], Fk["input"], Fk["seq"], Fk["act"]))")
+        Pk["cols"] == cols || error("GEN_NETSKIP: $(GEN_NETSKIP)'s pred.jld2 is on other record columns")
+        get(Pk, "innoise", :none) === :head && Pk["loss"] === :crps ||
+            error("GEN_NETSKIP: a step-4 CRPS run in head mode (k1 / k2) is expected")
+        sck = Pk["scaling"]
+        maximum(abs, Float64.(sck.input_map) .- Float64.(scaling.input_map)) < 1e-12 &&
+            maximum(abs, vec(sck.out_scaling.mu) .- mo) < 1e-12 * maximum(so) &&
+            maximum(abs, vec(sck.out_scaling.sigma) .- so) < 1e-12 * maximum(so) ||
+            error("GEN_NETSKIP: $(GEN_NETSKIP)'s scaling is not this run's (SKIP = $SKIP, SKIP_CENTER = data?)")
+        key, rk = only(Fk["res"])
+        haskey(rk, :refit) || error("GEN_NETSKIP: $GEN_NETSKIP has no refit")
+        (; model = mkmodel(key[1]), ps1 = rk.ps.net, st1 = rk.st, ps3 = rk.refit.ps.net, st3 = rk.refit.st,
+         Pk, seed = key[4], bd = Float64.(vec(rk.refit.ps.head.bd)), key)
+    end
+    "B: the frozen step-4 network (stage 1 or 3 = the refit) on windows (A, Q), standardised target, Float64."
+    knet(A, Q, stage) = Float64.(first(GEN_K.model(modelin(A, Q), stage == 1 ? GEN_K.ps1 : GEN_K.ps3,
+                                                   stage == 1 ? GEN_K.st1 : GEN_K.st3)))
+    all(diff(cols) .== 1) || error("the record columns are not contiguous")
+    "Index of record columns `c` in `cols` (the whole-record arrays)."
+    atc(c) = c .- cols[1] .+ 1
+    # B: its stage-1 and refitted networks on the recorded history, every step of `cols`; checked against pred.jld2
+    const GEN_YK1, GEN_YK3 = !GEN_NET ? (nothing, nothing) : let AQ = lagtensor(Xf)
+        y1, y3 = knet(AQ[1], AQ[2], 1), knet(AQ[1], AQ[2], 3)
+        sk = GEN_K.seed
+        for (y, p, lab) in ((y1, GEN_K.Pk["pred1"][sk], "stage 1"), (y3, GEN_K.Pk["pred3"][sk], "refit"))
+            e = maximum(abs, (y .* so .+ mo .+ skipq(cols) .- p) ./ so)
+            e < 1e-4 || error("GEN_NETSKIP: the $lab network differs from $(GEN_NETSKIP)'s pred.jld2 by $e target sd")
+            @info "B: the frozen step-4 network reproduces its pred.jld2" GEN_NETSKIP lab max_diff_target_sd = e
+        end
+        y1, y3
+    end
+    "B: the frozen network's response to noisy windows (A, Q) at record columns `c` (stage 1 or 3); 0 otherwise."
+    knet_dy(A, Q, c, stage) = !GEN_NET ? 0.0 : knet(A, Q, stage) .- (stage == 1 ? GEN_YK1 : GEN_YK3)[:, atc(c)]
+    "B: the frozen network's clean prediction at record columns `c` (stage 1 or 3), standardised; 0 otherwise."
+    knet_off(c, stage) = !GEN_NET ? zeros(nq, length(c)) : (stage == 1 ? GEN_YK1 : GEN_YK3)[:, atc(c)]
+    const GEN_SIGMA = GEN_NET ? let Sd = GEN_K.Pk["S_deploy"][GEN_K.seed], Sn = GEN_K.Pk["S_noisy"][GEN_K.seed]
+        # k1a's deployed Σ (cnn_closure_export.jl headcorrnt): the refitted head's sds, the correlation of S_noisy
+        sd = exp.(GEN_K.bd)
+        maximum(abs, sd ./ sqrt.(diag(Sd)) .- 1) < 1e-5 || error("GEN_NETSKIP: the refitted head's sds are not S_deploy's")
+        Diagonal(sd) * (Sn ./ sqrt.(diag(Sn) * diag(Sn)')) * Diagonal(sd)
+    end : let ds = load(joinpath(TO_folder, "..", "TO_LRS", SKIP, "LinReg.jld2"), "stoch_distr", "scaling")
         d, sc_ = ds
         sgo = vec(sc_.out_scaling.sigma)
         S = Matrix{Float64}(hasproperty(d.Σ, :mat) ? d.Σ.mat : d.Σ)
@@ -734,23 +805,100 @@ if GEN
     # (`Cls`: together, least squares on 1-8.2 TU) -- its target is that model's residual, and L starts at the Cholesky
     # factor of its residual's covariance on the fit rows (about zero) -- so stage 1 starts as least squares on 1-8.2
     # TU + its MVG and the early stop is held out. The REFIT (stage 2) is unchanged: the skip LinReg, its target, L0.
-    const GEN_HELD = envc("GEN_STAGE1", "skip") == "heldout"
-    envc("GEN_STAGE1", "skip") in ("skip", "heldout") || error("RIKFLOW_CNN_GEN_STAGE1 must be skip or heldout")
-    const GEN_SIGMA_S = GEN_HELD ? mom0(Rls) : GEN_SIGMA              # stage 1's start Σ (target units)
+    # | heldout_skip (card step5_skips.md, 2026-11-11: step 5 on LinReg1_nt and LinReg7): for any linear skip on this
+    # regressor, heldout's "skip + least squares of its residual" is least squares on 1-8.2 TU, so stage 1 would not
+    # depend on the skip. Here stage 1's skip is the skip's own RECIPE refitted on the fit rows (ridge with its λ; the
+    # noise-trained closed form with its self-consistent Σ), `TO_LRS/<SKIP>_s1` from `tools/skip_heldout.jl`: its
+    # target is that model's residual about its MVG mean, L starts at the Cholesky factor of its Σ, so stage 1 starts
+    # as the refitted skip + its MVG. For LinReg1 it is heldout to round-off (asserted). The refit is unchanged.
+    const GEN_S1MODE = envc("GEN_STAGE1", "skip")
+    GEN_S1MODE in ("skip", "heldout", "heldout_skip") || error("RIKFLOW_CNN_GEN_STAGE1 must be skip, heldout or heldout_skip")
+    const GEN_HELD = GEN_S1MODE != "skip"                             # stage 1 held out (either construction)
+    const GEN_HSKIP = GEN_S1MODE == "heldout_skip"
+    GEN_NET && GEN_S1MODE != "skip" && error("GEN_NETSKIP: stage 1 is the step-4 run's own stage-1 network (GEN_STAGE1 = skip)")
+    """
+    A white LinReg's (`TO_LRS/<name>/LinReg.jld2`) predicted correction (raw) on the record columns of the skip, and
+    its MVG mean (raw) and Σ (its scaled units), as step3_data.jl's SKIPQ computes the skip's.
+    """
+    function gen_linreg_pred(name)
+        d1 = load(joinpath(TO_folder, "..", "TO_LRS", name, "LinReg.jld2"))
+        s1, hl1 = d1["scaling"].in_scaling, d1["hist_len"]
+        hl1 == SKIPQ.hl || error("$name: history $hl1, the skip's $(SKIPQ.hl)")
+        hs = RF.HistorySpec(; h = hl1, n_qoi = nq, hist_var = :q_star_q, include_predictor = true)
+        a0, b0 = cfg.train_range[1], size(rec.q_star, 2)
+        X, _, st = RF.build_history(hs, RF.scale_input(rec.q_star[:, a0:b0], s1), RF.scale_input(rec.q[:, a0:(b0 + 1)], s1))
+        X = Float64.(X)
+        cs = (a0 - 1) .+ st
+        cs[1] == SKIPQ.first && cs[end] == SKIPQ.last || error("$name: steps $(cs[1])-$(cs[end]), the skip's $(SKIPQ.first)-$(SKIPQ.last)")
+        sg1 = vec(s1.sigma)
+        pred = permutedims((X * permutedims(Matrix{Float64}(d1["c"])) .- X[:, 1:nq]) .* sg1')
+        sgo1 = vec(d1["scaling"].out_scaling.sigma)
+        # its linear response to a regressor perturbation dx in `dat`'s scaling (raw), as step3_data.jl's SKIPK
+        fsd = vcat(repeat(vec(dat.scaling.in_scaling.sigma), 2cfg.h + 1), 1.0)
+        K1 = Diagonal(sg1) * Matrix{Float64}(d1["c"]) * Diagonal(fsd ./ vcat(repeat(sg1, 2cfg.h + 1), 1.0))
+        return (; d = d1, pred, mu_raw = sgo1 .* Vector{Float64}(mean(d1["stoch_distr"])),
+                Sigma = Matrix{Float64}(cov(d1["stoch_distr"])), sgo = sgo1, K = K1)
+    end
+    const GEN_S1 = !GEN_HSKIP ? nothing : let
+        own = gen_linreg_pred(SKIP)                                   # the function, checked on the skip itself
+        maximum(abs, own.pred .- SKIPQ.pred) <= 1e-12 * maximum(abs, SKIPQ.pred) ||
+            error("gen_linreg_pred does not reproduce the skip's own predictions")
+        maximum(abs, own.K .- SKIPK) <= 1e-12 * maximum(abs, SKIPK) || error("gen_linreg_pred's response is not SKIPK")
+        s = gen_linreg_pred(SKIP * "_s1")
+        s.d["s1_fit_rows"] == (cols_tr[1], cols_tr[ntr]) ||
+            error("$(SKIP)_s1 was fitted on rows $(s.d["s1_fit_rows"]), stage 1 fits $((cols_tr[1], cols_tr[ntr]))")
+        # in the network's standardised target, at record column n: (stage-1 skip + its MVG mean - skip - mo) / so
+        off = (s.pred .+ s.mu_raw .- SKIPQ.pred .- mo) ./ so
+        # its response checked against its own predictions on pairs of record steps (as step3_data.jl's SKIPK)
+        let ra = 1:200, rb = 1001:1200, ca = cols_tr[ra], cb = cols_tr[rb], at(c) = c .- SKIPQ.first .+ 1
+            lhs = s.pred[:, at(ca)] .- s.pred[:, at(cb)]
+            rhs = s.K * (Float64.(dat.Xc[:, ra]) .- Float64.(dat.Xc[:, rb])) .- (rec.q_star[:, ca] .- rec.q_star[:, cb])
+            (e = maximum(abs, lhs .- rhs) / maximum(abs, lhs)) < 1e-8 || error("$(SKIP)_s1: linear response off by $e")
+        end
+        (; off, Sigma = Diagonal(s.sgo ./ so) * s.Sigma * Diagonal(s.sgo ./ so), prov = s.d["s1_provenance"], K = s.K)
+    end
+    "Stage 1's skip beyond the skip LinReg (standardised target) at record columns `c` (heldout_skip)."
+    gen_s1off(c) = GEN_S1.off[:, c .- SKIPQ.first .+ 1]
+    const GEN_SIGMA_S = GEN_HSKIP ? GEN_S1.Sigma : GEN_HELD ? mom0(Rls) : GEN_SIGMA   # stage 1's start Σ (target units)
     const GEN_L0S = T.(Matrix(cholesky(Symmetric(GEN_SIGMA_S)).L))
-    const Ytr_g32 = GEN_HELD ? T.(Ytr .- Cls' * Rtr_) : Ytr32          # stage 1's target
-    const Yva_g = GEN_HELD ? Yva .- Cls' * Rva_ : Yva
+    const Ytr_g = GEN_HSKIP ? Ytr .- gen_s1off(cols_tr[1:ntr]) :       # stage 1's target (B: minus its stage-1 network)
+                  GEN_HELD ? Ytr .- Cls' * Rtr_ : Ytr .- knet_off(cols_tr[1:ntr], 1)
+    const Ytr_g32 = T.(Ytr_g)
+    """
+    Stage 1's skip's response to a regressor perturbation `dx` (`dat`'s scaling), standardised target: the refitted
+    skip's (heldout_skip), least squares' on the fit rows (heldout: the skip's + Cls'), else the skip's (`skip_dy`).
+    """
+    s1_dy(dx) = GEN_HSKIP ? (GEN_S1.K * dx) ./ so : GEN_HELD ? skip_dy(dx) .+ Cls' * dx : skip_dy(dx)
+    const Yva_g = GEN_HSKIP ? Yva .- gen_s1off(cols_tr[(ntr + 1):end]) : GEN_HELD ? Yva .- Cls' * Rva_ :
+                  Yva .- knet_off(cols_tr[(ntr + 1):end], 1)
+    "The deployed skip's residual on the validation rows (B: minus the refitted step-4 network), standardised."
+    const Yva_3 = Yva .- knet_off(cols_tr[(ntr + 1):end], 3)
+    "The refit's target on all 1-10 TU rows (B: minus the refitted step-4 network), standardised."
+    const Yall_g = Float64.(dat.Yc) .- knet_off(cols_tr, 3)
+    "The deployed skip's residual on every step of `cols` (B: minus the refitted step-4 network), standardised."
+    const Yf_g = Yf .- knet_off(cols, 3)
     const Yva_g32 = T.(Yva_g)
-    "Stage 1's skip beyond the skip LinReg, on the whole record (standardised target): Cls' x, or 0."
-    gen_s1_offset() = GEN_HELD ? Cls' * Xr64 : zeros(nq, size(Xr64, 2))
-    GEN_HELD && @info "stage 1 held out: skip + least squares on the fit rows" ls_sd_over_skip_sd = sqrt.(diag(GEN_SIGMA_S) ./ diag(GEN_SIGMA))
+    "Stage 1's skip beyond the skip LinReg, on the whole record (standardised target): Cls' x, the refitted skip's, or 0."
+    gen_s1_offset() = GEN_HSKIP ? gen_s1off(cols) : GEN_HELD ? Cls' * Xr64 : knet_off(cols, 1)
+    "The refit's skip beyond the skip LinReg on the whole record: B's refitted step-4 network, or 0."
+    gen_s3_offset() = knet_off(cols, 3)
+    GEN_S1MODE == "heldout" && @info "stage 1 held out: skip + least squares on the fit rows" ls_sd_over_skip_sd = sqrt.(diag(GEN_SIGMA_S) ./ diag(GEN_SIGMA))
+    if GEN_HSKIP
+        # against heldout's construction (least squares on the fit rows): the same for LinReg1, the refitted
+        # skip's deficit to least squares otherwise (rms over the rows, standardised target)
+        dtr = rmsq((Ytr .- Cls' * Rtr_) .- Float64.(Ytr_g32))
+        dva = rmsq((Yva .- Cls' * Rva_) .- Yva_g)
+        @info "stage 1 held out: the skip's recipe refitted on the fit rows" SKIP recipe = GEN_S1.prov.recipe rows = GEN_S1.prov.rows sd_over_skip_sd = sqrt.(diag(GEN_SIGMA_S) ./ diag(GEN_SIGMA)) vs_ls_fit_rows = dtr vs_ls_val_rows = dva clean_rms_val_over_ls = rmsq(Yva_g) ./ rmsq(Yva .- Cls' * Rva_)
+        SKIP == "LinReg1" && (maximum(dva) < 1e-6 && maximum(abs, GEN_SIGMA_S .- mom0(Rls)) < 1e-8 ||
+                              error("heldout_skip on LinReg1 differs from heldout (LS on the fit rows): $(maximum(dva))"))
+    end
     # RIKFLOW_CNN_GEN_OUTINIT = zero (default: the output layer's weights and bias start at zero, so the fit starts at
     # the LinReg + MVG) | random (Rik, 2026-11-06: "If that does not work; try using random intialization instead of
     # 0"): Glorot-uniform output weights (the bias stays zero), so the network starts away from the LinReg and the
     # gradient reaches its hidden layers from the first update; the start check is then skipped
     const GEN_OUTRAND = envc("GEN_OUTINIT", "zero") == "random"
     envc("GEN_OUTINIT", "zero") in ("zero", "random") || error("RIKFLOW_CNN_GEN_OUTINIT must be zero or random")
-    @info "step 5 generator" SKIP GEN_M GEN_MVAL GEN_MCHK GEN_MREC sd_L0 = sqrt.(diag(GEN_SIGMA)) sd_val_target = vec(std(Yva; dims = 2))
+    @info "step 5 generator" SKIP GEN_NETSKIP GEN_HIST GEN_M GEN_MVAL GEN_MCHK GEN_MREC sd_L0 = sqrt.(diag(GEN_SIGMA)) sd_val_target = vec(std(Yva; dims = 2))
 end
 
 function mkmodel_gen(C)
@@ -804,6 +952,17 @@ function gen_corr(model, p, st, A, Q, M, rng)
     return Cm ./ sqrt.(diag(Cm) * diag(Cm)')
 end
 corrof(S) = S ./ sqrt.(diag(S) * diag(S)')
+"""
+A2c: the lower factor of the generator's average conditional sample covariance on windows (A, Q) from `M` draws of a
+FIXED stream `seed` (so that it changes with the parameters only): the samples' pooled covariance about each window's
+mean, the network's response to ε included (host, outside any gradient).
+"""
+function gen_tot_factor(model, p, st, A, Q, M, seed)
+    B = size(Q, 2)
+    X = Float64.(gen_samples(model, p, st, A, Q, randn(Xoshiro(seed), T, nq, B * M)))
+    R = reshape(X .- mean(X; dims = 3), nq, :)
+    return Matrix(cholesky(Symmetric(R * R' ./ (B * (M - 1)))).L)
+end
 
 function fit_gen(C, lr, wd, seed)
     rng = Xoshiro(seed)
@@ -816,7 +975,23 @@ function fit_gen(C, lr, wd, seed)
     loss(p, A, Q, E, Y) = gen_score(gen_samples(model, p, st, A, Q, E), Y)
     nrng = Xoshiro(seed + 7919)                                     # the samples' own stream
     Eva = randn(Xoshiro(seed + 104729), T, nq, size(Yva32, 2) * GEN_MVAL)   # ONE fixed set of validation draws
-    vloss(p) = Float64(loss(p, Ava, Qva, Eva, Yva_g32))
+    # GEN_HIST = own: the history noise's own stream, and ONE fixed set of validation history normals (times the
+    # current L at every validation, as step 4's head mode)
+    hrng = Xoshiro(seed + 15485863)
+    Evh = randn(Xoshiro(seed + 104723), nq, cfg.h * size(Yva, 2))
+    # the injected factor: own = the current L; owntot (A2c) = the generator's average total sample covariance on 512
+    # fixed fit rows, refreshed at every validation
+    injrows = GEN_TOT ? shuffle(Xoshiro(seed + 98), 1:ntr)[1:min(512, ntr)] : Int[]
+    injf(p) = GEN_TOT ? gen_tot_factor(model, p, st, Atr[:, :, injrows], Qtr[:, injrows], 8, seed + 99) : Float64.(gen_L(p))
+    Linj = Ref(GEN_OWN ? injf(ps) : zeros(nq, nq))
+    "The validation rows' (A, Q, Y): the recorded history, or (own) with the window noise of the current L."
+    function val_data(p)
+        GEN_OWN || return (Ava, Qva, Yva_g32)
+        eta = eta_from(Linj[], Evh)                                  # refreshed for p before each validation
+        A, Q = noisy_tensor(Xc[:, (ntr + 1):end], eta)
+        return (A, Q, T.(Yva_g .- s1_dy(window_noise(eta)) .- knet_dy(A, Q, cols_tr[(ntr + 1):end], 1)))
+    end
+    vloss(p) = (d = val_data(p); Float64(loss(p, d[1], d[2], Eva, d[3])))
     best = (; val = vloss(ps), ps = deepcopy(ps), update = 0)
     val0 = best.val
     # the start IS LinReg1 + MVG (heldout: least squares on 1-8.2 TU + its MVG): the network's output is zero, the
@@ -833,11 +1008,19 @@ function fit_gen(C, lr, wd, seed)
         for k in 1:nb
             c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
             E = randn(nrng, T, nq, length(c) * GEN_M)
-            Ab, Qb, Yb = Atr[:, :, c], Qtr[:, c], Ytr_g32[:, c]
+            if GEN_OWN                                              # η = the current L ε, outside the gradient
+                GEN_TOT || (Linj[] = Float64.(gen_L(ps)))
+                eb = eta_from(Linj[], randn(hrng, nq, cfg.h * length(c)))
+                Ab, Qb = noisy_tensor(Xc[:, c], eb)
+                Yb = T.(Ytr_g[:, c] .- s1_dy(window_noise(eb)) .- knet_dy(Ab, Qb, cols_tr[c], 1))
+            else
+                Ab, Qb, Yb = Atr[:, :, c], Qtr[:, c], Ytr_g32[:, c]
+            end
             g = Zygote.gradient(p -> loss(p, Ab, Qb, E, Yb), ps)[1]
             opt, ps = Optimisers.update(opt, ps, g)
             upd += 1
             upd % CST.val_every == 0 || continue
+            GEN_OWN && (Linj[] = injf(ps))                          # owntot: refresh the total factor
             v = vloss(ps)
             push!(hist.update, upd); push!(hist.val, v); push!(hist.lr, cur)
             if v < best.val
@@ -871,7 +1054,25 @@ function fit_gen(C, lr, wd, seed)
     crps_start = RF.crps_fair_samples(Xs_, Yva_g)
     es_chk, es_start = RF.energy_fair_samples(Xc_, Yva_g), RF.energy_fair_samples(Xs_, Yva_g)   # the joint score too
     best.update == 0 && @info "best iterate = the start" max_abs_sample_diff = maximum(abs, Xc_ .- Xs_) crps_chk crps_start
-    crps_mvg = crps_eval(Yva, sqrt.(diag(GEN_SIGMA)))              # LinReg1 + MVG, closed form (the PASS reference)
+    # GEN_HIST = own: the same check with each model under ITS OWN history noise -- the fit's window noise from its L,
+    # the start's from L0, the same standard normals (paired); the start's samples are L0 ε whatever its input, its
+    # target the stage-1 skip's noisy residual. The A2 PASS rule.
+    own = !GEN_OWN ? nothing : let Eh = randn(Xoshiro(seed + 274), nq, cfg.h * size(Yva, 2))
+        Lb_inj = injf(pb)                                           # its injected factor (own: L; owntot: total)
+        eb, e0 = eta_from(Lb_inj, Eh), eta_from(Float64.(GEN_L0S), Eh)
+        An, Qn = noisy_tensor(Xc[:, (ntr + 1):end], eb)
+        cva = cols_tr[(ntr + 1):end]
+        Yb_ = Yva_g .- s1_dy(window_noise(eb)) .- knet_dy(An, Qn, cva, 1)
+        Y0_ = Yva_g .- s1_dy(window_noise(e0)) .- (GEN_NET ? knet_dy(noisy_tensor(Xc[:, (ntr + 1):end], e0)..., cva, 1) : 0.0)
+        Xn = Float64.(gen_samples(model, pb, st, An, Qn, Ec))
+        sn = gen_stats(model, pb, st, An, Qn, GEN_MCHK, Xoshiro(seed + 275))
+        (; crps_chk = RF.crps_fair_samples(Xn, Yb_), crps_start = RF.crps_fair_samples(Xs_, Y0_),
+         es_chk = RF.energy_fair_samples(Xn, Yb_), es_start = RF.energy_fair_samples(Xs_, Y0_),
+         err_over_start = rmsq(Yb_ .- sn.mu) ./ rmsq(Y0_), spread_over_err = sqrt.(vec(mean(sn.sd .^ 2; dims = 2))) ./ rmsq(Yb_ .- sn.mu),
+         # the escape measure: the injected noise's sd over the sd of the noise the closure draws (1 = all injected)
+         inj_over_drawn = sqrt.(diag(Lb_inj * Lb_inj')) ./ sqrt.(vec(mean(sn.sd .^ 2; dims = 2))))
+    end
+    crps_mvg = crps_eval(Yva_3, sqrt.(diag(GEN_SIGMA)))            # the skip + MVG, closed form (B: k1a), in sample
     s = gen_stats(model, pb, st, Ava, Qva, GEN_MCHK, Xoshiro(seed + 272))
     err = rmsq(Yva_g .- s.mu)                                       # = the full prediction's error
     Lb = Float64.(gen_L(pb))
@@ -879,11 +1080,11 @@ function fit_gen(C, lr, wd, seed)
     Rs = gen_corr(model, pb, st, Ava, Qva, GEN_MCHK, Xoshiro(seed + 273))
     return (; ps = pb, st, val_loss = best.val, val0, best_update = best.update, updates = upd, stop, hist,
             nparams = Lux.parameterlength(model), crps_chk, crps_start, crps_mvg, crps_ls = LS_CRPS,
-            spread_over_err = sqrt.(vtot) ./ err, err_over_lr1 = err ./ rmsq(Yva),
+            spread_over_err = sqrt.(vtot) ./ err, err_over_lr1 = err ./ rmsq(Yva_3),
             share_L = diag(Lb * Lb') ./ vtot, share_net = vec(mean(s.sdg .^ 2; dims = 2)) ./ vtot,
             corr_samples = Rs, corr_LLt = corrof(Lb * Lb'), corr_Sigma = corrof(GEN_SIGMA), L = Lb,
-            es_chk, es_start, score = GEN_SCORE, stage1 = GEN_HELD ? :heldout : :skip,
-            crps_start_closed = crps_eval(Yva_g, sqrt.(diag(GEN_SIGMA_S))),
+            es_chk, es_start, score = GEN_SCORE, stage1 = Symbol(GEN_S1MODE),
+            crps_start_closed = crps_eval(Yva_g, sqrt.(diag(GEN_SIGMA_S))), own, hist_noise = GEN_HIST,
             loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT, init = CINIT, M = GEN_M, Mval = GEN_MVAL)
 end
 
@@ -901,8 +1102,13 @@ function refit_gen(C, lr, wd, seed, hist, nupd)
     wd > 0 && Optimisers.adjust!(opt.L; lambda = zero(T))
     loss(p, A, Q, E, Y) = gen_score(gen_samples(model, p, st, A, Q, E), Y)
     nrng = Xoshiro(seed + 7919)
+    hrng = Xoshiro(seed + 15485863)                                 # GEN_HIST = own: as fit_gen
+    injrows = GEN_TOT ? shuffle(Xoshiro(seed + 98), 1:ntr)[1:min(512, ntr)] : Int[]   # owntot: as fit_gen
+    injf(p) = GEN_TOT ? gen_tot_factor(model, p, st, Atr[:, :, injrows], Qtr[:, injrows], 8, seed + 99) : Float64.(gen_L(p))
+    Linj = Ref(GEN_OWN ? injf(ps) : zeros(nq, nq))
     lr_at(u) = T(hist.lr[searchsortedfirst(hist.update, u)])
-    Aall, Qall, Yall = cat(Atr, Ava; dims = 3), hcat(Qtr, Qva), hcat(Ytr32, Yva32)
+    Aall, Qall, Yall = cat(Atr, Ava; dims = 3), hcat(Qtr, Qva), T.(Yall_g)   # = hcat(Ytr32, Yva32) without B
+    Yall64 = Yall_g
     N = size(Yall, 2)
     nb = fld(N, CST.batch)
     upd, cur = 0, T(lr)
@@ -914,7 +1120,15 @@ function refit_gen(C, lr, wd, seed, hist, nupd)
             l == cur || (Optimisers.adjust!(opt, l); cur = l)
             c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
             E = randn(nrng, T, nq, length(c) * GEN_M)
-            g = Zygote.gradient(p -> loss(p, Aall[:, :, c], Qall[:, c], E, Yall[:, c]), ps)[1]
+            if GEN_OWN                                              # the skip's own response (refit: the skip LinReg)
+                Linj[] = (GEN_TOT && upd % CST.val_every != 0) ? Linj[] : injf(ps)   # owntot: every val_every updates
+                eb = eta_from(Linj[], randn(hrng, nq, cfg.h * length(c)))
+                Ab, Qb = noisy_tensor(Xc[:, c], eb)
+                Yb = T.(Yall64[:, c] .- skip_dy(window_noise(eb)) .- knet_dy(Ab, Qb, cols_tr[c], 3))
+            else
+                Ab, Qb, Yb = Aall[:, :, c], Qall[:, c], Yall[:, c]
+            end
+            g = Zygote.gradient(p -> loss(p, Ab, Qb, E, Yb), ps)[1]
             opt, ps = Optimisers.update(opt, ps, g)
             upd += 1
         end
@@ -990,14 +1204,23 @@ if GEN
                 C, K, D, r.nparams, lr, wd, seed, r.updates, r.best_update, r.stop,
                 GEN_SCORE === :energy ? "energy score" : "CRPS", GEN_MVAL, r.val_loss, r.val0,
                 (time() - t0) / 60)
-        @printf("     CHECK val CRPS (M %d fixed draws) %.4f | the start (%s), same draws %.4f -> %s | closed forms: the start %.4f, LinReg1 + MVG %.4f (%s) | LS refit 1-8.2 TU %.4f\n",
-                GEN_MCHK, r.crps_chk, GEN_HELD ? "LS on 1-8.2 TU + its MVG" : "LinReg1 + MVG", r.crps_start,
-                r.crps_chk <= r.crps_start ? "PASS" : "FAIL", r.crps_start_closed, r.crps_mvg,
+        @printf("     CHECK val CRPS (M %d fixed draws) %.4f | the start (%s), same draws %.4f -> %s | closed forms: the start %.4f, %s + MVG %.4f (%s) | LS refit 1-8.2 TU %.4f\n",
+                GEN_MCHK, r.crps_chk, GEN_HSKIP ? "$(SKIP) refitted on 1-8.2 TU + its MVG" : GEN_HELD ? "LS on 1-8.2 TU + its MVG" : "$(SKIP) + MVG", r.crps_start,
+                r.crps_chk <= r.crps_start ? "PASS" : "FAIL", r.crps_start_closed, SKIP, r.crps_mvg,
                 r.crps_chk <= r.crps_mvg ? "below" : "above", r.crps_ls)
         @printf("     val energy score (same %d draws) %.4f | the start %.4f (%+.2f %%)\n", GEN_MCHK, r.es_chk, r.es_start,
                 100 * (r.es_chk / r.es_start - 1))
-        @printf("     val per QoI: samples' sd / error of their mean %s | error of the mean / LinReg1's %s\n",
-                fmt(r.spread_over_err), fmt(r.err_over_lr1))
+        r.own === nothing ||
+            @printf("     OWNCHECK (each under its own history noise, paired) val CRPS %.4f | the start %.4f (%+.2f %%) -> %s | energy %.4f | the start %.4f (%+.2f %%) | error of the mean / the start's %s | sd / error %s\n",
+                    r.own.crps_chk, r.own.crps_start, 100 * (r.own.crps_chk / r.own.crps_start - 1),
+                    r.own.crps_chk <= r.own.crps_start ? "PASS" : "FAIL", r.own.es_chk, r.own.es_start,
+                    100 * (r.own.es_chk / r.own.es_start - 1), fmt(r.own.err_over_start), fmt(r.own.spread_over_err))
+        r.own === nothing || @printf("     ESCAPE CHECK (%s): injected noise sd / drawn noise sd %s | L sd / L0 sd %s | the network's share %s
+",
+                                     GEN_HIST, fmt(r.own.inj_over_drawn), fmt(sqrt.(diag(r.L * r.L')) ./ sqrt.(diag(GEN_SIGMA_S))),
+                                     fmt(r.share_net))
+        @printf("     val per QoI: samples' sd / error of their mean %s | error of the mean / the skip's (%s, in sample there) %s\n",
+                fmt(r.spread_over_err), SKIP, fmt(r.err_over_lr1))
         @printf("     share of the sample variance: L eps %s | the network's part %s (rest: their covariance)\n",
                 fmt(r.share_L), fmt(r.share_net))
         @printf("     correlation: max |samples - Sigma| %.3f, max |L L' - Sigma| %.3f | L sd / L0 sd %s\n",
@@ -1020,13 +1243,13 @@ if GEN
             ich = HO[1:300]
             Ech = randn(Xoshiro(seed + 2026), T, nq, length(ich))
             ych = Float64.(dropdims(gen_samples(model3, ps3, st3, Arec[:, :, ich], Qrec[:, ich], Ech); dims = 3))
-            gstat[seed] = (; mean1 = rawg(st1.mu .+ gen_s1_offset(), cols), sd1 = st1.sd, sdg1 = st1.sdg, mean3 = rawg(st3s.mu, cols), sd3 = st3s.sd,
+            gstat[seed] = (; mean1 = rawg(st1.mu .+ gen_s1_offset(), cols), sd1 = st1.sd, sdg1 = st1.sdg, mean3 = rawg(st3s.mu .+ gen_s3_offset(), cols), sd3 = st3s.sd,
                            sdg3 = st3s.sdg, corr10, corrho, L3 = Float64.(gen_L(ps3)),
-                           chk = (; cols = cols[ich], E = Float64.(Ech), y = rawg(ych, cols[ich])))
+                           chk = (; cols = cols[ich], E = Float64.(Ech), y = rawg(ych .+ gen_s3_offset()[:, ich], cols[ich])))
             resg[(C, lr, wd, seed)] = merge(resg[(C, lr, wd, seed)], (; refit = (; ps = ps3, st = st3, updates = r.best_update)))
-            ho = rmsq(Yf[:, HO] .- st3s.mu[:, HO])
-            @printf("     refit on 1-10 TU (%d updates, %.1f min): 10-100 TU error of the sample mean / LinReg1's %s | sd / error %s | corr max |.-Sigma| 1-10 %.3f, 10-100 %.3f\n",
-                    r.best_update, (time() - t1) / 60, fmt(ho ./ rmsq(Yf[:, HO])),
+            ho = rmsq(Yf_g[:, HO] .- st3s.mu[:, HO])
+            @printf("     refit on 1-10 TU (%d updates, %.1f min): 10-100 TU error of the sample mean / %s's %s | sd / error %s | corr max |.-Sigma| 1-10 %.3f, 10-100 %.3f\n",
+                    r.best_update, (time() - t1) / 60, SKIP, fmt(ho ./ rmsq(Yf_g[:, HO])),
                     fmt(sqrt.(vec(mean(st3s.sd[:, HO] .^ 2; dims = 2))) ./ ho),
                     maximum(abs, corr10 .- corrof(GEN_SIGMA)), maximum(abs, corrho .- corrof(GEN_SIGMA)))
         end
@@ -1037,13 +1260,13 @@ if GEN
     jldsave(joinpath(out_dir, "fits.jld2"); res = resg, ls_crps = LS_CRPS, settings = CST, K, D, feat = FEAT, cfg,
             loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT, innoise = CINN, innoise_sigma = CINN_SRC,
             skip = SKIP, Sigma = GEN_SIGMA, L0 = Float64.(GEN_L0), M = GEN_M, Mval = GEN_MVAL, score = GEN_SCORE,
-            stage1 = GEN_HELD ? :heldout : :skip, Sigma_stage1 = GEN_SIGMA_S, outinit = GEN_OUTRAND ? :random : :zero)
+            stage1 = Symbol(GEN_S1MODE), Sigma_stage1 = GEN_SIGMA_S, outinit = GEN_OUTRAND ? :random : :zero, hist_noise = GEN_HIST, netskip = GEN_NETSKIP)
     if CREFIT
         jldsave(joinpath(out_dir, "pred.jld2"); cols, gen = gstat, seeds = CSEEDS, wd = only(CWDS), n_channels = only(CHS),
                 loss = CLOSS, h = cfg.h, K, D, feat = FEAT, input = CINPUT, seq = CSEQ, act = CACT, scaling,
-                skip = SKIP, Sigma = GEN_SIGMA, Mrec = GEN_MREC, innoise = CINN, stage1 = GEN_HELD ? :heldout : :skip,
+                skip = SKIP, Sigma = GEN_SIGMA, Mrec = GEN_MREC, innoise = CINN, stage1 = Symbol(GEN_S1MODE), hist_noise = GEN_HIST,
                 # the target on every step of `cols`: the skip LinReg's residual, centred at its MVG mean, / so
-                ytarget = Yf)
+                ytarget = Yf_g, netskip = GEN_NETSKIP)
     end
     @info "written" out_dir
     exit()

@@ -484,6 +484,23 @@ function check_shapes(w::LSTMWeights, spec::LSTMSpec)
             all(iszero, w.bd) && all(iszero, w.Wd) ||
                 error("emission = :generator: bd and Wd must be zero (nothing is added after the network)")
         end
+        # step 5 B: a frozen CNN mean, only on a generator with a linear skip (the step-4 closure's LinReg map)
+        mn = cnn_mean_net(w)
+        if mn !== nothing
+            is_generator(spec) && spec.skip || error("Cv.mean_net (a frozen CNN mean) needs emission = :generator and skip")
+            Hm, nchm = mn.n_hidden, size(mn.seq_index, 2)
+            size(mn.seq_index, 1) == spec.hist.h && length(mn.q_index) == nout ||
+                error("mean_net: the sequence layout does not match h = $(spec.hist.h), N_Q = $nout")
+            all(i -> 1 <= i <= nin, mn.seq_index) && all(i -> 1 <= i <= nin, mn.q_index) ||
+                error("mean_net: seq_index / q_index point outside the $nin inputs")
+            Km, Cm = size(mn.W1, 1), size(mn.W1, 3)
+            size(mn.W1, 2) == nchm && size(mn.W2) == (Km, Cm, Cm) && length(mn.b1) == Cm && length(mn.b2) == Cm ||
+                error("mean_net: convolution shapes")
+            nfm = (spec.hist.h - 2(Km - 1)) * Cm + nout
+            size(mn.Wx) == (Hm, nfm) && size(mn.Wh) == (Hm, (mn.n_layers - 1) * Hm) &&
+                length(mn.b) == mn.n_layers * Hm && size(mn.V1) == (nout, Hm) && length(mn.cdec) == nout ||
+                error("mean_net: dense layer shapes")
+        end
     else
         w.Cv === nothing || error("Cv (convolution weights) is set but arch = $(spec.arch)")
     end
@@ -824,12 +841,54 @@ end
 `FlattenLayer` does (`vec`), and the current predictor `x[q_index]` appended (Lux's
 `Parallel(vcat, conv, NoOpLayer())`).
 """
-function cnn_features(w::LSTMWeights{T}, spec::LSTMSpec, x::AbstractVector) where {T}
-    cv = w.Cv
+cnn_features(w::LSTMWeights{T}, spec::LSTMSpec, x::AbstractVector) where {T} = _cnn_features(w.Cv, x, T)
+"The features of `cnn_features` from a convolution tuple `cv` (`W1`, `b1`, `W2`, `b2`, `seq_index`, `q_index`)."
+function _cnn_features(cv, x::AbstractVector, ::Type{T}) where {T}
     S, nch = size(cv.seq_index)
     A = T[T(x[cv.seq_index[t, c]]) for t in 1:S, c in 1:nch]
     h2 = conv1d_tanh(conv1d_tanh(A, cv.W1, cv.b1), cv.W2, cv.b2)
     return vcat(vec(h2), T[T(x[i]) for i in cv.q_index])
+end
+
+"""
+    cnn_mean_net(w) -> NamedTuple or nothing
+
+Step 5 variant B (2026-11-11, card `analysis/cards/step5_skips.md`; Rik: "A2, both skips; and B"): a generator
+whose skip is a step-4 closure's FROZEN CNN mean on top of its linear skip, `y = g(x, ε) + m(x) + Ws x + L ε`.
+`m` is stored as `w.Cv.mean_net` (a key of the convolution tuple, so no struct or spec field changes and every
+older file loads unchanged): `(; W1, b1, W2, b2, seq_index, q_index, Wx, Wh, b, V1, cdec, n_hidden, n_layers)`,
+the step-4 network's convolutions and dense layers without its own `Ws` (the generator's `Ws` is the same LinReg's
+map). Built by [`mean_net_from`](@ref); `nothing` when absent.
+"""
+cnn_mean_net(w::LSTMWeights) = (w.Cv !== nothing && haskey(w.Cv, :mean_net)) ? w.Cv.mean_net : nothing
+
+"The frozen mean `m(x)` of a `cnn_mean_net` tuple for the mapped input column `x`, in `T`."
+function frozen_mean(mn, x::AbstractVector, ::Type{T}) where {T}
+    H = mn.n_hidden
+    h1 = tanh.(mn.Wx * _cnn_features(mn, x, T) .+ mn.b[1:H])
+    return mn.V1 * dense_hidden(mn.n_layers, mn.Wh, mn.b, h1, H) .+ mn.cdec
+end
+
+"`w` with the frozen CNN mean `mn` (a `cnn_mean_net` tuple) added to its convolution tuple; other fields shared."
+with_mean_net(w::LSTMWeights{T}, mn) where {T} =
+    LSTMWeights{T}(w.Wx, w.Wh, w.b, w.We, w.be, w.Bmu, w.Bsig, w.V1, w.V2, w.cdec, w.Wd, w.bd, w.LR, w.Ws, w.P,
+                   merge(w.Cv, (; mean_net = mn)))
+
+"""
+    mean_net_from(w, spec; T = eltype(w.Wx))
+
+The `cnn_mean_net` tuple of a deployed `arch = :cnn` closure `(spec, w)` (a step-4 CNN on a linear skip): its
+convolutions, sequence layout and dense layers, its `Ws` left out. `frozen_mean(m, x) + w.Ws x` is that closure's
+deployed mean (V99).
+"""
+function mean_net_from(w::LSTMWeights, spec::LSTMSpec; T::Type = eltype(w.Wx))
+    is_cnn(spec) && !is_generator(spec) || error("mean_net_from: a deployed :cnn mean model, not $(spec.arch) / $(spec.emission)")
+    cnn_mean_net(w) === nothing || error("mean_net_from: the closure carries a frozen mean itself")
+    cv = w.Cv
+    return (; W1 = Array{T,3}(cv.W1), b1 = Vector{T}(cv.b1), W2 = Array{T,3}(cv.W2), b2 = Vector{T}(cv.b2),
+            seq_index = Matrix{Int}(cv.seq_index), q_index = Vector{Int}(cv.q_index), Wx = Matrix{T}(w.Wx),
+            Wh = Matrix{T}(w.Wh), b = Vector{T}(w.b), V1 = Matrix{T}(w.V1), cdec = Vector{T}(w.cdec),
+            n_hidden = spec.n_hidden, n_layers = spec.n_layers)
 end
 
 """
@@ -857,6 +916,8 @@ function cnn_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin::
     st.h .= h2
     st.y .= w.V1 * h2 .+ w.cdec
     spec.skip && (st.y .+= w.Ws * T.(x))
+    mn = cnn_mean_net(w)                    # step 5 B: the frozen step-4 CNN mean (generators only, check_shapes)
+    mn === nothing || (st.y .+= frozen_mean(mn, x, T))
     if gen
         st.y .+= LowerTriangular(w.LR) * T.(eps)
         fill!(st.logd, zero(T))

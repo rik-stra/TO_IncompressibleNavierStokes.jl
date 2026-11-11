@@ -4,7 +4,7 @@
 #
 #     julia --startup-file=no --project=analysis analysis/gen_offline.jl <run dir under TO_LSTM> [<run> ...] [--fig]
 #
-# Per run and seed, in the target's units (what LinReg1 misses, / its 1-10 TU sd), by deciles of q*/q_ref (edges
+# Per run and seed, in the target's units (what the skip LinReg misses, / its 1-10 TU sd; LinReg1 in step 5, any skip since 2026-11-11), by deciles of q*/q_ref (edges
 # from 1-10 TU, per QoI, as Fig. colour-scale / `plot_paper_secs45.jl` `fig_scale`):
 #   - the samples' sd (rms over the bin's steps) over the constant sd of LinReg1 + MVG (sqrt diag Σ), for the
 #     stage-1 network on 8.2-10 TU and the refitted one on 10-100 TU; beside it LinReg1's residual's spread about
@@ -47,7 +47,7 @@ function main(args)
         tr = findall(n -> 400 <= n <= 4000, cols)
         va = findall(n -> 0.8 * 3600 + 400 < n <= 4000, cols)          # stage 1's validation rows, ~8.2-10 TU
         ho = findall(n -> 10 < n * DT <= 100, cols)
-        @printf("\n%s (skip %s, Mrec %d): spread per decile of q*/q_ref, over LinReg1 + MVG's constant sd\n", run, P["skip"], P["Mrec"])
+        @printf("\n%s (skip %s, Mrec %d): spread per decile of q*/q_ref, over the skip + MVG's constant sd\n", run, P["skip"], P["Mrec"])
         figdat = Dict{Int,Any}()
         for seed in sort(collect(keys(P["gen"])))
             g = P["gen"][seed]
@@ -73,7 +73,7 @@ function main(args)
                         eos[k] = sqrt(mean(abs2, err[i, r])) / sqrt(mean(abs2, sd[i, r]))
                         shr[k] = mean(abs2, sdg[i, r]) / mean(abs2, sd[i, r])
                     end
-                    @printf("    %-8s spread %s | power law %s | LinReg1 resid. spread %s\n", LABELS[i], fmt(spr), fmt(pl), fmt(emp))
+                    @printf("    %-8s spread %s | power law %s | skip resid. spread %s\n", LABELS[i], fmt(spr), fmt(pl), fmt(emp))
                     @printf("    %-8s error/sd %s | net share %s\n", "", fmt(eos), fmt(shr))
                     seed == first(sort(collect(keys(P["gen"])))) && stage == 3 && (figdat[i] = (; spr, pl, emp))
                 end
@@ -86,7 +86,7 @@ function main(args)
                     maximum(abs, (g.L3 * g.L3') ./ sqrt.(diag(g.L3 * g.L3') * diag(g.L3 * g.L3')') .- S ./ (sd0 * sd0')))
             # the matrices: lower triangle the samples' (10-100 TU), upper triangle Sigma's (LinReg1 + MVG)
             Rs, R0 = g.corrho, S ./ (sd0 * sd0')
-            println("    correlation, lower: samples (refit, 10-100 TU) | upper: LinReg1's Sigma; QoIs ", join(LABELS, " "))
+            println("    correlation, lower: samples (refit, 10-100 TU) | upper: the skip's Sigma; QoIs ", join(LABELS, " "))
             for i in 1:NQ
                 println("      ", join((@sprintf("%+.2f", j < i ? Rs[i, j] : j > i ? R0[i, j] : 1.0) for j in 1:NQ), " "))
             end
@@ -104,7 +104,7 @@ function makefig(fd, run)
             ax = Axis(fig[rr, cc]; title = LABELS[i], xlabel = rr == 2 ? "decile of q*/q_ref (1-10 TU edges)" : "",
                       ylabel = cc == 1 ? "spread / constant" : "")
             lines!(ax, 1:10, fd[i].pl; color = :gray40, label = "power law (step 2)")
-            scatter!(ax, 1:10, fd[i].emp; color = :white, strokecolor = :black, strokewidth = 0.8, label = "LinReg1 residual spread")
+            scatter!(ax, 1:10, fd[i].emp; color = :white, strokecolor = :black, strokewidth = 0.8, label = "skip residual spread")
             scatterlines!(ax, 1:10, fd[i].spr; color = :red, label = "generator samples")
             hlines!(ax, [1.0]; color = :gray70, linestyle = :dash)
             i == 1 && axislegend(ax; position = :lt, labelsize = 7, framevisible = false)

@@ -4,7 +4,13 @@
 # `d6_lib.jl` resolves for D6_MODEL = step3/closures/<name>, and checks it.
 #
 #     julia --startup-file=no --project=training exp_square_HIT/tools/cnn_closure_export.jl \
-#           <run> <noise> <name> [skip=<LinReg>]
+#           <run> <noise> <name> [skip=<LinReg>] [meannet=<step-4 closure>]
+#
+# `meannet=<step-4 closure under step3/closures>` (step 5 variant B, 2026-11-11, card analysis/cards/step5_skips.md;
+# noise gen and skip= only): the run was trained by cnn_mean_fit.jl with RIKFLOW_CNN_GEN_NETSKIP = that closure's fit
+# dir, on its FROZEN CNN mean. The generator then carries that closure's network as `Cv.mean_net` (`RF.mean_net_from`,
+# `RF.with_mean_net`): its fit dir must be the run's `netskip`, its Ws and scaling this run's; `frozen_mean + Ws z` is
+# checked against that closure's own deployed mean on 300 record steps, and the translation check covers the sum.
 #
 # `skip=<LinReg>` (step 4, 2026-11-06; paper Eq. skip net): the run was trained on a FROZEN LinReg under
 # output/TO_LRS (`cnn_mean_fit.jl` with RIKFLOW_MLP_SKIP=<LinReg>; the fit files do not record which, so it is
@@ -48,10 +54,13 @@
 include(joinpath(@__DIR__, "lrs_scale_variant.jl"))   # fit_ar, fit_scale (and RF, REF, NQ, DT); main guarded
 using Random
 
-length(ARGS) in (3, 4) || error("usage: cnn_closure_export.jl <run> <noise> <name> [skip=<LinReg>]")
+length(ARGS) in (3, 4, 5) || error("usage: cnn_closure_export.jl <run> <noise> <name> [skip=<LinReg>] [meannet=<closure>]")
 const XRUN, XNOISE, XNAME = ARGS[1], ARGS[2], ARGS[3]
-const XSKIP = length(ARGS) == 4 ? (startswith(ARGS[4], "skip=") ? ARGS[4][6:end] :
-                                   error("the 4th argument is skip=<LinReg>; got $(ARGS[4])")) : ""
+const XOPT = Dict(let i = findfirst(==('='), a); i === nothing && error("optional arguments are key=value; got $a"); a[1:(i - 1)] => a[(i + 1):end] end
+                  for a in ARGS[4:end])
+issubset(keys(XOPT), ("skip", "meannet")) || error("optional arguments: skip=<LinReg>, meannet=<closure>; got $(collect(keys(XOPT)))")
+const XSKIP = get(XOPT, "skip", "")
+const XMEAN = get(XOPT, "meannet", "")
 const XNT_MODES = ("mvgnt", "headcorrnt")
 XNOISE in ("mvg", "head", "headcorr", "ar2n", "pl", "gen", XNT_MODES...) ||
     error("noise must be mvg, head, headcorr, ar2n, pl, gen, mvgnt or headcorrnt; got $XNOISE")
@@ -67,6 +76,9 @@ const XGEN = P["loss"] === :crps_gen                  # step 5's generator
 XGEN == (XNOISE == "gen") || error(XGEN ? "$XRUN is a step-5 generator (crps_gen): export it with noise gen" :
                                           "noise gen is for a step-5 generator (crps_gen); $XRUN is not")
 XGEN && XSKIP != P["skip"] && error("$XRUN was trained on the skip $(P["skip"]); got skip=$XSKIP")
+const XNETSKIP = XGEN ? get(P, "netskip", "") : ""
+isempty(XMEAN) == isempty(XNETSKIP) || error(isempty(XMEAN) ? "$XRUN was trained on the frozen CNN mean of $XNETSKIP: give meannet=<its closure>" :
+                                                "meannet= is for a generator trained with GEN_NETSKIP; $XRUN was not")
 const XINN = get(P, "innoise", :none)
 const XNT = XINN !== :none                           # a noise-trained run
 XNT == (XNOISE in XNT_MODES) || error(XNT ? "$XRUN is noise-trained: export it with noise $(join(XNT_MODES, " or "))" :
@@ -220,13 +232,45 @@ elseif XNOISE == "pl"
     @printf("  power law: beta %s\n", fmt(f.beta))
 end
 w = RF.cnn_weights(r.refit.ps.net, spec; seq_index, q_index = 1:NQ, bd, LR, Ws, T = XT)
+if !isempty(XMEAN)                                  # step 5 B: the step-4 closure's network, frozen
+    kd = joinpath(XTO, "step3", "closures", XMEAN)
+    kf = only(filter(f -> startswith(f, "StochLSTM_seed") && endswith(f, ".jld2"), readdir(kd)))
+    kc = RF.load_stochlstm(joinpath(kd, kf))
+    kc.extras.run == XNETSKIP || error("meannet $XMEAN was exported from $(kc.extras.run), the run was trained on $XNETSKIP")
+    kc.spec.skip && kc.weights.Ws !== nothing || error("meannet $XMEAN has no linear skip")
+    eW = maximum(abs, Float64.(kc.weights.Ws) .- Float64.(Ws)) / maximum(abs, Ws)
+    eW < 1e-12 || error("meannet $XMEAN's Ws differs from skip=$(XSKIP)'s by $eW (relative)")
+    maximum(abs, Float64.(kc.scaling.input_map) .- Float64.(scaling.input_map)) < 1e-12 &&
+        maximum(abs, vec(kc.scaling.out_scaling.mu) .- mo) < 1e-12 * maximum(so) &&
+        maximum(abs, vec(kc.scaling.out_scaling.sigma) .- so) < 1e-12 * maximum(so) ||
+        error("meannet $XMEAN's scaling is not the run's")
+    global w = RF.with_mean_net(w, RF.mean_net_from(kc.weights, kc.spec; T = XT))
+    RF.check_shapes(w, spec)
+    # frozen_mean + Ws z against the step-4 closure's own deployed mean (no stochastic part) on 300 record steps
+    let picks = sort(unique(rand(Xoshiro(3), findall(n -> 400 + h <= n <= 40000 - 1, cols), 300))), Pm = Float64.(scaling.input_map)
+        Xreg, csr = xr(scaling.in_scaling)
+        stk = RF.LSTMState(kc.spec, XT)
+        em = 0.0
+        for i in picks
+            x = Pm * Xreg[:, cols[i] - csr[1] + 1]
+            RF.cnn_window!(stk, kc.weights, kc.spec, reshape(x, :, 1))
+            em = max(em, maximum(abs, RF.frozen_mean(RF.cnn_mean_net(w), x, XT) .+ Ws * x .- stk.y))
+        end
+        @printf("meannet %s (%s): frozen mean + Ws z against its deployed mean on %d record steps, max |diff| %.1e target sd
+",
+                XMEAN, kc.extras.run, length(picks), em)
+        em < 1e-10 || error("the frozen mean differs from $(XMEAN)'s deployed mean by $em")
+    end
+end
 sc = merge(scaling, extra)
 dir = joinpath(XTO, "step3", "closures", XNAME)
 isdir(dir) && error("$dir exists; refusing to overwrite")
 file = joinpath(dir, "StochLSTM_seed$(seed).jld2")
 RF.save_stochlstm(file, spec, w, sc; run = XRUN, noise = XNOISE, provenance = prov, seed, C, lr, wd,
                   loss = P["loss"], train_steps = (400, 4000), made = string(now()),
-                  skip = isempty(XSKIP) ? "none" : XSKIP, precision = string(XT), innoise = string(XINN))
+                  skip = isempty(XSKIP) ? "none" : XSKIP, precision = string(XT), innoise = string(XINN),
+                  meannet = isempty(XMEAN) ? "none" : XMEAN, netskip = isempty(XNETSKIP) ? "none" : XNETSKIP,
+                  hist_noise = string(get(P, "hist_noise", :recorded)))
 @printf("wrote %s\n", file)
 
 # the translation check

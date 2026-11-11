@@ -35,6 +35,7 @@
     include(joinpath(SRC, "ts_lstm.jl"))
     include(joinpath(SRC, "ts_lstm_online.jl"))
     include(joinpath(SRC, "ts_score.jl"))
+    include(joinpath(SRC, "ts_lstm_io.jl"))           # V101: the save/load round trip
 
     const C, K, D = 5, 2, 7
 
@@ -127,6 +128,16 @@
     end
 
     drive(m, Q) = reduce(hcat, [copy(get_next_item_timeseries(m, Q[:, t])) for t in axes(Q, 2)])
+
+    "A step-4 closure (emission :constant, the linear skip Ws) and the generator that carries its network frozen."
+    function bpair(nq = 3, h = 4; L = Matrix(cholesky([1 0.5 0.2; 0.5 1 0.3; 0.2 0.3 1.0]).L) ./ 4, seed_k = 21)
+        Ws = randn(Xoshiro(3), nq, nin(nq, h)) ./ 5
+        spk = spec(nq, h; emission = :constant, skip = true)
+        wk = weights(spk; L = Matrix(1.0I, nq, nq), Ws, seed = seed_k)
+        spg = spec(nq, h; skip = true)
+        wg0 = weights(spg; L, Ws, zero_out = true)
+        return (; spk, wk, spg, wg = with_mean_net(wg0, mean_net_from(wk, spk)), wg0, L, Ws)
+    end
 end
 
 @testitem "V98 emission = :generator: the CNN only, N_Q more inputs to the dense layers, L lower, bd = Wd = 0" default_imports = false setup = [GenFix] begin
@@ -312,4 +323,75 @@ end
     @test energy_fair_samples(Xr, Y) < 0.95 * energy_fair_samples(Xw, Y)
     @test isapprox(crps_fair_samples(Xr, Y), crps_fair_samples(Xw, Y); rtol = 0.02)
     @test_throws ErrorException energy_fair_samples(randn(3, 5, 1), randn(3, 5))
+end
+
+# V101 -- step 5 variant B (2026-11-11, card analysis/cards/step5_skips.md; Rik: "A2, both skips; and B"): a generator
+# that carries a step-4 closure's FROZEN CNN mean, `y = g(x, ε) + m(x) + Ws x + L ε` (`Cv.mean_net`). Pinned: at its
+# start (output layer at zero) it IS the step-4 closure's deployed mean plus L ε, in the forward pass and step by step
+# online with the member's own ε; a closure without `mean_net` is untouched; the refusals; a save/load round trip.
+
+@testitem "V101 a generator carrying a frozen CNN mean: at its start = the step-4 closure's mean + L ε" default_imports = false setup = [GenFix] begin
+    using Test, Random, LinearAlgebra
+    using .GenFix: cnn_window!, LSTMState, cnn_mean_net, check_shapes
+    b = GenFix.bpair()
+    @test cnn_mean_net(b.wg0) === nothing
+    @test cnn_mean_net(b.wg) !== nothing
+    @test check_shapes(b.wg, b.spg)
+    for seed in 1:5
+        x = randn(Xoshiro(seed), size(b.Ws, 2))
+        e = randn(Xoshiro(100 + seed), 3)
+        sk, sg = LSTMState(b.spk, Float64), LSTMState(b.spg, Float64)
+        cnn_window!(sk, b.wk, b.spk, reshape(x, :, 1))
+        cnn_window!(sg, b.wg, b.spg, reshape(x, :, 1); eps = e)
+        @test sg.y ≈ sk.y .+ b.L * e rtol = 1e-12 atol = 1e-14
+        # without the frozen mean: the network (zero at its start) + Ws x + L ε, as V98
+        s0 = LSTMState(b.spg, Float64)
+        cnn_window!(s0, b.wg0, b.spg, reshape(x, :, 1); eps = e)
+        @test s0.y ≈ b.Ws * x .+ b.L * e rtol = 1e-12
+    end
+end
+
+@testitem "V101 online: the B generator at its start = the step-4 closure's mean + L ε with the member's own ε" default_imports = false setup = [GenFix] begin
+    using Test, Random, LinearAlgebra
+    using .GenFix: scaling, path, StochLSTM, get_next_item_timeseries, cnn_window!, LSTMState
+    b = GenFix.bpair()
+    nq, h = 3, 4
+    mo = [0.01, -0.02, 0.03]
+    sc = scaling(nq, h; mo)
+    Q, warm = path(fill(3.0, nq), 20; nwarm = 6)
+    g = StochLSTM(b.spg, b.wg, sc; spinnup_data = warm, rng = Xoshiro(5), gate = 0.0)
+    ref = Xoshiro(5)
+    for t in 1:20
+        dg = get_next_item_timeseries(g, Q[:, t])
+        t <= 6 && (@test dg == warm[:, t]; continue)
+        e = [randn(ref) for _ in 1:nq]
+        sk = LSTMState(b.spk, Float64)
+        cnn_window!(sk, b.wk, b.spk, g.xwin[:, 1:1])           # the step-4 closure's mean on the same window
+        @test dg ≈ (sk.y .+ b.L * e) .* 0.1 .+ mo rtol = 1e-10  # so = 0.1
+    end
+    @test rand(g.rng) == rand(ref)                             # the same N_Q normals per predicted step
+end
+
+@testitem "V101 a frozen CNN mean: refused off a generator with a linear skip, or with wrong shapes; round trip" default_imports = false setup = [GenFix] begin
+    using Test, Random, LinearAlgebra
+    using .GenFix: check_shapes, with_mean_net, mean_net_from, spec, weights, cnn_mean_net, save_stochlstm,
+                   load_stochlstm, scaling, cnn_window!, LSTMState
+    b = GenFix.bpair()
+    mn = mean_net_from(b.wk, b.spk)
+    @test_throws ErrorException check_shapes(with_mean_net(b.wk, mn), b.spk)            # not a generator
+    spn = spec(3, 4)                                                                     # a generator without skip
+    @test_throws ErrorException check_shapes(with_mean_net(weights(spn; L = b.L), mn), spn)
+    @test_throws ErrorException mean_net_from(b.wg0, b.spg)                              # a generator is no mean model
+    bad = merge(mn, (; V1 = zeros(3, 2)))
+    @test_throws ErrorException check_shapes(with_mean_net(b.wg0, bad), b.spg)
+    mktempdir() do d
+        f = save_stochlstm(joinpath(d, "g.jld2"), b.spg, b.wg, scaling(3, 4))
+        r = load_stochlstm(f)
+        @test cnn_mean_net(r.weights) !== nothing
+        x, e = randn(Xoshiro(2), size(b.Ws, 2)), randn(Xoshiro(3), 3)
+        s1, s2 = LSTMState(b.spg, Float64), LSTMState(r.spec, Float64)
+        cnn_window!(s1, b.wg, b.spg, reshape(x, :, 1); eps = e)
+        cnn_window!(s2, r.weights, r.spec, reshape(x, :, 1); eps = e)
+        @test s1.y == s2.y
+    end
 end
