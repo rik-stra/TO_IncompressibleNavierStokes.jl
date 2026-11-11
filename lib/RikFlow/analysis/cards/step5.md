@@ -323,4 +323,77 @@ work; try using random intialization instead of 0")
 
 ## Post hoc
 
-(empty)
+- 2026-11-06: code committed as `cb189c9f` (Rik: "Yes, commit + push"; only the step-5 files, plus the PARTNER entry
+  in `train_hindcast.jl`) and pushed (origin `cd759ad3` → `cb189c9f`, with Rik's `f94f4217`, `8e1ed477`, `ca84c79e`).
+  Snellius fast-forwarded `cd759ad3` → `cb189c9f`; its `TO_LRS/LinReg1/LinReg.jld2` sha256 `4e94fb7f…b8ba12` = the
+  laptop's and the desktop's. Artefact copied laptop → Snellius, sha256 `19ce5462…d714` equal on desktop, laptop and
+  Snellius. Budget before the runs: 22 852 of 150 000 SBU used.
+- Jobs (gpu_a100, at `cb189c9f`): training hindcast `28947513` (array 1, `run_d6_train_lstm.sh
+  step3/closures/LinReg1_CNN_gen`), long-run smoke `28947514`.
+- ⚠️ **Production submitted BEFORE the defect rule, chained on success** (Rik, 2026-11-06: "also submit the longruns and
+  full hindcasts (with dependency on these)"): `--dependency=afterok:28947513:28947514`, at `cb189c9f`, gpu_a100. Full
+  hindcast (`run_d6_packed.sh`, array 1–10, `D6_OUT=output/D6_LinReg1_CNN_gen`) `28947607`; long runs (`run_online.sh
+  lstm 2 <r>`, `-t 00:30:00`, `RIKFLOW_M4_MODEL_DIR=output/TO_LSTM/step3/closures/LinReg1_CNN_gen`) r = 1–5:
+  `28947609`, `28947611`, `28947612`, `28947613`, `28947614`. The defect rule is checked on the training hindcast as
+  soon as it lands; if it flags, Rik decides whether to cancel.
+- Long-run smoke `28947514` COMPLETED (2:34, `cb189c9f`): `PASS: 1 closure(s)` — complete (200 of 200 steps), warm-up
+  dQ bit-identical to the record, q and dQ finite, the guard fired 0 / 100 steps after the warm-up, model file the fit
+  dir's.
+- **2026-11-11, scored.** All 16 job records COMPLETED (training hindcast 17:46; hindcast tasks 30–34 min; long runs
+  10.5 min each). Copied to the laptop: 50 + 900 files, summed file bytes equal on both sides (9 880 650 / 177 852 810);
+  the 5 replicas' sha256 equal (`b85a464d…`, `866febc2…`, `eca1eec6…`, `7013f86f…`, `eaa7534b…`). Snellius home 83.6 %.
+  Scratch logs (session scratchpad): `train_step5.log`, `full_step5.log`, `score_step5.log` (driver `score_step5.jl`,
+  `paired_compare` × 3), `longrun_step5.log`, `gate_hind_step5.log`, `gate_long_step5.log`.
+- **Defect rule** (training hindcast `D6train_LinReg1_CNN_gen`, `train_hindcast.jl LinReg1_CNN_gen LinReg1`): **none
+  flagged** — no member diverged; spread-skill ≤ 0.5 TU 0.73–0.81 (LinReg1 0.61–0.78), ratio to the partner 1.18 1.10
+  1.07 1.08 1.03 1.04; guard 0 of 60 000 forecast steps (LinReg1 246); bias at 0.5 TU −0.3 % (LinReg1 −6.1 %), at 2.5 TU
+  +5.4 % (+2.0 %).
+
+  | closure | CRPS_0.5 | CRPS_3 | e_0.5 | cal. | b_0.5 | b_2.5 | guard | b | D | D range | CRPS_100 | e_100 | SS ratio | guard |
+  |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+  | LinReg1 (λ = 0) | 0.221 | 0.390 | 0.455 | 28 | −2.9 | −5.9 | 0.42 | −7.3 | 0.84 | 0.59–1.01 | 0.387 | 0.649 | 1.53 | 1.13 |
+  | LinReg1 + power-law scale (step 2) | 0.220 | 0.393 | 0.455 | 27 | −2.8 | −5.0 | 0.20 | −6.1 | 0.79 | 0.57–0.95 | 0.402 | 0.684 | 1.36 | 0.41 |
+  | **s5 LinReg1 + stochastic CNN (`LinReg1_CNN_gen`)** | 0.275 | 0.404 | 0.543 | 14 | +2.8 | −0.6 | <0.01 | −1.4 | 0.48 | 0.42–0.68 | 0.381 | 0.642 | 1.35 | 0 |
+  | LinReg7 (λ = 1) | 0.263 | 0.408 | 0.498 | 5 | −4.0 | −5.1 | 0 | −4.9 | 0.65 | 0.54–0.91 | 0.386 | 0.691 | 0.99 | 0 |
+
+  Six digits: CRPS_0.5 0.27452 (LinReg1 0.22079, LinReg1_pl 0.22016); CRPS_3 0.40394 (paired with LinReg1_pl, where no
+  member diverges; 0.40360 paired with LinReg1); e_0.5 0.5426. Guard: hindcast 5 of 1 080 000 steps (1 member, 1 IC, none
+  in leads 1–200; LinReg1 4 498, 35 members); long runs 0 of 199 500 (LinReg1 2 259, LinReg1_pl 814). No member diverged
+  (LinReg1: 3). Hindcast ensembles against LinReg1's (`--full`, ≤ 0.5 TU): spread 0.84–0.91 ×, error of the ensemble
+  mean 1.15–1.20 ×; r at leads 25–200 0.62–0.98 (LinReg1 0.78–1.07), at 400–1000 0.97–1.36 (1.14–1.48). Long runs: per-QoI
+  spread–skill 1.34–1.36 (LinReg1 1.49–1.59), one run with b_i of both signs.
+
+  Paired differences (90 % IC-block bootstrap, 10 000 resamples; % of B). G: the single-run D range 0.42–0.68 overlaps
+  LinReg7's 0.54–0.91 (and lies below LinReg1's 0.59–1.01): G passes.
+  | A vs B | CRPS_0.5 | CRPS_3 | e_0.5 | cal. A − B | S | C | verdict |
+  |---|---|---|---|---|---|---|---|
+  | s5 vs LinReg1 (partner = criterion) | +24.3 [+13.9, +33.0] (worse) | +3.4 [−0.3, +7.2], n.r. | +19.2 [+9.9, +27.4] (worse) | −14 [−16, −4] | fail | fail | **does not improve** |
+  | s5 vs LinReg1 + power law (reported, C3) | +24.7 [+14.1, +33.5] (worse) | +2.9 [−1.3, +6.8], n.r. | +19.2 [+9.9, +27.4] (worse) | −13 [−17, −6] | fail | fail | no |
+  | LinReg1 + power law vs LinReg1 (for reference) | −0.3 [−1.0, +0.5] | +0.5, n.r. | −0.0, n.r. | −1 [−2, +6] | fail | fail | no |
+
+  Against "Expected": the verdict is as expected (does not improve), and as expected the ensembles are narrower and the
+  guard nearly silent. Not as expected: (1) **the skill at 0.5 TU is clearly worse**, not "about the same": the ensemble
+  mean's error is 15–20 % above LinReg1's at leads ≤ 0.5 TU, although offline (one step, recorded history, 10–100 TU) the
+  sample mean's error was LinReg1's (1.013–1.018 ×, the sampling noise of 32 draws) and the training hindcast (in the
+  training window) has a smaller bias than LinReg1's; the short-lead ensembles are under-dispersed (14 calibrated cells
+  against 28). (2) **The long runs are not over-dispersed as feared and are closer to the reference than LinReg1's**: D
+  0.48 against 0.84 (single runs 0.42–0.68), mean bias −1.4 % against −7.3 %, CRPS_100 0.381 and e_100 0.642 at or below
+  LinReg1's, spread–skill 1.35 against 1.53, no guard firing. Explanation not yet checked: the card's own-draws diagnostic
+  (the network's response to a history carrying its own samples) was not run before the coupled runs.
+- **2026-11-11, the own-draws diagnostic** (Rik: "Yes, run it"; `exp_square_HIT/tools/gen_owndraws.jl`, laptop, the
+  exported closure in plain arrays, no Lux; 10–100 TU, 3 paths, means of 16 draws; units LinReg1's clean rms; the desktop
+  was unreachable, so the Lux mode first written into `cnn_mean_fit.jl` was removed again):
+
+  | per QoI Z[0,6] E[0,6] Z[7,15] E[7,15] Z[16,32] E[16,32] | error, recorded history | error, own draws in the history | drawn noise sd | response |
+  |---|---|---|---|---|
+  | LinReg1 + MVG | 1.000 (all) | 1.31 1.32 2.58 2.50 1.39 1.59 | 0.95 0.94 0.97 0.97 0.97 0.97 | 0.89 0.92 2.45 2.37 1.00 1.28 |
+  | s5 generator | 1.03 (all; a 16-draw mean's noise) | 1.30 1.31 2.37 2.30 1.38 1.55 | 0.91 0.89 0.90 0.91 0.98 0.96 | 0.93 0.97 2.40 2.30 1.01 1.26 |
+
+  LinReg1's row reproduces `tab: own-draws` (response ~2.4 in the middle band). **The generator responds to its own
+  draws as LinReg1 does** (it keeps LinReg1's skip, as expected), and one step ahead with its own draws in the history
+  its error is no worse (a little lower, its noise being smaller). So the coupled short-lead loss is **not a one-step
+  own-draw effect**: it builds up over the coupled steps (the ensemble mean's error over LinReg1's is ~1.0 at lead 25,
+  1.04–1.16 at lead 100, 1.13–1.28 at lead 200). Unexplained.
+- Not run (Rik, 2026-11-11: "add it as suggestion to the results text"): a hindcast of LinReg1 with the learned noise
+  skip L alone (network part off), to separate the learned noise from the network's state-dependent part. Passed to the
+  paper session as a suggestion sentence for `sec:res-stoch`.
