@@ -244,10 +244,10 @@ end
 
 # Reset the recurrence and replay the filled window, oldest first, each step with its OWN stored
 # latent draw. Leaves the last step's output in `m.state`.
-function _replay_window!(m::StochLSTM)
+function _replay_window!(m::StochLSTM; gate = nothing)
     reset!(m.state)
     if is_cnn(m.spec)
-        cnn_window!(m.state, m.weights, m.spec, view(m.xwin, :, 1:m.nwin[]))
+        cnn_window!(m.state, m.weights, m.spec, view(m.xwin, :, 1:m.nwin[]); gate)
         return m
     end
     if is_dense(m.spec)
@@ -446,7 +446,9 @@ function get_next_item_timeseries(m::StochLSTM{T}, q_star) where {T}
                 m.ewin[i, j] = ns * T(randn(m.rng))
             end
         end
-        _replay_window!(m)
+        # the step-4 mechanism test (`cnn_level_gate`): the network's output weighted by each QoI's own level q*^n
+        lg = is_cnn(m.spec) ? cnn_level_gate(m.weights) : nothing
+        _replay_window!(m; gate = lg === nothing ? nothing : level_gate_weights(lg, qs_host))
     else
         lstm_step!(m.state, m.weights, m.spec, x; rng = m.rng, sample_latent = true)
     end

@@ -264,3 +264,138 @@ end
     @test length(errs) == 10 && maximum(errs) < 1e-12
     @test_throws ErrorException linreg_skip_map(c[:, 1:(end - 1)], lin, sc, HIST)  # a LinReg of another width
 end
+
+# ---------------------------------------------------------------------------------------------------------------
+# V103 (2026-11-13, card step4.md "Mechanism test 2"): a step-4 closure with its NETWORK output gated by each QoI's
+# own level (`cnn_level_gate`, `level_gate_weights`, `cnn_window!(...; gate)`); the skip is never gated.
+# ---------------------------------------------------------------------------------------------------------------
+@testitem "V103 level_gate_weights: 1 / 0 at the thresholds, half cosines between, the two modes sum to one" default_imports = false setup = [CnnFix] begin
+    using Test
+    using .CnnFix: level_gate_weights
+    lg = (; mode = :extremes, lo_full = [1.0, 0.0], lo_edge = [2.0, 1.0], hi_edge = [4.0, 3.0], hi_full = [5.0, 5.0])
+    lb = merge(lg, (; mode = :bulk))
+    @test level_gate_weights(lg, [0.5, -1.0]) == [1.0, 1.0]                  # below lo_full
+    @test level_gate_weights(lg, [1.0, 0.0]) == [1.0, 1.0]                   # at lo_full
+    @test level_gate_weights(lg, [2.0, 1.0]) == [0.0, 0.0]                   # at lo_edge
+    @test level_gate_weights(lg, [3.0, 2.0]) == [0.0, 0.0]                   # the bulk
+    @test level_gate_weights(lg, [4.0, 3.0]) == [0.0, 0.0]                   # at hi_edge
+    @test level_gate_weights(lg, [5.0, 5.0]) == [1.0, 1.0]                   # at hi_full
+    @test level_gate_weights(lg, [1.5, 4.0]) ≈ [0.5, 0.5]                    # the tapers' midpoints
+    for q in ([0.7, 0.3], [1.3, 0.8], [3.0, 2.0], [4.6, 4.1], [9.0, 9.0])
+        @test level_gate_weights(lg, q) .+ level_gate_weights(lb, q) == [1.0, 1.0]
+    end
+    xs = range(0.0, 6.0; length = 601)                                       # continuous and monotone on each side
+    w = [first(level_gate_weights(lg, [x, 2.0])) for x in xs]
+    @test maximum(abs, diff(w)) < 0.02
+    @test issorted(w[xs .<= 3.0]; rev = true) && issorted(w[xs .>= 3.0])
+end
+
+@testitem "V103 cnn_window!: gate ones is the ungated closure bit for bit, gate zeros is the skip alone" default_imports = false setup = [CnnFix] begin
+    using Test
+    using Random
+    using .CnnFix
+    using .CnnFix: NQ, NIN, LSTMState, cnn_window!, check_shapes, with_level_gate
+    Ws = randn(Xoshiro(3), NQ, NIN) ./ 5
+    sp = CnnFix.spec(skip = true)
+    for T in (Float32, Float64)
+        w, w0 = CnnFix.weights(sp; Ws, T), CnnFix.weights(sp; Ws, T, zero_out = true)
+        for s in 1:5
+            x = randn(Xoshiro(s), T, NIN, 1)
+            a, b, c, d = LSTMState(sp, T), LSTMState(sp, T), LSTMState(sp, T), LSTMState(sp, T)
+            cnn_window!(a, w, sp, x); cnn_window!(b, w, sp, x; gate = ones(NQ))
+            @test a.y == b.y && a.logd == b.logd && a.h == b.h
+            cnn_window!(c, w, sp, x; gate = zeros(NQ)); cnn_window!(d, w0, sp, x)
+            @test c.y == d.y && c.logd == d.logd                              # the network at zero: the skip
+            g = [0.0, 0.3, 1.0]
+            e = LSTMState(sp, T); cnn_window!(e, w, sp, x; gate = g)
+            @test e.y ≈ c.y .+ T.(g) .* (a.y .- c.y) rtol = (T === Float32 ? 1e-5 : 1e-12)
+        end
+    end
+    # only on a step-4 closure (skip, not a generator), with ordered thresholds of N_Q entries
+    lg = (; mode = :bulk, lo_full = fill(1.0, NQ), lo_edge = fill(2.0, NQ), hi_edge = fill(4.0, NQ), hi_full = fill(5.0, NQ))
+    @test check_shapes(with_level_gate(CnnFix.weights(sp; Ws, T = Float64), lg), sp)
+    @test_throws ErrorException check_shapes(with_level_gate(CnnFix.weights(), lg), CnnFix.spec())   # no skip
+    @test_throws ErrorException check_shapes(with_level_gate(CnnFix.weights(sp; Ws), merge(lg, (; mode = :all))), sp)
+    @test_throws ErrorException check_shapes(with_level_gate(CnnFix.weights(sp; Ws), merge(lg, (; lo_edge = fill(0.5, NQ)))), sp)
+    @test_throws ErrorException check_shapes(with_level_gate(CnnFix.weights(sp; Ws), merge(lg, (; hi_full = fill(5.0, NQ - 1)))), sp)
+end
+
+@testitem "V103 online: the gated closure draws as the ungated one; bulk-only in the bulk IS it, extremes-only IS the skip" default_imports = false setup = [CnnFix] begin
+    using Test
+    using Random
+    using .CnnFix
+    using .CnnFix: NQ, NIN, StochLSTM, LSTMState, cnn_window!, get_next_item_timeseries, with_level_gate, level_gate_weights
+    Ws = randn(Xoshiro(3), NQ, NIN) ./ 5
+    sp = CnnFix.spec(skip = true)
+    q_star, warm = CnnFix.stream()
+    wide = (; lo_full = fill(-100.0, NQ), lo_edge = fill(-99.0, NQ), hi_edge = fill(99.0, NQ), hi_full = fill(100.0, NQ))
+    function runm(w; stochastic = true)
+        m = StochLSTM(sp, w, CnnFix.scaling(); spinnup_data = warm, rng = Xoshiro(5), gate = 0.0, stochastic)
+        return m, [get_next_item_timeseries(m, q_star[:, k]) for k in 1:16]
+    end
+    for T in (Float32, Float64)
+        w, w0 = CnnFix.weights(sp; Ws, T), CnnFix.weights(sp; Ws, T, zero_out = true)
+        _, full = runm(w)
+        _, skip = runm(w0)
+        _, bulk = runm(with_level_gate(w, merge(wide, (; mode = :bulk))))
+        _, ext = runm(with_level_gate(w, merge(wide, (; mode = :extremes))))
+        @test bulk == full                       # every level in the bulk: the closure itself, draws included
+        @test ext == skip                        # ... and extremes-only is its skip (plus the same noise)
+        @test full != skip
+    end
+    # mixed: thresholds inside the stream, so each QoI switches between the zones; y = skip + w .* network per step
+    lg = (; mode = :extremes, lo_full = fill(2.0, NQ), lo_edge = fill(2.6, NQ), hi_edge = fill(3.4, NQ), hi_full = fill(4.0, NQ))
+    w = CnnFix.weights(sp; Ws, T = Float64)
+    m = StochLSTM(sp, with_level_gate(w, lg), CnnFix.scaling(); spinnup_data = warm, rng = Xoshiro(5), gate = 0.0,
+                  stochastic = false)
+    ws = Float64[]
+    for k in 1:16
+        get_next_item_timeseries(m, q_star[:, k])
+        k <= 6 && continue
+        g = level_gate_weights(lg, q_star[:, k])
+        append!(ws, g)
+        a, c = LSTMState(sp, Float64), LSTMState(sp, Float64)
+        cnn_window!(a, w, sp, m.xwin[:, 1:1])
+        cnn_window!(c, w, sp, m.xwin[:, 1:1]; gate = zeros(NQ))
+        @test m.state.y ≈ c.y .+ g .* (a.y .- c.y) rtol = 1e-12
+    end
+    @test any(iszero, ws) && any(isone, ws) && any(x -> 0 < x < 1, ws)       # all three zones were met
+end
+
+@testitem "V103 gate zero everywhere: the step-4 closure on a frozen LinReg IS that LinReg, whatever its network" default_imports = false setup = [CnnFix] begin
+    using Test
+    using Random
+    using LinearAlgebra
+    using .CnnFix
+    using .CnnFix: NQ, H, NREG, NIN, HIST, StochLSTM, get_next_item_timeseries, linreg_skip_map, with_level_gate
+    rng = Xoshiro(11)
+    P0 = Matrix{Float64}(I, NREG, NREG) .+ 0.1 .* randn(rng, NREG, NREG)
+    P = vcat(P0, randn(rng, H * NQ, NREG) ./ 4)
+    # target mean zero here: the closure adds the network target's mean through its scaling, which no gate removes
+    sc = merge(CnnFix.scaling(), (; input_map = P, out_scaling = (; mu = zeros(NQ, 1), sigma = reshape([0.3, 0.2, 0.1], NQ, 1))))
+    lin = (; in_scaling = (; mu = reshape([0.2, 0.25, 0.35], NQ, 1), sigma = reshape([1.5, 1.8, 2.2], NQ, 1)),
+           out_scaling = (; mu = reshape([0.15, 0.3, 0.2], NQ, 1), sigma = reshape([1.4, 1.9, 2.0], NQ, 1)))
+    c = hcat(Matrix{Float64}(I, NQ, NQ), zeros(NQ, NREG - NQ)) .+ 0.05 .* randn(rng, NQ, NREG)
+    Ws = linreg_skip_map(c, lin, sc, HIST)
+    sp = CnnFix.spec(skip = true)
+    lg = (; mode = :extremes, lo_full = fill(-100.0, NQ), lo_edge = fill(-99.0, NQ), hi_edge = fill(99.0, NQ),
+          hi_full = fill(100.0, NQ))
+    w = with_level_gate(CnnFix.weights(sp; Ws, T = Float64), lg)            # a RANDOM network, gated off
+    q_star, warm = CnnFix.stream()
+    m = StochLSTM(sp, w, sc; spinnup_data = warm, rng = Xoshiro(5), gate = 0.0, stochastic = false)
+    s(v) = (v .- vec(lin.in_scaling.mu)) ./ vec(lin.in_scaling.sigma)
+    q = similar(q_star)
+    errs = Float64[]
+    for k in 1:16
+        dQ = get_next_item_timeseries(m, q_star[:, k])
+        if k <= 6
+            q[:, k] = q_star[:, k] .+ warm[:, k]
+            continue
+        end
+        x = vcat(s(q_star[:, k]), reduce(vcat, [vcat(s(q[:, k - j]), s(q_star[:, k - j])) for j in 1:H]), 1.0)
+        ref = (c * x) .* vec(lin.out_scaling.sigma) .+ vec(lin.out_scaling.mu) .- q_star[:, k]
+        push!(errs, maximum(abs, dQ .- ref) / maximum(abs, ref))
+        q[:, k] = q_star[:, k] .+ ref
+    end
+    @test length(errs) == 10 && maximum(errs) < 1e-12
+end

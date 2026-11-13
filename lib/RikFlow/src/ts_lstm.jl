@@ -501,6 +501,17 @@ function check_shapes(w::LSTMWeights, spec::LSTMSpec)
                 length(mn.b) == mn.n_layers * Hm && size(mn.V1) == (nout, Hm) && length(mn.cdec) == nout ||
                 error("mean_net: dense layer shapes")
         end
+        # the step-4 mechanism test (2026-11-13): the network's output gated by each QoI's level
+        lg = cnn_level_gate(w)
+        if lg !== nothing
+            !is_generator(spec) && spec.skip ||
+                error("Cv.level_gate (the network gated by the level) needs a step-4 closure: skip, not a generator")
+            lg.mode in (:extremes, :bulk) || error("level_gate: mode must be :extremes or :bulk; got $(lg.mode)")
+            all(v -> length(v) == nout, (lg.lo_full, lg.lo_edge, lg.hi_edge, lg.hi_full)) ||
+                error("level_gate: every threshold vector needs N_Q = $nout entries")
+            all(lg.lo_full .< lg.lo_edge .< lg.hi_edge .< lg.hi_full) ||
+                error("level_gate: thresholds must satisfy lo_full < lo_edge < hi_edge < hi_full per QoI")
+        end
     else
         w.Cv === nothing || error("Cv (convolution weights) is set but arch = $(spec.arch)")
     end
@@ -862,6 +873,35 @@ map). Built by [`mean_net_from`](@ref); `nothing` when absent.
 """
 cnn_mean_net(w::LSTMWeights) = (w.Cv !== nothing && haskey(w.Cv, :mean_net)) ? w.Cv.mean_net : nothing
 
+"""
+    cnn_level_gate(w) -> NamedTuple or nothing
+    level_gate_weights(lg, q) -> Vector
+    with_level_gate(w, lg)
+
+The step-4 mechanism test (2026-11-13, card `analysis/cards/step4.md`, "Mechanism test 2"; Rik: "do all of them"):
+a step-4 closure (`skip`, not a generator) whose NETWORK output `V1 h + cdec` is multiplied, per QoI, by a weight
+set by that QoI's own level q*^n (raw units), so that the network acts only at the extremes or only in the bulk; the
+skip `Ws x` (and the target mean the scaling adds) is never gated. Stored as `w.Cv.level_gate = (; mode, lo_full,
+lo_edge, hi_edge, hi_full)` (a key of the convolution tuple: older files load unchanged), the four thresholds per
+QoI in raw level units. The extremes weight is 1 at or below `lo_full`, falls as a half cosine to 0 at `lo_edge`, is
+0 up to `hi_edge`, rises as a half cosine to 1 at `hi_full`, and is 1 above; `mode = :extremes` deploys that weight,
+`:bulk` one minus it, so the two arms sum to the ungated closure. `cnn_window!(...; gate)` applies it (V103).
+"""
+cnn_level_gate(w::LSTMWeights) = (w.Cv !== nothing && haskey(w.Cv, :level_gate)) ? w.Cv.level_gate : nothing
+
+function level_gate_weights(lg, q::AbstractVector)
+    wext = map(eachindex(q)) do i
+        x, a, b, c, d = Float64(q[i]), lg.lo_full[i], lg.lo_edge[i], lg.hi_edge[i], lg.hi_full[i]
+        x <= a ? 1.0 : x < b ? 0.5 * (1 + cospi((x - a) / (b - a))) : x <= c ? 0.0 :
+        x < d ? 0.5 * (1 - cospi((x - c) / (d - c))) : 1.0
+    end
+    return lg.mode === :extremes ? wext : 1.0 .- wext
+end
+
+with_level_gate(w::LSTMWeights{T}, lg) where {T} =
+    LSTMWeights{T}(w.Wx, w.Wh, w.b, w.We, w.be, w.Bmu, w.Bsig, w.V1, w.V2, w.cdec, w.Wd, w.bd, w.LR, w.Ws, w.P,
+                   merge(w.Cv, (; level_gate = lg)))
+
 "The frozen mean `m(x)` of a `cnn_mean_net` tuple for the mapped input column `x`, in `T`."
 function frozen_mean(mn, x::AbstractVector, ::Type{T}) where {T}
     H = mn.n_hidden
@@ -904,7 +944,10 @@ appended to the dense layers' input and `L ε` (`L = LR`) is added to the output
 `st.logd` is zero. Any other emission refuses an `eps`.
 """
 function cnn_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin::AbstractMatrix;
-                     eps::Union{Nothing,AbstractVector} = nothing) where {T}
+                     eps::Union{Nothing,AbstractVector} = nothing,
+                     gate::Union{Nothing,AbstractVector} = nothing) where {T}
+    # `gate` (step-4 mechanism test, `cnn_level_gate`): per-QoI weights on the network's output, the skip ungated
+    gate === nothing || !is_generator(spec) || error("cnn_window!: a level gate is for step-4 closures, not generators")
     H = spec.n_hidden
     gen = is_generator(spec)
     gen == (eps !== nothing) ||
@@ -914,7 +957,7 @@ function cnn_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin::
     h1 = tanh.(w.Wx * F .+ w.b[1:H])
     h2 = dense_hidden(spec.n_layers, w.Wh, w.b, h1, H)
     st.h .= h2
-    st.y .= w.V1 * h2 .+ w.cdec
+    gate === nothing ? (st.y .= w.V1 * h2 .+ w.cdec) : (st.y .= T.(gate) .* (w.V1 * h2 .+ w.cdec))
     spec.skip && (st.y .+= w.Ws * T.(x))
     mn = cnn_mean_net(w)                    # step 5 B: the frozen step-4 CNN mean (generators only, check_shapes)
     mn === nothing || (st.y .+= frozen_mean(mn, x, T))
