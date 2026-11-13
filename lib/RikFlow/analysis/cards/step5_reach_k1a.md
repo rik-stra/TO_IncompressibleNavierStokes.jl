@@ -65,7 +65,7 @@ generator reaches k1a only at its start") and nothing is run coupled.
 
 ## Coupled (gpu_a100)
 
-Long runs first: 5 × 100 TU with k1a's replica seeds (`run_online.sh lstm 2 <r>`, ≈ 125 SBU). Only if the summed KS D ≤ 0.4
+Long runs first: 5 × 100 TU with k1a's replica seeds (`run_online.sh lstm 2 <r>`). Only if the summed KS D ≤ 0.4
 (k1a 0.32, k1b 0.29): the training hindcast (defect rule against k1a) and the full hindcast. If the full hindcast does not
 fit before Tue 17 Nov, long runs alone.
 

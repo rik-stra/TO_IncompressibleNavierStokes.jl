@@ -215,7 +215,7 @@ Reported, without a clause:
 Test ID **V98** (V96 unused, V97 is the q1-q2 session's).
 
 ### Offline: the CPU grid (desktop, 2026-11-06 15:32–15:38; fits `TO_LSTM/step5/gen_wd<wd>_s<s>`, logs
-`/export/scratch2/rik/tmp/step5_grid/`; `analysis/gen_offline.jl`)
+`the desktop's tmp/step5_grid/`; `analysis/gen_offline.jl`)
 
 - **Grid** (6 weight decays × 3 seeds, 8 000–13 800 updates each, ~27 ms per update):
   - wd 0, 0.01, 0.03, 0.1, 0.3: **every seed stops at update 0**, i.e. the closure IS LinReg1 + MVG (validation CRPS
@@ -241,7 +241,7 @@ Test ID **V98** (V96 unused, V97 is the q1-q2 session's).
   before any coupled run (GATE 1, asked 2026-11-06).**
 
 ### Offline: the energy-score grid (Rik at GATE 1, "Energy score, rerun"; desktop 2026-11-06 15:48–15:55; fits
-`TO_LSTM/step5/gen_es_wd<wd>_s<s>`, logs `/export/scratch2/rik/tmp/step5_grid_es/`)
+`TO_LSTM/step5/gen_es_wd<wd>_s<s>`, logs `the desktop's tmp/step5_grid_es/`)
 
 - **All 18 fits stop at update 0**: every weight decay, every seed. The closure is LinReg1 + MVG exactly (check PASS
   trivially, energy score +0.00 %, correlation = Σ's, network share 0).
@@ -274,7 +274,7 @@ work; try using random intialization instead of 0")
 - Fallback built, not run (not needed): `RIKFLOW_CNN_GEN_OUTINIT=random` (Glorot output weights, bias zero; the start
   check skipped).
 - **Grid, held-out + energy score** (desktop 16:01–16:05; `TO_LSTM/step5/gen_ho_wd<wd>_s<s>`, logs
-  `/export/scratch2/rik/tmp/step5_grid_ho/`): wd 0–0.3 every seed at update 0 again (the validation score rises from
+  `the desktop's tmp/step5_grid_ho/`): wd 0–0.3 every seed at update 0 again (the validation score rises from
   the first 1k updates: wd 0 1.678 → 1.972 at 5k); **wd 1 all three seeds learn** (best at 1 300 / 2 500 / 3 600
   updates). Rule: **wd 1** (seed-mean validation ES 1.657 against 1.669), the edge of the grid as in both earlier grids.
 - **Check, wd 1** (256 draws, same draws as the held-out start = LS on 1–8.2 TU + its MVG): CRPS seed 1 **3.4764
@@ -293,13 +293,13 @@ work; try using random intialization instead of 0")
   against LinReg1's own correction on 39 596 steps 1.1e-13; translation check (the fit's own deviates, 300 steps of
   10–100 TU) max 3.8e-7, rms 8.2e-8 target sd. Log `TO_LSTM/step3/closures/export_step5_build.log`.
 - **Training loss on 1–10 TU** (Rik asked; `RIKFLOW_CNN_GEN_TRAINLOG=20000`, the refit's setup at constant lr 1e-3, = the
-  refit up to its update count; logs `/export/scratch2/rik/tmp/step5_trainlog/`): wd 1 beats LinReg1 + MVG on its
+  refit up to its update count; logs `the desktop's tmp/step5_trainlog/`): wd 1 beats LinReg1 + MVG on its
   training data by ~2 % in energy score within ~1 000 updates and stays there to 20 000 (−1.8 to −2.5 %; at the refit's
   update: seed 1 −2.4 %, CRPS −2.7 %); 10–100 TU −0.5 to −0.8 %. wd 0 memorises (−65 % training, +101 % held out at
   20 000 updates).
 - 🔒 **Grid extended by wd 3 and 10** (Rik, 2026-11-06: "also add two stronger wait decays to the grid to check if they
   do better (with early stopping)"; held-out + energy score; `gen_ho_wd{3,10}_s{1,2,3}`, logs
-  `/export/scratch2/rik/tmp/step5_grid_ho2/`): wd 10 every seed at update 0; wd 3 all seeds learn (best at 10 400 /
+  `the desktop's tmp/step5_grid_ho2/`): wd 10 every seed at update 0; wd 3 all seeds learn (best at 10 400 /
   8 500 / 1 100; check −0.68 / −0.57 / −0.68 % CRPS against the held-out start). Seed-mean validation ES: wd 1 1.6570,
   wd 3 1.6585, the rest 1.6692 → **the rule still picks wd 1**, now inside the grid. The candidate stays
   `LinReg1_CNN_gen` (wd 1, seed 1).
@@ -318,7 +318,7 @@ work; try using random intialization instead of 0")
 
 - Training hindcast (the defect rule against LinReg1), the long-run smoke, the full hindcast (`run_d6_packed.sh`) and
   5 long runs (`run_online.sh lstm 2 <r>`, `-t 00:30:00`).
-- Cost ≈ 810 SBU, plus the CPU grid (six weight decays × three seeds, doubled if (c) is tried; CRPS on CPU about 3.5 ms
+- Cost: the four Snellius jobs per closure, plus the CPU grid (six weight decays × three seeds, doubled if (c) is tried; CRPS on CPU about 3.5 ms
   per update). Storage ≈ 1.6 GB.
 
 ## Post hoc
@@ -327,7 +327,7 @@ work; try using random intialization instead of 0")
   in `train_hindcast.jl`) and pushed (origin `cd759ad3` → `cb189c9f`, with Rik's `f94f4217`, `8e1ed477`, `ca84c79e`).
   Snellius fast-forwarded `cd759ad3` → `cb189c9f`; its `TO_LRS/LinReg1/LinReg.jld2` sha256 `4e94fb7f…b8ba12` = the
   laptop's and the desktop's. Artefact copied laptop → Snellius, sha256 `19ce5462…d714` equal on desktop, laptop and
-  Snellius. Budget before the runs: 22 852 of 150 000 SBU used.
+  Snellius.
 - Jobs (gpu_a100, at `cb189c9f`): training hindcast `28947513` (array 1, `run_d6_train_lstm.sh
   step3/closures/LinReg1_CNN_gen`), long-run smoke `28947514`.
 - ⚠️ **Production submitted BEFORE the defect rule, chained on success** (Rik, 2026-11-06: "also submit the longruns and

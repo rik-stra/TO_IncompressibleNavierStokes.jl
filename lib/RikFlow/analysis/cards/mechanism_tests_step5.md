@@ -23,7 +23,7 @@ hoc" changes.**
 - **Verified:** weights identical element for element; scaling identical except `dq_offset`; the deployed closure
   (stochastic = false) against k1a at the first predicted step on 20 record windows: dQ differs by the offset in E[0,6]
   (residual 2.8e-19) and by 0.0 in the other QoIs; Σ unchanged (bd, LR identical).
-- **Runs:** 5 × 100 TU with k1a's replica seeds (`run_online.sh lstm 2 <r>`, ≈ 125 SBU), gpu_a100.
+- **Runs:** 5 × 100 TU with k1a's replica seeds (`run_online.sh lstm 2 <r>`), gpu_a100.
 - **Rule** (the paper session's, fixed here): B-like collapse (D ≥ 0.6 or b ≤ −6 %) → the bulk offset alone is sufficient;
   D ≤ 0.4 and b ≥ −4 % → B also needs its low-tail push, or something else; in between → graded.
 - **Prediction (written 2026-11-13, before the run): graded, not a collapse.** D 0.35–0.55, b −4 to −5.5 % (k1a −3.3 %).
@@ -40,7 +40,7 @@ hoc" changes.**
   level for all six QoIs, in ‰ of the reference mean level per step. W0 must give exactly 0.
 - **Threshold, prediction per variant, and which two go coupled:** written here after the measurement and before any long
   run (next section). The threshold is calibrated on B and k1a — post hoc for those two (their long runs are known).
-- **Runs:** 5 × 100 TU with k1a's replica seeds, for the predicted best variant and one predicted failure (2 × 125 SBU). If
+- **Runs:** 5 × 100 TU with k1a's replica seeds, for the predicted best variant and one predicted failure. If
   the predicted best is a-c, its centring code (src, `Cv.centred`) needs Rik's commit approval and a Snellius pull.
 - **Verdict:** both predictions right → the gate predicts the long runs; otherwise → it does not.
 
@@ -92,3 +92,37 @@ tail split of the bias, collapse episodes per 100 TU; against k1a and B. Hand-ov
 side-session notes.
 
 ## Post hoc
+- 2026-11-13, **code committed `6bf53ed8`** (Rik: "Yes, commit and submit. But you need to check with the step 4 agent";
+  the step-4 session's level gate `565fc3b2` was already pushed, so this commit holds only the step-5 session's hunks;
+  that session informed) and pushed. Full suite 4034 pass, 1 fail = the pre-existing V36 (after `offset_closure.jl`'s
+  check loop was moved into a `let`). Snellius pulled `565fc3b2` → `6bf53ed8`.
+- **Submitted 2026-11-13** (gpu_a100, `run_online.sh lstm 2 <r>`, k1a's replica seeds, `-t 00:30:00`, long runs only;
+  closures copied, sha256 equal: a-c `5a6f82fe…`, c `548500a6…`, test 4 `5e66f353…`). Deployment check on Snellius's
+  checkout (temporary script, removed): a-c is centred and at ε = 0 equals k1a's mean (0.0); c's frozen mean + Ws z =
+  k1a's mean (0.0); the test-4 closure has k1a's weights and dq_offset −8.700e-5 in E[0,6] — PASS. Jobs:
+  - test 3, a-c (predicted pass): `29227171`–`29227175`;
+  - test 3, c (predicted fail): `29227177`, `29227178`, `29227180`, `29227182`, `29227183`;
+  - test 4, k1a + E[0,6] offset (predicted graded): `29227184`–`29227188`.
+- 2026-11-13, **scored** (Rik: "check if the long runs are finished", "Yes, copy and score them"). All 15 job records
+  COMPLETED; c's replica 5 (`29227183`) blew up at step 11 575 (t ≈ 28.9 TU; "Unreasonable large QoI", then NaNs), so c is
+  stable 4 of 5. Copied Snellius → laptop, the 15 replicas' sha256 equal. Scored with `longrun_stats.jl`, `gate_census.jl`
+  and copies of the step-4 reviewer's `s4_longrun_decomp.jl`, `tail_bias.jl`, `peak_collapse.jl` (c's splits on its 4
+  stable runs). Hand-over: side-session notes `mechanism_tests_step5.md`.
+
+  | closure | prediction | D (single runs) | b | CRPS₁₀₀ | e₁₀₀ | KS raw / mean-m. / mean+sd-m. | low-tail part of b | collapses / 100 TU | guard | stable |
+  |---|---|---|---|---|---|---|---|---|---|---|
+  | k1a | — | 0.32 (0.17–0.51) | −3.3 | 0.369 | 0.655 | 0.32 / 0.19 / 0.20 | −1.7 | 6.4 | 0.002 % | 5/5 |
+  | **a-c** (test 3) | pass | **0.53** (0.43–0.77) | **+1.9** | 0.365 | 0.632 | 0.53 / 0.32 / 0.25 | +0.3 | 2.2 | 0 | 5/5 |
+  | **c** (test 3) | fail | **0.73** (0.43–0.88) | −7.6 | 0.381 | 0.734 | 0.73 / 0.49 / 0.41 | −5.7 | 9.5 | 4.75 % | 4/5 |
+  | **k1a + offset** (test 4) | graded | **0.49** (0.41–0.66) | −4.5 | 0.370 | 0.681 | 0.49 / 0.19 / 0.19 | −2.2 | 7.6 | 0 | 5/5 |
+  | B | (fail) | 1.03 (0.76–1.32) | −11.4 | 0.478 | 0.932 | 1.03 / 0.67 / 0.53 | −9.6 | 9.6 | 2.0 % | 5/5 |
+
+  - **Test 3 verdict (the rule fixed above): a-c predicted pass, D 0.53 → wrong; c predicted fail, D 0.73 → right. Not both
+    right → the gate as specified does NOT predict the long runs.** a-c fails HIGH (mean / ref 1.01–1.03, b +1.9 %): the
+    one-sided gate's assumption that an upward push is harmless was wrong. Post hoc: the bulk push maps monotonically onto
+    the long-run bias (B −0.050 ‰ → −11.4 %, c −0.032 → −7.6, k1a 0 → −3.3, a-c +0.059 → +1.9); a two-sided bound would
+    have sorted the four runs.
+  - **Test 4 verdict: graded** (D 0.49, b −4.5 %), as predicted (D 0.35–0.55, b −4 to −5.5). The constant offset moves k1a's
+    mean by about −1.2 points and leaves its shape (KS matched 0.19 / 0.19) and collapse rate (7.6 / 100 TU, as k1a ×1.08)
+    unchanged: **the bulk offset alone is not sufficient for B's collapse**; B also needs its low-tail push, or something
+    else.

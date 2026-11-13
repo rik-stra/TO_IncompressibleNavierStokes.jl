@@ -146,7 +146,7 @@ Hindcast K = 90, M = 10, 100 + 1200 steps; CRPS₀.₅, CRPS_all, e₀.₅, r, c
 ## Runs (gpu_a100; as step 5)
 
 Per closure: training hindcast (`run_d6_train_lstm.sh`), long-run smoke, full hindcast (`run_d6_packed.sh`, array 1–10),
-5 long runs (`run_online.sh lstm 2 <r>`, `-t 00:30:00`). ≈ 810 SBU each, ≈ 2 430 SBU for three. Deadline: last submission
+5 long runs (`run_online.sh lstm 2 <r>`, `-t 00:30:00`). Deadline: last submission
 Tue 17 Nov, freeze Fri 20 Nov.
 
 ## Built (2026-11-11; uncommitted, Rik commits)
@@ -161,8 +161,8 @@ Tue 17 Nov, freeze Fri 20 Nov.
 | B: export | `cnn_closure_export.jl … gen <name> skip=LinReg1_nt meannet=<k1 closure>`: fit dir = the run's `netskip`, Ws and scaling equal, frozen mean + Ws z = the k1 closure's deployed mean on 300 steps; translation check on the samples | smoke below |
 | any skip in the tools | `gen_owndraws.jl` (skip = RIKFLOW_MLP_SKIP; the closure's Ws checked against it), `gen_offline.jl` labels; `train_hindcast.jl` PARTNER: `LinReg1_nt_CNN_gen_nt` → LinReg1_nt, `LinReg7_CNN_gen_nt` → LinReg7, `k1_CNN_gen_nt` → k1a | — |
 
-Desktop build copies (not the shared checkout): `/export/scratch2/rik/step5s_build` (A2's grid; HEAD `d9c576dd` + the
-step-5-skips files as of the A2 code), `/export/scratch2/rik/step5b_build` (+ B). Grids: logs `/export/scratch2/rik/tmp/
+Desktop build copies (not the shared checkout): `the desktop's step5s_build` (A2's grid; HEAD `d9c576dd` + the
+step-5-skips files as of the A2 code), `the desktop's step5b_build` (+ B). Grids: logs `the desktop's tmp/
 step5s_grid/` (diagnostic), `step5s_a2/` (A2); fits `TO_LSTM/step5/gen_hs_<skip>_wd<wd>_s<s>` (diagnostic),
 `gen_a2_<skip>_wd<wd>_s<s>` (A2).
 
