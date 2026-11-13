@@ -484,6 +484,7 @@ function check_shapes(w::LSTMWeights, spec::LSTMSpec)
             all(iszero, w.bd) && all(iszero, w.Wd) ||
                 error("emission = :generator: bd and Wd must be zero (nothing is added after the network)")
         end
+        is_centred(w) && !is_generator(spec) && error("Cv.centred (a network centred on ε) needs emission = :generator")
         # step 5 B: a frozen CNN mean, only on a generator with a linear skip (the step-4 closure's LinReg map)
         mn = cnn_mean_net(w)
         if mn !== nothing
@@ -909,6 +910,18 @@ function frozen_mean(mn, x::AbstractVector, ::Type{T}) where {T}
     return mn.V1 * dense_hidden(mn.n_layers, mn.Wh, mn.b, h1, H) .+ mn.cdec
 end
 
+"""
+    is_centred(w), with_centred(w)
+
+Step 5, reaching k1a (2026-11-13, card `analysis/cards/step5_reach_k1a.md`): a generator whose network is CENTRED on ε,
+`y = g(x, ε) - g(x, 0) + (m(x)) + Ws x + L ε`, so that at ε = 0 the closure is its skip; flagged by the key `centred = true`
+in the convolution tuple (older files load unchanged). Generators only (`check_shapes`).
+"""
+is_centred(w::LSTMWeights) = w.Cv !== nothing && haskey(w.Cv, :centred) && w.Cv.centred === true
+with_centred(w::LSTMWeights{T}) where {T} =
+    LSTMWeights{T}(w.Wx, w.Wh, w.b, w.We, w.be, w.Bmu, w.Bsig, w.V1, w.V2, w.cdec, w.Wd, w.bd, w.LR, w.Ws, w.P,
+                   merge(w.Cv, (; centred = true)))
+
 "`w` with the frozen CNN mean `mn` (a `cnn_mean_net` tuple) added to its convolution tuple; other fields shared."
 with_mean_net(w::LSTMWeights{T}, mn) where {T} =
     LSTMWeights{T}(w.Wx, w.Wh, w.b, w.We, w.be, w.Bmu, w.Bsig, w.V1, w.V2, w.cdec, w.Wd, w.bd, w.LR, w.Ws, w.P,
@@ -961,6 +974,10 @@ function cnn_window!(st::LSTMState{T}, w::LSTMWeights{T}, spec::LSTMSpec, xwin::
     spec.skip && (st.y .+= w.Ws * T.(x))
     mn = cnn_mean_net(w)                    # step 5 B: the frozen step-4 CNN mean (generators only, check_shapes)
     mn === nothing || (st.y .+= frozen_mean(mn, x, T))
+    if gen && is_centred(w)                 # step 5, reach k1a: the network centred on ε, g(x, ε) - g(x, 0)
+        h10 = tanh.(w.Wx * vcat(cnn_features(w, spec, x), zeros(T, length(eps))) .+ w.b[1:H])
+        st.y .-= w.V1 * dense_hidden(spec.n_layers, w.Wh, w.b, h10, H) .+ w.cdec
+    end
     if gen
         st.y .+= LowerTriangular(w.LR) * T.(eps)
         fill!(st.logd, zero(T))

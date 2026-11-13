@@ -24,8 +24,15 @@ include(joinpath(@__DIR__, "step3_innoise.jl"))
 isempty(SKIP) && error("set RIKFLOW_MLP_SKIP to the closure's skip (and RIKFLOW_MLP_SKIP_CENTER=mvg)")
 const NAME = length(ARGS) >= 1 ? ARGS[1] : "LinReg1_CNN_gen"
 const NREP = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 3
-const MM = 16
-fit = RF.load_stochlstm(joinpath(TO_folder, "step3", "closures", NAME, "StochLSTM_seed1.jld2"))
+# RIKFLOW_OWNDRAWS_M (default 16, the setting of every table before 2026-11-13) draws per sample mean; RIKFLOW_OWNDRAWS_CRN = 1:
+# the noisy means use the SAME deviates as the clean mean (common random numbers). 🔴 Without CRN the generator's response
+# rms(noisy mean - clean mean) carries the Monte Carlo noise of two independent M-draw means, about 2/M of the noise variance
+# in quadrature (M = 16: +0.125), while a LinReg / step-4 comparator's mean is exact: the generator's response was biased
+# upward (card step5_reach_k1a.md). Use M = 64 with CRN.
+const MM = parse(Int, strip(get(ENV, "RIKFLOW_OWNDRAWS_M", "16")))
+const CRN = strip(get(ENV, "RIKFLOW_OWNDRAWS_CRN", "0")) == "1"
+const CDIR = joinpath(TO_folder, "step3", "closures", NAME)
+fit = RF.load_stochlstm(joinpath(CDIR, only(filter(f -> startswith(f, "StochLSTM_seed") && endswith(f, ".jld2"), readdir(CDIR)))))
 sp, w = fit.spec, fit.weights
 RF.is_generator(sp) || error("$NAME is not a step-5 generator")
 # B (card step5_skips.md): a generator carrying a step-4 closure's frozen CNN mean m (`Cv.mean_net`). Its comparator is
@@ -101,7 +108,7 @@ for rep in 1:NREP
         dx = window_noise(path_eta(et))
         sk = skip_dy(dx)                                            # the skip's response (target units)
         if lab == "generator"
-            mu_n = gmean(Xf .+ P * dx, MM, Xoshiro(5000 + rep)) .+ sk
+            mu_n = gmean(Xf .+ P * dx, MM, CRN ? Xoshiro(31) : Xoshiro(5000 + rep)) .+ sk
             mc = mu_c
         else
             mu_n, mc = sk .+ fmean(Xf .+ P * dx), MC                # B: the step-4 closure on the noisy history
@@ -111,8 +118,8 @@ for rep in 1:NREP
     end
     @printf("path %d of %d done (%.1f min)\n", rep, NREP, (time() - t0) / 60); flush(stdout)
 end
-@printf("\nOWNDRAWS %s: 10-100 TU (%d steps), %d paths, means of %d draws; per QoI Z[0,6] E[0,6] Z[7,15] E[7,15] Z[16,32] E[16,32]\n",
-        NAME, length(ho), NREP, MM)
+@printf("\nOWNDRAWS %s: 10-100 TU (%d steps), %d paths, means of %d draws (CRN %s); per QoI Z[0,6] E[0,6] Z[7,15] E[7,15] Z[16,32] E[16,32]\n",
+        NAME, length(ho), NREP, MM, CRN)
 @printf("  unit: %s's clean rms on 10-100 TU (target units) %s\n", SKIP, fmt3(unit))
 for lab in (CLAB, "generator")
     a = sqrt.(acc[lab])

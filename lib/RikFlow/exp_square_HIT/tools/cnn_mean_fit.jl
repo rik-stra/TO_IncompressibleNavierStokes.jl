@@ -733,6 +733,17 @@ if GEN
     GEN_HIST in (:recorded, :own, :owntot) || error("RIKFLOW_CNN_GEN_HIST must be recorded, own or owntot; got $GEN_HIST")
     const GEN_OWN = GEN_HIST in (:own, :owntot)
     const GEN_TOT = GEN_HIST === :owntot
+    # Card step5_reach_k1a.md (Rik 2026-11-13: "let the step 5 agent try to at least reach the performance of step 4"):
+    #   RIKFLOW_CNN_GEN_LFIX = 1: L is frozen at L0 (its gradient dropped; with GEN_NETSKIP: k1a's Σ);
+    #   RIKFLOW_CNN_GEN_CENTRE = 1: the network's output is CENTRED on ε, g(z, q*, ε) - g(z, q*, 0), so at ε = 0 the closure is
+    #     its skip (it cannot move the mean there; deployed with `Cv.centred`, `RF.with_centred`);
+    #   RIKFLOW_CNN_GEN_SDCAP = c (> 0): a penalty GEN_SDCAP_W (default 100) x Σ_i max(sd_i / sd0_i - c, 0)^2 on the drawn sd per
+    #     QoI (the samples' pooled within-window sd over the batch) against the skip's √diag Σ (B: k1a's), in training and in
+    #     the validation loss.
+    const GEN_LFIX = envc("GEN_LFIX", "0") == "1"
+    const GEN_CENTRE = envc("GEN_CENTRE", "0") == "1"
+    const GEN_SDCAP = parse(Float64, envc("GEN_SDCAP", "0"))
+    const GEN_SDCAP_W = parse(Float64, envc("GEN_SDCAP_W", "100"))
     const GEN_M = parse(Int, envc("GEN_M", "4"))
     const GEN_MVAL = parse(Int, envc("GEN_MVAL", "16"))
     const GEN_MCHK = parse(Int, envc("GEN_MCHK", "256"))
@@ -898,7 +909,7 @@ if GEN
     # gradient reaches its hidden layers from the first update; the start check is then skipped
     const GEN_OUTRAND = envc("GEN_OUTINIT", "zero") == "random"
     envc("GEN_OUTINIT", "zero") in ("zero", "random") || error("RIKFLOW_CNN_GEN_OUTINIT must be zero or random")
-    @info "step 5 generator" SKIP GEN_NETSKIP GEN_HIST GEN_M GEN_MVAL GEN_MCHK GEN_MREC sd_L0 = sqrt.(diag(GEN_SIGMA)) sd_val_target = vec(std(Yva; dims = 2))
+    @info "step 5 generator" SKIP GEN_NETSKIP GEN_HIST GEN_LFIX GEN_CENTRE GEN_SDCAP GEN_M GEN_MVAL GEN_MCHK GEN_MREC sd_L0 = sqrt.(diag(GEN_SIGMA)) sd_val_target = vec(std(Yva; dims = 2))
 end
 
 function mkmodel_gen(C)
@@ -921,7 +932,11 @@ function gen_samples(model, p, st, A, Q, E)
     B = size(Q, 2)
     M = size(E, 2) ÷ B
     M * B == size(E, 2) || error("gen_samples: E has $(size(E, 2)) columns for $B windows")
-    Y = first(model((repeat(A, 1, 1, M), repeat(Q, 1, M), E), p.net, st)) .+ gen_L(p) * E
+    G = first(model((repeat(A, 1, 1, M), repeat(Q, 1, M), E), p.net, st))
+    if GEN_CENTRE                                                   # g(z, q*, ε) - g(z, q*, 0)
+        G = G .- repeat(first(model((A, Q, zero(E[:, 1:B])), p.net, st)), 1, M)
+    end
+    Y = G .+ gen_L(p) * E
     return reshape(Y, nq, B, M)
 end
 """
@@ -934,6 +949,7 @@ function gen_stats(model, p, st, A, Q, M, rng)
     for _ in 1:M
         E = randn(rng, T, nq, N)
         g = Float64.(first(model((A, Q, E), p.net, st)))
+        GEN_CENTRE && (g = g .- Float64.(first(model((A, Q, zero(E)), p.net, st))))
         y = g .+ Float64.(gen_L(p) * E)
         s1 .+= y; s2 .+= y .^ 2; g1 .+= g; g2 .+= g .^ 2
     end
@@ -952,6 +968,13 @@ function gen_corr(model, p, st, A, Q, M, rng)
     return Cm ./ sqrt.(diag(Cm) * diag(Cm)')
 end
 corrof(S) = S ./ sqrt.(diag(S) * diag(S)')
+"The sd-cap penalty (GEN_SDCAP > 0) on samples X (N_Q x B x M): the drawn sd per QoI over the skip's, above the cap."
+function gen_cap(X)
+    GEN_SDCAP > 0 || return zero(eltype(X))
+    D = X .- mean(X; dims = 3)
+    sd = sqrt.(vec(sum(abs2, D; dims = (2, 3))) ./ (size(X, 2) * (size(X, 3) - 1)))
+    return T(GEN_SDCAP_W) * sum(abs2, max.(sd ./ T.(sqrt.(diag(GEN_SIGMA))) .- T(GEN_SDCAP), zero(T)))
+end
 """
 A2c: the lower factor of the generator's average conditional sample covariance on windows (A, Q) from `M` draws of a
 FIXED stream `seed` (so that it changes with the parameters only): the samples' pooled covariance about each window's
@@ -972,7 +995,7 @@ function fit_gen(C, lr, wd, seed)
     rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
     opt = Optimisers.setup(rule, ps)
     wd > 0 && Optimisers.adjust!(opt.L; lambda = zero(T))          # no weight decay on L
-    loss(p, A, Q, E, Y) = gen_score(gen_samples(model, p, st, A, Q, E), Y)
+    loss(p, A, Q, E, Y) = (X = gen_samples(model, p, st, A, Q, E); gen_score(X, Y) + gen_cap(X))
     nrng = Xoshiro(seed + 7919)                                     # the samples' own stream
     Eva = randn(Xoshiro(seed + 104729), T, nq, size(Yva32, 2) * GEN_MVAL)   # ONE fixed set of validation draws
     # GEN_HIST = own: the history noise's own stream, and ONE fixed set of validation history normals (times the
@@ -1017,6 +1040,7 @@ function fit_gen(C, lr, wd, seed)
                 Ab, Qb, Yb = Atr[:, :, c], Qtr[:, c], Ytr_g32[:, c]
             end
             g = Zygote.gradient(p -> loss(p, Ab, Qb, E, Yb), ps)[1]
+            GEN_LFIX && (g = merge(g, (; L = nothing)))                # L frozen at L0
             opt, ps = Optimisers.update(opt, ps, g)
             upd += 1
             upd % CST.val_every == 0 || continue
@@ -1070,7 +1094,9 @@ function fit_gen(C, lr, wd, seed)
          es_chk = RF.energy_fair_samples(Xn, Yb_), es_start = RF.energy_fair_samples(Xs_, Y0_),
          err_over_start = rmsq(Yb_ .- sn.mu) ./ rmsq(Y0_), spread_over_err = sqrt.(vec(mean(sn.sd .^ 2; dims = 2))) ./ rmsq(Yb_ .- sn.mu),
          # the escape measure: the injected noise's sd over the sd of the noise the closure draws (1 = all injected)
-         inj_over_drawn = sqrt.(diag(Lb_inj * Lb_inj')) ./ sqrt.(vec(mean(sn.sd .^ 2; dims = 2))))
+         inj_over_drawn = sqrt.(diag(Lb_inj * Lb_inj')) ./ sqrt.(vec(mean(sn.sd .^ 2; dims = 2))),
+         # step5_reach_k1a gate 2 (stage 1): the drawn sd under its own noise over the skip's (B: k1a's) sd
+         drawn_over_ref = sqrt.(vec(mean(sn.sd .^ 2; dims = 2))) ./ sqrt.(diag(GEN_SIGMA)))
     end
     crps_mvg = crps_eval(Yva_3, sqrt.(diag(GEN_SIGMA)))            # the skip + MVG, closed form (B: k1a), in sample
     s = gen_stats(model, pb, st, Ava, Qva, GEN_MCHK, Xoshiro(seed + 272))
@@ -1100,7 +1126,7 @@ function refit_gen(C, lr, wd, seed, hist, nupd)
     rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
     opt = Optimisers.setup(rule, ps)
     wd > 0 && Optimisers.adjust!(opt.L; lambda = zero(T))
-    loss(p, A, Q, E, Y) = gen_score(gen_samples(model, p, st, A, Q, E), Y)
+    loss(p, A, Q, E, Y) = (X = gen_samples(model, p, st, A, Q, E); gen_score(X, Y) + gen_cap(X))
     nrng = Xoshiro(seed + 7919)
     hrng = Xoshiro(seed + 15485863)                                 # GEN_HIST = own: as fit_gen
     injrows = GEN_TOT ? shuffle(Xoshiro(seed + 98), 1:ntr)[1:min(512, ntr)] : Int[]   # owntot: as fit_gen
@@ -1129,6 +1155,7 @@ function refit_gen(C, lr, wd, seed, hist, nupd)
                 Ab, Qb, Yb = Aall[:, :, c], Qall[:, c], Yall[:, c]
             end
             g = Zygote.gradient(p -> loss(p, Ab, Qb, E, Yb), ps)[1]
+            GEN_LFIX && (g = merge(g, (; L = nothing)))                # L frozen at L0
             opt, ps = Optimisers.update(opt, ps, g)
             upd += 1
         end
@@ -1155,7 +1182,7 @@ if GEN && GEN_TRAINLOG > 0
         rule = wd > 0 ? Optimisers.AdamW(T(lr), (T(0.9), T(0.999)), T(wd); couple = true) : Optimisers.Adam(T(lr))
         opt = Optimisers.setup(rule, ps)
         wd > 0 && Optimisers.adjust!(opt.L; lambda = zero(T))
-        loss(p, A, Q, E, Y) = gen_score(gen_samples(model, p, st, A, Q, E), Y)
+        loss(p, A, Q, E, Y) = (X = gen_samples(model, p, st, A, Q, E); gen_score(X, Y) + gen_cap(X))
         nrng = Xoshiro(seed + 7919)
         Etr = randn(Xoshiro(seed + 555), T, nq, size(Yall_, 2) * 16)
         Eho = randn(Xoshiro(seed + 556), T, nq, length(HO) * 4)
@@ -1178,6 +1205,7 @@ if GEN && GEN_TRAINLOG > 0
                 c = idxs[((k - 1) * CST.batch + 1):(k * CST.batch)]
                 E = randn(nrng, T, nq, length(c) * GEN_M)
                 g = Zygote.gradient(p -> loss(p, Aall_[:, :, c], Qall_[:, c], E, Yall_[:, c]), ps)[1]
+                GEN_LFIX && (g = merge(g, (; L = nothing)))                # L frozen at L0
                 opt, ps = Optimisers.update(opt, ps, g)
                 upd += 1
                 upd % 200 == 0 && logline(ps, upd)
@@ -1219,6 +1247,9 @@ if GEN
 ",
                                      GEN_HIST, fmt(r.own.inj_over_drawn), fmt(sqrt.(diag(r.L * r.L')) ./ sqrt.(diag(GEN_SIGMA_S))),
                                      fmt(r.share_net))
+        r.own === nothing || @printf("     GATE 2 (stage 1): drawn sd under its own noise / the skip's sd %s | LFIX %s CENTRE %s SDCAP %g
+",
+                                     fmt(r.own.drawn_over_ref), GEN_LFIX, GEN_CENTRE, GEN_SDCAP)
         @printf("     val per QoI: samples' sd / error of their mean %s | error of the mean / the skip's (%s, in sample there) %s\n",
                 fmt(r.spread_over_err), SKIP, fmt(r.err_over_lr1))
         @printf("     share of the sample variance: L eps %s | the network's part %s (rest: their covariance)\n",
@@ -1260,11 +1291,13 @@ if GEN
     jldsave(joinpath(out_dir, "fits.jld2"); res = resg, ls_crps = LS_CRPS, settings = CST, K, D, feat = FEAT, cfg,
             loss = CLOSS, input = CINPUT, seq = CSEQ, act = CACT, innoise = CINN, innoise_sigma = CINN_SRC,
             skip = SKIP, Sigma = GEN_SIGMA, L0 = Float64.(GEN_L0), M = GEN_M, Mval = GEN_MVAL, score = GEN_SCORE,
-            stage1 = Symbol(GEN_S1MODE), Sigma_stage1 = GEN_SIGMA_S, outinit = GEN_OUTRAND ? :random : :zero, hist_noise = GEN_HIST, netskip = GEN_NETSKIP)
+            stage1 = Symbol(GEN_S1MODE), Sigma_stage1 = GEN_SIGMA_S, outinit = GEN_OUTRAND ? :random : :zero, hist_noise = GEN_HIST, netskip = GEN_NETSKIP,
+            lfix = GEN_LFIX, centre = GEN_CENTRE, sdcap = GEN_SDCAP, sdcap_w = GEN_SDCAP_W)
     if CREFIT
         jldsave(joinpath(out_dir, "pred.jld2"); cols, gen = gstat, seeds = CSEEDS, wd = only(CWDS), n_channels = only(CHS),
                 loss = CLOSS, h = cfg.h, K, D, feat = FEAT, input = CINPUT, seq = CSEQ, act = CACT, scaling,
                 skip = SKIP, Sigma = GEN_SIGMA, Mrec = GEN_MREC, innoise = CINN, stage1 = Symbol(GEN_S1MODE), hist_noise = GEN_HIST,
+                centre = GEN_CENTRE, lfix = GEN_LFIX, sdcap = GEN_SDCAP,
                 # the target on every step of `cols`: the skip LinReg's residual, centred at its MVG mean, / so
                 ytarget = Yf_g, netskip = GEN_NETSKIP)
     end

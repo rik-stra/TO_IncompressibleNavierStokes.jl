@@ -27,7 +27,7 @@ Paper: `sec:lever-stoch` (closures.tex), `sec:res-stoch` (Table `tab: s5-offline
 | run | closure (artefact `TO_LSTM/step3/closures/<name>`) | the one change against step 5 | matched partner | also reported against |
 |---|---|---|---|---|
 | s5n | A2 on LinReg1_nt (`LinReg1_nt_CNN_gen_nt`) | skip LinReg1_nt; trained with its own noise in the history | LinReg1_nt (reused) | k1b `LinReg1_nt_CNN_crps_nt_head`; LinReg1 (criterion) |
-| s5r | A2 on LinReg7 (`LinReg7_CNN_gen_nt`) | skip LinReg7 (λ = 1); trained with its own noise in the history | LinReg7 (reused) | k2a `LinReg7_CNN_crps_nt_headcorr`; LinReg1 (criterion) |
+| s5r | A2c on LinReg7 (`LinReg7_CNN_gen_ntc`; the A2 export `LinReg7_CNN_gen_nt` is a diagnostic, not run) | skip LinReg7 (λ = 1); trained with its own TOTAL noise in the history (A2c) | LinReg7 (reused) | k2a `LinReg7_CNN_crps_nt_headcorr`; LinReg1 (criterion) |
 | s5k | B on k1's CNN mean (`k1_CNN_gen_nt`) | skip = k1's frozen CNN mean + LinReg1_nt; trained with its own noise in the history | k1a `LinReg1_nt_CNN_crps_nt_headcorr` (the same mean with learned sds + refitted correlation) | k1b; LinReg1 (criterion) |
 
 Priority if not all fit before the last submission (Tue 17 Nov): s5n, then s5k, then s5r (paper session; Rik decides).
@@ -263,6 +263,37 @@ coupled it would be step 5 on LinReg1 again. The paper session's reason for A2 h
   draws in the history its error is 1.3–1.9 × the noise it draws, so the coupled short-lead ensembles should be too
   narrow. Against "Expected": the mean correction is as expected (k2-like); the weak response is NOT kept.
 
+### s5r again: A2c on LinReg7 (Rik: "A2c, check B too"; desktop grid 17:11–17:36, `gen_a2c_LinReg7_wd<wd>_s<s>`, logs
+`tmp/step5s_a2c/`)
+
+- **Grid:** every weight decay learns far (check −22 to −50 %). Rule (exact): **wd 0.3** (seed-mean ES 0.9955; wd 1
+  1.0209; the rest 1.032–1.488). Seed 1 best at 21 200 updates.
+- **Escape check: fixed.** wd 0.3, injected noise sd / drawn noise sd 0.95 0.96 0.94 0.94 0.91 0.91 (seeds 2–3 0.93–0.99);
+  L sd / L₀ 0.65 0.84 0.38 0.40 0.58 0.54 (L still narrows, but the noise the network adds is now injected as well); the
+  network's share 0.32 0.14 1.06 0.71 0.23 0.38 (values above 1 elsewhere in the grid: the network's ε-response partly
+  cancels L ε; the total is what is injected).
+- Check (own noise, paired): seed 1 **2.0031 against 3.9949 (−49.86 %, PASS)**, seeds 2 / 3 −49.9 / −48.5 %.
+- **Candidate `LinReg7_CNN_gen_ntc` = `step5/gen_a2c_LinReg7_wd0.3_s1`** (the name `LinReg7_CNN_gen_nt` stays the A2
+  diagnostic). Exported (desktop `step5b_build`): translation 1.9e-6 / rms 2.6e-7; sha256
+  `19f20580f17ecd1401cf66db02eb25e5f545b92f30f72c3340789952258ed781` (desktop = laptop). PARTNER `LinReg7_CNN_gen_ntc` →
+  LinReg7 added (uncommitted, train_hindcast.jl).
+- Refit, 10–100 TU: the mean rebuilds most of the ridge's deficit, as k2 and the A2 fit (error over LinReg7's 0.62 0.96
+  0.29 0.25 0.63 0.53); overall error / sd 0.99 1.03 1.00 0.93 1.18 1.05 (A2: 1.10–1.38); the spread grows mildly with
+  the level (Z[7,15] 0.21 → 0.34 of LinReg7's constant sd across the deciles; the power law 0.51 → 1.36); samples'
+  correlation off Σ by 0.34 (L L' 0.17).
+- **Response to its own draws:**
+
+  | per QoI Z[0,6] E[0,6] Z[7,15] E[7,15] Z[16,32] E[16,32] | error, recorded | error, own draws | drawn noise sd | noisy error / noise | response |
+  |---|---|---|---|---|---|
+  | LinReg7 + MVG | 1.000 | 1.11 1.05 1.16 1.13 1.11 1.09 | 0.95 0.96 1.00 0.94 0.97 1.00 | 1.16 1.10 1.16 1.21 1.14 1.10 | 0.49 0.34 0.58 0.56 0.50 0.43 |
+  | s5r A2 (diagnostic) | 0.59 0.92 0.21 0.22 0.62 0.49 | 0.69 1.05 0.32 0.31 0.69 0.62 | 0.54 0.84 0.17 0.20 0.46 0.42 | 1.28 1.26 1.87 1.57 1.49 1.46 | 0.76 0.69 1.45 1.17 0.71 0.95 |
+  | **s5r A2c** | 0.63 0.97 0.30 0.25 0.64 0.54 | 0.70 1.05 0.36 0.33 0.66 0.60 | 0.64 0.96 0.30 0.28 0.55 0.52 | 1.09 1.09 1.19 1.19 1.20 1.15 | **0.58 0.53 0.75 0.82 0.48 0.61** |
+
+  With A2c the response stays near the skip's (middle band 0.75 / 0.82 against LinReg7's 0.58 / 0.56, A2's 1.45 / 1.17),
+  the residual met with its own draws is 1.09–1.20 × the drawn noise (LinReg7 1.10–1.21), and the mean keeps most of its
+  gain (with its own draws 0.33–0.36 of LinReg7's error in the middle band). Against "Expected": the weak response is
+  kept and the mean corrects, as expected of A2 (now that the noise is injected in full).
+
 ### s5k: B on k1's frozen mean, A2 (desktop grid 16:59–17:16; `gen_b_k1_wd<wd>_s<s>`, logs `tmp/step5s_b/`; the old k1,
 step-4 z0 verdict KEEP 2026-11-11)
 
@@ -312,3 +343,109 @@ recorded-history check +1.9 %, as expected of a noise-trained fit); export `smok
   `29131089` (`run_d6_packed.sh`, array 1–10, `D6_OUT=output/D6_LinReg1_nt_CNN_gen_nt`), long runs (`run_online.sh lstm 2
   <r>`, `-t 00:30:00`) r = 1–5: `29131090`, `29131092`, `29131093`, `29131094`, `29131096`. The defect rule is checked on
   the training hindcast as soon as it lands; if it flags, Rik decides whether to cancel.
+- 2026-11-11, **code committed `dff6b5b0`** (Rik, here: "Yes, commit + push"; the approval the paper session relayed was
+  blocked by auto mode) and pushed: the 8 step-5-skips files (src/ts_lstm.jl, test/test_cnn_generator.jl, cnn_mean_fit.jl,
+  cnn_closure_export.jl, skip_heldout.jl, gen_owndraws.jl, gen_offline.jl, this card); full suite 3941 pass, 1 fail = the
+  pre-existing V36. `analysis/train_hindcast.jl`'s PARTNER lines stay uncommitted (beside another session's edits).
+- **s5n training hindcast and smoke** (Rik: "Yes, chain production" covered this check): `29131087` COMPLETED 17:19,
+  smoke `29131088` COMPLETED, `PASS: 1 closure(s)` (200 of 200 steps). Copied (50 files, 9 897 300 bytes summed, equal on
+  both sides). **Defect rule** (`train_hindcast.jl LinReg1_nt_CNN_gen_nt LinReg1_nt`): **none flagged** — no member
+  diverged; ≤ 0.5 TU spread-skill 0.46–0.62, ratio to LinReg1_nt's 1.02 0.98 1.02 1.02 1.01 1.01; guard 9 of 60 000
+  forecast steps (1 member; LinReg1_nt 0); bias at 0.5 TU −4.0 % (LinReg1_nt −4.5 %), at 2.5 TU −0.5 % (+1.9 %). Against
+  LinReg1_nt (≤ 0.5 TU, in the training window): spread 0.91–0.96 ×, error of the ensemble mean 0.89–0.98 ×. The chained
+  production ran: long runs `29131090`–`96` COMPLETED (10.5 min each); full hindcast `29131089` running at 17:4x.
+  Snellius's working tree carried another session's uncommitted edits (d6_lib.jl, run_d6.jl, time_series_methods.jl;
+  histnoise) while these jobs ran.
+- 2026-11-11, **s5k (B) submitted** (Rik: "Yes, chain production"). Snellius pulled `d9c576dd` → `dff6b5b0` (`--ff-only`);
+  artefact copied, sha256 `72f026f7…a6c` equal; **deployment check on Snellius's checkout** (login node, `julia
+  --project`, a temporary script, removed): frozen mean + Ws z against k1a's deployed mean on 50 random inputs, max |diff|
+  **0.0**; the generator's sample = network + frozen mean + Ws z + L ε, max |diff| 0.0 — PASS. Jobs (gpu_a100):
+  training hindcast `29132299`, smoke `29132300`; ⚠️ production chained afterok on both (before the defect rule): full
+  hindcast `29132301` (`D6_OUT=output/D6_k1_CNN_gen_nt`), long runs `29132302`–`29132306`.
+- 2026-11-11, **s5r (A2c) submitted** (Rik, asked "Copy LinReg7_CNN_gen_ntc to Snellius and submit it with production
+  chained?": "Yes, chain production"). Snellius at `dff6b5b0`; artefact sha256 `19f20580…d781` equal; partner runs
+  `D6_LinReg7`, `D6train_LinReg7` present. Jobs (gpu_a100): training hindcast `29132409`, smoke `29132411`; ⚠️ production
+  chained afterok on both: full hindcast `29132412` (`D6_OUT=output/D6_LinReg7_CNN_gen_ntc`), long runs
+  `29132413`–`29132417`.
+- 2026-11-11, **scored** (Rik: "Yes, copy"; all 30 job records COMPLETED, read-only check by the paper session at 18:35).
+  Copied Snellius → laptop: per closure `D6_<name>` (900 files), `D6train_<name>` (50) and the five long-run replicas;
+  summed bytes equal per folder, the 15 replicas' sha256 equal. Scratch logs (session scratchpad): `train_s5k.log`,
+  `train_s5r.log` (defect rule), `full_s5s.log` (`train_hindcast.jl --full`), `score_s5s.log` (driver `score_step5s.jl`,
+  `paired_compare` × 9), `longrun_s5s.log`, `decomp_s5s.log` (the step-4 session's `s4_longrun_decomp.jl`, closures
+  extended), `gate_s5s.log` + a long-run census. **Defect rule** (training hindcasts): s5k none (no member diverged; ratio
+  to k1a 1.14 1.03 1.11 1.13 1.11 1.11; guard 215 of 60 000 steps, 1 member; k1a 0); s5r none (ratio to LinReg7 1.20 1.36
+  1.36 1.38 1.27 1.28; guard 0). Hand-over: side-session notes `step5_skips_results_for_paper.md`.
+
+#### Coupled (Table `tab: res s5` rows; hindcast K = 90, M = 10; long runs 5 × 100 TU)
+
+| closure | CRPS_0.5 | CRPS_3 | e_0.5 | cal. | b_0.5 | b_2.5 | guard | b | D | D range | CRPS_100 | e_100 | SS ratio | guard |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| LinReg1 (λ = 0) | 0.221 | 0.390 | 0.455 | 28 | −2.9 | −5.9 | 0.42 | −7.3 | 0.84 | 0.59–1.01 | 0.387 | 0.649 | 1.53 | 1.13 |
+| LinReg1_nt | 0.236 | 0.402 | 0.469 | 15 | −2.0 | −4.0 | 0.03 | −5.1 | 0.76 | 0.54–0.88 | 0.380 | 0.679 | 1.25 | 0.04 |
+| k1a LinReg1_nt + CNN, learned sds + refitted corr. | 0.227 | 0.364 | 0.444 | 13 | −0.4 | −2.5 | 0.02 | −3.3 | 0.32 | 0.17–0.51 | 0.369 | 0.655 | 1.12 | <0.01 |
+| k1b the same, learned head | 0.231 | 0.365 | 0.446 | 15 | −0.3 | −2.3 | 0.02 | −2.6 | 0.29 | 0.19–0.38 | 0.333 | 0.581 | 1.27 | 0.01 |
+| **s5n LinReg1_nt + stochastic CNN (own noise)** | 0.240 | 0.397 | 0.470 | 10 | −1.7 | −5.9 | 0.16 | −6.6 | 0.77 | 0.64–1.03 | 0.392 | 0.706 | 1.26 | 0.35 |
+| **s5k k1 mean + stochastic CNN (own noise)** | 0.228 | 0.405 | 0.446 | 8 | −1.5 | −8.9 | 0.17 | −11.4 | 1.03 | 0.76–1.32 | 0.478 | 0.932 | 1.30 | 2.00 |
+| LinReg7 (λ = 1) | 0.263 | 0.408 | 0.498 | 5 | −4.0 | −5.1 | 0 | −4.9 | 0.65 | 0.54–0.91 | 0.386 | 0.691 | 0.99 | 0 |
+| k2a LinReg7 + CNN, learned sds + refitted corr. | 0.230 | 0.387 | 0.456 | 12 | −3.2 | −3.0 | 0.05 | −3.2 | 0.33 | 0.30–0.58 | 0.375 | 0.667 | 1.18 | 0.01 |
+| **s5r LinReg7 + stochastic CNN (own total noise)** | 0.254 | 0.425 | 0.494 | 8 | −2.1 | −4.3 | 0.13 | −4.4 | 0.62 | 0.53–0.72 | 0.394 | 0.682 | 1.36 | 0.07 |
+| (step 5, LinReg1 + stochastic CNN) | 0.275 | 0.404 | 0.543 | 14 | +2.8 | −0.6 | <0.01 | −1.4 | 0.48 | 0.42–0.68 | 0.381 | 0.642 | 1.35 | 0 |
+
+Guard columns: % of forecast steps (hindcast) / of long-run steps. Six digits: CRPS_0.5 0.24034 / 0.22826 / 0.25448;
+CRPS_3 0.39729 / 0.40518 / 0.42528 (paired with the matched partner). No member diverged in any of the three; every
+long run stable 5 of 5; no guard firing in leads 1–200.
+
+#### Paired verdicts (90 % IC-block bootstrap, 10 000 resamples; % of B; G from the long runs)
+
+G (KS guard against LinReg7, single-run D 0.54–0.91): s5n 0.64–1.03, s5k 0.76–1.32, s5r 0.53–0.72 — all overlap, **G
+passes for all three.**
+
+| A vs B | CRPS_0.5 | CRPS_3 | e_0.5 | cal. A − B | S | C | verdict |
+|---|---|---|---|---|---|---|---|
+| s5n vs LinReg1_nt (partner) | +1.8 [−1.4, +4.8], n.r. | −1.1 [−3.2, +1.0], n.r. | +0.2, n.r. | −5 [−7, +1] | fail | fail | **does not improve** |
+| s5n vs k1b (step 4, same skip) | +3.9 [+0.4, +7.6] (worse) | +8.9 (worse) | +5.2 (worse) | −5 [−7, +1] | fail | fail | no |
+| s5n vs LinReg1 (criterion) | +8.9 [+4.9, +12.7] (worse) | +1.5, n.r. | +3.1 (worse) | −18 [−22, −7] | fail | fail | **does not improve** |
+| s5k vs k1a (partner) | +0.4 [−2.3, +2.9], n.r. | +11.4 [+7.3, +15.4] (worse) | +0.4, n.r. | −5 [−6, +3] | fail | fail | **does not improve** |
+| s5k vs k1b | −1.4 [−4.2, +1.4], n.r. | +11.0 (worse) | −0.1, n.r. | −7 [−7, +4] | fail | fail | no |
+| s5k vs LinReg1 (criterion) | +3.4 [−1.3, +7.7], n.r. | +3.5, n.r. | −2.2, n.r. | −20 [−21, −5] | fail | fail | **does not improve** |
+| s5r vs LinReg7 (partner) | −3.2 [−8.8, +2.2], n.r. | +4.1 [+0.5, +8.0] (worse) | −0.9, n.r. | +3 [−2, +10] | fail | fail | **does not improve** |
+| s5r vs k2a (step 4, same skip) | +10.5 [+6.1, +14.8] (worse) | +10.0 (worse) | +8.3 (worse) | −4 [−7, +1] | fail | fail | no |
+| s5r vs LinReg1 (criterion) | +15.3 [+9.3, +21.4] (worse) | +9.0 (worse) | +8.5 (worse) | −20 [−24, −9] | fail | fail | **does not improve** |
+
+#### Long runs: how much of D is mean, width, shape (step-4 session's decomposition; summed KS over the QoIs)
+
+| closure | KS raw | mean matched | mean and sd matched | mean / ref | sd / ref |
+|---|---|---|---|---|---|
+| LinReg1 | 0.84 | 0.45 | 0.27 | 0.91–0.94 | 1.23–1.40 |
+| LinReg1_nt | 0.76 | 0.34 | 0.10 | 0.94–0.96 | 1.11–1.25 |
+| k1a | 0.32 | 0.19 | 0.20 | 0.96–0.98 | 1.02–1.07 |
+| k1b | 0.29 | 0.22 | 0.22 | 0.97–0.98 | 1.03–1.08 |
+| **s5n** | 0.77 | 0.31 | 0.22 | 0.92–0.95 | 1.11–1.27 |
+| **s5k (B)** | 1.03 | 0.67 | 0.53 | 0.87–0.90 | 1.34–1.62 |
+| LinReg7 | 0.65 | 0.14 | 0.08 | 0.94–0.96 | 0.89–1.00 |
+| k2a | 0.33 | 0.24 | 0.27 | 0.96–1.00 | 1.04–1.15 |
+| **s5r** | 0.62 | 0.39 | 0.19 | 0.95–0.98 | 1.11–1.31 |
+| (step 5 on LinReg1) | 0.48 | 0.39 | 0.25 | 0.98–0.99 | 1.10–1.16 |
+
+**B against k1a (the same frozen mean; B adds the generator's learned L and a small state-dependent part):** short leads
+equal (CRPS₀.₅ +0.4 % n.r., e₀.₅ +0.4 % n.r.), but from 1–3 TU on B's ensembles widen (spread 1.24–1.48 × k1a's,
+error 1.15–1.33 ×) and its long runs fall away from the reference on all three counts: the mean lower (b −11.4 % against
+−3.3 %; 0.87–0.90 of the reference, with a downward drift: second half over first 0.86–1.00 in three of five runs, 6–12 %
+of the samples below the reference's minimum), the width too large (sd 1.34–1.62 against 1.02–1.07), and the shape off
+even when mean and sd are matched (0.53 against 0.20); long-run guard 2.00 % of steps (k1a < 0.01 %). Offline B's noise
+was only a little wider than k1a's in the middle band (1.29 / 1.50 against 1.18 / 1.40 of k1a's clean rms) and its
+response a little stronger (0.81 / 0.87 against 0.77 / 0.81); coupled, that small excess compounds.
+
+#### Readings (to check against the paper's claims)
+
+1. **C5 holds where it was predicted.** On the weak-response skips the short-lead loss of step 5 disappears: s5n against
+   LinReg1_nt +1.8 % (n.r.), s5r against LinReg7 −3.2 % (n.r.), against step 5's +24.3 % [+13.9, +33.0] on LinReg1. The
+   generator keeps the skip's response (0.75–0.87, not 2.4) because it is trained with its noise in the history.
+2. **But it adds nothing over the skip, and loses to step 4 on the same skip.** s5n is LinReg1_nt in every column (D
+   0.77 against 0.76); s5r is about LinReg7 short and long (D 0.62 against 0.65), and 10 % worse than k2a at short
+   leads; B equals k1a at short leads and is far worse long (D 1.03 against 0.32). None improves on its partner, on the
+   step-4 network or on LinReg1; all pass G.
+3. **Step 4 against step 5 on the same skips** (the question that motivated the runs): the difference is not which skip
+   the network sits on. With the skip and the training history matched, the step-4 network (a mean correction with a
+   learned constant Gaussian) beats the generator at short leads on LinReg7 and in the long runs on both skips.
+4. **The calibrated-cell count drops** for all three (8–10 against the partners' 5–15 and LinReg1's 28).

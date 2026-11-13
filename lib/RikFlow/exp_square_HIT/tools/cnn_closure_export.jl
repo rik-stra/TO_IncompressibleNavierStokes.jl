@@ -232,6 +232,8 @@ elseif XNOISE == "pl"
     @printf("  power law: beta %s\n", fmt(f.beta))
 end
 w = RF.cnn_weights(r.refit.ps.net, spec; seq_index, q_index = 1:NQ, bd, LR, Ws, T = XT)
+const XCENTRE = XGEN && get(P, "centre", false) === true   # step5_reach_k1a: the network centred on ε (GEN_CENTRE)
+XCENTRE && (w = RF.with_centred(w); RF.check_shapes(w, spec))
 if !isempty(XMEAN)                                  # step 5 B: the step-4 closure's network, frozen
     kd = joinpath(XTO, "step3", "closures", XMEAN)
     kf = only(filter(f -> startswith(f, "StochLSTM_seed") && endswith(f, ".jld2"), readdir(kd)))
@@ -270,7 +272,7 @@ RF.save_stochlstm(file, spec, w, sc; run = XRUN, noise = XNOISE, provenance = pr
                   loss = P["loss"], train_steps = (400, 4000), made = string(now()),
                   skip = isempty(XSKIP) ? "none" : XSKIP, precision = string(XT), innoise = string(XINN),
                   meannet = isempty(XMEAN) ? "none" : XMEAN, netskip = isempty(XNETSKIP) ? "none" : XNETSKIP,
-                  hist_noise = string(get(P, "hist_noise", :recorded)))
+                  hist_noise = string(get(P, "hist_noise", :recorded)), centred = XCENTRE)
 @printf("wrote %s\n", file)
 
 # the translation check

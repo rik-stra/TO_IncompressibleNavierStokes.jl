@@ -395,3 +395,68 @@ end
         @test s1.y == s2.y
     end
 end
+
+# V102 -- step 5 reaching k1a (2026-11-13, card analysis/cards/step5_reach_k1a.md): a generator CENTRED on ε (`Cv.centred`),
+# y = g(x, ε) - g(x, 0) [+ m(x)] + Ws x + L ε. Pinned: the forward pass by hand; at ε = 0 the output is the skip exactly (with
+# a frozen mean: the step-4 closure's mean); online with the member's ε; refused off a generator; a save/load round trip.
+
+@testitem "V102 a generator centred on ε: g(x, ε) - g(x, 0) + Ws x + L ε; at ε = 0 the skip exactly" default_imports = false setup = [GenFix] begin
+    using Test, Random, LinearAlgebra
+    using .GenFix: spec, weights, nin, cnn_window!, cnn_features, LSTMState, with_centred, is_centred, check_shapes,
+                   with_mean_net, mean_net_from
+    nq, h = 3, 4
+    L = Matrix(cholesky([1 0.5 0.2; 0.5 1 0.3; 0.2 0.3 1.0]).L) ./ 4
+    Ws = randn(Xoshiro(3), nq, nin(nq, h)) ./ 5
+    sp = spec(nq, h; skip = true)
+    w0 = weights(sp; L, Ws)                                    # a trained-looking generator (output layer not zero)
+    w = with_centred(w0)
+    @test is_centred(w) && !is_centred(w0)
+    @test check_shapes(w, sp)
+    net(x, e) = (F = vcat(cnn_features(w0, sp, x), e); h1 = tanh.(w0.Wx * F .+ w0.b[1:7]);
+                 w0.V1 * tanh.(w0.Wh * h1 .+ w0.b[8:14]) .+ w0.cdec)
+    for s in 1:5
+        x, e = randn(Xoshiro(s), nin(nq, h)), randn(Xoshiro(50 + s), nq)
+        st = LSTMState(sp, Float64)
+        cnn_window!(st, w, sp, reshape(x, :, 1); eps = e)
+        @test st.y ≈ net(x, e) .- net(x, zeros(nq)) .+ Ws * x .+ L * e rtol = 1e-12
+        cnn_window!(st, w, sp, reshape(x, :, 1); eps = zeros(nq))
+        @test maximum(abs, st.y .- Ws * x) < 1e-12               # at ε = 0: the skip
+    end
+    # with a frozen CNN mean (B): at ε = 0 the step-4 closure's deployed mean
+    b = GenFix.bpair()
+    wc = with_centred(with_mean_net(weights(b.spg; L, Ws = b.Ws), mean_net_from(b.wk, b.spk)))
+    @test check_shapes(wc, b.spg)
+    x = randn(Xoshiro(9), size(b.Ws, 2))
+    sk, sg = LSTMState(b.spk, Float64), LSTMState(b.spg, Float64)
+    cnn_window!(sk, b.wk, b.spk, reshape(x, :, 1))
+    cnn_window!(sg, wc, b.spg, reshape(x, :, 1); eps = zeros(3))
+    @test maximum(abs, sg.y .- sk.y) < 1e-12
+end
+
+@testitem "V102 centred: online with the member's ε; refused off a generator; round trip" default_imports = false setup = [GenFix] begin
+    using Test, Random, LinearAlgebra
+    using .GenFix: spec, weights, nin, scaling, path, StochLSTM, get_next_item_timeseries, cnn_window!, LSTMState,
+                   with_centred, is_centred, check_shapes, save_stochlstm, load_stochlstm
+    nq, h = 3, 4
+    L = Matrix(1.0I, nq, nq) ./ 3
+    Ws = randn(Xoshiro(3), nq, nin(nq, h)) ./ 5
+    sp = spec(nq, h; skip = true)
+    w = with_centred(weights(sp; L, Ws))
+    Q, warm = path(fill(3.0, nq), 16; nwarm = 6)
+    m = StochLSTM(sp, w, scaling(nq, h); spinnup_data = warm, rng = Xoshiro(5), gate = 0.0)
+    ref = Xoshiro(5)
+    for k in 1:16
+        dQ = get_next_item_timeseries(m, Q[:, k])
+        k <= 6 && continue
+        e = [randn(ref) for _ in 1:nq]
+        st = LSTMState(sp, Float64)
+        cnn_window!(st, w, sp, m.xwin[:, 1:1]; eps = e)
+        @test dQ ≈ st.y .* 0.1 rtol = 1e-12
+    end
+    spk = spec(nq, h; emission = :constant, skip = true)
+    @test_throws ErrorException check_shapes(with_centred(weights(spk; L = Matrix(1.0I, nq, nq), Ws)), spk)
+    mktempdir() do d
+        r = load_stochlstm(save_stochlstm(joinpath(d, "c.jld2"), sp, w, scaling(nq, h)))
+        @test is_centred(r.weights)
+    end
+end
